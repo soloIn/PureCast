@@ -135,11 +135,62 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
     stream >> method >> uri >> version;
 
     std::string cseq = parse_header(request, "CSeq");
-    LOGI("处理 RTSP 方法: %s, CSeq: %s", method.c_str(), cseq.c_str());
+    LOGI("处理 RTSP 方法: %s, URI: %s, CSeq: %s", method.c_str(), uri.c_str(), cseq.c_str());
 
     std::ostringstream response;
 
-    if (method == "OPTIONS") {
+    if (method == "GET") {
+        if (uri.find("/info") != std::string::npos) {
+            // 💡 针对 iOS 发起的 /info 探针，声明纯音频 AirPort Express (features=7)，避免进入 AirPlay 2 配对通道
+            std::string plist =
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n"
+                "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\r\n"
+                "<plist version=\"1.0\">\r\n"
+                "<dict>\r\n"
+                "    <key>model</key>\r\n"
+                "    <string>AirPort4,107</string>\r\n"
+                "    <key>features</key>\r\n"
+                "    <integer>7</integer>\r\n"
+                "    <key>sourceVersion</key>\r\n"
+                "    <string>220.68</string>\r\n"
+                "    <key>statusFlags</key>\r\n"
+                "    <integer>4</integer>\r\n"
+                "</dict>\r\n"
+                "</plist>\r\n";
+
+            response << "RTSP/1.0 200 OK\r\n"
+                     << "CSeq: " << cseq << "\r\n"
+                     << "Content-Type: text/x-apple-plist+xml\r\n"
+                     << "Content-Length: " << plist.size() << "\r\n"
+                     << "Server: AirTunes/220.68\r\n\r\n"
+                     << plist;
+        } else {
+            response << "RTSP/1.0 200 OK\r\n"
+                     << "CSeq: " << cseq << "\r\n"
+                     << "Server: AirTunes/220.68\r\n\r\n";
+        }
+    } else if (method == "POST") {
+        if (uri.find("/pair-setup") != std::string::npos || uri.find("/pair-verify") != std::string::npos) {
+            // 明确拒绝 AirPlay 2 配对请求，迫使 iOS 客户端降级至免认证的标准 AirPlay 1 RAOP 协议
+            LOGW("收到 AirPlay 2 配对探测请求 (%s)，返回 405 Method Not Allowed 触发客户端 AirPlay 1 回退", uri.c_str());
+            response << "RTSP/1.0 405 Method Not Allowed\r\n"
+                     << "CSeq: " << cseq << "\r\n"
+                     << "Server: AirTunes/220.68\r\n\r\n";
+        } else {
+            response << "RTSP/1.0 200 OK\r\n"
+                     << "CSeq: " << cseq << "\r\n"
+                     << "Server: AirTunes/220.68\r\n\r\n";
+        }
+    } else if (method == "FLUSH") {
+        response << "RTSP/1.0 200 OK\r\n"
+                 << "CSeq: " << cseq << "\r\n"
+                 << "RTP-Info: rtptime=0\r\n"
+                 << "Server: AirTunes/220.68\r\n\r\n";
+    } else if (method == "GET_PARAMETER") {
+        response << "RTSP/1.0 200 OK\r\n"
+                 << "CSeq: " << cseq << "\r\n"
+                 << "Server: AirTunes/220.68\r\n\r\n";
+    } else if (method == "OPTIONS") {
         response << "RTSP/1.0 200 OK\r\n"
                  << "CSeq: " << cseq << "\r\n"
                  << "Public: ANNOUNCE, SETUP, RECORD, PAUSE, FLUSH, TEARDOWN, OPTIONS, GET_PARAMETER, SET_PARAMETER\r\n"

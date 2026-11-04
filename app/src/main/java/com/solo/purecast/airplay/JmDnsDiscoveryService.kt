@@ -75,14 +75,13 @@ class JmDnsDiscoveryService(private val context: Context) {
 
             jmdns = JmDNS.create(localIp, friendlyName)
 
-            // 1. 构建 _airplay._tcp.local. 服务
+            // 1. 覆盖广播 _airplay._tcp.local. 为纯音频 AirPort 音箱 (features=0x7, model=AirPort4,107)
+            // 彻底覆盖旧的 AppleTV2,1 缓存，坚决剔除 pk 与 pi 避免 iOS 误入 AirPlay 2 配对通道
             val airplayProps = mapOf(
                 "deviceid" to formatMacWithColons(macAddressFormatted),
-                "features" to "0x5A7FFFF7,0x1E",
+                "features" to "0x7",
                 "flags" to "0x4",
-                "model" to "AppleTV2,1",
-                "pk" to "b07727d6f6cd5e08b58ede525ec3cdeaa252ad9f683fedc4d1fba8343fc95634",
-                "pi" to "2e388006-13ba-4041-9a67-25dd4a43d536",
+                "model" to "AirPort4,107",
                 "srcvers" to "220.68",
                 "vv" to "2"
             )
@@ -90,13 +89,13 @@ class JmDnsDiscoveryService(private val context: Context) {
             airPlayServiceInfo = ServiceInfo.create(
                 AIRPLAY_SERVICE_TYPE,
                 friendlyName,
-                airPlayPort,
+                raopPort, // 统一指向 RAOP 5000 端口
                 0,
                 0,
                 airplayProps
             )
 
-            // 2. 构建 _raop._tcp.local. 服务 (服务名必须为: MAC@Name)
+            // 2. 构建 _raop._tcp.local. 纯音频 AirTunes 广播服务 (标准命名: MAC@Name)
             val raopInstanceName = "${macAddressFormatted}@$friendlyName"
             val raopProps = mapOf(
                 "ch" to "2",
@@ -113,7 +112,8 @@ class JmDnsDiscoveryService(private val context: Context) {
                 "tp" to "UDP",
                 "txtvers" to "1",
                 "vn" to "3",
-                "vs" to "220.68"
+                "vs" to "220.68",
+                "am" to "AirPort4,107"
             )
 
             raopServiceInfo = ServiceInfo.create(
@@ -129,7 +129,7 @@ class JmDnsDiscoveryService(private val context: Context) {
             jmdns?.registerService(raopServiceInfo)
 
             isBroadcasting = true
-            Logger.service.i(TAG, "AirPlay 1 / RAOP 双服务已成功通过 JmDNS 广播在局域网中")
+            Logger.service.i(TAG, "AirPlay 1 (AirTunes / RAOP) 纯音频双服务已成功通过 JmDNS 广播在局域网中 (am=AirPort4,107, features=0x7)")
             true
         } catch (e: Exception) {
             Logger.service.e(TAG, "启动 JmDnsDiscoveryService 异常", e)

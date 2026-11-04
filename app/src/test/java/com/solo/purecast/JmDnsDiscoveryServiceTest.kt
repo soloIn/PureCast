@@ -20,12 +20,12 @@ class JmDnsDiscoveryServiceTest {
         val airplayPort = 7000
         val raopPort = 5000
 
-        // 验证 _airplay._tcp.local. 服务属性
+        // 验证 _airplay._tcp.local. 服务属性 (纯音频 AirPort4,107, features=0x7)
         val airplayProps = mapOf(
             "deviceid" to "4A:3B:2C:1D:0E:1F",
-            "features" to "0x5A7FFFF7,0x1E",
+            "features" to "0x7",
             "flags" to "0x4",
-            "model" to "AppleTV2,1",
+            "model" to "AirPort4,107",
             "srcvers" to "220.68",
             "vv" to "2"
         )
@@ -33,7 +33,7 @@ class JmDnsDiscoveryServiceTest {
         val airplayInfo = ServiceInfo.create(
             JmDnsDiscoveryService.AIRPLAY_SERVICE_TYPE,
             friendlyName,
-            airplayPort,
+            raopPort,
             0,
             0,
             airplayProps
@@ -41,9 +41,9 @@ class JmDnsDiscoveryServiceTest {
 
         assertEquals(JmDnsDiscoveryService.AIRPLAY_SERVICE_TYPE, airplayInfo.type)
         assertEquals(friendlyName, airplayInfo.name)
-        assertEquals(7000, airplayInfo.port)
-        assertEquals("AppleTV2,1", airplayInfo.getPropertyString("model"))
-        assertEquals("0x5A7FFFF7,0x1E", airplayInfo.getPropertyString("features"))
+        assertEquals(5000, airplayInfo.port)
+        assertEquals("AirPort4,107", airplayInfo.getPropertyString("model"))
+        assertEquals("0x7", airplayInfo.getPropertyString("features"))
 
         // 验证 _raop._tcp.local. 服务属性与命名规范 (必须为 MAC@Name)
         val raopInstanceName = "${mac}@$friendlyName"
@@ -57,7 +57,8 @@ class JmDnsDiscoveryServiceTest {
             "sr" to "44100",
             "ss" to "16",
             "tp" to "UDP",
-            "txtvers" to "1"
+            "txtvers" to "1",
+            "am" to "AirPort4,107"
         )
 
         val raopInfo = ServiceInfo.create(
@@ -73,6 +74,7 @@ class JmDnsDiscoveryServiceTest {
         assertEquals("4A3B2C1D0E1F@PureCast TV", raopInfo.name)
         assertEquals(5000, raopInfo.port)
         assertEquals("UDP", raopInfo.getPropertyString("tp"))
+        assertEquals("AirPort4,107", raopInfo.getPropertyString("am"))
         assertEquals("44100", raopInfo.getPropertyString("sr"))
         assertEquals("16", raopInfo.getPropertyString("ss"))
         assertEquals("2", raopInfo.getPropertyString("ch"))
