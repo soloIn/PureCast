@@ -94,34 +94,94 @@ bool FlacDecoder::decode_stream(
          pFlac->sampleRate, pFlac->channels, pFlac->bitsPerSample,
          static_cast<unsigned long long>(pFlac->totalPCMFrameCount));
 
+    const unsigned int target_bits = (pFlac->bitsPerSample > 16) ? 24 : 16;
     if (on_format_ready) {
         on_format_ready(static_cast<int>(pFlac->sampleRate),
-                        static_cast<int>(pFlac->bitsPerSample),
+                        static_cast<int>(target_bits),
                         static_cast<int>(pFlac->channels),
                         user_data);
     }
 
     constexpr size_t FRAMES_PER_READ = 2048;
-    std::vector<drflac_int16> pcm_frames(FRAMES_PER_READ * pFlac->channels);
-    const size_t bytes_per_frame = pFlac->channels * sizeof(drflac_int16);
+    const unsigned int bits = pFlac->bitsPerSample;
+    const unsigned int channels = pFlac->channels;
 
-    while (AudioEngine::instance().is_streaming()) {
-        drflac_uint64 frames_read = drflac_read_pcm_frames_s16(pFlac, FRAMES_PER_READ, pcm_frames.data());
-        if (frames_read == 0) {
-            LOGI("FLAC 流解码到达 EOF 边界");
-            break;
+    if (bits > 16) {
+        // 💡 24-bit FLAC：采用 drflac_read_pcm_frames_s32 解码，提取 24 位整数 PCM (3 字节每采样)，保持 100% Bit-Perfect
+        std::vector<drflac_int32> pcm32_frames(FRAMES_PER_READ * channels);
+        std::vector<uint8_t> pcm24_bytes(FRAMES_PER_READ * channels * 3);
+
+        while (AudioEngine::instance().is_running()) {
+            if (AudioEngine::instance().is_paused()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                continue;
+            }
+
+            drflac_uint64 frames_read = drflac_read_pcm_frames_s32(pFlac, FRAMES_PER_READ, pcm32_frames.data());
+            if (frames_read == 0) {
+                LOGI("FLAC 24-bit 流解码到达 EOF 边界");
+                break;
+            }
+
+            // 💡 dr_flac 将 24-bit 采样在 s32 中高位对齐 (sample24 << 8)
+            // 提取纯粹的 3 字节小端序原始采样 (Byte1=Low, Byte2=Mid, Byte3=High)
+            const size_t total_samples = frames_read * channels;
+            uint8_t* dst = pcm24_bytes.data();
+            for (size_t i = 0; i < total_samples; ++i) {
+                uint32_t u = static_cast<uint32_t>(pcm32_frames[i]);
+                *dst++ = static_cast<uint8_t>((u >> 8) & 0xFF);
+                *dst++ = static_cast<uint8_t>((u >> 16) & 0xFF);
+                *dst++ = static_cast<uint8_t>((u >> 24) & 0xFF);
+            }
+
+            const size_t bytes_to_write = total_samples * 3;
+            size_t written_total = 0;
+
+            while (written_total < bytes_to_write && AudioEngine::instance().is_running()) {
+                if (AudioEngine::instance().is_paused()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    continue;
+                }
+                int n = AudioEngine::instance().write_pcm(pcm24_bytes.data() + written_total, bytes_to_write - written_total);
+                if (n > 0) {
+                    written_total += static_cast<size_t>(n);
+                } else {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                }
+            }
         }
+    } else {
+        // 💡 16-bit FLAC：采用 drflac_read_pcm_frames_s16 直接直通无损还原
+        std::vector<drflac_int16> pcm_frames(FRAMES_PER_READ * channels);
+        const size_t bytes_per_frame = channels * sizeof(drflac_int16);
 
-        const uint8_t* raw_bytes = reinterpret_cast<const uint8_t*>(pcm_frames.data());
-        size_t bytes_to_write = frames_read * bytes_per_frame;
-        size_t written_total = 0;
+        while (AudioEngine::instance().is_running()) {
+            if (AudioEngine::instance().is_paused()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                continue;
+            }
 
-        while (written_total < bytes_to_write && AudioEngine::instance().is_streaming()) {
-            int n = AudioEngine::instance().write_pcm(raw_bytes + written_total, bytes_to_write - written_total);
-            if (n > 0) {
-                written_total += static_cast<size_t>(n);
-            } else {
-                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            drflac_uint64 frames_read = drflac_read_pcm_frames_s16(pFlac, FRAMES_PER_READ, pcm_frames.data());
+            if (frames_read == 0) {
+                LOGI("FLAC 16-bit 流解码到达 EOF 边界");
+                break;
+            }
+
+            const uint8_t* raw_bytes = reinterpret_cast<const uint8_t*>(pcm_frames.data());
+            size_t bytes_to_write = frames_read * bytes_per_frame;
+            size_t written_total = 0;
+
+            while (written_total < bytes_to_write && AudioEngine::instance().is_running()) {
+                if (AudioEngine::instance().is_paused()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    continue;
+                }
+                int n = AudioEngine::instance().write_pcm(raw_bytes + written_total, bytes_to_write - written_total);
+                if (n > 0) {
+                    written_total += static_cast<size_t>(n);
+                } else {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                }
             }
         }
     }

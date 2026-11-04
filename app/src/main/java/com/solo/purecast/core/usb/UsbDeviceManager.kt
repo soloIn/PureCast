@@ -37,6 +37,11 @@ class UsbDeviceManager(
     private var activeConnection: UsbDeviceConnection? = null
     private val isExclusiveTaken = AtomicBoolean(false)
 
+    // 💡 记录当前活跃的声卡硬件配置，切歌时比对是否需要重配底层 Native 驱动
+    private var currentSampleRate: Int = 0
+    private var currentBitDepth: Int = 0
+    private var currentChannels: Int = 0
+
     // 💡 10 秒空闲自动归还调度任务
     private var idleTimeoutMillis = 10_000L
     private val releaseRunnable = Runnable {
@@ -194,8 +199,23 @@ class UsbDeviceManager(
         }
 
         if (isExclusiveTaken.get() && activeConnection != null) {
-            Logger.usb.i(TAG, "USB 设备当前已被独占接管，维持当前连接")
-            return true
+            if (currentSampleRate == sampleRate && currentBitDepth == bitDepth && currentChannels == channels) {
+                Logger.usb.i(TAG, "USB 设备当前已被独占接管且音频规格一致 ($sampleRate Hz, $bitDepth bit, $channels ch)，维持当前连接")
+                return true
+            }
+            Logger.usb.i(TAG, "检测到音频规格变更: ${currentSampleRate}Hz/${currentBitDepth}bit -> ${sampleRate}Hz/${bitDepth}bit，重新配置底层 Native 驱动...")
+            val fd = activeConnection!!.fileDescriptor
+            val ret = NativeAudioEngine.openDevice(fd, sampleRate, bitDepth, channels)
+            if (ret == 0) {
+                currentSampleRate = sampleRate
+                currentBitDepth = bitDepth
+                currentChannels = channels
+                Logger.usb.i(TAG, "🎉 音频硬件规格切频配置成功: ${sampleRate}Hz / ${bitDepth}bit / ${channels}ch")
+                return true
+            } else {
+                Logger.usb.w(TAG, "动态重配 Native 驱动失败 ($ret)，释放旧连接并尝试重建...")
+                releaseUsbExclusive()
+            }
         }
 
         Logger.usb.i(TAG, "打开 UsbDeviceConnection 并穿透 Linux usbfs fd 到 C++ 驱动层...")
@@ -221,16 +241,23 @@ class UsbDeviceManager(
         }
 
         activeConnection = connection
+        currentSampleRate = sampleRate
+        currentBitDepth = bitDepth
+        currentChannels = channels
         isExclusiveTaken.set(true)
-        Logger.usb.i(TAG, "🎉 成功独占 USB 声卡，Bit-Perfect 传输流水线就绪")
+        Logger.usb.i(TAG, "🎉 成功独占 USB 声卡，Bit-Perfect 传输流水线就绪 (${sampleRate}Hz / ${bitDepth}bit)")
         return true
     }
 
     /**
-     * 标记进入空闲状态，启动 10 秒倒计时让渡
+     * 标记进入空闲状态，启动空闲倒计时让渡 (0秒表示常驻独占，不启动倒计时)
      */
     fun scheduleIdleRelease() {
         mainHandler.removeCallbacks(releaseRunnable)
+        if (idleTimeoutMillis <= 0L) {
+            Logger.usb.i(TAG, "已配置常驻独占策略 (0秒)，保持声卡独占不自动让渡")
+            return
+        }
         Logger.usb.i(TAG, "启动 ${idleTimeoutMillis / 1000} 秒空闲声卡让渡倒计时...")
         mainHandler.postDelayed(releaseRunnable, idleTimeoutMillis)
     }
@@ -268,6 +295,9 @@ class UsbDeviceManager(
         }
 
         isExclusiveTaken.set(false)
+        currentSampleRate = 0
+        currentBitDepth = 0
+        currentChannels = 0
 
         // 💡 步骤 3: 声卡主动自检自愈 (Self-Healing Check)
         // 触发 Android AudioService 刷新物理音频设备路由，确保其他电视 App 恢复出声
@@ -290,8 +320,8 @@ class UsbDeviceManager(
     }
 
     fun setIdleTimeoutSeconds(seconds: Int) {
-        idleTimeoutMillis = seconds.coerceAtLeast(3) * 1000L
-        Logger.usb.i(TAG, "更新空闲声卡让渡时间为: $seconds 秒")
+        idleTimeoutMillis = if (seconds <= 0) 0L else seconds.coerceAtLeast(3) * 1000L
+        Logger.usb.i(TAG, "更新空闲声卡让渡时间为: $seconds 秒 (0秒为常驻独占)")
     }
 
     fun isExclusive(): Boolean = isExclusiveTaken.get()

@@ -2,6 +2,8 @@ package com.solo.purecast.ui.components
 
 import android.graphics.Bitmap
 import android.os.Build
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
@@ -27,6 +29,7 @@ import kotlinx.coroutines.withContext
  * 1. API 31+ (Android 12+): 启用原生硬件级 Modifier.blur(60.dp)
  * 2. API 30 (Android 11 电视系统): Google 全面废弃 RenderScript，
  *    通过轻量级 Kotlin 内存 StackBlur 算法对 128x128 缩略图模糊 (< 3ms 开销)，杜绝低端 32 位电视卡顿。
+ * 3. 动态色彩过渡：集成 animateColorAsState(tween(1200))，实现专辑切换时的柔和光影流转。
  */
 @Composable
 fun FluidBackground(
@@ -34,6 +37,18 @@ fun FluidBackground(
     secondaryColor: Color = Color(0xFF141A29),
     modifier: Modifier = Modifier
 ) {
+    // 💡 柔和色彩流转动画，切歌时背景平滑渐变
+    val animatedPrimary by animateColorAsState(
+        targetValue = primaryColor,
+        animationSpec = tween(durationMillis = 1200),
+        label = "fluidPrimaryColor"
+    )
+    val animatedSecondary by animateColorAsState(
+        targetValue = secondaryColor,
+        animationSpec = tween(durationMillis = 1200),
+        label = "fluidSecondaryColor"
+    )
+
     Box(
         modifier = modifier
             .fillMaxSize()
@@ -48,8 +63,8 @@ fun FluidBackground(
                     .background(
                         Brush.radialGradient(
                             colors = listOf(
-                                primaryColor.copy(alpha = 0.45f),
-                                secondaryColor.copy(alpha = 0.30f),
+                                animatedPrimary.copy(alpha = 0.45f),
+                                animatedSecondary.copy(alpha = 0.30f),
                                 Color(0xFF0F1015).copy(alpha = 0.95f)
                             ),
                             radius = 1200f
@@ -57,7 +72,7 @@ fun FluidBackground(
                     )
             )
         } else {
-            // 💡 API 30 纯 Kotlin 内存级 StackBlur 快速生成模糊图
+            // 💡 API 30 纯 Kotlin 内存级 StackBlur 快速生成模糊图 (按目标色离散触发，杜绝 60fps 动画重绘抖动)
             var blurredBitmap by remember(primaryColor, secondaryColor) { mutableStateOf<Bitmap?>(null) }
 
             LaunchedEffect(primaryColor, secondaryColor) {

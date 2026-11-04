@@ -85,6 +85,7 @@ dependencies {
     implementation(libs.androidx.tv.material)
     implementation(libs.androidx.tv.foundation)
     implementation(libs.androidx.palette.ktx)
+    implementation(libs.coil.compose)
 
     // Coroutines
     implementation(libs.kotlinx.coroutines.core)

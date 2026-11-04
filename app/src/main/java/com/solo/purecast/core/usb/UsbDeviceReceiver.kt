@@ -11,7 +11,7 @@ import com.solo.purecast.util.Logger
 
 /**
  * 💡 USB 设备热插拔与开机广播监听器
- * 拦截 USB_DEVICE_ATTACHED、USB_DEVICE_DETACHED 以及 BOOT_COMPLETED 事件
+ * 拦截 USB_DEVICE_ATTACHED、USB_DEVICE_DETACHED 以及各类电视盒子的开机/快速唤醒广播
  */
 class UsbDeviceReceiver : BroadcastReceiver() {
 
@@ -32,8 +32,10 @@ class UsbDeviceReceiver : BroadcastReceiver() {
                 Logger.usb.i(TAG, "检测到 USB 设备拔出: ${device?.deviceName}")
             }
 
-            Intent.ACTION_BOOT_COMPLETED -> {
-                Logger.usb.i(TAG, "电视盒子开机自启完成，拉起后台音频服务并冷启动枚举 USB 设备...")
+            Intent.ACTION_BOOT_COMPLETED,
+            ACTION_QUICKBOOT_POWERON,
+            ACTION_HTC_QUICKBOOT_POWERON -> {
+                Logger.usb.i(TAG, "电视盒子冷开机或快速开机广播触发 ($action)，拉起后台音频服务并冷启动枚举 USB 设备...")
                 PlaybackService.start(context)
             }
         }
@@ -41,5 +43,7 @@ class UsbDeviceReceiver : BroadcastReceiver() {
 
     companion object {
         private const val TAG = "UsbDeviceReceiver"
+        const val ACTION_QUICKBOOT_POWERON = "android.intent.action.QUICKBOOT_POWERON"
+        const val ACTION_HTC_QUICKBOOT_POWERON = "com.htc.intent.action.QUICKBOOT_POWERON"
     }
 }

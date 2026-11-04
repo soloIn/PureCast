@@ -27,10 +27,15 @@
 
     <!-- 💡 自启与设备保持相关权限 -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- 💡 Android 13+ 前台服务与媒体通知推送权限 -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 💡 申请免电池优化白名单权限，确保待机与熄屏不杀后台 UPnP / AirPlay 投屏服务 -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <!-- 💡 仅用于保持电视盒重启后 USB DAC 的授权状态，严禁在工程中调用 AudioRecord 硬件录音 API -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <!-- 💡 局域网被动唤醒悬浮窗展示保底（对不支持 Leanback 设置页的固件优雅降级） -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
 
     <application
         android:name=".PureCastApp"
@@ -76,6 +81,9 @@
                 <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
                 <action android:name="android.hardware.usb.action.USB_DEVICE_DETACHED" />
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <!-- 💡 电视盒子快速开机与快速唤醒广播适配 -->
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                <action android:name="com.htc.intent.action.QUICKBOOT_POWERON" />
             </intent-filter>
             <meta-data
                 android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"

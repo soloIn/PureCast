@@ -2,7 +2,15 @@
 """
 PureCast 端到端 UPnP 音频推流测试脚本
 基于标准 Python3 库，无需外部依赖。
-生成标准 44.1kHz / 16-bit 双声道正弦波音频流，并通过 UPnP AVTransport 推送至 PureCast TV。
+支持生成标准 16-bit (CD) 与 24-bit (Hi-Res 高解析 96k/192k) 双声道正弦波音频流，并通过 UPnP AVTransport 推送至 PureCast TV。
+
+用法:
+  python3 scripts/test_upnp_push.py [target_host] [target_port] [duration] [fmt] [sample_rate] [bit_depth]
+示例:
+  # 标准 CD 规格 16-bit / 44.1kHz WAV:
+  python3 scripts/test_upnp_push.py 192.168.2.179 7952 5 wav 44100 16
+  # 高解析 24-bit / 96kHz WAV:
+  python3 scripts/test_upnp_push.py 192.168.2.179 7952 5 wav 96000 24
 """
 
 import sys
@@ -18,7 +26,6 @@ import urllib.error
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 
 TEST_PORT = 8999
-AUDIO_FILE_NAME = "purecast_test_tone.wav"
 
 def get_local_ip():
     import subprocess
@@ -30,11 +37,14 @@ def get_local_ip():
         pass
     return "192.168.2.124"
 
-def generate_sine_wav(filename, duration_sec=5, sample_rate=44100, freq=440.0):
-    """生成 44.1kHz / 16-bit 双声道标准正弦波 WAV 文件"""
+def generate_sine_wav(filename, duration_sec=5, sample_rate=44100, bit_depth=16, freq=440.0):
+    """
+    生成双声道标准正弦波 WAV 文件
+    支持 16-bit 与 24-bit PCM，支持 44.1kHz、48kHz、96kHz、192kHz 等高解析规格
+    """
     num_samples = int(duration_sec * sample_rate)
     num_channels = 2
-    bits_per_sample = 16
+    bits_per_sample = bit_depth
     bytes_per_sample = bits_per_sample // 8
     block_align = num_channels * bytes_per_sample
     byte_rate = sample_rate * block_align
@@ -61,16 +71,21 @@ def generate_sine_wav(filename, duration_sec=5, sample_rate=44100, freq=440.0):
         f.write(b"data")
         f.write(struct.pack("<I", data_size))
 
-        # PCM 载荷
+        # PCM 载荷生成
+        max_amplitude = 8388607.0 if bit_depth == 24 else 32767.0
+        # 振幅 0.5 (-6dBFS)，防止削顶
         for i in range(num_samples):
             t = float(i) / sample_rate
-            # 振幅 0.5 (-6dBFS)，防止削顶
-            val = int(0.5 * 32767.0 * math.sin(2.0 * math.pi * freq * t))
-            sample_bytes = struct.pack("<h", val)
+            val = int(0.5 * max_amplitude * math.sin(2.0 * math.pi * freq * t))
+            if bit_depth == 24:
+                # 💡 24-bit PCM 打包为 3 字节小端序 (Little-Endian)
+                sample_bytes = struct.pack("<i", val)[:3]
+            else:
+                sample_bytes = struct.pack("<h", val)
             f.write(sample_bytes) # Left
             f.write(sample_bytes) # Right
 
-    print(f"✅ 成功生成测试音频: {filename} ({duration_sec}s, {sample_rate}Hz, 16bit, 440Hz)")
+    print(f"✅ 成功生成测试音频: {filename} ({duration_sec}s, {sample_rate}Hz, {bit_depth}bit, {freq}Hz)")
 
 def send_soap_action(target_host, target_port, action_name, action_xml):
     soap_body = f"""<?xml version="1.0" encoding="utf-8"?>
@@ -138,30 +153,33 @@ def main():
     target_port = int(sys.argv[2]) if len(sys.argv) > 2 else 7952
     duration = int(sys.argv[3]) if len(sys.argv) > 3 else 5
     fmt = sys.argv[4].lower() if len(sys.argv) > 4 else "wav"
+    sample_rate = int(sys.argv[5]) if len(sys.argv) > 5 else 44100
+    bit_depth = int(sys.argv[6]) if len(sys.argv) > 6 else 16
 
     local_ip = get_local_ip()
     temp_dir = "/tmp/purecast_test"
     os.makedirs(temp_dir, exist_ok=True)
-    wav_path = os.path.join(temp_dir, "purecast_test_tone.wav")
+    file_prefix = f"purecast_test_{sample_rate}_{bit_depth}"
+    wav_path = os.path.join(temp_dir, f"{file_prefix}.wav")
 
-    generate_sine_wav(wav_path, duration_sec=duration, sample_rate=44100, freq=440.0)
+    generate_sine_wav(wav_path, duration_sec=duration, sample_rate=sample_rate, bit_depth=bit_depth, freq=440.0)
 
     if fmt == "flac":
-        file_name = "purecast_test_tone.flac"
+        file_name = f"{file_prefix}.flac"
         flac_path = os.path.join(temp_dir, file_name)
         subprocess.check_call(["ffmpeg", "-y", "-i", wav_path, flac_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         mime = "audio/flac"
     else:
-        file_name = "purecast_test_tone.wav"
+        file_name = f"{file_prefix}.wav"
         mime = "audio/wav"
 
     server = start_http_server(temp_dir, TEST_PORT)
-    print(f">> 本地 HTTP 音频服务已启动: http://{local_ip}:{TEST_PORT}/{file_name} ({mime})")
+    print(f">> 本地 HTTP 音频服务已启动: http://{local_ip}:{TEST_PORT}/{file_name} ({mime}, {sample_rate}Hz, {bit_depth}bit)")
 
     stream_url = f"http://{local_ip}:{TEST_PORT}/{file_name}"
-    didl_metadata = f"""&lt;DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/"&gt;&lt;item id="1" parentID="0" restricted="1"&gt;&lt;dc:title&gt;PureCast 440Hz Test Tone ({fmt.upper()})&lt;/dc:title&gt;&lt;upnp:artist&gt;PureCast Test Suite&lt;/upnp:artist&gt;&lt;upnp:album&gt;Lossless Benchmark&lt;/upnp:album&gt;&lt;res protocolInfo="http-get:*:{mime}:*"&gt;""" + stream_url + """&lt;/res&gt;&lt;/item&gt;&lt;/DIDL-Lite&gt;"""
+    didl_metadata = f"""&lt;DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/"&gt;&lt;item id="1" parentID="0" restricted="1"&gt;&lt;dc:title&gt;PureCast 440Hz Test Tone ({sample_rate}Hz/{bit_depth}bit {fmt.upper()})&lt;/dc:title&gt;&lt;upnp:artist&gt;PureCast Test Suite&lt;/upnp:artist&gt;&lt;upnp:album&gt;Lossless Benchmark&lt;/upnp:album&gt;&lt;res protocolInfo="http-get:*:{mime}:*"&gt;""" + stream_url + """&lt;/res&gt;&lt;/item&gt;&lt;/DIDL-Lite&gt;"""
 
-    print(f">> 向 PureCast MediaRenderer ({target_host}:{target_port}) 发起推流 ({fmt.upper()})...")
+    print(f">> 向 PureCast MediaRenderer ({target_host}:{target_port}) 发起推流 ({fmt.upper()}, {sample_rate}Hz, {bit_depth}bit)...")
     
     # 1. SetAVTransportURI
     set_uri_xml = f"""<InstanceID>0</InstanceID><CurrentURI>{stream_url}</CurrentURI><CurrentURIMetaData>{didl_metadata}</CurrentURIMetaData>"""
@@ -173,13 +191,25 @@ def main():
     play_xml = "<InstanceID>0</InstanceID><Speed>1</Speed>"
     send_soap_action(target_host, target_port, "Play", play_xml)
 
-    print(">> 正在推流中 (等待 4 秒监听音频)...")
-    time.sleep(4)
+    print(f">> 正在推流中 (持续播放 {duration} 秒)...")
+    time.sleep(max(1, duration))
 
     # 3. Stop
     stop_xml = "<InstanceID>0</InstanceID>"
     send_soap_action(target_host, target_port, "Stop", stop_xml)
     print(">> 测试推流完成，已发送 Stop 指令")
+
+    # 4. 可选：尝试抓取 adb 日志校验
+    try:
+        adb_check = subprocess.run(["adb", "logcat", "-d", "-s", "PureCastNative:I"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=2)
+        if adb_check.returncode == 0 and adb_check.stdout.strip():
+            lines = adb_check.stdout.strip().splitlines()
+            recent_lines = lines[-10:] if len(lines) > 10 else lines
+            print(">> 最近 Native 驱动日志验证:")
+            for l in recent_lines:
+                print(f"   {l}")
+    except Exception:
+        pass
 
 if __name__ == "__main__":
     main()

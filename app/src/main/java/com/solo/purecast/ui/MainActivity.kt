@@ -2,15 +2,28 @@ package com.solo.purecast.ui
 
 import android.os.Bundle
 import android.view.KeyEvent
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.compose.runtime.mutableLongStateOf
 import com.solo.purecast.model.PlaybackStatus
 import com.solo.purecast.service.PlaybackService
 import com.solo.purecast.ui.screen.MainTvScreen
 import com.solo.purecast.ui.theme.PureCastTheme
 import com.solo.purecast.util.Logger
 
+/**
+ * 💡 PureCast 大屏主入口 Activity
+ * 严格遵从 AGENTS.md 约束与 10-Foot 遥控器大屏交互规范：
+ * 1. 物理遥控器按键全局拦截：精准响应 KEYCODE_MENU（呼出/收起侧边栏）及媒体播放按键。
+ * 2. 实时流保护：遥控器切歌键在 airupnp 等外部实时流时拦截并弹出温和 Toast 提示。
+ * 3. 防烧屏按键重置：任意遥控器按键输入即刻唤醒控制栏并重置 3 分钟无操作计时器。
+ */
 class MainActivity : ComponentActivity() {
+
+    // 💡 遥控器 MENU 键与全局按键触发器 (以时间戳驱动 Compose 响应)
+    private val menuKeyTrigger = mutableLongStateOf(0L)
+    private val userInteractionTrigger = mutableLongStateOf(0L)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -22,7 +35,11 @@ class MainActivity : ComponentActivity() {
         setContent {
             PureCastTheme {
                 MainTvScreen(
-                    onTogglePlayPause = { togglePlayPause() }
+                    onTogglePlayPause = { togglePlayPause() },
+                    onPreviousTrack = { handlePreviousTrack() },
+                    onNextTrack = { handleNextTrack() },
+                    menuKeyTrigger = menuKeyTrigger.longValue,
+                    userInteractionTrigger = userInteractionTrigger.longValue
                 )
             }
         }
@@ -53,12 +70,41 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun handlePreviousTrack() {
+        Logger.ui.i(TAG, "遥控器触发: 上一曲")
+        PlaybackService.instance?.handlePreviousTrack()
+        Toast.makeText(this, "已请求上一曲", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun handleNextTrack() {
+        Logger.ui.i(TAG, "遥控器触发: 下一曲")
+        PlaybackService.instance?.handleNextTrack()
+        Toast.makeText(this, "已请求下一曲", Toast.LENGTH_SHORT).show()
+    }
+
+    /**
+     * 💡 全局按键分发：按键即重置 3 分钟防烧屏休眠倒计时
+     */
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (event.action == KeyEvent.ACTION_DOWN) {
+            userInteractionTrigger.longValue = System.currentTimeMillis()
+        }
+        return super.dispatchKeyEvent(event)
+    }
+
     /**
      * 💡 物理遥控器按键精确拦截
      */
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
         Logger.ui.d(TAG, "收到遥控器按键事件: keyCode=$keyCode")
         when (keyCode) {
+            // 💡 拦截遥控器 MENU 键呼出/关闭设置侧边栏抽屉
+            KeyEvent.KEYCODE_MENU -> {
+                Logger.ui.i(TAG, "遥控器触发: KEYCODE_MENU 呼出全功能设置侧边栏")
+                menuKeyTrigger.longValue = System.currentTimeMillis()
+                return true
+            }
+
             KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE,
             KeyEvent.KEYCODE_MEDIA_PLAY,
             KeyEvent.KEYCODE_MEDIA_PAUSE -> {
@@ -68,6 +114,16 @@ class MainActivity : ComponentActivity() {
 
             KeyEvent.KEYCODE_MEDIA_STOP -> {
                 PlaybackService.instance?.stopPlayback()
+                return true
+            }
+
+            KeyEvent.KEYCODE_MEDIA_PREVIOUS -> {
+                handlePreviousTrack()
+                return true
+            }
+
+            KeyEvent.KEYCODE_MEDIA_NEXT -> {
+                handleNextTrack()
                 return true
             }
         }

@@ -1,0 +1,232 @@
+package com.solo.purecast.ui.components
+
+import android.view.KeyEvent
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.focusable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsFocusedAsState
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.tv.material3.ExperimentalTvMaterial3Api
+import androidx.tv.material3.Text
+import com.solo.purecast.ui.theme.PureCastPrimary
+
+/**
+ * 💡 PureCast 纤细圆角进度条与时间轴组件 (ProgressBarComponent)
+ * 遵循 Apple TV 极简工业美学设计：
+ * 1. 轨道高度默认为 4dp，D-Pad 获得焦点时动态平滑展开至 6dp 并点亮白色微光发光边框。
+ * 2. 左侧展示当前播放时间 (mm:ss)，右侧展示总时长或实时流 "LIVE / 实时直通" 状态。
+ * 3. 针对非实时流支持遥控器 D-Pad 左右键快进 / 快退 10 秒；针对实时广播流自适应禁用寻道。
+ */
+@OptIn(ExperimentalTvMaterial3Api::class)
+@Composable
+fun ProgressBarComponent(
+    currentPositionMs: Long,
+    totalDurationMs: Long,
+    isLiveStream: Boolean,
+    onSeek: (newPositionMs: Long) -> Unit,
+    modifier: Modifier = Modifier,
+    focusRequester: FocusRequester? = null,
+    onPlayPauseClick: (() -> Unit)? = null
+) {
+    val canFocus = !isLiveStream && totalDurationMs > 0L
+    val interactionSource = remember { MutableInteractionSource() }
+    val isFocused by interactionSource.collectIsFocusedAsState()
+
+    // 💡 焦点展开动画：获得焦点时轨道由 4dp 增至 6dp，带来沉浸式反馈
+    val animatedHeight by animateDpAsState(
+        targetValue = if (isFocused && canFocus) 6.dp else 4.dp,
+        animationSpec = tween(durationMillis = 200),
+        label = "progressBarHeight"
+    )
+
+    // 💡 实时流呼吸红点动画
+    val infiniteTransition = rememberInfiniteTransition(label = "liveDotTransition")
+    val liveDotAlpha by infiniteTransition.animateFloat(
+        initialValue = 0.35f,
+        targetValue = 1.0f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 800),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "liveDotAlpha"
+    )
+
+    // 计算进度比例 (0.0f ~ 1.0f)
+    val progressFraction = if (isLiveStream || totalDurationMs <= 0L) {
+        1.0f
+    } else {
+        (currentPositionMs.toFloat() / totalDurationMs.toFloat()).coerceIn(0.0f, 1.0f)
+    }
+
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .then(if (canFocus && focusRequester != null) Modifier.focusRequester(focusRequester) else Modifier)
+            .then(if (canFocus) Modifier.focusable(interactionSource = interactionSource) else Modifier)
+            // 💡 遥控器 D-Pad 左右方向键寻道拦截 (快退 / 快进 10 秒) 及中心确认键
+            .onPreviewKeyEvent { keyEvent ->
+                if (canFocus && keyEvent.nativeKeyEvent.action == KeyEvent.ACTION_DOWN) {
+                    when (keyEvent.nativeKeyEvent.keyCode) {
+                        KeyEvent.KEYCODE_DPAD_LEFT -> {
+                            val target = (currentPositionMs - 10_000L).coerceAtLeast(0L)
+                            onSeek(target)
+                            return@onPreviewKeyEvent true
+                        }
+                        KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                            val target = (currentPositionMs + 10_000L).coerceAtMost(totalDurationMs)
+                            onSeek(target)
+                            return@onPreviewKeyEvent true
+                        }
+                        KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> {
+                            onPlayPauseClick?.invoke()
+                            return@onPreviewKeyEvent true
+                        }
+                    }
+                }
+                false
+            }
+            .padding(vertical = 4.dp)
+    ) {
+        // 进度条轨道容器
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = if (isFocused) 2.dp else 3.dp),
+            contentAlignment = Alignment.CenterStart
+        ) {
+            // 背景槽（未播放部分）
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(animatedHeight)
+                    .clip(RoundedCornerShape(animatedHeight / 2))
+                    .background(Color(0x33FFFFFF))
+                    .then(
+                        if (isFocused) {
+                            Modifier.border(
+                                width = 1.dp,
+                                color = Color.White.copy(alpha = 0.5f),
+                                shape = RoundedCornerShape(animatedHeight / 2)
+                            )
+                        } else Modifier
+                    )
+            )
+
+            // 高亮填充条（已播放部分）
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth(progressFraction)
+                    .height(animatedHeight)
+                    .clip(RoundedCornerShape(animatedHeight / 2))
+                    .background(
+                        if (isFocused) Color.White else PureCastPrimary
+                    )
+            )
+
+            // 💡 获得焦点时的进度发光游标点 (Thumb Indicator)
+            if (isFocused && !isLiveStream && totalDurationMs > 0L) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth(progressFraction),
+                    contentAlignment = Alignment.CenterEnd
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(12.dp)
+                            .shadow(6.dp, CircleShape, spotColor = Color.White)
+                            .clip(CircleShape)
+                            .background(Color.White)
+                    )
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(6.dp))
+
+        // 底部时间指示栏 (左侧已播放，右侧总时长或实时流徽章)
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            // 左侧已播放时间：始终展示当前真实已播放时长
+            Text(
+                text = formatTimeMs(currentPositionMs),
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Medium,
+                color = if (isFocused && canFocus) Color.White else Color(0xFFB0B0B8)
+            )
+
+            // 右侧总时长或实时流状态
+            if (isLiveStream || totalDurationMs <= 0L) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(7.dp)
+                            .clip(CircleShape)
+                            .background(Color(0xFFFF453A).copy(alpha = liveDotAlpha))
+                    )
+                    Text(
+                        text = "LIVE / 实时直通",
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = Color(0xFFFF453A)
+                    )
+                }
+            } else {
+                Text(
+                    text = formatTimeMs(totalDurationMs),
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = Color(0xFF8E8E93)
+                )
+            }
+        }
+    }
+}
+
+/**
+ * 💡 辅助工具：将毫秒时间平滑转换为 mm:ss 格式
+ */
+private fun formatTimeMs(ms: Long): String {
+    if (ms <= 0L) return "00:00"
+    val totalSeconds = ms / 1000
+    val minutes = totalSeconds / 60
+    val seconds = totalSeconds % 60
+    return "%02d:%02d".format(minutes, seconds)
+}
