@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 💡 索尼 Sony 硬件 Vendor ID 0x054c (十进制 1356) -->
+    <usb-device vendor-id="1356" />
+    <!-- 💡 USB Audio Device Class (0x01) -->
+    <usb-device class="1" />
+</resources>

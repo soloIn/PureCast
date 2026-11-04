@@ -1,0 +1,11 @@
+<resources>
+    <string name="app_name">PureCast</string>
+    <string name="renderer_default_name">PureCast TV</string>
+    <string name="service_notification_channel_name">音频串流服务</string>
+    <string name="service_notification_title">PureCast 正在运行</string>
+    <string name="service_notification_desc">等待音频推送中...</string>
+    <string name="dac_connected">Sony ZX300A 已连接</string>
+    <string name="dac_disconnected">USB DAC 未连接</string>
+    <string name="status_bit_perfect">Bit-Perfect 直通</string>
+    <string name="status_standby">声卡待机让渡</string>
+</resources>
