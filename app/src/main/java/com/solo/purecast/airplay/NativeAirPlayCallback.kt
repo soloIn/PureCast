@@ -56,4 +56,11 @@ interface NativeAirPlayCallback {
         durationMs: Long,
         coverArt: ByteArray?
     )
+
+    /**
+     * 💡 接收到推流端播放进度更新 (SET_PARAMETER progress: start/curr/end)
+     * @param positionMs 当前播放位置 (毫秒)
+     * @param durationMs 歌曲总时长 (毫秒)
+     */
+    fun onProgressUpdated(positionMs: Long, durationMs: Long)
 }

@@ -32,6 +32,7 @@ public:
     using StreamStopCallback = std::function<void()>;
     using MetadataCallback = std::function<void(const std::string& title, const std::string& artist, const std::string& album, long duration_ms, const std::vector<uint8_t>& cover_art)>;
     using ChallengeCallback = std::function<std::string(const std::string& challenge_b64)>;
+    using ProgressCallback = std::function<void(long position_ms, long duration_ms)>;
 
     RaopServer();
     ~RaopServer();
@@ -45,6 +46,7 @@ public:
     void set_stream_stop_callback(StreamStopCallback cb) { stream_stop_cb_ = std::move(cb); }
     void set_metadata_callback(MetadataCallback cb) { metadata_cb_ = std::move(cb); }
     void set_challenge_callback(ChallengeCallback cb) { challenge_cb_ = std::move(cb); }
+    void set_progress_callback(ProgressCallback cb) { progress_cb_ = std::move(cb); }
 
     void set_decrypted_aes_key(const std::vector<uint8_t>& key, const std::vector<uint8_t>& iv) {
         rtp_.set_crypto_key(key, iv);
@@ -74,6 +76,7 @@ private:
     StreamStopCallback stream_stop_cb_{nullptr};
     MetadataCallback metadata_cb_{nullptr};
     ChallengeCallback challenge_cb_{nullptr};
+    ProgressCallback progress_cb_{nullptr};
 };
 
 } // namespace purecast::raop

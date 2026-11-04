@@ -123,6 +123,9 @@ class PlaybackService : LifecycleService() {
             },
             onMetadataReceivedListener = { title, artist, album, durationMs, coverArt ->
                 onAirPlayMetadataReceived(title, artist, album, durationMs, coverArt)
+            },
+            onProgressUpdatedListener = { positionMs, durationMs ->
+                onAirPlayProgressUpdated(positionMs, durationMs)
             }
         )
 
@@ -223,7 +226,10 @@ class PlaybackService : LifecycleService() {
             baseActions or PlaybackState.ACTION_SEEK_TO
         }
 
-        val currentPosMs = (upnpServer?.getCurrentPlayPositionSeconds() ?: 0L) * 1000L
+        val currentPosMs = when (currentStreamSource) {
+            StreamSource.AIRPLAY -> _playbackPositionMs.value
+            else -> (upnpServer?.getCurrentPlayPositionSeconds() ?: 0L) * 1000L
+        }
         val playbackSpeed = if (status == PlaybackStatus.PLAYING) 1.0f else 0.0f
 
         val playbackState = PlaybackState.Builder()
@@ -441,6 +447,7 @@ class PlaybackService : LifecycleService() {
 
     /**
      * 💡 原生 AirPlay 1 DMAP 元数据更新事件 (SET_PARAMETER 触发)
+     * 支持多包增量合并 (Smart Merge)，杜绝后序元数据包将封面或歌名相互覆盖冲刷
      */
     private fun onAirPlayMetadataReceived(
         title: String,
@@ -449,15 +456,43 @@ class PlaybackService : LifecycleService() {
         durationMs: Long,
         coverArt: ByteArray?
     ) {
+        val current = _currentMetadata.value
+        val mergedTitle = when {
+            title.isNotEmpty() -> title
+            current.title.isNotEmpty() && current.title != "AirPlay 音频直通" -> current.title
+            else -> "AirPlay 音频直通"
+        }
+        val mergedArtist = when {
+            artist.isNotEmpty() -> artist
+            current.artist.isNotEmpty() && current.artist != "AirPlay 设备" -> current.artist
+            else -> "AirPlay 设备"
+        }
+        val mergedAlbum = if (album.isNotEmpty()) album else current.album
+        val mergedCover = if (coverArt != null && coverArt.isNotEmpty()) coverArt else current.coverBytes
+        val mergedDuration = if (durationMs > 0) durationMs else current.durationMs
+
         val meta = TrackMetadata(
-            title = title.ifEmpty { "AirPlay 音频直通" },
-            artist = artist.ifEmpty { "AirPlay 设备" },
-            album = album,
-            coverBytes = coverArt,
-            durationMs = durationMs,
-            isLiveStream = true
+            title = mergedTitle,
+            artist = mergedArtist,
+            album = mergedAlbum,
+            coverBytes = mergedCover,
+            durationMs = mergedDuration,
+            isLiveStream = (mergedDuration <= 0)
         )
         updateMetadata(meta)
+    }
+
+    /**
+     * 💡 原生 AirPlay 1 播放进度与总时长更新 (SET_PARAMETER progress: start/curr/end 触发)
+     */
+    private fun onAirPlayProgressUpdated(positionMs: Long, durationMs: Long) {
+        val current = _currentMetadata.value
+        if (durationMs > 0 && current.durationMs != durationMs) {
+            val updated = current.copy(durationMs = durationMs, isLiveStream = false)
+            updateMetadata(updated)
+        }
+        _playbackPositionMs.value = positionMs
+        updateMediaSessionState()
     }
 
     fun pausePlayback() {

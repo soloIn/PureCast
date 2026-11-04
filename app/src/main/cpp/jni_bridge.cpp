@@ -165,6 +165,42 @@ static void notify_java_metadata(
     }
 }
 
+static void notify_java_progress_updated(long position_ms, long duration_ms) {
+    std::lock_guard<std::recursive_mutex> lock(g_airplay_mutex);
+    if (!g_jvm || !g_airplay_callback) return;
+
+    JNIEnv* env = nullptr;
+    bool attached = false;
+    jint res = g_jvm->GetEnv((void**)&env, JNI_VERSION_1_6);
+    if (res == JNI_EDETACHED) {
+        if (g_jvm->AttachCurrentThread(&env, nullptr) != JNI_OK) {
+            return;
+        }
+        attached = true;
+    }
+
+    jclass cls = env->GetObjectClass(g_airplay_callback);
+    jmethodID mid = env->GetMethodID(
+        cls,
+        "onProgressUpdated",
+        "(JJ)V"
+    );
+
+    if (mid) {
+        env->CallVoidMethod(
+            g_airplay_callback,
+            mid,
+            static_cast<jlong>(position_ms),
+            static_cast<jlong>(duration_ms)
+        );
+    }
+    env->DeleteLocalRef(cls);
+
+    if (attached) {
+        g_jvm->DetachCurrentThread();
+    }
+}
+
 static std::string notify_java_challenge_requested(const std::string& challenge_b64) {
     std::lock_guard<std::recursive_mutex> lock(g_airplay_mutex);
     if (!g_jvm || !g_airplay_callback) return "";
@@ -385,6 +421,7 @@ Java_com_solo_purecast_core_nativebridge_NativeAudioEngine_startAirPlayServer(
     g_raop_server->set_stream_stop_callback(notify_java_stream_stopped);
     g_raop_server->set_metadata_callback(notify_java_metadata);
     g_raop_server->set_challenge_callback(notify_java_challenge_requested);
+    g_raop_server->set_progress_callback(notify_java_progress_updated);
 
     bool ok = g_raop_server->start(port);
     return ok ? JNI_TRUE : JNI_FALSE;

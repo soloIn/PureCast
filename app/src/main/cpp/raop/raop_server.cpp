@@ -9,6 +9,7 @@
 #include <android/log.h>
 
 #define RAOP_TAG "PureCastRAOP"
+#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, RAOP_TAG, __VA_ARGS__)
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, RAOP_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, RAOP_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, RAOP_TAG, __VA_ARGS__)
@@ -294,22 +295,62 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
                  << "Audio-Latency: 11025\r\n"
                  << "Server: AirTunes/105.1\r\n\r\n";
     } else if (method == "SET_PARAMETER") {
-        // DMAP 元数据推送 (application/x-dmap-tagged 或 image/none)
         std::string content_type = parse_header(request, "Content-Type");
-        if (content_type.find("application/x-dmap-tagged") != std::string::npos ||
-            content_type.find("image/") != std::string::npos) {
-            size_t header_end = request.find("\r\n\r\n");
-            if (header_end != std::string::npos) {
-                const uint8_t* payload = reinterpret_cast<const uint8_t*>(request.data() + header_end + 4);
-                size_t payload_len = request.size() - (header_end + 4);
+        size_t header_end = request.find("\r\n\r\n");
+
+        if (header_end != std::string::npos) {
+            const uint8_t* payload = reinterpret_cast<const uint8_t*>(request.data() + header_end + 4);
+            size_t payload_len = request.size() - (header_end + 4);
+
+            if (content_type.find("application/x-dmap-tagged") != std::string::npos) {
+                // 💡 1. 结构化 DMAP 元数据解析 (歌名、艺术家、专辑)
                 DmapMetadata dmap;
                 if (DmapParser::parse(payload, payload_len, dmap)) {
                     if (metadata_cb_) {
                         metadata_cb_(dmap.title, dmap.artist, dmap.album, dmap.duration_ms, dmap.cover_art);
                     }
                 }
+            } else if (content_type.find("image/") != std::string::npos) {
+                // 💡 2. 封面图片推送 (JPEG/PNG 原始二进制，杜绝送入 DMAP 解析器被误丢弃)
+                std::vector<uint8_t> cover_art;
+                if (content_type.find("image/none") == std::string::npos && payload_len > 0) {
+                    cover_art.assign(payload, payload + payload_len);
+                    LOGI("SET_PARAMETER 收到原生封面图片推送: %s, 字节数=%zu", content_type.c_str(), payload_len);
+                } else {
+                    LOGI("SET_PARAMETER 收到清空封面请求 (image/none)");
+                }
+                if (metadata_cb_) {
+                    metadata_cb_("", "", "", 0, cover_art);
+                }
+            } else if (content_type.find("text/parameters") != std::string::npos) {
+                // 💡 3. 文本参数推送 (progress: start/curr/end 播放时间进度或音量)
+                std::string body(reinterpret_cast<const char*>(payload), payload_len);
+                size_t prog_pos = body.find("progress:");
+                if (prog_pos != std::string::npos) {
+                    size_t start_pos = prog_pos + 9;
+                    while (start_pos < body.size() && body[start_pos] == ' ') start_pos++;
+                    size_t line_end = body.find("\r\n", start_pos);
+                    if (line_end == std::string::npos) line_end = body.size();
+                    std::string prog_val = body.substr(start_pos, line_end - start_pos);
+
+                    // 格式: start/curr/end (RTP 时间戳)
+                    uint64_t start_ts = 0, curr_ts = 0, end_ts = 0;
+                    char s1 = 0, s2 = 0;
+                    std::istringstream pstream(prog_val);
+                    if (pstream >> start_ts >> s1 >> curr_ts >> s2 >> end_ts && s1 == '/' && s2 == '/') {
+                        uint32_t rate = current_params_.sample_rate > 0 ? current_params_.sample_rate : 44100;
+                        long pos_ms = (curr_ts >= start_ts) ? static_cast<long>((curr_ts - start_ts) * 1000ULL / rate) : 0;
+                        long dur_ms = (end_ts >= start_ts) ? static_cast<long>((end_ts - start_ts) * 1000ULL / rate) : 0;
+                        LOGD("AirPlay 进度实时校准: pos=%ld ms, duration=%ld ms (RTP: %s)",
+                             pos_ms, dur_ms, prog_val.c_str());
+                        if (progress_cb_) {
+                            progress_cb_(pos_ms, dur_ms);
+                        }
+                    }
+                }
             }
         }
+
         response << "RTSP/1.0 200 OK\r\n"
                  << "CSeq: " << cseq << "\r\n\r\n";
     } else if (method == "TEARDOWN") {

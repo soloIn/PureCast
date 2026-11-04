@@ -170,7 +170,7 @@ uint64_t RaopRtp::get_ntp_timestamp() {
 void RaopRtp::data_loop() {
     setpriority(PRIO_PROCESS, 0, -10); // 提升数据接收线程优先级
     std::vector<uint8_t> buffer(2048);
-    std::vector<uint8_t> pcm_frame(RaopJitterBuffer::FRAME_BYTES);
+    std::vector<uint8_t> pcm_frame(16384); // 💡 支持最大 4096 采样 * 4 字节，杜绝内存越界
     std::vector<uint8_t> decrypted_payload(2048);
 
     LOGI("RAOP RTP 数据接收线程已启动");

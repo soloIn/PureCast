@@ -21,7 +21,8 @@ class AirPlayServerManager(
     private val scope: CoroutineScope,
     private val onStreamRequestedListener: (sampleRate: Int, bitDepth: Int, channels: Int, clientIp: String, dacpPort: Int, token: String) -> Boolean,
     private val onStreamStoppedListener: () -> Unit,
-    private val onMetadataReceivedListener: (title: String, artist: String, album: String, durationMs: Long, coverArt: ByteArray?) -> Unit
+    private val onMetadataReceivedListener: (title: String, artist: String, album: String, durationMs: Long, coverArt: ByteArray?) -> Unit,
+    private val onProgressUpdatedListener: (positionMs: Long, durationMs: Long) -> Unit = { _, _ -> }
 ) {
     companion object {
         private const val TAG = "AirPlayServerManager"
@@ -114,6 +115,10 @@ class AirPlayServerManager(
             ) {
                 Logger.airplay.i(TAG, "AirPlay 收到 DMAP 元数据: title=$title, artist=$artist, album=$album, coverSize=${coverArt?.size ?: 0}")
                 onMetadataReceivedListener(title, artist, album, durationMs, coverArt)
+            }
+
+            override fun onProgressUpdated(positionMs: Long, durationMs: Long) {
+                onProgressUpdatedListener(positionMs, durationMs)
             }
         })
 
