@@ -248,9 +248,9 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
             if (rtp_.start(data_p, ctrl_p, timing_p)) {
                 response << "RTSP/1.0 200 OK\r\n"
                          << "CSeq: " << cseq << "\r\n"
-                         << "Transport: RTP/AVP/UDP;unicast;mode=record;server_port=" << data_p
-                         << ";control_port=" << ctrl_p
-                         << ";timing_port=" << timing_p << "\r\n"
+                         << "Transport: RTP/AVP/UDP;unicast;interleaved=0-1;mode=record;control_port=" << ctrl_p
+                         << ";timing_port=" << timing_p
+                         << ";server_port=" << data_p << "\r\n"
                          << "Session: 1\r\n"
                          << "Audio-Jack-Status: connected; type=digital\r\n"
                          << "Server: AirTunes/105.1\r\n\r\n";

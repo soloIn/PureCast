@@ -9,7 +9,7 @@
 
 static JavaVM* g_jvm = nullptr;
 static jobject g_airplay_callback = nullptr;
-static std::mutex g_airplay_mutex;
+static std::recursive_mutex g_airplay_mutex;
 static std::unique_ptr<purecast::raop::RaopServer> g_raop_server = nullptr;
 
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* /* reserved */) {
@@ -18,7 +18,7 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* /* reserved */) {
 }
 
 static bool notify_java_stream_requested(const purecast::raop::RaopStreamParams& params) {
-    std::lock_guard<std::mutex> lock(g_airplay_mutex);
+    std::lock_guard<std::recursive_mutex> lock(g_airplay_mutex);
     if (!g_jvm || !g_airplay_callback) return true;
 
     JNIEnv* env = nullptr;
@@ -75,7 +75,7 @@ static bool notify_java_stream_requested(const purecast::raop::RaopStreamParams&
 }
 
 static void notify_java_stream_stopped() {
-    std::lock_guard<std::mutex> lock(g_airplay_mutex);
+    std::lock_guard<std::recursive_mutex> lock(g_airplay_mutex);
     if (!g_jvm || !g_airplay_callback) return;
 
     JNIEnv* env = nullptr;
@@ -107,7 +107,7 @@ static void notify_java_metadata(
     long duration_ms,
     const std::vector<uint8_t>& cover_art
 ) {
-    std::lock_guard<std::mutex> lock(g_airplay_mutex);
+    std::lock_guard<std::recursive_mutex> lock(g_airplay_mutex);
     if (!g_jvm || !g_airplay_callback) return;
 
     JNIEnv* env = nullptr;
@@ -166,7 +166,7 @@ static void notify_java_metadata(
 }
 
 static std::string notify_java_challenge_requested(const std::string& challenge_b64) {
-    std::lock_guard<std::mutex> lock(g_airplay_mutex);
+    std::lock_guard<std::recursive_mutex> lock(g_airplay_mutex);
     if (!g_jvm || !g_airplay_callback) return "";
 
     JNIEnv* env = nullptr;
@@ -367,7 +367,7 @@ Java_com_solo_purecast_core_nativebridge_NativeAudioEngine_startAirPlayServer(
     jint port,
     jobject callback
 ) {
-    std::lock_guard<std::mutex> lock(g_airplay_mutex);
+    std::lock_guard<std::recursive_mutex> lock(g_airplay_mutex);
     if (g_airplay_callback) {
         env->DeleteGlobalRef(g_airplay_callback);
         g_airplay_callback = nullptr;
@@ -395,7 +395,7 @@ Java_com_solo_purecast_core_nativebridge_NativeAudioEngine_stopAirPlayServer(
     JNIEnv* env,
     jobject /* thiz */
 ) {
-    std::lock_guard<std::mutex> lock(g_airplay_mutex);
+    std::lock_guard<std::recursive_mutex> lock(g_airplay_mutex);
     if (g_raop_server) {
         g_raop_server->stop();
         g_raop_server.reset();
@@ -425,7 +425,7 @@ Java_com_solo_purecast_core_nativebridge_NativeAudioEngine_setAirPlayCryptoKey(
     env->GetByteArrayRegion(aes_key, 0, key_len, reinterpret_cast<jbyte*>(key.data()));
     env->GetByteArrayRegion(aes_iv, 0, iv_len, reinterpret_cast<jbyte*>(iv.data()));
 
-    std::lock_guard<std::mutex> lock(g_airplay_mutex);
+    std::lock_guard<std::recursive_mutex> lock(g_airplay_mutex);
     if (g_raop_server) {
         g_raop_server->set_decrypted_aes_key(key, iv);
     }
