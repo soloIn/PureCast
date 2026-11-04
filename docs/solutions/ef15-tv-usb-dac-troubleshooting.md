@@ -40,6 +40,16 @@ problem_type: hardware-debugging
 - **解决方案**：
   严格遵循 UPnP AVTransport 标准状态机：`handleSetAvTransportUri` 仅解析并缓存 URI 与元数据；待收到客户端 `handlePlay` 指令时才正式触发 `demuxer.start(uri)` 开启下载与音频解封装。
 
+### 问题六：FLAC 压缩流直通、UAC2 实体时钟及包调度错误导致“呲呲”白噪声
+- **根因**：
+  1. **FLAC 压缩数据误作 PCM 直通**：AirConnect (`airupnp`) 默认配置 `<codec>flac</codec>` 强推 FLAC 流。原 `StreamDemuxer` 未集成 FLAC 解码，回退逻辑将未经解压的 FLAC 压缩二进制熵数据直接写入 SPSC 环形缓冲区，DAC 接收后转化为全幅白噪声（“呲呲呲”杂音）。
+  2. **UAC2 Clock Source 实体描述符与接口号错位**：UAC2 规范中 Clock Source 子类型为 `0x0A`（代码误填 `0x0B`），导致未能匹配到真实 Clock ID（索尼 Walkman 为 3）。同时 `wIndex` 传入了 AudioStreaming 接口（1）而非 AudioControl 接口（0），且未 claim 接口 0，导致硬件时钟锁频请求返回 `-9` / `-1` 错误，DAC 硬件时钟失锁。
+  3. **固定数据包导致 USB 8000 微帧/秒时钟脱节**：44.1kHz 在 USB High-Speed（125us 微帧，8000 包/秒）下平均每包为 5.5125 采样点。原代码固定每包填充 7 个采样点（折合 56kHz），导致环形缓冲区瞬时跑空、FIFO 欠载并伴随偶数/奇数字节丢包，破坏 16-bit 双声道采样对齐。
+- **解决方案**：
+  1. 在 Native 层引入轻量单头文件 `dr_flac`（`dr_flac.c` + `flac_decoder.cpp`），在 `StreamDemuxer` 中通过探测前 4 字节魔数自动分流：若为 `fLaC` 则由 Native 流式解码为 16-bit PCM 直通环形缓冲区；若为 `RIFF` 则按 WAV 格式直通。
+  2. 修正 UAC2 实体常量 `CLOCK_SOURCE = 0x0A`，在 `parse_audio_descriptors` 中精准捕获 Clock ID（3）与 AudioControl 接口（0），并在接管时一并 claim 控制接口，实现 `CS_SAM_FREQ_CONTROL` 成功锁定 44100Hz 物理硬件时钟。
+  3. 引入 **Bresenham 时钟步进算法**：通过累加器在 8000 次微帧传输中交替发送 5 采样点与 6 采样点数据包，在 1 秒内严格精确输出 44,100 个采样点，并修正环形缓冲区满载自旋等待排空逻辑，消除杂音与破音。
+
 ## 3. 验证结果
 1. **Bit-Perfect 硬件独占传输**：
    - Walkman 成功识别采样率并以 S16_LE / S24 等物理帧传输，绕过系统 SRC。
