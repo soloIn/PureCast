@@ -169,7 +169,8 @@ fun MainTvScreen(
     // ==========================================
     // 2. Coil + Palette 动态流光背景提取
     // ==========================================
-    val (palettePrimary, paletteSecondary) = rememberPaletteFromUri(metadata.coverUri)
+    val coverData: Any? = metadata.coverBytes ?: metadata.coverUri
+    val (palettePrimary, paletteSecondary) = rememberPaletteFromCover(coverData)
 
     // 封面放大弹簧动画
     val isPlaying = playbackStatus == PlaybackStatus.PLAYING
@@ -223,15 +224,16 @@ fun MainTvScreen(
                         .border(1.dp, Color(0xFF32364A), RoundedCornerShape(24.dp)),
                     contentAlignment = Alignment.Center
                 ) {
-                    // 💡 Coil 异步加载高清网络封面，仅允许合法 http/https 协议以防异常 scheme 导致崩溃
-                    val cover = metadata.coverUri
-                    val isSafeCoverUri = !cover.isNullOrEmpty() &&
-                            (cover.startsWith("http://", ignoreCase = true) || cover.startsWith("https://", ignoreCase = true))
+                    // 💡 Coil 异步加载高清网络封面或 AirPlay 内存字节封面
+                    val uri = metadata.coverUri
+                    val hasValidCover = metadata.coverBytes != null ||
+                            (!uri.isNullOrEmpty() &&
+                                (uri.startsWith("http://", ignoreCase = true) || uri.startsWith("https://", ignoreCase = true)))
 
-                    if (isSafeCoverUri) {
+                    if (hasValidCover && coverData != null) {
                         SubcomposeAsyncImage(
                             model = ImageRequest.Builder(LocalContext.current)
-                                .data(cover)
+                                .data(coverData)
                                 .crossfade(true)
                                 .build(),
                             contentDescription = "Album Cover",
@@ -437,33 +439,40 @@ private fun DefaultCoverCard(
 }
 
 /**
- * 💡 异步从封面 Uri 提取 Palette 调色板主色调与次色调
+ * 💡 异步从封面提取 Palette 调色板主色调与次色调 (支持 Uri 字符串与 ByteArray)
  * 注意：必须通过 allowHardware(false) 获取软件位图，否则 API 28+ 访问硬件位图会抛出异常
  */
 @Composable
-private fun rememberPaletteFromUri(
-    coverUri: String?,
+private fun rememberPaletteFromCover(
+    coverData: Any?,
     defaultPrimary: Color = Color(0xFF1E2838),
     defaultSecondary: Color = Color(0xFF0F121C)
 ): Pair<Color, Color> {
     val context = LocalContext.current
-    var colors by remember(coverUri) {
+    var colors by remember(coverData) {
         mutableStateOf(Pair(defaultPrimary, defaultSecondary))
     }
 
-    LaunchedEffect(coverUri) {
-        val isValidScheme = coverUri?.startsWith("http://", ignoreCase = true) == true ||
-                coverUri?.startsWith("https://", ignoreCase = true) == true
-        if (coverUri.isNullOrEmpty() || !isValidScheme) {
+    LaunchedEffect(coverData) {
+        if (coverData == null) {
             colors = Pair(defaultPrimary, defaultSecondary)
             return@LaunchedEffect
+        }
+
+        if (coverData is String) {
+            val isValidScheme = coverData.startsWith("http://", ignoreCase = true) ||
+                    coverData.startsWith("https://", ignoreCase = true)
+            if (!isValidScheme) {
+                colors = Pair(defaultPrimary, defaultSecondary)
+                return@LaunchedEffect
+            }
         }
 
         withContext(Dispatchers.IO) {
             try {
                 val imageLoader = context.imageLoader
                 val request = ImageRequest.Builder(context)
-                    .data(coverUri)
+                    .data(coverData)
                     .allowHardware(false) // 💡 必须禁用硬件位图，Palette 提取像素需要软件 Bitmap
                     .size(256, 256) // 缩放解析以加速提取并降低电视内存占用
                     .build()

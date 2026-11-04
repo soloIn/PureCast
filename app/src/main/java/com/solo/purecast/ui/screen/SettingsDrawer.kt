@@ -98,6 +98,8 @@ fun SettingsDrawer(
     }
     var isEditingCustomName by remember { mutableStateOf(false) }
     var customNameInput by remember { mutableStateOf(friendlyName) }
+    var isAirPlayEnabled by remember { mutableStateOf(settingsRepo.isAirPlayEnabled()) }
+    var isUpnpEnabled by remember { mutableStateOf(settingsRepo.isUpnpEnabled()) }
     val drawerFocusRequester = remember { FocusRequester() }
 
     LaunchedEffect(Unit) {
@@ -337,6 +339,85 @@ fun SettingsDrawer(
                                 Text(text = "取消", fontSize = 12.sp)
                             }
                         }
+                    }
+                }
+            }
+
+            // ==========================================
+            // 板块: 局域网接收协议引擎控制
+            // ==========================================
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(Color(0xFF1C1E2B))
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text(
+                    text = "【局域网投播协议引擎】",
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = Color(0xFFFF9F0A)
+                )
+
+                // AirPlay 1 开关条目
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(text = "AirPlay 1 (RAOP · ALAC)", fontSize = 14.sp, color = Color.White)
+                        Text(text = "免桥接 44.1kHz 源码直通", fontSize = 11.sp, color = Color(0xFF8E8E93))
+                    }
+                    Button(
+                        onClick = {
+                            val target = !isAirPlayEnabled
+                            isAirPlayEnabled = target
+                            PlaybackService.instance?.setAirPlayEnabled(target)
+                            Toast.makeText(context, if (target) "已开启 AirPlay 1 服务" else "已关闭 AirPlay 1 服务", Toast.LENGTH_SHORT).show()
+                        },
+                        scale = ButtonDefaults.scale(scale = 1.0f, focusedScale = 1.08f),
+                        shape = ButtonDefaults.shape(RoundedCornerShape(8.dp)),
+                        colors = ButtonDefaults.colors(
+                            containerColor = if (isAirPlayEnabled) PureCastPrimary else Color(0xFF282B3D),
+                            focusedContainerColor = Color.White,
+                            contentColor = Color.White,
+                            focusedContentColor = Color.Black
+                        )
+                    ) {
+                        Text(text = if (isAirPlayEnabled) "已启用" else "已禁用", fontSize = 12.sp)
+                    }
+                }
+
+                // UPnP / DLNA 开关条目
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(text = "UPnP / DLNA (MediaRenderer)", fontSize = 14.sp, color = Color.White)
+                        Text(text = "支持 192kHz/24bit FLAC 高解析", fontSize = 11.sp, color = Color(0xFF8E8E93))
+                    }
+                    Button(
+                        onClick = {
+                            val target = !isUpnpEnabled
+                            isUpnpEnabled = target
+                            PlaybackService.instance?.setUpnpEnabled(target)
+                            Toast.makeText(context, if (target) "已开启 UPnP 服务" else "已关闭 UPnP 服务", Toast.LENGTH_SHORT).show()
+                        },
+                        scale = ButtonDefaults.scale(scale = 1.0f, focusedScale = 1.08f),
+                        shape = ButtonDefaults.shape(RoundedCornerShape(8.dp)),
+                        colors = ButtonDefaults.colors(
+                            containerColor = if (isUpnpEnabled) PureCastPrimary else Color(0xFF282B3D),
+                            focusedContainerColor = Color.White,
+                            contentColor = Color.White,
+                            focusedContentColor = Color.Black
+                        )
+                    ) {
+                        Text(text = if (isUpnpEnabled) "已启用" else "已禁用", fontSize = 12.sp)
                     }
                 }
             }

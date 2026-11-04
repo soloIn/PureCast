@@ -1,4 +1,5 @@
 #include "raop_server.h"
+#include "dmap_parser.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -200,7 +201,22 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
                  << "Audio-Latency: 11025\r\n"
                  << "Server: AirTunes/220.68\r\n\r\n";
     } else if (method == "SET_PARAMETER") {
-        // DMAP 元数据推送
+        // DMAP 元数据推送 (application/x-dmap-tagged 或 image/none)
+        std::string content_type = parse_header(request, "Content-Type");
+        if (content_type.find("application/x-dmap-tagged") != std::string::npos ||
+            content_type.find("image/") != std::string::npos) {
+            size_t header_end = request.find("\r\n\r\n");
+            if (header_end != std::string::npos) {
+                const uint8_t* payload = reinterpret_cast<const uint8_t*>(request.data() + header_end + 4);
+                size_t payload_len = request.size() - (header_end + 4);
+                DmapMetadata dmap;
+                if (DmapParser::parse(payload, payload_len, dmap)) {
+                    if (metadata_cb_) {
+                        metadata_cb_(dmap.title, dmap.artist, dmap.album, dmap.duration_ms, dmap.cover_art);
+                    }
+                }
+            }
+        }
         response << "RTSP/1.0 200 OK\r\n"
                  << "CSeq: " << cseq << "\r\n\r\n";
     } else if (method == "TEARDOWN") {

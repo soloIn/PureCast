@@ -83,6 +83,26 @@ fun SignalPathPill(
             color = Color(0xFFD1D1D6)
         )
 
+        // 协议标签
+        val protocolLabel = when (audioState.protocol) {
+            com.solo.purecast.model.StreamProtocol.AIRPLAY_1 -> "AirPlay 1 · ALAC"
+            com.solo.purecast.model.StreamProtocol.UPNP_DLNA -> "UPnP / DLNA"
+            com.solo.purecast.model.StreamProtocol.NONE -> null
+        }
+        if (protocolLabel != null) {
+            Box(
+                modifier = Modifier
+                    .size(width = 1.dp, height = 12.dp)
+                    .background(Color(0xFF3A3D4E))
+            )
+            Text(
+                text = protocolLabel,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Medium,
+                color = Color(0xFFA1A1A6)
+            )
+        }
+
         // Bit-Perfect 独立高亮标签
         if (audioState.isExclusive) {
             Box(

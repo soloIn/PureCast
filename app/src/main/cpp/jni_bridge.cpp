@@ -1,7 +1,169 @@
 #include <jni.h>
 #include <string>
+#include <vector>
+#include <memory>
+#include <mutex>
 #include "audio_engine.h"
 #include "flac_decoder.h"
+#include "raop/raop_server.h"
+
+static JavaVM* g_jvm = nullptr;
+static jobject g_airplay_callback = nullptr;
+static std::mutex g_airplay_mutex;
+static std::unique_ptr<purecast::raop::RaopServer> g_raop_server = nullptr;
+
+JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* /* reserved */) {
+    g_jvm = vm;
+    return JNI_VERSION_1_6;
+}
+
+static bool notify_java_stream_requested(const purecast::raop::RaopStreamParams& params) {
+    std::lock_guard<std::mutex> lock(g_airplay_mutex);
+    if (!g_jvm || !g_airplay_callback) return true;
+
+    JNIEnv* env = nullptr;
+    bool attached = false;
+    jint res = g_jvm->GetEnv((void**)&env, JNI_VERSION_1_6);
+    if (res == JNI_EDETACHED) {
+        if (g_jvm->AttachCurrentThread(&env, nullptr) != JNI_OK) {
+            return false;
+        }
+        attached = true;
+    }
+
+    jclass cls = env->GetObjectClass(g_airplay_callback);
+    jmethodID mid = env->GetMethodID(
+        cls,
+        "onStreamRequested",
+        "(IIILjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;I)Z"
+    );
+
+    jstring j_client_ip = env->NewStringUTF(params.client_ip.c_str());
+    jstring j_key = env->NewStringUTF(params.aes_key_base64.c_str());
+    jstring j_iv = env->NewStringUTF(params.aes_iv_base64.c_str());
+    jstring j_dacp_id = env->NewStringUTF(params.dacp_id.c_str());
+    jstring j_token = env->NewStringUTF(params.active_remote_token.c_str());
+
+    jboolean ret = JNI_TRUE;
+    if (mid) {
+        ret = env->CallBooleanMethod(
+            g_airplay_callback,
+            mid,
+            params.sample_rate,
+            params.bit_depth,
+            params.channels,
+            j_client_ip,
+            j_key,
+            j_iv,
+            j_dacp_id,
+            j_token,
+            params.dacp_port
+        );
+    }
+
+    env->DeleteLocalRef(j_client_ip);
+    env->DeleteLocalRef(j_key);
+    env->DeleteLocalRef(j_iv);
+    env->DeleteLocalRef(j_dacp_id);
+    env->DeleteLocalRef(j_token);
+    env->DeleteLocalRef(cls);
+
+    if (attached) {
+        g_jvm->DetachCurrentThread();
+    }
+    return ret == JNI_TRUE;
+}
+
+static void notify_java_stream_stopped() {
+    std::lock_guard<std::mutex> lock(g_airplay_mutex);
+    if (!g_jvm || !g_airplay_callback) return;
+
+    JNIEnv* env = nullptr;
+    bool attached = false;
+    jint res = g_jvm->GetEnv((void**)&env, JNI_VERSION_1_6);
+    if (res == JNI_EDETACHED) {
+        if (g_jvm->AttachCurrentThread(&env, nullptr) != JNI_OK) {
+            return;
+        }
+        attached = true;
+    }
+
+    jclass cls = env->GetObjectClass(g_airplay_callback);
+    jmethodID mid = env->GetMethodID(cls, "onStreamStopped", "()V");
+    if (mid) {
+        env->CallVoidMethod(g_airplay_callback, mid);
+    }
+    env->DeleteLocalRef(cls);
+
+    if (attached) {
+        g_jvm->DetachCurrentThread();
+    }
+}
+
+static void notify_java_metadata(
+    const std::string& title,
+    const std::string& artist,
+    const std::string& album,
+    long duration_ms,
+    const std::vector<uint8_t>& cover_art
+) {
+    std::lock_guard<std::mutex> lock(g_airplay_mutex);
+    if (!g_jvm || !g_airplay_callback) return;
+
+    JNIEnv* env = nullptr;
+    bool attached = false;
+    jint res = g_jvm->GetEnv((void**)&env, JNI_VERSION_1_6);
+    if (res == JNI_EDETACHED) {
+        if (g_jvm->AttachCurrentThread(&env, nullptr) != JNI_OK) {
+            return;
+        }
+        attached = true;
+    }
+
+    jclass cls = env->GetObjectClass(g_airplay_callback);
+    jmethodID mid = env->GetMethodID(
+        cls,
+        "onMetadataReceived",
+        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;J[B)V"
+    );
+
+    if (mid) {
+        jstring j_title = env->NewStringUTF(title.c_str());
+        jstring j_artist = env->NewStringUTF(artist.c_str());
+        jstring j_album = env->NewStringUTF(album.c_str());
+        jbyteArray j_cover = nullptr;
+
+        if (!cover_art.empty()) {
+            j_cover = env->NewByteArray(static_cast<jsize>(cover_art.size()));
+            env->SetByteArrayRegion(
+                j_cover,
+                0,
+                static_cast<jsize>(cover_art.size()),
+                reinterpret_cast<const jbyte*>(cover_art.data())
+            );
+        }
+
+        env->CallVoidMethod(
+            g_airplay_callback,
+            mid,
+            j_title,
+            j_artist,
+            j_album,
+            static_cast<jlong>(duration_ms),
+            j_cover
+        );
+
+        env->DeleteLocalRef(j_title);
+        env->DeleteLocalRef(j_artist);
+        env->DeleteLocalRef(j_album);
+        if (j_cover) env->DeleteLocalRef(j_cover);
+    }
+    env->DeleteLocalRef(cls);
+
+    if (attached) {
+        g_jvm->DetachCurrentThread();
+    }
+}
 
 extern "C" {
 
@@ -153,6 +315,76 @@ Java_com_solo_purecast_core_nativebridge_NativeAudioEngine_decodeFlacStream(
         &cb_data
     );
     return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_solo_purecast_core_nativebridge_NativeAudioEngine_startAirPlayServer(
+    JNIEnv* env,
+    jobject /* thiz */,
+    jint port,
+    jobject callback
+) {
+    std::lock_guard<std::mutex> lock(g_airplay_mutex);
+    if (g_airplay_callback) {
+        env->DeleteGlobalRef(g_airplay_callback);
+        g_airplay_callback = nullptr;
+    }
+
+    if (callback) {
+        g_airplay_callback = env->NewGlobalRef(callback);
+    }
+
+    if (!g_raop_server) {
+        g_raop_server = std::make_unique<purecast::raop::RaopServer>();
+    }
+
+    g_raop_server->set_stream_request_callback(notify_java_stream_requested);
+    g_raop_server->set_stream_stop_callback(notify_java_stream_stopped);
+    g_raop_server->set_metadata_callback(notify_java_metadata);
+
+    bool ok = g_raop_server->start(port);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT void JNICALL
+Java_com_solo_purecast_core_nativebridge_NativeAudioEngine_stopAirPlayServer(
+    JNIEnv* env,
+    jobject /* thiz */
+) {
+    std::lock_guard<std::mutex> lock(g_airplay_mutex);
+    if (g_raop_server) {
+        g_raop_server->stop();
+        g_raop_server.reset();
+    }
+
+    if (g_airplay_callback) {
+        env->DeleteGlobalRef(g_airplay_callback);
+        g_airplay_callback = nullptr;
+    }
+}
+
+JNIEXPORT void JNICALL
+Java_com_solo_purecast_core_nativebridge_NativeAudioEngine_setAirPlayCryptoKey(
+    JNIEnv* env,
+    jobject /* thiz */,
+    jbyteArray aes_key,
+    jbyteArray aes_iv
+) {
+    if (!aes_key || !aes_iv) return;
+
+    jsize key_len = env->GetArrayLength(aes_key);
+    jsize iv_len = env->GetArrayLength(aes_iv);
+
+    std::vector<uint8_t> key(key_len);
+    std::vector<uint8_t> iv(iv_len);
+
+    env->GetByteArrayRegion(aes_key, 0, key_len, reinterpret_cast<jbyte*>(key.data()));
+    env->GetByteArrayRegion(aes_iv, 0, iv_len, reinterpret_cast<jbyte*>(iv.data()));
+
+    std::lock_guard<std::mutex> lock(g_airplay_mutex);
+    if (g_raop_server) {
+        g_raop_server->set_decrypted_aes_key(key, iv);
+    }
 }
 
 } // extern "C"

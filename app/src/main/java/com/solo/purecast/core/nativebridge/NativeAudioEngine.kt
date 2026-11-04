@@ -109,4 +109,24 @@ object NativeAudioEngine {
         inputStream: java.io.InputStream,
         callback: FlacFormatCallback
     ): Boolean
+
+    /**
+     * 💡 启动底层 Native RAOP (AirPlay 1 RTSP) 服务
+     * @param port RTSP 服务监听端口 (默认 5000)
+     * @param callback 协议事件与流状态监听器
+     */
+    external fun startAirPlayServer(
+        port: Int,
+        callback: com.solo.purecast.airplay.NativeAirPlayCallback
+    ): Boolean
+
+    /**
+     * 💡 停止底层 Native RAOP 服务并释放全部网络与音频管道
+     */
+    external fun stopAirPlayServer()
+
+    /**
+     * 💡 注入经由 RSA-2048 私钥解密出的原始 AES-128 密钥与 IV
+     */
+    external fun setAirPlayCryptoKey(aesKey: ByteArray, aesIv: ByteArray)
 }
