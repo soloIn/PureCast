@@ -1,0 +1,67 @@
+#pragma once
+
+#include <string>
+#include <functional>
+#include <thread>
+#include <atomic>
+#include <vector>
+#include <cstdint>
+
+namespace purecast::raop {
+
+struct RaopStreamParams {
+    int sample_rate{44100};
+    int bit_depth{16};
+    int channels{2};
+    std::string aes_key_base64;
+    std::string aes_iv_base64;
+    std::string client_ip;
+    int client_control_port{0};
+    int client_timing_port{0};
+    std::string dacp_id;
+    std::string active_remote_token;
+    int dacp_port{0};
+};
+
+class RaopServer {
+public:
+    using StreamRequestCallback = std::function<bool(const RaopStreamParams& params)>;
+    using StreamStopCallback = std::function<void()>;
+    using MetadataCallback = std::function<void(const std::string& title, const std::string& artist, const std::string& album, long duration_ms, const std::vector<uint8_t>& cover_art)>;
+
+    RaopServer();
+    ~RaopServer();
+
+    bool start(int port = 5000);
+    void stop();
+
+    bool is_running() const { return is_running_.load(); }
+
+    void set_stream_request_callback(StreamRequestCallback cb) { stream_request_cb_ = std::move(cb); }
+    void set_stream_stop_callback(StreamStopCallback cb) { stream_stop_cb_ = std::move(cb); }
+    void set_metadata_callback(MetadataCallback cb) { metadata_cb_ = std::move(cb); }
+
+    const RaopStreamParams& current_params() const { return current_params_; }
+
+private:
+    void server_loop();
+    void handle_client(int client_fd);
+    void handle_rtsp_request(int client_fd, const std::string& request);
+
+    std::string parse_header(const std::string& request, const std::string& header_name);
+    std::string parse_sdp_attribute(const std::string& sdp, const std::string& attr_name);
+
+private:
+    int server_port_{5000};
+    int server_fd_{-1};
+    std::atomic<bool> is_running_{false};
+    std::thread server_thread_;
+
+    RaopStreamParams current_params_{};
+
+    StreamRequestCallback stream_request_cb_{nullptr};
+    StreamStopCallback stream_stop_cb_{nullptr};
+    MetadataCallback metadata_cb_{nullptr};
+};
+
+} // namespace purecast::raop

@@ -55,12 +55,18 @@ set(PURECAST_SRC
     ${PURECAST_NATIVE_ROOT}/audio_engine.cpp
     ${PURECAST_NATIVE_ROOT}/dr_flac.c
     ${PURECAST_NATIVE_ROOT}/flac_decoder.cpp
+    ${PURECAST_NATIVE_ROOT}/crypto/aes.c
+    ${PURECAST_NATIVE_ROOT}/alac/alac_decoder.cpp
+    ${PURECAST_NATIVE_ROOT}/raop/raop_server.cpp
 )
 
 add_library(purecast_usb SHARED ${PURECAST_SRC})
 
 target_include_directories(purecast_usb PRIVATE
     ${PURECAST_NATIVE_ROOT}
+    ${PURECAST_NATIVE_ROOT}/crypto
+    ${PURECAST_NATIVE_ROOT}/alac
+    ${PURECAST_NATIVE_ROOT}/raop
     ${LIBUSB_ROOT}
 )
 
