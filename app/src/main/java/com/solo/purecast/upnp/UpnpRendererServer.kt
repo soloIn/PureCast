@@ -318,6 +318,8 @@ class UpnpRendererServer(
     }
 
     private fun handleGetProtocolInfo(): String {
+        // 💡 声明支持的 Sink 协议格式：
+        // 现已完整原生集成 dr_flac 与 WAV Demuxer，可同时无损直通解析 WAV 及 FLAC 高清流
         val supported = "http-get:*:audio/wav:*,http-get:*:audio/x-wav:*,http-get:*:audio/flac:*,http-get:*:audio/x-flac:*,http-get:*:audio/L16:*"
         val inner = "<Source></Source><Sink>$supported</Sink>"
         return buildSoapResponse("GetProtocolInfoResponse", "urn:schemas-upnp-org:service:ConnectionManager:1", inner)

@@ -32,11 +32,12 @@ namespace uac1 {
     constexpr uint8_t GET_CUR = 0x81;
 }
 
-// UAC2 实体与控制子类型
+// UAC2 实体与控制子类型 (依据 UAC2 规范表 A-9)
 namespace uac2 {
-    constexpr uint8_t CLOCK_SOURCE    = 0x0B;
-    constexpr uint8_t CLOCK_SELECTOR  = 0x0C;
-    constexpr uint8_t CLOCK_MULTIPLIER = 0x0D;
+    constexpr uint8_t CLOCK_SOURCE     = 0x0A;
+    constexpr uint8_t CLOCK_SELECTOR   = 0x0B;
+    constexpr uint8_t CLOCK_MULTIPLIER = 0x0C;
+    constexpr uint8_t SAMPLE_RATE_CONVERTER = 0x0D;
 
     // UAC2 Clock Source 控制选择器
     constexpr uint8_t CS_SAM_FREQ_CONTROL = 0x01;
@@ -91,7 +92,8 @@ struct Uac2FormatTypeIDesc {
  * 💡 UAC 音频流接口与端点配置信息
  */
 struct AudioEndpointInfo {
-    int interface_number = -1;
+    int control_interface_number = 0; // AudioControl 接口号
+    int interface_number = -1;        // AudioStreaming 接口号
     int alt_setting = -1;
     uint8_t endpoint_address = 0;
     uint16_t max_packet_size = 0;

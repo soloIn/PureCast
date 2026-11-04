@@ -77,6 +77,7 @@ bool AudioEngine::parse_audio_descriptors(libusb_device* dev) {
 
             // 检查 AudioControl 接口中的 Clock Source 实体 (UAC2)
             if (alt->bInterfaceClass == uac::CLASS_AUDIO && alt->bInterfaceSubClass == uac::SUBCLASS_AUDIOCONTROL) {
+                endpoint_info_.control_interface_number = alt->bInterfaceNumber;
                 const uint8_t* extra = alt->extra;
                 int extra_len = alt->extra_length;
                 while (extra_len >= 3) {
@@ -87,8 +88,10 @@ bool AudioEngine::parse_audio_descriptors(libusb_device* dev) {
 
                     if (type == uac::CS_INTERFACE && subtype == uac::uac2::CLOCK_SOURCE) {
                         found_clock_id = extra[3];
+                        endpoint_info_.clock_id = found_clock_id;
                         endpoint_info_.is_uac2 = true;
-                        LOGI("发现 UAC2 Clock Source 实体 ID: %u", found_clock_id);
+                        LOGI("发现 UAC2 Clock Source 实体 ID: %u, Control Iface: %d",
+                             found_clock_id, endpoint_info_.control_interface_number);
                     }
                     extra += len;
                     extra_len -= len;
@@ -167,11 +170,11 @@ int AudioEngine::configure_clock(int sample_rate) {
         // bmRequestType: 0x21 (Host to Interface, Class-specific)
         // bRequest: 0x01 (CS_CUR / SET_CUR)
         // wValue: (CS_SAM_FREQ_CONTROL << 8) -> 0x0100
-        // wIndex: (clock_id << 8) | interface_number
+        // wIndex: (clock_id << 8) | (control_interface_number & 0xFF)
         const uint8_t req_type = static_cast<uint8_t>(LIBUSB_REQUEST_TYPE_CLASS) | static_cast<uint8_t>(LIBUSB_RECIPIENT_INTERFACE);
         const uint8_t bRequest = uac::uac2::CS_CUR;
         const uint16_t wValue = (uac::uac2::CS_SAM_FREQ_CONTROL << 8);
-        const uint16_t wIndex = (endpoint_info_.clock_id << 8) | (endpoint_info_.interface_number & 0xFF);
+        const uint16_t wIndex = (endpoint_info_.clock_id << 8) | (endpoint_info_.control_interface_number & 0xFF);
 
         uint32_t freq_le = static_cast<uint32_t>(sample_rate);
         uint8_t data[4];
@@ -182,9 +185,11 @@ int AudioEngine::configure_clock(int sample_rate) {
 
         int r = libusb_control_transfer(dev_handle_, req_type, bRequest, wValue, wIndex, data, sizeof(data), 1000);
         if (r < 0) {
-            LOGW("UAC2 CS_SAM_FREQ_CONTROL 发送返回 %d, 尝试备用控制端点", r);
+            LOGW("UAC2 CS_SAM_FREQ_CONTROL 发送返回 %d (clock_id=%u, iface=%d)",
+                 r, endpoint_info_.clock_id, endpoint_info_.control_interface_number);
         } else {
-            LOGI("UAC2 时钟设置成功: %d Hz", sample_rate);
+            LOGI("UAC2 时钟设置成功: %d Hz (clock_id=%u, iface=%d)",
+                 sample_rate, endpoint_info_.clock_id, endpoint_info_.control_interface_number);
         }
     } else {
         // 💡 UAC1 规范：发送 SAMPLING_FREQ_CONTROL 至端点
@@ -256,7 +261,15 @@ int AudioEngine::open_device(int fd, int sample_rate, int bit_depth, int channel
         LOGI("确定声卡输出物理子帧格式: S16_LE (2 bytes per sample)");
     }
 
-    // 💡 步骤 1: 卸载 Linux 内核驱动 snd-usb-audio，实现独占
+    // 💡 步骤 1: 卸载 Linux 内核驱动 snd-usb-audio，实现全链路接口独占
+    if (endpoint_info_.control_interface_number >= 0 &&
+        endpoint_info_.control_interface_number != endpoint_info_.interface_number) {
+        if (libusb_kernel_driver_active(dev_handle_, endpoint_info_.control_interface_number) == 1) {
+            libusb_detach_kernel_driver(dev_handle_, endpoint_info_.control_interface_number);
+        }
+        libusb_claim_interface(dev_handle_, endpoint_info_.control_interface_number);
+    }
+
     if (libusb_kernel_driver_active(dev_handle_, endpoint_info_.interface_number) == 1) {
         LOGI("检测到 Linux 内核 snd-usb-audio 驱动活跃，执行 detach...");
         r = libusb_detach_kernel_driver(dev_handle_, endpoint_info_.interface_number);
@@ -292,17 +305,23 @@ int AudioEngine::open_device(int fd, int sample_rate, int bit_depth, int channel
     // 💡 步骤 5: 构建无锁环形缓冲区 (默认 1MB，支持 ~5 秒无损缓冲)
     ring_buffer_ = std::make_unique<SpscRingBuffer>(1024 * 1024);
 
-    // 计算每微帧或每毫秒包大小
-    // USB High-Speed 下每 125us 一个微帧 (8000 microframes/sec)
-    // 包大小 = ceil(sample_rate / 8000) * channels * subslot_size
-    const size_t samples_per_packet = static_cast<size_t>(std::ceil(static_cast<double>(sample_rate) / 8000.0)) + 1;
-    packet_size_ = samples_per_packet * current_channels_ * endpoint_info_.subslot_size;
+    // 💡 步骤 6: 配置 Bresenham 时钟步进 (解决 44.1kHz 分数包采样率与 USB High-Speed 8000微帧/秒同步)
+    // High-Speed (125us 微帧): 每秒 8000 microframes
+    packet_rate_ = 8000;
+    base_samples_per_packet_ = static_cast<uint32_t>(sample_rate / packet_rate_);
+    remainder_samples_ = static_cast<uint32_t>(sample_rate % packet_rate_);
+    bresenham_accum_ = 0;
+
+    // 分配单个 URB packet 的最大缓冲区 (base_samples + 2)
+    const size_t max_samples_per_pkt = base_samples_per_packet_ + 2;
+    packet_size_ = max_samples_per_pkt * current_channels_ * endpoint_info_.subslot_size;
     if (packet_size_ > endpoint_info_.max_packet_size && endpoint_info_.max_packet_size > 0) {
         packet_size_ = endpoint_info_.max_packet_size;
     }
     if (packet_size_ == 0) packet_size_ = 512;
 
-    LOGI("计算等时 URB 数据包尺寸: packet_size=%zu, subslot=%u", packet_size_, endpoint_info_.subslot_size);
+    LOGI("配置 Bresenham 时钟步进: rate=%d, base_samples=%u, rem=%u, packet_rate=%u, max_pkt_size=%zu",
+         sample_rate, base_samples_per_packet_, remainder_samples_, packet_rate_, packet_size_);
 
     // 💡 步骤 6: 预分配等时 URB 池与传输线程
     is_running_.store(true);
@@ -383,19 +402,28 @@ void AudioEngine::process_isoc_transfer(struct libusb_transfer* transfer) {
 
     // 临时输入缓冲区 (存放原始 16-bit PCM)
     static thread_local std::vector<uint8_t> temp_pcm16;
-    const size_t samples_per_pkt = packet_size_ / (current_channels_ * endpoint_info_.subslot_size);
-    const size_t raw16_pkt_bytes = samples_per_pkt * current_channels_ * sizeof(int16_t);
-    temp_pcm16.resize(raw16_pkt_bytes);
 
     for (int i = 0; i < transfer->num_iso_packets; ++i) {
         struct libusb_iso_packet_descriptor* pkt = &transfer->iso_packet_desc[i];
-        pkt->length = static_cast<unsigned int>(packet_size_);
         uint8_t* pkt_buf = base_buf + (i * packet_size_);
+
+        // 💡 Bresenham 时钟步进计算当前微帧所需采样点数 (如 44.1kHz 时交替 5 与 6 采样点)
+        size_t samples_this_pkt = base_samples_per_packet_;
+        bresenham_accum_ += remainder_samples_;
+        if (bresenham_accum_ >= packet_rate_) {
+            bresenham_accum_ -= packet_rate_;
+            samples_this_pkt += 1;
+        }
+
+        const size_t target_pkt_bytes = samples_this_pkt * current_channels_ * endpoint_info_.subslot_size;
+        const size_t raw16_pkt_bytes = samples_this_pkt * current_channels_ * sizeof(int16_t);
+        pkt->length = static_cast<unsigned int>(target_pkt_bytes);
 
         if (paused || !ring_buffer_ || ring_buffer_->available_read() < raw16_pkt_bytes) {
             // 💡 暂停或下溢时填充静音帧，保持等时时钟锁相不丢步
-            std::memset(pkt_buf, 0, packet_size_);
+            std::memset(pkt_buf, 0, target_pkt_bytes);
         } else {
+            temp_pcm16.resize(raw16_pkt_bytes);
             // 从无锁环形缓冲区读取纯 PCM 数据
             size_t bytes_read = ring_buffer_->read(temp_pcm16.data(), raw16_pkt_bytes);
             if (bytes_read == raw16_pkt_bytes) {
@@ -407,7 +435,7 @@ void AudioEngine::process_isoc_transfer(struct libusb_transfer* transfer) {
                     current_output_format_
                 );
             } else {
-                std::memset(pkt_buf, 0, packet_size_);
+                std::memset(pkt_buf, 0, target_pkt_bytes);
             }
         }
     }
@@ -477,11 +505,19 @@ int AudioEngine::release_device() {
         // (2) 释放接口独占
         if (is_claimed_.load()) {
             libusb_release_interface(dev_handle_, endpoint_info_.interface_number);
+            if (endpoint_info_.control_interface_number >= 0 &&
+                endpoint_info_.control_interface_number != endpoint_info_.interface_number) {
+                libusb_release_interface(dev_handle_, endpoint_info_.control_interface_number);
+            }
             is_claimed_.store(false);
         }
 
         // (3) 💡 重新绑定 Linux 内核驱动 snd-usb-audio (触发底层 USBDEVFS_CONNECT ioctl)
         LOGI("重新向 Linux 内核挂载 snd-usb-audio 驱动 (USBDEVFS_CONNECT)...");
+        if (endpoint_info_.control_interface_number >= 0 &&
+            endpoint_info_.control_interface_number != endpoint_info_.interface_number) {
+            libusb_attach_kernel_driver(dev_handle_, endpoint_info_.control_interface_number);
+        }
         int r = libusb_attach_kernel_driver(dev_handle_, endpoint_info_.interface_number);
         if (r != LIBUSB_SUCCESS) {
             LOGW("libusb_attach_kernel_driver 结果: %d (声卡可能已处于内核接管态)", r);
@@ -508,6 +544,10 @@ size_t AudioEngine::get_buffer_available() const {
 
 size_t AudioEngine::get_buffer_capacity() const {
     return ring_buffer_ ? ring_buffer_->capacity() : 0;
+}
+
+size_t AudioEngine::get_available_read() const {
+    return ring_buffer_ ? ring_buffer_->available_read() : 0;
 }
 
 } // namespace purecast

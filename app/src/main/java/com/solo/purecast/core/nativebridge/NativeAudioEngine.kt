@@ -86,7 +86,27 @@ object NativeAudioEngine {
     external fun getBufferCapacity(): Int
 
     /**
+     * 获取无锁环形缓冲区当前未消费（可读）的有效 PCM 字节数
+     */
+    external fun getAvailableRead(): Int
+
+    /**
      * 检查声卡当前是否处于独占活跃状态
      */
     external fun isStreaming(): Boolean
+
+    /**
+     * FLAC 解码器采样格式解析就绪回调
+     */
+    fun interface FlacFormatCallback {
+        fun onFormatReady(sampleRate: Int, bitDepth: Int, channels: Int)
+    }
+
+    /**
+     * 💡 通过 Native dr_flac 流式无损解码 FLAC 并实时直通写入环形缓冲区
+     */
+    external fun decodeFlacStream(
+        inputStream: java.io.InputStream,
+        callback: FlacFormatCallback
+    ): Boolean
 }

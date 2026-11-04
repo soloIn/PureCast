@@ -39,11 +39,12 @@ fi
 
 echo ">> 校验 32 位 ELF 头部信息..."
 if [ -n "${READELF}" ] && [ -x "${READELF}" ]; then
-    "${READELF}" -h "${SO_32}" | grep -E "Class:|Machine:"
+    ELF_HEADER=$("${READELF}" -h "${SO_32}")
+    echo "${ELF_HEADER}" | grep -E "Class:|Machine:"
     
     # 断言包含 ELF32 与 ARM
-    "${READELF}" -h "${SO_32}" | grep -q "ELF32" || { echo "❌ 并非 ELF32 格式"; exit 1; }
-    "${READELF}" -h "${SO_32}" | grep -q "ARM" || { echo "❌ 并非 ARM 架构"; exit 1; }
+    echo "${ELF_HEADER}" | grep "ELF32" >/dev/null || { echo "❌ 并非 ELF32 格式"; exit 1; }
+    echo "${ELF_HEADER}" | grep "ARM" >/dev/null || { echo "❌ 并非 ARM 架构"; exit 1; }
     echo "✅ 成功验证: libpurecast_usb.so 严格为 32 位 ARM (ELF32) 格式！"
 else
     file "${SO_32}"

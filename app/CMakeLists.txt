@@ -53,6 +53,8 @@ set(PURECAST_NATIVE_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/src/main/cpp)
 set(PURECAST_SRC
     ${PURECAST_NATIVE_ROOT}/jni_bridge.cpp
     ${PURECAST_NATIVE_ROOT}/audio_engine.cpp
+    ${PURECAST_NATIVE_ROOT}/dr_flac.c
+    ${PURECAST_NATIVE_ROOT}/flac_decoder.cpp
 )
 
 add_library(purecast_usb SHARED ${PURECAST_SRC})

@@ -12,6 +12,7 @@ import struct
 import socket
 import threading
 import time
+import subprocess
 import urllib.request
 import urllib.error
 from http.server import HTTPServer, SimpleHTTPRequestHandler
@@ -135,20 +136,32 @@ def start_http_server(directory, port):
 def main():
     target_host = sys.argv[1] if len(sys.argv) > 1 else "192.168.2.179"
     target_port = int(sys.argv[2]) if len(sys.argv) > 2 else 7952
+    duration = int(sys.argv[3]) if len(sys.argv) > 3 else 5
+    fmt = sys.argv[4].lower() if len(sys.argv) > 4 else "wav"
 
     local_ip = get_local_ip()
     temp_dir = "/tmp/purecast_test"
     os.makedirs(temp_dir, exist_ok=True)
-    wav_path = os.path.join(temp_dir, AUDIO_FILE_NAME)
+    wav_path = os.path.join(temp_dir, "purecast_test_tone.wav")
 
-    generate_sine_wav(wav_path, duration_sec=5, sample_rate=44100, freq=440.0)
+    generate_sine_wav(wav_path, duration_sec=duration, sample_rate=44100, freq=440.0)
+
+    if fmt == "flac":
+        file_name = "purecast_test_tone.flac"
+        flac_path = os.path.join(temp_dir, file_name)
+        subprocess.check_call(["ffmpeg", "-y", "-i", wav_path, flac_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        mime = "audio/flac"
+    else:
+        file_name = "purecast_test_tone.wav"
+        mime = "audio/wav"
+
     server = start_http_server(temp_dir, TEST_PORT)
-    print(f">> 本地 HTTP 音频服务已启动: http://{local_ip}:{TEST_PORT}/{AUDIO_FILE_NAME}")
+    print(f">> 本地 HTTP 音频服务已启动: http://{local_ip}:{TEST_PORT}/{file_name} ({mime})")
 
-    stream_url = f"http://{local_ip}:{TEST_PORT}/{AUDIO_FILE_NAME}"
-    didl_metadata = """&lt;DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/"&gt;&lt;item id="1" parentID="0" restricted="1"&gt;&lt;dc:title&gt;PureCast 440Hz Test Tone&lt;/dc:title&gt;&lt;upnp:artist&gt;PureCast Test Suite&lt;/upnp:artist&gt;&lt;upnp:album&gt;Lossless Benchmark&lt;/upnp:album&gt;&lt;res protocolInfo="http-get:*:audio/wav:*"&gt;""" + stream_url + """&lt;/res&gt;&lt;/item&gt;&lt;/DIDL-Lite&gt;"""
+    stream_url = f"http://{local_ip}:{TEST_PORT}/{file_name}"
+    didl_metadata = f"""&lt;DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/"&gt;&lt;item id="1" parentID="0" restricted="1"&gt;&lt;dc:title&gt;PureCast 440Hz Test Tone ({fmt.upper()})&lt;/dc:title&gt;&lt;upnp:artist&gt;PureCast Test Suite&lt;/upnp:artist&gt;&lt;upnp:album&gt;Lossless Benchmark&lt;/upnp:album&gt;&lt;res protocolInfo="http-get:*:{mime}:*"&gt;""" + stream_url + """&lt;/res&gt;&lt;/item&gt;&lt;/DIDL-Lite&gt;"""
 
-    print(f">> 向 PureCast MediaRenderer ({target_host}:{target_port}) 发起推流...")
+    print(f">> 向 PureCast MediaRenderer ({target_host}:{target_port}) 发起推流 ({fmt.upper()})...")
     
     # 1. SetAVTransportURI
     set_uri_xml = f"""<InstanceID>0</InstanceID><CurrentURI>{stream_url}</CurrentURI><CurrentURIMetaData>{didl_metadata}</CurrentURIMetaData>"""

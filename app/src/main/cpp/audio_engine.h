@@ -55,6 +55,8 @@ public:
 
     [[nodiscard]] size_t get_buffer_capacity() const;
 
+    [[nodiscard]] size_t get_available_read() const;
+
 private:
     void event_thread_func();
     static void LIBUSB_CALL isoc_transfer_cb(struct libusb_transfer* transfer);
@@ -88,6 +90,12 @@ private:
     int current_bit_depth_{16};
     int current_channels_{2};
     size_t packet_size_{0};
+
+    // 💡 Bresenham 时钟步进参数 (44.1kHz 分数包对齐与锁相)
+    uint32_t bresenham_accum_{0};
+    uint32_t base_samples_per_packet_{5};
+    uint32_t remainder_samples_{4100};
+    uint32_t packet_rate_{8000};
 
     std::recursive_mutex op_mutex_;
 };

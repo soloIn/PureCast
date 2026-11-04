@@ -74,38 +74,71 @@ class StreamDemuxer(
 
                 inputStream = BufferedInputStream(connection.inputStream, 64 * 1024)
 
-                // 💡 步骤 1: 解析容器头 (WAV / L16)
-                val format = parseHeader(inputStream)
-                Logger.upnp.i(TAG, "容器头部解析完毕: 采样率=${format.sampleRate}Hz, 位深=${format.bitDepth}bit, 声道=${format.channels}")
+                // 💡 步骤 1: 探测前 12 字节魔数区分 FLAC 或 WAV
+                inputStream.mark(64)
+                val magic = ByteArray(12)
+                readFully(inputStream, magic, 0, 12)
+                inputStream.reset()
 
-                // 通知主服务开启硬件独占与时钟锁定
-                onStreamStarted(format.sampleRate, format.bitDepth, format.channels)
-
-                // 💡 步骤 2: 流式搬运纯 PCM 数据包直接灌入 Native SPSC RingBuffer
-                val pcmBuffer = ByteArray(4096)
+                val magicStr = String(magic, 0, 4)
                 var totalBytesReceived = 0L
 
-                while (isActive && isDemuxing) {
-                    val bytesRead = inputStream.read(pcmBuffer, 0, pcmBuffer.size)
-                    if (bytesRead == -1) {
-                        Logger.upnp.i(TAG, "音频流正常读取至 EOF 边界")
-                        break
+                if (magicStr == "fLaC") {
+                    Logger.upnp.i(TAG, "检测到 FLAC 无损流容器 (fLaC)，交由 Native dr_flac 流式无损解码...")
+                    val ok = NativeAudioEngine.decodeFlacStream(inputStream) { rate, bits, ch ->
+                        Logger.upnp.i(TAG, "Native dr_flac 解析音频规格成功: $rate Hz, $bits bit, $ch ch")
+                        onStreamStarted(rate, bits, ch)
                     }
+                    if (!ok) {
+                        Logger.upnp.w(TAG, "Native dr_flac 解码失败或提前退出")
+                    }
+                } else if (magicStr == "RIFF") {
+                    // 💡 解析容器头 (WAV / L16)
+                    val format = parseHeader(inputStream)
+                    Logger.upnp.i(TAG, "WAV 容器头部解析完毕: 采样率=${format.sampleRate}Hz, 位深=${format.bitDepth}bit, 声道=${format.channels}")
 
-                    if (bytesRead > 0) {
-                        totalBytesReceived += bytesRead
-                        // 零拷贝直接写入 C++ 环形缓冲
-                        val written = NativeAudioEngine.writePcm(pcmBuffer, 0, bytesRead)
-                        if (written < bytesRead) {
-                            // 环形缓冲满载时微休眠 2ms 等待等时 URB 消费
-                            Thread.sleep(2)
-                            val remaining = bytesRead - written
-                            NativeAudioEngine.writePcm(pcmBuffer, written, remaining)
+                    // 通知主服务开启硬件独占与时钟锁定
+                    onStreamStarted(format.sampleRate, format.bitDepth, format.channels)
+
+                    // 💡 流式搬运纯 PCM 数据包直接灌入 Native SPSC RingBuffer
+                    val pcmBuffer = ByteArray(4096)
+
+                    while (isActive && isDemuxing) {
+                        val bytesRead = inputStream.read(pcmBuffer, 0, pcmBuffer.size)
+                        if (bytesRead == -1) {
+                            Logger.upnp.i(TAG, "音频流正常读取至 EOF 边界")
+                            break
+                        }
+
+                        if (bytesRead > 0) {
+                            totalBytesReceived += bytesRead
+                            var offset = 0
+                            var remaining = bytesRead
+                            while (remaining > 0 && isActive && isDemuxing) {
+                                val written = NativeAudioEngine.writePcm(pcmBuffer, offset, remaining)
+                                if (written > 0) {
+                                    offset += written
+                                    remaining -= written
+                                } else {
+                                    // 💡 环形缓冲满载时微休眠 2ms 等待等时 URB 消费，绝对禁止丢字节以防破坏 16-bit 采样字节对齐
+                                    Thread.sleep(2)
+                                }
+                            }
                         }
                     }
+                } else {
+                    Logger.upnp.e(TAG, "未知的音频流魔数: $magicStr，拦截直通以防杂音")
+                    throw IllegalArgumentException("不支持的非 WAV/FLAC 格式流: $magicStr")
                 }
 
-                Logger.upnp.i(TAG, "音频流传输完成，总共传输 $totalBytesReceived 字节 PCM 载荷")
+                Logger.upnp.i(TAG, "音频流数据拉取完毕，等待环形缓冲排空播放...")
+                // 💡 等待环形缓冲区中的数据被 USB DAC 完全消费播放完毕 (最多等待 6 秒防挂起)
+                var waitCount = 0
+                while (isActive && isDemuxing && NativeAudioEngine.getAvailableRead() > 0 && waitCount < 120) {
+                    Thread.sleep(50)
+                    waitCount++
+                }
+                Logger.upnp.i(TAG, "音频流播放完毕")
             } catch (e: CancellationException) {
                 Logger.upnp.i(TAG, "音频拉取流被主动取消")
             } catch (e: Exception) {
@@ -147,8 +180,8 @@ class StreamDemuxer(
         val wave = String(magic, 8, 4)
 
         if (riff != "RIFF" || wave != "WAVE") {
-            Logger.upnp.w(TAG, "未检测到标准 RIFF/WAVE 标识符 (riff=$riff, wave=$wave)，默认回退至 44.1kHz/16bit/2ch")
-            return AudioStreamFormat(44100, 16, 2)
+            Logger.upnp.e(TAG, "流格式非标准无损 WAV/PCM (riff=$riff, wave=$wave)，拦截直通以防压缩数据产生白噪声")
+            throw IllegalArgumentException("不支持的非 WAV 格式流: $riff / $wave (请确保投屏端传输无损 PCM/WAV)")
         }
 
         var sampleRate = 44100

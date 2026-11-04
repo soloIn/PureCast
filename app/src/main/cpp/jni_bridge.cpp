@@ -1,6 +1,7 @@
 #include <jni.h>
 #include <string>
 #include "audio_engine.h"
+#include "flac_decoder.h"
 
 extern "C" {
 
@@ -93,11 +94,65 @@ Java_com_solo_purecast_core_nativebridge_NativeAudioEngine_getBufferCapacity(
     return static_cast<jint>(purecast::AudioEngine::instance().get_buffer_capacity());
 }
 
+JNIEXPORT jint JNICALL
+Java_com_solo_purecast_core_nativebridge_NativeAudioEngine_getAvailableRead(
+    JNIEnv * /* env */,
+    jobject /* thiz */) {
+    return static_cast<jint>(purecast::AudioEngine::instance().get_available_read());
+}
+
 JNIEXPORT jboolean JNICALL
 Java_com_solo_purecast_core_nativebridge_NativeAudioEngine_isStreaming(
     JNIEnv * /* env */,
     jobject /* thiz */) {
     return purecast::AudioEngine::instance().is_streaming() ? JNI_TRUE : JNI_FALSE;
+}
+
+struct JniFormatCallbackData {
+    JNIEnv* env;
+    jobject callback_obj;
+    jmethodID callback_method;
+};
+
+static void jni_flac_format_cb(int sample_rate, int bit_depth, int channels, void* user_data) {
+    auto* cb_data = static_cast<JniFormatCallbackData*>(user_data);
+    if (cb_data && cb_data->env && cb_data->callback_obj && cb_data->callback_method) {
+        cb_data->env->CallVoidMethod(
+            cb_data->callback_obj,
+            cb_data->callback_method,
+            sample_rate,
+            bit_depth,
+            channels
+        );
+    }
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_solo_purecast_core_nativebridge_NativeAudioEngine_decodeFlacStream(
+    JNIEnv* env,
+    jobject /* thiz */,
+    jobject input_stream,
+    jobject on_format_callback
+) {
+    if (!input_stream || !on_format_callback) return JNI_FALSE;
+
+    jclass cb_class = env->GetObjectClass(on_format_callback);
+    jmethodID cb_method = env->GetMethodID(cb_class, "onFormatReady", "(III)V");
+    if (!cb_method) return JNI_FALSE;
+
+    JniFormatCallbackData cb_data{
+        env,
+        on_format_callback,
+        cb_method
+    };
+
+    bool ok = purecast::FlacDecoder::decode_stream(
+        env,
+        input_stream,
+        jni_flac_format_cb,
+        &cb_data
+    );
+    return ok ? JNI_TRUE : JNI_FALSE;
 }
 
 } // extern "C"
