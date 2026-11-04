@@ -56,6 +56,7 @@ set(PURECAST_SRC
     ${PURECAST_NATIVE_ROOT}/dr_flac.c
     ${PURECAST_NATIVE_ROOT}/flac_decoder.cpp
     ${PURECAST_NATIVE_ROOT}/crypto/aes.c
+    ${PURECAST_NATIVE_ROOT}/alac/alac.c
     ${PURECAST_NATIVE_ROOT}/alac/alac_decoder.cpp
     ${PURECAST_NATIVE_ROOT}/raop/raop_server.cpp
     ${PURECAST_NATIVE_ROOT}/raop/raop_jitter_buffer.cpp

@@ -51,6 +51,13 @@ public:
     void set_alac_config(int frame_length, int bit_depth, int channels, int sample_rate);
 
     /**
+     * 💡 传入 RTSP ANNOUNCE 中的 a=fmtp 参数初始化 ALAC 解码器
+     */
+    void init_alac(const int32_t* fmtp) {
+        alac_decoder_.init(fmtp);
+    }
+
+    /**
      * 是否正在运行
      */
     bool is_running() const { return is_running_.load(std::memory_order_relaxed); }

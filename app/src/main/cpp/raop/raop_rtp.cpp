@@ -171,6 +171,7 @@ void RaopRtp::data_loop() {
     setpriority(PRIO_PROCESS, 0, -10); // 提升数据接收线程优先级
     std::vector<uint8_t> buffer(2048);
     std::vector<uint8_t> pcm_frame(RaopJitterBuffer::FRAME_BYTES);
+    std::vector<uint8_t> decrypted_payload(2048);
 
     LOGI("RAOP RTP 数据接收线程已启动");
 
@@ -189,41 +190,65 @@ void RaopRtp::data_loop() {
         if (n < 12) continue;
 
         uint8_t payload_type = buffer[1] & 0x7F;
-        // AirTunes/RAOP 音频包 payload type 通常为 96 (0x60)
-        if (payload_type != 96 && payload_type != 84) {
-            // 非音频数据跳过
+        // 💡 AirTunes/RAOP 音频包类型:
+        // 0x60 (96): 标准实时音频数据包
+        // 0x56 (86): 重传音频数据包 (带有额外 4 字节前导头)
+        // 0x54 (84): Sync 控制包 (非音频数据，直接忽略)
+        if (payload_type != 96 && payload_type != 86) {
             continue;
         }
 
-        uint16_t seq = (static_cast<uint16_t>(buffer[2]) << 8) | buffer[3];
-        uint32_t ts = (static_cast<uint32_t>(buffer[4]) << 24) |
-                      (static_cast<uint32_t>(buffer[5]) << 16) |
-                      (static_cast<uint32_t>(buffer[6]) << 8)  |
-                      buffer[7];
+        const uint8_t* pktp = buffer.data();
+        ssize_t plen = n;
 
-        uint8_t* payload = buffer.data() + 12;
-        size_t payload_len = static_cast<size_t>(n - 12);
+        if (payload_type == 86) {
+            // 重传音频包跳过 4 字节
+            pktp += 4;
+            plen -= 4;
+        }
+
+        if (plen < 12) continue;
+
+        uint16_t seq = (static_cast<uint16_t>(pktp[2]) << 8) | pktp[3];
+        uint32_t ts = (static_cast<uint32_t>(pktp[4]) << 24) |
+                      (static_cast<uint32_t>(pktp[5]) << 16) |
+                      (static_cast<uint32_t>(pktp[6]) << 8)  |
+                      pktp[7];
+
+        const uint8_t* payload = pktp + 12;
+        size_t payload_len = static_cast<size_t>(plen - 12);
+        if (payload_len < 16) continue;
 
         // 1. AES-128-CBC 解密
-        if (has_crypto_.load(std::memory_order_relaxed) && payload_len > 0) {
-            size_t crypt_len = (payload_len / 16) * 16;
-            if (crypt_len > 0) {
+        // 💡 AirPlay 1 规范要求:
+        // 每个音频包独立初始化 CBC 向量 (使用 ANNOUNCE 协商的 aes_iv_)
+        // 解密长度为 16 字节整倍数 (payload_len & ~0xf)，尾部余数保持明文拷贝
+        decrypted_payload.resize(payload_len);
+        memcpy(decrypted_payload.data(), payload, payload_len);
+
+        if (has_crypto_.load(std::memory_order_relaxed)) {
+            size_t aeslen = payload_len & ~0xf;
+            if (aeslen > 0) {
+                uint8_t iv[16];
+                memcpy(iv, aes_iv_.data(), 16);
                 struct AES_ctx ctx;
-                AES_init_ctx_iv(&ctx, aes_key_.data(), aes_iv_.data());
-                AES_CBC_decrypt_buffer(&ctx, payload, crypt_len);
+                AES_init_ctx_iv(&ctx, aes_key_.data(), iv);
+                AES_CBC_decrypt_buffer(&ctx, decrypted_payload.data(), aeslen);
             }
         }
 
-        // 2. ALAC 实时无损解码为 16-bit 44.1kHz PCM
+        // 2. ALAC 实时无损解码为 16-bit 44.1kHz PCM (S16_LE)
         size_t out_bytes = 0;
-        if (alac_decoder_.decode_frame(payload, payload_len, pcm_frame.data(), out_bytes)) {
-            std::vector<uint8_t> pcm_copy(pcm_frame.data(), pcm_frame.data() + out_bytes);
-            jitter_buffer_.push(seq, ts, std::move(pcm_copy));
+        if (alac_decoder_.decode_frame(decrypted_payload.data(), payload_len, pcm_frame.data(), out_bytes)) {
+            if (out_bytes > 0) {
+                std::vector<uint8_t> pcm_copy(pcm_frame.data(), pcm_frame.data() + out_bytes);
+                jitter_buffer_.push(seq, ts, std::move(pcm_copy));
 
-            // 3. 将连续就绪的 PCM 帧出队并推入 SPSC 环形缓冲区
-            std::vector<uint8_t> ready_frame;
-            while (jitter_buffer_.pop(ready_frame)) {
-                AudioEngine::instance().write_pcm(ready_frame.data(), ready_frame.size());
+                // 3. 将连续就绪的 PCM 帧出队并推入 SPSC 环形缓冲区
+                std::vector<uint8_t> ready_frame;
+                while (jitter_buffer_.pop(ready_frame)) {
+                    AudioEngine::instance().write_pcm(ready_frame.data(), ready_frame.size());
+                }
             }
         }
     }

@@ -197,6 +197,7 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
                      << "Server: AirTunes/105.1\r\n\r\n";
         }
     } else if (method == "FLUSH") {
+        rtp_.reset_buffer(); // 💡 收到 FLUSH 立即重置 JitterBuffer，杜绝上一曲残余数据产生的爆音
         response << "RTSP/1.0 200 OK\r\n"
                  << "CSeq: " << cseq << "\r\n"
                  << "RTP-Info: rtptime=0\r\n"
@@ -215,6 +216,30 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
         // 解析 SDP 中的 rsaaeskey 与 aesiv
         current_params_.aes_key_base64 = parse_sdp_attribute(request, "rsaaeskey");
         current_params_.aes_iv_base64 = parse_sdp_attribute(request, "aesiv");
+
+        // 💡 提取 SDP a=fmtp 参数行 (例如 a=fmtp:96 352 0 16 40 10 14 2 255 0 0 44100)
+        std::string fmtp_str = parse_sdp_attribute(request, "fmtp");
+        current_params_.fmtp.clear();
+        if (!fmtp_str.empty()) {
+            std::istringstream iss(fmtp_str);
+            int32_t val;
+            while (iss >> val) {
+                current_params_.fmtp.push_back(val);
+            }
+        }
+
+        if (current_params_.fmtp.size() >= 12) {
+            LOGI("ANNOUNCE 提取 fmtp 参数 (12项): frame_size=%d, sample_size=%d, sample_rate=%d",
+                 current_params_.fmtp[1], current_params_.fmtp[3], current_params_.fmtp[11]);
+            current_params_.sample_rate = current_params_.fmtp[11];
+            current_params_.bit_depth = current_params_.fmtp[3];
+            current_params_.channels = current_params_.fmtp[7] > 0 ? current_params_.fmtp[7] : 2;
+            rtp_.init_alac(current_params_.fmtp.data());
+        } else {
+            LOGI("ANNOUNCE 未检测到标准 12 项 fmtp，采用标准 44.1kHz/16-bit 默认配置初始化 ALAC");
+            rtp_.init_alac(nullptr);
+        }
+
         LOGI("ANNOUNCE 提取密钥: key_len=%zu, iv_len=%zu",
              current_params_.aes_key_base64.size(), current_params_.aes_iv_base64.size());
 
