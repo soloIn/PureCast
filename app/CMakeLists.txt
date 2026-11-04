@@ -58,6 +58,8 @@ set(PURECAST_SRC
     ${PURECAST_NATIVE_ROOT}/crypto/aes.c
     ${PURECAST_NATIVE_ROOT}/alac/alac_decoder.cpp
     ${PURECAST_NATIVE_ROOT}/raop/raop_server.cpp
+    ${PURECAST_NATIVE_ROOT}/raop/raop_jitter_buffer.cpp
+    ${PURECAST_NATIVE_ROOT}/raop/raop_rtp.cpp
 )
 
 add_library(purecast_usb SHARED ${PURECAST_SRC})

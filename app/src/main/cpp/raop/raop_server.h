@@ -7,6 +7,8 @@
 #include <vector>
 #include <cstdint>
 
+#include "raop_rtp.h"
+
 namespace purecast::raop {
 
 struct RaopStreamParams {
@@ -41,6 +43,11 @@ public:
     void set_stream_stop_callback(StreamStopCallback cb) { stream_stop_cb_ = std::move(cb); }
     void set_metadata_callback(MetadataCallback cb) { metadata_cb_ = std::move(cb); }
 
+    void set_decrypted_aes_key(const std::vector<uint8_t>& key, const std::vector<uint8_t>& iv) {
+        rtp_.set_crypto_key(key, iv);
+    }
+
+    RaopRtp& rtp() { return rtp_; }
     const RaopStreamParams& current_params() const { return current_params_; }
 
 private:
@@ -57,6 +64,7 @@ private:
     std::atomic<bool> is_running_{false};
     std::thread server_thread_;
 
+    RaopRtp rtp_;
     RaopStreamParams current_params_{};
 
     StreamRequestCallback stream_request_cb_{nullptr};

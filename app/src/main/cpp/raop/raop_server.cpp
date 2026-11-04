@@ -62,6 +62,8 @@ void RaopServer::stop() {
     if (!is_running_.exchange(false)) return;
 
     LOGI("正在停止 RaopServer...");
+    rtp_.stop();
+
     if (server_fd_ >= 0) {
         shutdown(server_fd_, SHUT_RDWR);
         close(server_fd_);
@@ -173,17 +175,26 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
         }
 
         if (accepted) {
-            response << "RTSP/1.0 200 OK\r\n"
-                     << "CSeq: " << cseq << "\r\n"
-                     << "Transport: RTP/AVP/UDP;unicast;mode=record;server_port=6000;control_port=6001;timing_port=6002\r\n"
-                     << "Session: 1\r\n"
-                     << "Audio-Jack-Status: connected; type=digital\r\n"
-                     << "Server: AirTunes/220.68\r\n\r\n";
+            int data_p = 0, ctrl_p = 0, timing_p = 0;
+            if (rtp_.start(data_p, ctrl_p, timing_p)) {
+                response << "RTSP/1.0 200 OK\r\n"
+                         << "CSeq: " << cseq << "\r\n"
+                         << "Transport: RTP/AVP/UDP;unicast;mode=record;server_port=" << data_p
+                         << ";control_port=" << ctrl_p
+                         << ";timing_port=" << timing_p << "\r\n"
+                         << "Session: 1\r\n"
+                         << "Audio-Jack-Status: connected; type=digital\r\n"
+                         << "Server: AirTunes/220.68\r\n\r\n";
+            } else {
+                response << "RTSP/1.0 500 Internal Server Error\r\n"
+                         << "CSeq: " << cseq << "\r\n\r\n";
+            }
         } else {
             response << "RTSP/1.0 503 Service Unavailable\r\n"
                      << "CSeq: " << cseq << "\r\n\r\n";
         }
     } else if (method == "RECORD") {
+        rtp_.reset_buffer();
         response << "RTSP/1.0 200 OK\r\n"
                  << "CSeq: " << cseq << "\r\n"
                  << "Audio-Latency: 11025\r\n"
@@ -193,6 +204,7 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
         response << "RTSP/1.0 200 OK\r\n"
                  << "CSeq: " << cseq << "\r\n\r\n";
     } else if (method == "TEARDOWN") {
+        rtp_.stop();
         if (stream_stop_cb_) {
             stream_stop_cb_();
         }
