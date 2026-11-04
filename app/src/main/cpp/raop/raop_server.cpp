@@ -1,5 +1,6 @@
 #include "raop_server.h"
 #include "dmap_parser.h"
+#include "../audio_engine.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -7,6 +8,19 @@
 #include <fcntl.h>
 #include <sstream>
 #include <android/log.h>
+
+#ifdef LOGD
+#undef LOGD
+#endif
+#ifdef LOGI
+#undef LOGI
+#endif
+#ifdef LOGW
+#undef LOGW
+#endif
+#ifdef LOGE
+#undef LOGE
+#endif
 
 #define RAOP_TAG "PureCastRAOP"
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, RAOP_TAG, __VA_ARGS__)
@@ -198,7 +212,8 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
                      << "Server: AirTunes/105.1\r\n\r\n";
         }
     } else if (method == "FLUSH") {
-        rtp_.reset_buffer(); // 💡 收到 FLUSH 立即重置 JitterBuffer，杜绝上一曲残余数据产生的爆音
+        rtp_.reset_buffer(); // 💡 收到 FLUSH 立即重置 JitterBuffer 与 AudioEngine 环形缓冲，杜绝残音爆音与断层
+        AudioEngine::instance().flush_buffer();
         response << "RTSP/1.0 200 OK\r\n"
                  << "CSeq: " << cseq << "\r\n"
                  << "RTP-Info: rtptime=0\r\n"
@@ -290,6 +305,7 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
         }
     } else if (method == "RECORD") {
         rtp_.reset_buffer();
+        AudioEngine::instance().flush_buffer();
         response << "RTSP/1.0 200 OK\r\n"
                  << "CSeq: " << cseq << "\r\n"
                  << "Audio-Latency: 11025\r\n"
@@ -355,6 +371,7 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
                  << "CSeq: " << cseq << "\r\n\r\n";
     } else if (method == "TEARDOWN") {
         rtp_.stop();
+        AudioEngine::instance().flush_buffer();
         if (stream_stop_cb_) {
             stream_stop_cb_();
         }

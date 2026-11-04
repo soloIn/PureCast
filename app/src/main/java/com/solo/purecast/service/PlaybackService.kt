@@ -26,9 +26,14 @@ import com.solo.purecast.model.PlaybackStatus
 import com.solo.purecast.model.TrackMetadata
 import com.solo.purecast.ui.MainActivity
 import com.solo.purecast.util.Logger
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 
 /**
  * 💡 PureCast 核心播放前台服务
@@ -63,6 +68,11 @@ class PlaybackService : LifecycleService() {
 
     // 💡 系统级 MediaSession 会话管理器
     private var mediaSession: MediaSession? = null
+
+    // 💡 AirPlay 进度平滑推进器 (基于单调时钟推算，补偿 iOS 连续播放时不发 RTSP progress 的特性)
+    private var airPlayProgressJob: kotlinx.coroutines.Job? = null
+    private var airPlayAnchorRealtimeMs: Long = 0L
+    private var airPlayBasePositionMs: Long = 0L
 
     override fun onCreate() {
         super.onCreate()
@@ -398,6 +408,13 @@ class PlaybackService : LifecycleService() {
             protocol = currentProto
         )
 
+        // 💡 若为 AirPlay 会话，启动单调时钟平滑进度推进器
+        if (currentStreamSource == StreamSource.AIRPLAY) {
+            airPlayBasePositionMs = 0L
+            airPlayAnchorRealtimeMs = android.os.SystemClock.elapsedRealtime()
+            launchAirPlayProgressTicker()
+        }
+
         updateMediaSessionState()
         updateNotification()
         return true
@@ -491,12 +508,42 @@ class PlaybackService : LifecycleService() {
             val updated = current.copy(durationMs = durationMs, isLiveStream = false)
             updateMetadata(updated)
         }
-        _playbackPositionMs.value = positionMs
+        startOrUpdateAirPlayProgress(positionMs, durationMs)
         updateMediaSessionState()
+    }
+
+    private fun startOrUpdateAirPlayProgress(positionMs: Long, durationMs: Long) {
+        airPlayBasePositionMs = positionMs
+        airPlayAnchorRealtimeMs = android.os.SystemClock.elapsedRealtime()
+        _playbackPositionMs.value = positionMs
+
+        if (_playbackStatus.value == PlaybackStatus.PLAYING && currentStreamSource == StreamSource.AIRPLAY) {
+            launchAirPlayProgressTicker()
+        }
+    }
+
+    private fun launchAirPlayProgressTicker() {
+        airPlayProgressJob?.cancel()
+        airPlayProgressJob = lifecycleScope.launch(Dispatchers.Default) {
+            while (isActive && _playbackStatus.value == PlaybackStatus.PLAYING && currentStreamSource == StreamSource.AIRPLAY) {
+                delay(500)
+                val elapsed = android.os.SystemClock.elapsedRealtime() - airPlayAnchorRealtimeMs
+                val duration = _currentMetadata.value.durationMs
+                var calculatedPos = airPlayBasePositionMs + elapsed
+                if (duration > 0 && calculatedPos > duration) {
+                    calculatedPos = duration
+                }
+                _playbackPositionMs.value = calculatedPos
+            }
+        }
     }
 
     fun pausePlayback() {
         Logger.service.i(TAG, "暂停音频播放...")
+        airPlayProgressJob?.cancel()
+        airPlayProgressJob = null
+        airPlayBasePositionMs = _playbackPositionMs.value
+
         NativeAudioEngine.pauseStream()
         _playbackStatus.value = PlaybackStatus.PAUSED
         releaseWifiLowLatencyLock()
@@ -516,6 +563,12 @@ class PlaybackService : LifecycleService() {
         }
         NativeAudioEngine.resumeStream()
         _playbackStatus.value = PlaybackStatus.PLAYING
+
+        if (currentStreamSource == StreamSource.AIRPLAY) {
+            airPlayAnchorRealtimeMs = android.os.SystemClock.elapsedRealtime()
+            launchAirPlayProgressTicker()
+        }
+
         upnpServer?.notifyTransportState("PLAYING")
         updateMediaSessionState()
         updateNotification()
@@ -523,6 +576,11 @@ class PlaybackService : LifecycleService() {
 
     fun stopPlayback() {
         Logger.service.i(TAG, "停止音频播放...")
+        airPlayProgressJob?.cancel()
+        airPlayProgressJob = null
+        airPlayBasePositionMs = 0L
+        airPlayAnchorRealtimeMs = 0L
+
         NativeAudioEngine.stopStream()
         _playbackStatus.value = PlaybackStatus.STOPPED
         _playbackPositionMs.value = 0L
