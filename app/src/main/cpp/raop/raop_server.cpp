@@ -137,6 +137,21 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
     std::string cseq = parse_header(request, "CSeq");
     LOGI("处理 RTSP 方法: %s, URI: %s, CSeq: %s", method.c_str(), uri.c_str(), cseq.c_str());
 
+    std::string challenge = parse_header(request, "Apple-Challenge");
+    std::string apple_response_header;
+    if (!challenge.empty()) {
+        LOGI("收到 Apple-Challenge: %s", challenge.c_str());
+        if (challenge_cb_) {
+            std::string sig = challenge_cb_(challenge);
+            if (!sig.empty()) {
+                apple_response_header = "Apple-Response: " + sig + "\r\nAudio-Jack-Status: connected; type=digital\r\n";
+                LOGI("生成 Apple-Response 响应头成功: len=%zu", sig.size());
+            } else {
+                LOGE("求解 Apple-Challenge 失败");
+            }
+        }
+    }
+
     std::ostringstream response;
 
     if (method == "GET") {
@@ -193,6 +208,7 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
     } else if (method == "OPTIONS") {
         response << "RTSP/1.0 200 OK\r\n"
                  << "CSeq: " << cseq << "\r\n"
+                 << apple_response_header
                  << "Public: ANNOUNCE, SETUP, RECORD, PAUSE, FLUSH, TEARDOWN, OPTIONS, GET_PARAMETER, SET_PARAMETER\r\n"
                  << "Server: AirTunes/105.1\r\n\r\n";
     } else if (method == "ANNOUNCE") {
@@ -204,6 +220,7 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
 
         response << "RTSP/1.0 200 OK\r\n"
                  << "CSeq: " << cseq << "\r\n"
+                 << apple_response_header
                  << "Server: AirTunes/105.1\r\n\r\n";
     } else if (method == "SETUP") {
         // 解析 Active-Remote 与 DACP-ID

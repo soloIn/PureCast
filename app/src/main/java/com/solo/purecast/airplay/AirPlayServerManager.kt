@@ -90,6 +90,21 @@ class AirPlayServerManager(
                 onStreamStoppedListener()
             }
 
+            override fun onChallengeRequested(challengeBase64: String): String? {
+                val localIp = jmdnsDiscoveryService.getLocalIpv4Address()
+                val macStr = jmdnsDiscoveryService.getMacAddressFormatted()
+                if (localIp == null) {
+                    Logger.airplay.e(TAG, "本地 IP 不可用，无法计算 Apple-Response")
+                    return null
+                }
+                val macBytes = ByteArray(6) { idx ->
+                    macStr.substring(idx * 2, idx * 2 + 2).toInt(16).toByte()
+                }
+                val response = AirPlayKeyDecryptor.solveAppleChallenge(challengeBase64, localIp, macBytes)
+                Logger.airplay.i(TAG, "计算 Apple-Challenge 响应: challenge=$challengeBase64, response=$response")
+                return response
+            }
+
             override fun onMetadataReceived(
                 title: String,
                 artist: String,

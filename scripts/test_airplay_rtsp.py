@@ -31,15 +31,18 @@ def main():
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.connect((target_ip, target_port))
 
-    # 1. OPTIONS
+    # 1. OPTIONS (附带真实 Apple-Challenge 挑战请求)
     req_options = (
         f"OPTIONS rtsp://{target_ip}/123456 RTSP/1.0\r\n"
         "CSeq: 1\r\n"
+        "Apple-Challenge: 9OsoWRfxJXoQpz7n0dUqyg==\r\n"
         "User-Agent: AirPlay/220.68\r\n"
         "Client-Instance: 0123456789ABCDEF\r\n\r\n"
     )
     resp = send_rtsp_req(s, req_options)
     assert "200 OK" in resp, "OPTIONS failed"
+    assert "Apple-Response:" in resp, "OPTIONS must contain Apple-Response header"
+    assert "Audio-Jack-Status:" in resp, "OPTIONS must contain Audio-Jack-Status header"
 
     # 2. ANNOUNCE
     sdp_body = (

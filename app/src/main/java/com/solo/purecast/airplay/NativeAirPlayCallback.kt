@@ -35,6 +35,13 @@ interface NativeAirPlayCallback {
     fun onStreamStopped()
 
     /**
+     * 收到 Apple-Challenge 挑战握手请求 (OPTIONS / ANNOUNCE 阶段)
+     * @param challengeBase64 Apple 设备发来的 Base64 编码随机挑战
+     * @return 经 RSA 私钥签名的 Apple-Response Base64 字符串，失败返回 null
+     */
+    fun onChallengeRequested(challengeBase64: String): String?
+
+    /**
      * 接收到推流端 DMAP 音乐元数据更新
      * @param title 歌曲名
      * @param artist 艺术家
