@@ -95,6 +95,7 @@ dependencies {
     implementation(libs.mmupnp)
     implementation(libs.ktor.client.core)
     implementation(libs.ktor.client.cio)
+    implementation(libs.jmdns)
 
     // Testing
     testImplementation(libs.junit)

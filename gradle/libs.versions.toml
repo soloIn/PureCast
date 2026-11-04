@@ -12,6 +12,7 @@ coil = "2.6.0"
 coroutines = "1.8.1"
 mmupnp = "3.1.6"
 ktor = "2.3.12"
+jmdns = "3.5.9"
 junit = "4.13.2"
 androidXTest = "1.6.1"
 robolectric = "4.13"
@@ -37,6 +38,7 @@ kotlinx-coroutines-android = { group = "org.jetbrains.kotlinx", name = "kotlinx-
 mmupnp = { group = "net.mm2d.mmupnp", name = "mmupnp", version.ref = "mmupnp" }
 ktor-client-core = { group = "io.ktor", name = "ktor-client-core", version.ref = "ktor" }
 ktor-client-cio = { group = "io.ktor", name = "ktor-client-cio", version.ref = "ktor" }
+jmdns = { group = "org.jmdns", name = "jmdns", version.ref = "jmdns" }
 
 # Testing
 junit = { group = "junit", name = "junit", version.ref = "junit" }
