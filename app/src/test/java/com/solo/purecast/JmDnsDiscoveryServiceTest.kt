@@ -48,17 +48,23 @@ class JmDnsDiscoveryServiceTest {
         // 验证 _raop._tcp.local. 服务属性与命名规范 (必须为 MAC@Name)
         val raopInstanceName = "${mac}@$friendlyName"
         val raopProps = mapOf(
+            "txtvers" to "1",
             "ch" to "2",
             "cn" to "0,1",
-            "da" to "true",
             "et" to "0,1",
-            "ek" to "1",
-            "pw" to "false",
+            "sv" to "false",
+            "da" to "true",
             "sr" to "44100",
             "ss" to "16",
+            "pw" to "false",
+            "vn" to "3",
             "tp" to "UDP",
-            "txtvers" to "1",
-            "am" to "AirPort4,107"
+            "md" to "0,1,2",
+            "vs" to "105.1",
+            "am" to "AirPort4,107",
+            "sf" to "0x4",
+            "fv" to "76400.10",
+            "ek" to "1"
         )
 
         val raopInfo = ServiceInfo.create(
@@ -78,5 +84,8 @@ class JmDnsDiscoveryServiceTest {
         assertEquals("44100", raopInfo.getPropertyString("sr"))
         assertEquals("16", raopInfo.getPropertyString("ss"))
         assertEquals("2", raopInfo.getPropertyString("ch"))
+        assertEquals("0x4", raopInfo.getPropertyString("sf"))
+        assertEquals("76400.10", raopInfo.getPropertyString("fv"))
+        assertEquals("105.1", raopInfo.getPropertyString("vs"))
     }
 }

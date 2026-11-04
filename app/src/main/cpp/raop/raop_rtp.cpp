@@ -87,9 +87,9 @@ bool RaopRtp::start(int& out_data_port, int& out_ctrl_port, int& out_timing_port
         return true;
     }
 
-    data_fd_ = bind_udp_socket(6000, data_port_);
-    ctrl_fd_ = bind_udp_socket(6001, ctrl_port_);
-    timing_fd_ = bind_udp_socket(6002, timing_port_);
+    data_fd_ = bind_udp_socket(7010, data_port_);
+    ctrl_fd_ = bind_udp_socket(7011, ctrl_port_);
+    timing_fd_ = bind_udp_socket(7012, timing_port_);
 
     if (data_fd_ < 0 || ctrl_fd_ < 0 || timing_fd_ < 0) {
         LOGE("初始化 RAOP UDP 端口组失败 (data=%d, ctrl=%d, timing=%d)", data_fd_, ctrl_fd_, timing_fd_);

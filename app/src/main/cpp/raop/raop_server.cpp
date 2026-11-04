@@ -162,12 +162,12 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
                      << "CSeq: " << cseq << "\r\n"
                      << "Content-Type: text/x-apple-plist+xml\r\n"
                      << "Content-Length: " << plist.size() << "\r\n"
-                     << "Server: AirTunes/220.68\r\n\r\n"
+                     << "Server: AirTunes/105.1\r\n\r\n"
                      << plist;
         } else {
             response << "RTSP/1.0 200 OK\r\n"
                      << "CSeq: " << cseq << "\r\n"
-                     << "Server: AirTunes/220.68\r\n\r\n";
+                     << "Server: AirTunes/105.1\r\n\r\n";
         }
     } else if (method == "POST") {
         if (uri.find("/pair-setup") != std::string::npos || uri.find("/pair-verify") != std::string::npos) {
@@ -175,26 +175,26 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
             LOGW("收到 AirPlay 2 配对探测请求 (%s)，返回 405 Method Not Allowed 触发客户端 AirPlay 1 回退", uri.c_str());
             response << "RTSP/1.0 405 Method Not Allowed\r\n"
                      << "CSeq: " << cseq << "\r\n"
-                     << "Server: AirTunes/220.68\r\n\r\n";
+                     << "Server: AirTunes/105.1\r\n\r\n";
         } else {
             response << "RTSP/1.0 200 OK\r\n"
                      << "CSeq: " << cseq << "\r\n"
-                     << "Server: AirTunes/220.68\r\n\r\n";
+                     << "Server: AirTunes/105.1\r\n\r\n";
         }
     } else if (method == "FLUSH") {
         response << "RTSP/1.0 200 OK\r\n"
                  << "CSeq: " << cseq << "\r\n"
                  << "RTP-Info: rtptime=0\r\n"
-                 << "Server: AirTunes/220.68\r\n\r\n";
+                 << "Server: AirTunes/105.1\r\n\r\n";
     } else if (method == "GET_PARAMETER") {
         response << "RTSP/1.0 200 OK\r\n"
                  << "CSeq: " << cseq << "\r\n"
-                 << "Server: AirTunes/220.68\r\n\r\n";
+                 << "Server: AirTunes/105.1\r\n\r\n";
     } else if (method == "OPTIONS") {
         response << "RTSP/1.0 200 OK\r\n"
                  << "CSeq: " << cseq << "\r\n"
                  << "Public: ANNOUNCE, SETUP, RECORD, PAUSE, FLUSH, TEARDOWN, OPTIONS, GET_PARAMETER, SET_PARAMETER\r\n"
-                 << "Server: AirTunes/220.68\r\n\r\n";
+                 << "Server: AirTunes/105.1\r\n\r\n";
     } else if (method == "ANNOUNCE") {
         // 解析 SDP 中的 rsaaeskey 与 aesiv
         current_params_.aes_key_base64 = parse_sdp_attribute(request, "rsaaeskey");
@@ -204,7 +204,7 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
 
         response << "RTSP/1.0 200 OK\r\n"
                  << "CSeq: " << cseq << "\r\n"
-                 << "Server: AirTunes/220.68\r\n\r\n";
+                 << "Server: AirTunes/105.1\r\n\r\n";
     } else if (method == "SETUP") {
         // 解析 Active-Remote 与 DACP-ID
         current_params_.active_remote_token = parse_header(request, "Active-Remote");
@@ -236,7 +236,7 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
                          << ";timing_port=" << timing_p << "\r\n"
                          << "Session: 1\r\n"
                          << "Audio-Jack-Status: connected; type=digital\r\n"
-                         << "Server: AirTunes/220.68\r\n\r\n";
+                         << "Server: AirTunes/105.1\r\n\r\n";
             } else {
                 response << "RTSP/1.0 500 Internal Server Error\r\n"
                          << "CSeq: " << cseq << "\r\n\r\n";
@@ -250,7 +250,7 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
         response << "RTSP/1.0 200 OK\r\n"
                  << "CSeq: " << cseq << "\r\n"
                  << "Audio-Latency: 11025\r\n"
-                 << "Server: AirTunes/220.68\r\n\r\n";
+                 << "Server: AirTunes/105.1\r\n\r\n";
     } else if (method == "SET_PARAMETER") {
         // DMAP 元数据推送 (application/x-dmap-tagged 或 image/none)
         std::string content_type = parse_header(request, "Content-Type");
