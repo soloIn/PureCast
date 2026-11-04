@@ -45,7 +45,7 @@ class JmDnsDiscoveryServiceTest {
         assertEquals("AirPort4,107", airplayInfo.getPropertyString("model"))
         assertEquals("0x7", airplayInfo.getPropertyString("features"))
 
-        // 验证 _raop._tcp.local. 服务属性与命名规范 (必须为 MAC@Name)
+        // 验证 _raop._tcp.local. 服务属性与命名规范 (必须为 MAC@Name, am=AirRecever3,1)
         val raopInstanceName = "${mac}@$friendlyName"
         val raopProps = mapOf(
             "txtvers" to "1",
@@ -61,7 +61,7 @@ class JmDnsDiscoveryServiceTest {
             "tp" to "UDP",
             "md" to "0,1,2",
             "vs" to "105.1",
-            "am" to "AirPort4,107",
+            "am" to "AirRecever3,1",
             "sf" to "0x4",
             "fv" to "76400.10",
             "ek" to "1"
@@ -80,7 +80,7 @@ class JmDnsDiscoveryServiceTest {
         assertEquals("4A3B2C1D0E1F@PureCast TV", raopInfo.name)
         assertEquals(5000, raopInfo.port)
         assertEquals("UDP", raopInfo.getPropertyString("tp"))
-        assertEquals("AirPort4,107", raopInfo.getPropertyString("am"))
+        assertEquals("AirRecever3,1", raopInfo.getPropertyString("am"))
         assertEquals("44100", raopInfo.getPropertyString("sr"))
         assertEquals("16", raopInfo.getPropertyString("ss"))
         assertEquals("2", raopInfo.getPropertyString("ch"))
