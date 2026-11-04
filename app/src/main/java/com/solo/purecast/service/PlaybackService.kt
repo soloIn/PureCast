@@ -40,6 +40,7 @@ class PlaybackService : LifecycleService() {
 
     private lateinit var usbDeviceManager: UsbDeviceManager
     private lateinit var audioFocusManager: AudioFocusManager
+    private var upnpServer: com.solo.purecast.upnp.UpnpRendererServer? = null
 
     private var multicastLock: WifiManager.MulticastLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
@@ -74,6 +75,11 @@ class PlaybackService : LifecycleService() {
 
         // 冷启动扫描已连接的 USB DAC
         usbDeviceManager.scanAndAttachDevice()
+
+        // 💡 启动 UPnP / DLNA MediaRenderer 服务端 (SSDP广播与SOAP控制)
+        upnpServer = com.solo.purecast.upnp.UpnpRendererServer(lifecycleScope, this).apply {
+            start()
+        }
     }
 
     private fun acquireSystemLocks() {
@@ -251,6 +257,8 @@ class PlaybackService : LifecycleService() {
     override fun onDestroy() {
         Logger.service.i(TAG, "PlaybackService onDestroy: 彻底清理服务...")
         instance = null
+        upnpServer?.stop()
+        upnpServer = null
         releaseSystemLocks()
         audioFocusManager.abandonFocus()
         usbDeviceManager.destroy()
