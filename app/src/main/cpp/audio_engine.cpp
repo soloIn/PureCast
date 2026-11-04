@@ -33,7 +33,7 @@ std::string AudioEngine::get_libusb_version() const {
 }
 
 int AudioEngine::init_context() {
-    std::lock_guard<std::mutex> lock(op_mutex_);
+    std::lock_guard<std::recursive_mutex> lock(op_mutex_);
     if (ctx_) {
         return 0; // 已初始化
     }
@@ -214,7 +214,7 @@ int AudioEngine::configure_clock(int sample_rate) {
 }
 
 int AudioEngine::open_device(int fd, int sample_rate, int bit_depth, int channels) {
-    std::lock_guard<std::mutex> lock(op_mutex_);
+    std::lock_guard<std::recursive_mutex> lock(op_mutex_);
     LOGI("接管 USB 硬件设备: fd=%d, rate=%d, bit=%d, ch=%d", fd, sample_rate, bit_depth, channels);
 
     if (init_context() != 0) {
@@ -448,7 +448,7 @@ int AudioEngine::stop_stream() {
 }
 
 int AudioEngine::release_device() {
-    std::lock_guard<std::mutex> lock(op_mutex_);
+    std::lock_guard<std::recursive_mutex> lock(op_mutex_);
     LOGI("开始执行声卡归还与内核驱动重绑时序...");
 
     // 💡 严格遵循时序规范：

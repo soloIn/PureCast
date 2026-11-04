@@ -20,15 +20,14 @@ TEST_PORT = 8999
 AUDIO_FILE_NAME = "purecast_test_tone.wav"
 
 def get_local_ip():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    import subprocess
     try:
-        s.connect(('8.8.8.8', 80))
-        ip = s.getsockname()[0]
+        out = subprocess.check_output(["ipconfig", "getifaddr", "en0"]).decode().strip()
+        if out:
+            return out
     except Exception:
-        ip = '127.0.0.1'
-    finally:
-        s.close()
-    return ip
+        pass
+    return "192.168.2.124"
 
 def generate_sine_wav(filename, duration_sec=5, sample_rate=44100, freq=440.0):
     """生成 44.1kHz / 16-bit 双声道标准正弦波 WAV 文件"""
@@ -73,7 +72,6 @@ def generate_sine_wav(filename, duration_sec=5, sample_rate=44100, freq=440.0):
     print(f"✅ 成功生成测试音频: {filename} ({duration_sec}s, {sample_rate}Hz, 16bit, 440Hz)")
 
 def send_soap_action(target_host, target_port, action_name, action_xml):
-    url = f"http://{target_host}:{target_port}/AVTransport/control"
     soap_body = f"""<?xml version="1.0" encoding="utf-8"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
   <s:Body>
@@ -83,21 +81,44 @@ def send_soap_action(target_host, target_port, action_name, action_xml):
   </s:Body>
 </s:Envelope>"""
 
-    headers = {
-        "Content-Type": 'text/xml; charset="utf-8"',
-        "SOAPACTION": f'"urn:schemas-upnp-org:service:AVTransport:1#{action_name}"',
-        "Content-Length": str(len(soap_body.encode("utf-8")))
-    }
+    body_bytes = soap_body.encode("utf-8")
+    http_req = (
+        f"POST /AVTransport/control HTTP/1.1\r\n"
+        f"Host: {target_host}:{target_port}\r\n"
+        f"Content-Type: text/xml; charset=\"utf-8\"\r\n"
+        f"SOAPACTION: \"urn:schemas-upnp-org:service:AVTransport:1#{action_name}\"\r\n"
+        f"Content-Length: {len(body_bytes)}\r\n"
+        f"Connection: close\r\n\r\n"
+    ).encode("utf-8") + body_bytes
 
-    req = urllib.request.Request(url, data=soap_body.encode("utf-8"), headers=headers, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            resp_body = resp.read().decode("utf-8")
-            print(f">> SOAP {action_name} 成功返回 (HTTP {resp.status})")
-            return resp_body
+        s = socket.socket()
+        s.settimeout(2)
+        s.connect((target_host, target_port))
+    except Exception:
+        # 💡 若局域网被本地路由拦截，优雅走本地 SOCKS5 代理 (Surge 6153)
+        s = socket.socket()
+        s.settimeout(4)
+        s.connect(("127.0.0.1", 6153))
+        s.sendall(b"\x05\x01\x00")
+        s.recv(2)
+        cmd = b"\x05\x01\x00\x01" + socket.inet_aton(target_host) + struct.pack(">H", target_port)
+        s.sendall(cmd)
+        rep = s.recv(10)
+        if len(rep) < 2 or rep[1] != 0:
+            print(f"⚠️ SOCKS5 连接失败: {rep}")
+            return None
+
+    try:
+        s.sendall(http_req)
+        resp = s.recv(4096).decode("utf-8", errors="ignore")
+        print(f">> SOAP {action_name} 结果: {resp.splitlines()[0] if resp else 'empty'}")
+        return resp
     except Exception as e:
-        print(f"⚠️ SOAP {action_name} 请求异常: {e}")
+        print(f"⚠️ 发送 SOAP 请求异常: {e}")
         return None
+    finally:
+        s.close()
 
 def start_http_server(directory, port):
     class QuietHandler(SimpleHTTPRequestHandler):

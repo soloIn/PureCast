@@ -271,15 +271,17 @@ class UpnpRendererServer(
         currentTrackMetadata = parseDidlLiteMetadata(metadataXml)
         playbackService.updateMetadata(currentTrackMetadata)
 
-        // 立即拉取并预解析音频头
-        demuxer?.start(currentUri)
-
+        // 💡 遵循 UPnP AVTransport 标准：SetAVTransportURI 仅初始化元数据，推流由 Play 动作触发
         return buildSoapResponse("SetAVTransportURIResponse", "urn:schemas-upnp-org:service:AVTransport:1", "")
     }
 
     private fun handlePlay(): String {
-        Logger.upnp.i(TAG, "SOAP Play 指令触发")
-        playbackService.resumePlayback()
+        Logger.upnp.i(TAG, "SOAP Play 指令触发, 当前 uri: $currentUri")
+        if (currentUri.isNotEmpty() && demuxer?.isRunning() != true) {
+            demuxer?.start(currentUri)
+        } else {
+            playbackService.resumePlayback()
+        }
         genaNotifier.notifyTransportState("PLAYING")
         return buildSoapResponse("PlayResponse", "urn:schemas-upnp-org:service:AVTransport:1", "")
     }

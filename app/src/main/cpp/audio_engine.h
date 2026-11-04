@@ -89,7 +89,7 @@ private:
     int current_channels_{2};
     size_t packet_size_{0};
 
-    std::mutex op_mutex_;
+    std::recursive_mutex op_mutex_;
 };
 
 } // namespace purecast

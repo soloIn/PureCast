@@ -192,6 +192,14 @@ class PlaybackService : LifecycleService() {
         usbDeviceManager.setIdleTimeoutSeconds(seconds)
     }
 
+    fun requestUsbPermission(activity: android.app.Activity) {
+        usbDeviceManager.requestPermissionWithActivity(activity)
+    }
+
+    fun scanUsbDevice() {
+        usbDeviceManager.scanAndAttachDevice()
+    }
+
     private fun createNotificationChannel() {
         val channel = NotificationChannel(
             CHANNEL_ID,

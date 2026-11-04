@@ -38,6 +38,8 @@ class StreamDemuxer(
     @Volatile
     private var isDemuxing = false
 
+    fun isRunning(): Boolean = isDemuxing
+
     /**
      * 启动流式拉取与解析任务
      * @param streamUrl HTTP 媒体流地址 (如 http://192.168.2.5:49152/stream.wav)

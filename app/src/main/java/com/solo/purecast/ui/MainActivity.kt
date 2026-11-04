@@ -28,6 +28,20 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        Logger.ui.i(TAG, "MainActivity onResume: 检查 USB DAC 授权状态...")
+        PlaybackService.instance?.requestUsbPermission(this)
+    }
+
+    override fun onNewIntent(intent: android.content.Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        Logger.ui.i(TAG, "MainActivity onNewIntent, action=${intent.action}")
+        PlaybackService.instance?.scanUsbDevice()
+        PlaybackService.instance?.requestUsbPermission(this)
+    }
+
     private fun togglePlayPause() {
         val currentStatus = PlaybackService.playbackStatus.value
         if (currentStatus == PlaybackStatus.PLAYING) {

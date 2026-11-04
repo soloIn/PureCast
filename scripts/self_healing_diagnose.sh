@@ -21,7 +21,7 @@ echo ">> 2. 检查 USB 硬件总线挂载信息 (Sony ZX300A 0x054c):"
 
 echo ""
 echo ">> 3. 抓取 PureCast 核心日志链路 (前台服务、USB 接管、Bit-Perfect 状态与内核重绑):"
-"${ADB_BIN}" -s "${TARGET_IP}:${TARGET_PORT}" logcat -d -v time -s "PureCast:USB:*" "PureCast:Audio:*" "PureCast:UPnP:*" "PureCast:Service:*" "PureCastNative:*" | tail -n 50 || true
+"${ADB_BIN}" -s "${TARGET_IP}:${TARGET_PORT}" logcat -d -v time -s "UsbDeviceManager:*" "PlaybackService:*" "PureCastNative:*" "NativeAudioEngine:*" "UpnpRendererServer:*" "StreamDemuxer:*" | tail -n 50 || true
 
 echo ""
 echo "=========================================================="

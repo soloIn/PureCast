@@ -115,20 +115,41 @@ class UsbDeviceManager(
             onDeviceStateChanged(true, candidate.productName ?: candidate.deviceName)
             return true
         } else {
-            Logger.usb.i(TAG, "尚未获取 USB 权限，发起异步授权请求...")
-            requestDevicePermission(candidate)
+            Logger.usb.i(TAG, "检测到未授权的 USB DAC 设备 (${candidate.productName}), 等待 Activity 呈现授权对话框...")
             return false
         }
     }
 
-    private fun requestDevicePermission(device: UsbDevice) {
+    /**
+     * 💡 由前台 Activity 发起原生 USB 授权对话框
+     */
+    fun requestPermissionWithActivity(activity: android.app.Activity) {
+        val device = activeDevice ?: run {
+            scanAndAttachDevice()
+            activeDevice
+        } ?: run {
+            Logger.usb.w(TAG, "requestPermissionWithActivity 失败: 无可用 USB 设备")
+            return
+        }
+
+        if (usbManager.hasPermission(device)) {
+            Logger.usb.i(TAG, "设备已拥有访问授权: ${device.productName}")
+            onDeviceStateChanged(true, device.productName ?: device.deviceName)
+            return
+        }
+
+        Logger.usb.i(TAG, "从 Activity (${activity.localClassName}) 发起 USB 权限申请对话框...")
+        requestDevicePermission(device, activity)
+    }
+
+    private fun requestDevicePermission(device: UsbDevice, ctx: Context = context) {
         val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         } else {
             PendingIntent.FLAG_UPDATE_CURRENT
         }
         val permissionIntent = PendingIntent.getBroadcast(
-            context,
+            ctx,
             0,
             Intent(ACTION_USB_PERMISSION),
             flags
