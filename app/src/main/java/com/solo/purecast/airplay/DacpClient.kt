@@ -30,9 +30,13 @@ class DacpClient(
         }
     }
 
+    @Volatile
     private var clientIp: String? = null
+    @Volatile
     private var dacpPort: Int = 0
+    @Volatile
     private var activeRemoteToken: String? = null
+    @Volatile
     private var pendingCommand: String? = null
 
     /**

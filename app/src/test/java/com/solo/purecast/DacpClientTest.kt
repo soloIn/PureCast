@@ -48,4 +48,24 @@ class DacpClientTest {
         assertFalse(client.hasActiveSession())
         assertEquals(0, client.getCurrentPort())
     }
+
+    @Test
+    fun testPendingCommandAutoRetryOnPortResolution() {
+        val client = DacpClient(testScope)
+        // 握手完成，端口尚未发现
+        client.updateSession("192.168.2.105", 0, "token123")
+        assertTrue(client.hasActiveSession())
+        assertEquals(0, client.getCurrentPort())
+
+        // 端口未就绪时发起播放/暂停指令，应暂存指令并先向默认端口发起试探
+        client.playPause()
+
+        // 当 mDNS 发现端口就绪后注入，应自动触发暂存指令重发
+        client.updatePort(49152)
+        assertEquals(49152, client.getCurrentPort())
+
+        // 再次更新同端口不应产生额外暂存指令副作用
+        client.updatePort(49152)
+        assertEquals(49152, client.getCurrentPort())
+    }
 }

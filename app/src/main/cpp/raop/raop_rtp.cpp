@@ -173,7 +173,7 @@ void RaopRtp::set_client_control_endpoint(const std::string& client_ip, int clie
 }
 
 void RaopRtp::send_resend_request(uint16_t first_seq, uint16_t count) {
-    if (!has_client_ctrl_.load(std::memory_order_relaxed) || ctrl_fd_ < 0 || count == 0) {
+    if (!has_client_ctrl_.load(std::memory_order_acquire) || ctrl_fd_ < 0 || count == 0) {
         return;
     }
 
@@ -189,10 +189,14 @@ void RaopRtp::send_resend_request(uint16_t first_seq, uint16_t count) {
     req[6] = static_cast<uint8_t>((count >> 8) & 0xFF);
     req[7] = static_cast<uint8_t>(count & 0xFF);
 
-    sendto(ctrl_fd_, req, sizeof(req), 0,
-           reinterpret_cast<const struct sockaddr*>(&client_ctrl_addr_),
-           sizeof(client_ctrl_addr_));
-    LOGI("⚡ 发送 RAOP 丢包重传请求: first_seq=%u, count=%u, req_seq=%u", first_seq, count, rseq);
+    ssize_t ret = sendto(ctrl_fd_, req, sizeof(req), 0,
+                         reinterpret_cast<const struct sockaddr*>(&client_ctrl_addr_),
+                         sizeof(client_ctrl_addr_));
+    if (ret < 0) {
+        LOGW("发送 RAOP 丢包重传请求失败: errno=%d", errno);
+    } else {
+        LOGI("⚡ 发送 RAOP 丢包重传请求: first_seq=%u, count=%u, req_seq=%u", first_seq, count, rseq);
+    }
 }
 
 void RaopRtp::set_crypto_key(const std::vector<uint8_t>& aes_key, const std::vector<uint8_t>& aes_iv) {
@@ -224,9 +228,18 @@ void RaopRtp::watchdog_loop() {
         if (last_time > 0 && !is_stream_paused_.load(std::memory_order_relaxed)) {
             uint64_t now = get_monotonic_time_ms();
             if (now > last_time && (now - last_time) >= 600) {
-                is_stream_paused_.store(true, std::memory_order_release);
-                LOGI("⚠️ 检测到 RTP 音频流停顿超 600ms (iPhone 暂停推流)，通知上层暂停");
-                if (state_cb_) state_cb_(true);
+                // 💡 二次双检与原子 CAS 切换：确保在与新包到达的微秒级竞态中不产生状态颠簸
+                bool expected = false;
+                if (is_stream_paused_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+                    uint64_t recheck_time = last_audio_packet_time_ms_.load(std::memory_order_relaxed);
+                    if (recheck_time == last_time) {
+                        LOGI("⚠️ 检测到 RTP 音频流停顿超 600ms (iPhone 暂停推流)，通知上层暂停");
+                        if (state_cb_) state_cb_(true);
+                    } else {
+                        // 在 CAS 切换瞬间新数据包到达并更新了时间戳，撤销暂停标记
+                        is_stream_paused_.store(false, std::memory_order_release);
+                    }
+                }
             }
         }
     }
