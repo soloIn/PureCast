@@ -1,11 +1,7 @@
 package com.solo.purecast.ui.screen
 
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
-import androidx.compose.animation.core.tween
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.basicMarquee
@@ -40,7 +36,6 @@ import androidx.compose.ui.draw.scale
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
@@ -59,7 +54,6 @@ import com.solo.purecast.ui.components.FluidBackground
 import com.solo.purecast.ui.components.PlaybackControls
 import com.solo.purecast.ui.components.ProgressBarComponent
 import com.solo.purecast.ui.components.SignalPathPill
-import com.solo.purecast.ui.theme.PureCastPrimary
 import com.solo.purecast.util.Logger
 import com.solo.purecast.util.PermissionHelper
 import kotlinx.coroutines.delay
@@ -71,12 +65,10 @@ import kotlin.math.sin
  * 1. 42% / 58% 黄金比例布局：左侧呈现 24dp 浮动圆角高清网络封面与弹簧缩放；右侧居中展示排版信息与控制项。
  * 2. GLES2 动态流光交融着色器背景：自适应从封面萃取多色并执行网格流动交融，优雅降级深邃夜空灰。
  * 3. 歌曲标题平滑跑马灯：通过 Modifier.basicMarquee() 保证超长标题永不截断。
- * 4. 纤细圆角进度条：支持 D-Pad 上下键聚焦、左右键步进快进/快退 10 秒；实时流显示 "LIVE / 实时直通" 并禁用寻道。
- * 5. 纯几何图标控制栏：上一曲、播放/暂停、下一曲与设置按钮统一尺寸与 1.12x 焦点高光。
- * 6. tvOS 原生全屏分类双栏设置：按下设置按钮或 MENU 键一键推入，返回键平滑回退并自愈焦点。
- * 7. 防烧屏双重防护引擎：
- *    - 微像素正弦平移 (Pixel Shift): 每 10 秒平滑微移 2~3 像素。
- *    - 3 分钟无操作控制栏自动淡出，按任意方向键即刻唤醒。
+ * 4. 浮岛悬浮 Dock (Floating Dock)：将进度条、时间戳、上一曲/播放/下一曲/设置整体包裹于毛玻璃半透底座内，
+ *    彻底解决背景色彩与文字融合、时间戳悬空孤立问题，在任意绚丽流光背景下都具有极高对比度。
+ * 5. 控制栏与进度条常驻显示：完全去掉自动隐藏功能，遥控器即按即响，交互零等待。
+ * 6. 微像素正弦平移 (Pixel Shift)：每 10 秒平滑微移 2~3 像素，防止 OLED / LCD 大屏烧屏。
  */
 @OptIn(ExperimentalTvMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
@@ -96,14 +88,11 @@ fun MainTvScreen(
     val playPauseFocusRequester = remember { FocusRequester() }
 
     // ==========================================
-    // 1. 防烧屏引擎: 微像素平移 + 3分钟自动淡出控制栏
+    // 1. OLED 防烧屏引擎: 微像素正弦平移 (每 10 秒平滑微移 2~3 像素)
     // ==========================================
     var pixelShiftX by remember { mutableFloatStateOf(0f) }
     var pixelShiftY by remember { mutableFloatStateOf(0f) }
-    var lastInteractionTimestamp by remember { mutableLongStateOf(System.currentTimeMillis()) }
-    var isControlsVisible by remember { mutableStateOf(true) }
 
-    // 10 秒周期性正弦微移，有效保护 OLED / LCD 电视屏幕
     LaunchedEffect(Unit) {
         var tick = 0.0
         while (true) {
@@ -114,41 +103,12 @@ fun MainTvScreen(
         }
     }
 
-    // 响应 Activity 全局按键分发：重置倒计时并即时唤醒控制栏
-    LaunchedEffect(userInteractionTrigger) {
-        if (userInteractionTrigger > 0L) {
-            lastInteractionTimestamp = System.currentTimeMillis()
-            if (!isControlsVisible) {
-                isControlsVisible = true
-            }
-        }
-    }
-
-    // 3 分钟无操作自动淡出控制栏检查
-    LaunchedEffect(playbackStatus) {
-        while (true) {
-            delay(2000)
-            if (playbackStatus == PlaybackStatus.PLAYING) {
-                val elapsed = System.currentTimeMillis() - lastInteractionTimestamp
-                if (elapsed >= 180_000L && isControlsVisible) {
-                    isControlsVisible = false
-                }
-            } else {
-                if (!isControlsVisible) {
-                    isControlsVisible = true
-                }
-            }
-        }
-    }
-
-    // 💡 控制栏显现时自动将遥控器焦点恢复至播放/暂停按钮
-    LaunchedEffect(isControlsVisible) {
-        if (isControlsVisible) {
-            delay(150)
-            try {
-                playPauseFocusRequester.requestFocus()
-            } catch (_: Exception) {}
-        }
+    // 💡 页面初次进入时自动请求焦点至播放/暂停按钮
+    LaunchedEffect(Unit) {
+        delay(200)
+        try {
+            playPauseFocusRequester.requestFocus()
+        } catch (_: Exception) {}
     }
 
     // ==========================================
@@ -160,21 +120,17 @@ fun MainTvScreen(
     // 封面放大弹簧动画
     val coverScale by animateFloatAsState(
         targetValue = if (isPlaying) 1.0f else 0.94f,
-        animationSpec = spring(dampingRatio = 0.8f, stiffness = 300f),
-        label = "coverScale"
+        animationSpec = spring(
+            dampingRatio = 0.8f,
+            stiffness = 300f
+        ),
+        label = "coverScaleAnim"
     )
 
     Box(
         modifier = modifier
             .fillMaxSize()
-            .onPreviewKeyEvent {
-                // 💡 界面内任意遥控器按键事件触发时即刻唤醒控制栏并重置防烧屏倒计时
-                lastInteractionTimestamp = System.currentTimeMillis()
-                if (!isControlsVisible) {
-                    isControlsVisible = true
-                }
-                false
-            }
+            .background(Color(0xFF0D0E15))
     ) {
         // 1. GLES2 材质网格动态流光背景
         FluidBackground(
@@ -197,13 +153,13 @@ fun MainTvScreen(
                     .fillMaxHeight(),
                 contentAlignment = Alignment.Center
             ) {
-                val coverShape = RoundedCornerShape(12.dp)
+                val coverShape = RoundedCornerShape(16.dp)
                 Box(
                     modifier = Modifier
                         .fillMaxWidth(0.88f)
                         .aspectRatio(1f)
                         .scale(coverScale)
-                        .shadow(24.dp, coverShape, spotColor = Color(0x66000000))
+                        .shadow(28.dp, coverShape, spotColor = Color(0x80000000))
                         .clip(coverShape)
                         .background(Color(0xFF161822)),
                     contentAlignment = Alignment.Center
@@ -263,14 +219,14 @@ fun MainTvScreen(
 
                 Spacer(modifier = Modifier.height(20.dp))
 
-                // 歌曲标题：启用 basicMarquee 实现超长平滑横向滚动
+                // 歌曲标题：启用 basicMarquee 实现超长平滑横向滚动，带有柔和阴影防融底
                 Text(
                     text = metadata.title,
-                    fontSize = 40.sp,
+                    fontSize = 38.sp,
                     fontWeight = FontWeight.Bold,
                     color = Color.White,
                     maxLines = 1,
-                    lineHeight = 48.sp,
+                    lineHeight = 46.sp,
                     modifier = Modifier
                         .fillMaxWidth()
                         .basicMarquee(
@@ -285,9 +241,9 @@ fun MainTvScreen(
                 // 艺术家
                 Text(
                     text = metadata.artist,
-                    fontSize = 24.sp,
+                    fontSize = 22.sp,
                     fontWeight = FontWeight.Medium,
-                    color = Color(0xFFB0B0B8),
+                    color = Color(0xFFD1D1D6),
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
@@ -297,20 +253,24 @@ fun MainTvScreen(
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
                         text = metadata.album,
-                        fontSize = 17.sp,
+                        fontSize = 16.sp,
                         color = Color(0xFFA1A1A6),
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
                 }
 
-                Spacer(modifier = Modifier.height(26.dp))
+                Spacer(modifier = Modifier.height(28.dp))
 
-                // 底部控制区域：支持 3 分钟防烧屏平滑淡出与按键即刻唤醒
-                AnimatedVisibility(
-                    visible = isControlsVisible,
-                    enter = fadeIn(animationSpec = tween(400)),
-                    exit = fadeOut(animationSpec = tween(800))
+                // 💡 遵循 Apple TV HIG 的毛玻璃悬浮 Dock (Frosted Glass Floating Dock)
+                // 将进度条、时间轴、操作控制栏统一承载于悬浮浮岛中，彻底解决文字与背景融合隐形的问题，且常驻显示
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(20.dp))
+                        .background(Color(0x2E000000))
+                        .border(1.dp, Color(0x1FFFFFFF), RoundedCornerShape(20.dp))
+                        .padding(horizontal = 22.dp, vertical = 18.dp)
                 ) {
                     Column(
                         modifier = Modifier.fillMaxWidth()
@@ -387,28 +347,38 @@ private fun IsolatedProgressBar(
 }
 
 /**
- * 💡 辅助组件：默认唱片占位卡片 (无封面或加载中时使用)
+ * 💡 辅助组件：默认唱片封面占位卡片 (采用 Apple 纯净微渐变与声波纹理)
  */
 @Composable
 private fun DefaultCoverCard(
     isPlaying: Boolean,
-    album: String
+    album: String,
+    modifier: Modifier = Modifier
 ) {
-    Column(
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(8.dp)
+    Box(
+        modifier = modifier
+            .fillMaxSize()
+            .background(Color(0xFF1E202B)),
+        contentAlignment = Alignment.Center
     ) {
-        Text(
-            text = if (isPlaying) "♪" else "♫",
-            fontSize = 64.sp,
-            color = PureCastPrimary
-        )
-        Text(
-            text = if (album.isNotEmpty()) album else "PureCast Lossless",
-            fontSize = 14.sp,
-            color = Color(0xFFA1A1A6),
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis
-        )
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            androidx.tv.material3.Icon(
+                painter = androidx.compose.ui.res.painterResource(id = com.solo.purecast.R.drawable.ic_waveform),
+                contentDescription = "Default Music Icon",
+                tint = if (isPlaying) Color.White else Color(0xFF6E6E73),
+                modifier = Modifier.width(64.dp).height(48.dp)
+            )
+            Text(
+                text = album.ifEmpty { "PureCast Hi-Fi" },
+                fontSize = 15.sp,
+                fontWeight = FontWeight.Medium,
+                color = Color(0xFF8E8E93),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
     }
 }

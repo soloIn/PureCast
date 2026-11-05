@@ -63,6 +63,7 @@ import com.solo.purecast.model.StreamProtocol
 import com.solo.purecast.core.nativebridge.NativeAudioEngine
 import com.solo.purecast.service.PlaybackService
 import com.solo.purecast.ui.theme.AppPalette
+import com.solo.purecast.ui.theme.ThemeMode
 import com.solo.purecast.util.Logger
 import kotlinx.coroutines.delay
 import java.util.Locale
@@ -84,9 +85,10 @@ enum class SettingsCategory(val title: String, val subtitle: String) {
  * 💡 PureCast 全屏双栏 Apple TV 系统级设置界面 (SettingsScreen)
  * 严格遵循 10-Foot 电视大屏与 Apple TV HIG 工业设计规范：
  * 1. 100% 实心不透明背景 (AppPalette.background)，彻底解决半透明穿透播放界面的问题；
- * 2. 完整适配深色 (Dark) / 浅色 (Light) 主题切换与持久化；
- * 3. 采用标准 Apple HIG 分组列表 (SettingsSection + SettingDivider)，消除碎裂卡片与文字遮挡；
- * 4. 左侧固定 300dp 导航栏，D-Pad 移动即响应式切换分类，按返回键或返回按钮平滑返回播放页。
+ * 2. 完整支持自动模式 (跟随系统 uiMode)、深色模式与浅色模式切换与持久化；
+ * 3. 彻底重构设置行排版：采用垂直分层 (SettingTieredRow) 与紧凑行 (SettingInlineRow)，
+ *    彻底根治因多按钮横塞导致的恶性 6 行逐字换行与空白大卡片 Bug；
+ * 4. 严守 TV Safe Area 安全区域：顶部 padding 提升至 76dp，消除任何电视 Overscan 削头截断。
  */
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
@@ -106,7 +108,7 @@ fun SettingsScreen(
     var selectedCategory by remember { mutableStateOf(SettingsCategory.APPEARANCE_AND_GENERAL) }
 
     // 1. 设备广播名与外观状态
-    var isDarkTheme by remember { mutableStateOf(AppPalette.isDark) }
+    var currentThemeMode by remember { mutableStateOf(AppPalette.mode) }
     var friendlyName by remember { mutableStateOf(settingsRepo.getFriendlyName()) }
     var isEditingCustomName by remember { mutableStateOf(false) }
     var customNameInput by remember { mutableStateOf(friendlyName) }
@@ -154,13 +156,13 @@ fun SettingsScreen(
 
     val defaultFocusRequester = remember { FocusRequester() }
     LaunchedEffect(Unit) {
-        delay(100)
+        delay(120)
         try {
             defaultFocusRequester.requestFocus()
         } catch (_: Exception) {}
     }
 
-    // 100% 实心不透明背景，彻底杜绝半透明穿透播放界面的问题
+    // 100% 实心不透明背景，杜绝半透明穿透播放界面的问题
     Box(
         modifier = modifier
             .fillMaxSize()
@@ -169,7 +171,7 @@ fun SettingsScreen(
         Row(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(horizontal = 64.dp, vertical = 48.dp),
+                .padding(start = 72.dp, end = 72.dp, top = 76.dp, bottom = 48.dp),
             horizontalArrangement = Arrangement.spacedBy(48.dp)
         ) {
             // ==========================================
@@ -267,38 +269,46 @@ fun SettingsScreen(
 
                 when (selectedCategory) {
                     SettingsCategory.APPEARANCE_AND_GENERAL -> {
-                        // 1. 界面外观深浅模式
+                        // 1. 界面外观深浅模式 (提供 自动/深色/浅色 3 档)
                         SettingsSection(title = "界面主题模式") {
-                            SettingRow(
+                            SettingTieredRow(
                                 title = "外观色彩模式",
-                                subtitle = "选择深色 (Dark) 或浅色 (Light) 主题风格"
+                                subtitle = "支持跟随系统动态自适应或强制深浅主题"
                             ) {
                                 Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                                     SegmentOptionButton(
-                                        label = "🌙 深色模式",
-                                        isSelected = isDarkTheme,
+                                        label = "⚡️ 自动 (跟随系统)",
+                                        isSelected = currentThemeMode == ThemeMode.AUTO,
                                         onClick = {
-                                            isDarkTheme = true
-                                            AppPalette.setDark(context, true)
+                                            currentThemeMode = ThemeMode.AUTO
+                                            AppPalette.setThemeMode(context, ThemeMode.AUTO)
+                                        }
+                                    )
+                                    SegmentOptionButton(
+                                        label = "🌙 深色模式",
+                                        isSelected = currentThemeMode == ThemeMode.DARK,
+                                        onClick = {
+                                            currentThemeMode = ThemeMode.DARK
+                                            AppPalette.setThemeMode(context, ThemeMode.DARK)
                                         }
                                     )
                                     SegmentOptionButton(
                                         label = "☀️ 浅色模式",
-                                        isSelected = !isDarkTheme,
+                                        isSelected = currentThemeMode == ThemeMode.LIGHT,
                                         onClick = {
-                                            isDarkTheme = false
-                                            AppPalette.setDark(context, false)
+                                            currentThemeMode = ThemeMode.LIGHT
+                                            AppPalette.setThemeMode(context, ThemeMode.LIGHT)
                                         }
                                     )
                                 }
                             }
                         }
 
-                        // 2. 局域网广播名称
+                        // 2. 局域网广播名称 (垂直分层布局，彻底杜绝横向挤压与逐字折行)
                         SettingsSection(title = "局域网广播设备标识") {
-                            SettingRow(
-                                title = "当前广播名称",
-                                subtitle = "用于 AirPlay 1 与 UPnP / DLNA 网络发现: $friendlyName"
+                            SettingTieredRow(
+                                title = "设备广播发现名称",
+                                subtitle = "当前网络标识: \"$friendlyName\" (用于 AirPlay 1 与 UPnP 广播)"
                             ) {
                                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                     listOf("PureCast TV", "客厅 Hi-Fi", "影音室 TV").forEach { preset ->
@@ -328,8 +338,8 @@ fun SettingsScreen(
 
                             if (isEditingCustomName) {
                                 SettingDivider()
-                                SettingRow(
-                                    title = "编辑自定义名称",
+                                SettingTieredRow(
+                                    title = "编辑自定义设备名",
                                     subtitle = "输入新的设备发现名称并确认保存"
                                 ) {
                                     Row(
@@ -338,10 +348,10 @@ fun SettingsScreen(
                                     ) {
                                         Box(
                                             modifier = Modifier
-                                                .width(220.dp)
+                                                .width(260.dp)
                                                 .clip(RoundedCornerShape(8.dp))
                                                 .background(AppPalette.surfaceSecondary)
-                                                .padding(horizontal = 12.dp, vertical = 8.dp)
+                                                .padding(horizontal = 14.dp, vertical = 8.dp)
                                         ) {
                                             BasicTextField(
                                                 value = customNameInput,
@@ -393,7 +403,8 @@ fun SettingsScreen(
 
                     SettingsCategory.USB_DAC -> {
                         SettingsSection(title = "USB DAC 硬件独占接管") {
-                            SettingRow(
+                            // 紧凑行：声卡端点与独占状态
+                            SettingInlineRow(
                                 title = "声卡端点与驱动状态",
                                 subtitle = if (audioState.isExclusive) "已解绑 Linux snd-usb-audio 内核驱动，直通 UAC2 硬件 (绕过 48kHz SRC)" else "声卡处于待机让渡或系统共享状态"
                             ) {
@@ -440,9 +451,10 @@ fun SettingsScreen(
 
                             SettingDivider()
 
-                            SettingRow(
+                            // 分层行：空闲自动让渡时机 (解决 4 个按钮挤爆文字导致 6 行换行的 Bug)
+                            SettingTieredRow(
                                 title = "空闲自动让渡时机",
-                                subtitle = "停止播放后，等待指定秒数自动解除声卡独占归还系统"
+                                subtitle = "停止播放后，等待指定秒数自动解除声卡独占并归还系统"
                             ) {
                                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                     listOf(Pair(5, "5秒"), Pair(10, "10秒 (推荐)"), Pair(30, "30秒"), Pair(0, "常驻独占")).forEach { (sec, label) ->
@@ -465,7 +477,7 @@ fun SettingsScreen(
 
                     SettingsCategory.PROTOCOLS -> {
                         SettingsSection(title = "本地网络音频流服务") {
-                            SettingRow(
+                            SettingInlineRow(
                                 title = "AirPlay 1 (AirTunes / RAOP)",
                                 subtitle = "支持 iOS / macOS / iTunes 纯音频低延迟推流，ALAC 44.1kHz 源码直通"
                             ) {
@@ -481,7 +493,7 @@ fun SettingsScreen(
 
                             SettingDivider()
 
-                            SettingRow(
+                            SettingInlineRow(
                                 title = "UPnP / DLNA (MediaRenderer 2.0)",
                                 subtitle = "支持 QQ音乐、网易云等 App 投播，支持 192kHz / 24bit Hi-Res 源码直通"
                             ) {
@@ -539,7 +551,7 @@ fun SettingsScreen(
 
 /**
  * 💡 标准 HIG 分组容器 (SettingsSection)
- * 连续圆角卡片包装内部所有配置行，消除碎片化 card 与遮挡
+ * 连续圆角卡片包装内部所有配置行，消除碎片化卡片与遮挡
  */
 @Composable
 private fun SettingsSection(
@@ -573,36 +585,30 @@ private fun SettingDivider() {
     Box(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 18.dp)
+            .padding(horizontal = 20.dp)
             .height(0.5.dp)
             .background(AppPalette.divider)
     )
 }
 
 /**
- * 💡 标准 HIG 配置行 (SettingRow)
- * 左侧放置标题与说明，右侧自适应放置交互控件，彻底杜绝横向挤压与文字重叠
+ * 💡 垂直分层配置行 (SettingTieredRow)
+ * 上层：100% 宽度展示标题与副标说明，保证长说明文字自然横向排版，永不折叠挤压；
+ * 下层：放置分段选择器或按钮组，彻底解决横向空间拥挤与空白卡片撑爆 Bug。
  */
 @Composable
-private fun SettingRow(
+private fun SettingTieredRow(
     title: String,
     subtitle: String,
-    content: @Composable RowScope.() -> Unit
+    content: @Composable () -> Unit
 ) {
-    Row(
+    Column(
         modifier = Modifier
             .fillMaxWidth()
-            .heightIn(min = 68.dp)
-            .padding(horizontal = 20.dp, vertical = 14.dp),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically
+            .padding(horizontal = 20.dp, vertical = 16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        Column(
-            modifier = Modifier
-                .weight(1f)
-                .padding(end = 24.dp),
-            verticalArrangement = Arrangement.spacedBy(4.dp)
-        ) {
+        Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
             Text(
                 text = title,
                 fontSize = 15.sp,
@@ -617,6 +623,47 @@ private fun SettingRow(
             )
         }
         content()
+    }
+}
+
+/**
+ * 💡 水平紧凑配置行 (SettingInlineRow)
+ * 适用于右侧仅有单个紧凑操作控件（如开关或按钮）的条目
+ */
+@Composable
+private fun SettingInlineRow(
+    title: String,
+    subtitle: String,
+    action: @Composable RowScope.() -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = 68.dp)
+            .padding(horizontal = 20.dp, vertical = 14.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .padding(end = 20.dp),
+            verticalArrangement = Arrangement.spacedBy(3.dp)
+        ) {
+            Text(
+                text = title,
+                fontSize = 15.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = AppPalette.primaryText
+            )
+            Text(
+                text = subtitle,
+                fontSize = 13.sp,
+                lineHeight = 18.sp,
+                color = AppPalette.secondaryText
+            )
+        }
+        action()
     }
 }
 
@@ -648,7 +695,7 @@ private fun SegmentOptionButton(
             text = label,
             fontSize = 13.sp,
             fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal,
-            modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp)
+            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
         )
     }
 }
@@ -696,7 +743,7 @@ private fun MetricDataRow(
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 20.dp, vertical = 12.dp),
+            .padding(horizontal = 20.dp, vertical = 14.dp),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically
     ) {
@@ -716,7 +763,7 @@ private fun PermissionCheckRow(
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 20.dp, vertical = 12.dp),
+            .padding(horizontal = 20.dp, vertical = 14.dp),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically
     ) {

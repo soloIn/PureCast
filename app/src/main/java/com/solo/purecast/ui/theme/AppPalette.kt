@@ -1,35 +1,78 @@
 package com.solo.purecast.ui.theme
 
 import android.content.Context
+import android.content.res.Configuration
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.graphics.Color
 
 /**
+ * 💡 PureCast 外观色彩模式枚举
+ */
+enum class ThemeMode(val title: String) {
+    AUTO("自动 (跟随系统)"),
+    DARK("深色模式"),
+    LIGHT("浅色模式")
+}
+
+/**
  * 💡 PureCast Apple TV HIG 自适应色彩系统 (AppPalette)
- * 严格遵从 HIG 规范，支持深色 (Dark) / 浅色 (Light) 模式切换与持久化存储
+ * 严格遵从 Apple TV HIG 规范，支持自动 (跟随系统 uiMode)、强制深色、强制浅色切换与持久化
  */
 object AppPalette {
-    var isDark by mutableStateOf(true) // 电视环境默认深色底
+    var mode by mutableStateOf(ThemeMode.AUTO)
         private set
+
+    var systemIsDark by mutableStateOf(true)
+        private set
+
+    val isDark: Boolean
+        get() = when (mode) {
+            ThemeMode.DARK -> true
+            ThemeMode.LIGHT -> false
+            ThemeMode.AUTO -> systemIsDark
+        }
 
     fun init(context: Context) {
         val prefs = context.getSharedPreferences("purecast_appearance", Context.MODE_PRIVATE)
-        isDark = prefs.getBoolean("is_dark_mode", true)
+        val savedModeStr = prefs.getString("theme_mode", null)
+        mode = if (savedModeStr != null) {
+            try {
+                ThemeMode.valueOf(savedModeStr)
+            } catch (_: Exception) {
+                ThemeMode.AUTO
+            }
+        } else if (prefs.contains("is_dark_mode")) {
+            // 兼容迁移旧版本布尔值
+            if (prefs.getBoolean("is_dark_mode", true)) ThemeMode.DARK else ThemeMode.LIGHT
+        } else {
+            ThemeMode.AUTO
+        }
+        updateSystemNightMode(context)
+    }
+
+    fun updateSystemNightMode(context: Context) {
+        val uiMode = context.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK
+        systemIsDark = uiMode != Configuration.UI_MODE_NIGHT_NO
+    }
+
+    fun setThemeMode(context: Context, newMode: ThemeMode) {
+        mode = newMode
+        context.getSharedPreferences("purecast_appearance", Context.MODE_PRIVATE)
+            .edit()
+            .putString("theme_mode", newMode.name)
+            .putBoolean("is_dark_mode", isDark)
+            .apply()
     }
 
     fun setDark(context: Context, enabled: Boolean) {
-        isDark = enabled
-        context.getSharedPreferences("purecast_appearance", Context.MODE_PRIVATE)
-            .edit()
-            .putBoolean("is_dark_mode", enabled)
-            .apply()
+        setThemeMode(context, if (enabled) ThemeMode.DARK else ThemeMode.LIGHT)
     }
 
     fun adaptive(light: Color, dark: Color): Color = if (isDark) dark else light
 
-    // 页面背景底色：浅色为柔和的灰白，深色为深邃的 #101014
+    // 页面背景底色：浅色为柔和的高级浅灰白，深色为深邃的 #101014
     val background get() = adaptive(Color(0xFFF2F2F7), Color(0xFF101014))
 
     // 卡片/分组容器背景：浅色为纯白，深色为 #1C1C22

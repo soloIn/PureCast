@@ -42,6 +42,9 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         Logger.ui.i(TAG, "MainActivity onCreate: 启动 Apple TV 风格大屏交互界面")
 
+        // 初始化外观色彩系统
+        com.solo.purecast.ui.theme.AppPalette.init(this)
+
         // 确保后台音频前台服务与 UPnP 监听已就绪
         PlaybackService.start(this)
 

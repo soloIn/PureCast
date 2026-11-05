@@ -21,7 +21,6 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
@@ -40,14 +39,14 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.tv.material3.ExperimentalTvMaterial3Api
 import androidx.tv.material3.Text
-import com.solo.purecast.ui.theme.PureCastPrimary
 
 /**
  * 💡 PureCast 纤细圆角进度条与时间轴组件 (ProgressBarComponent)
  * 遵循 Apple TV 极简工业美学设计：
- * 1. 轨道高度默认为 4dp，D-Pad 获得焦点时动态平滑展开至 6dp 并点亮白色微光发光边框。
- * 2. 左侧展示当前播放时间 (mm:ss)，右侧展示总时长或实时流 "LIVE / 实时直通" 状态。
- * 3. 针对非实时流支持遥控器 D-Pad 左右键快进 / 快退 10 秒；针对实时广播流自适应禁用寻道。
+ * 1. 轨道高度默认为 4dp，D-Pad 获得焦点时动态平滑展开至 6dp 并点亮白色微光发光边框与游标。
+ * 2. 悬浮对比度保护：轨道底槽采用高透半白 [Color(0x40FFFFFF)]，填充条使用高纯亮白 [Color.White]，在任意流光背景下清晰可见。
+ * 3. 左侧展示当前播放时间 (mm:ss)，右侧展示总时长或实时流 "LIVE / 实时直通" 状态。
+ * 4. 针对非实时流支持遥控器 D-Pad 左右键快进 / 快退 10 秒；针对实时广播流自适应禁用寻道。
  */
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
@@ -117,7 +116,7 @@ fun ProgressBarComponent(
                 }
                 false
             }
-            .padding(vertical = 4.dp)
+            .padding(vertical = 2.dp)
     ) {
         // 进度条轨道容器
         Box(
@@ -126,40 +125,37 @@ fun ProgressBarComponent(
                 .padding(vertical = if (isFocused) 2.dp else 3.dp),
             contentAlignment = Alignment.CenterStart
         ) {
-            // 背景槽（未播放部分）
+            // 背景槽（未播放部分：半透明纯白底）
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(animatedHeight)
                     .clip(RoundedCornerShape(animatedHeight / 2))
-                    .background(Color(0x33FFFFFF))
+                    .background(Color(0x40FFFFFF))
                     .then(
                         if (isFocused) {
                             Modifier.border(
                                 width = 1.dp,
-                                color = Color.White.copy(alpha = 0.5f),
+                                color = Color.White.copy(alpha = 0.6f),
                                 shape = RoundedCornerShape(animatedHeight / 2)
                             )
                         } else Modifier
                     )
             )
 
-            // 高亮填充条（已播放部分）
+            // 高亮填充条（已播放部分：纯净高亮白）
             Box(
                 modifier = Modifier
                     .fillMaxWidth(progressFraction)
                     .height(animatedHeight)
                     .clip(RoundedCornerShape(animatedHeight / 2))
-                    .background(
-                        if (isFocused) Color.White else PureCastPrimary
-                    )
+                    .background(Color.White)
             )
 
             // 💡 获得焦点时的进度发光游标点 (Thumb Indicator)
             if (isFocused && !isLiveStream && totalDurationMs > 0L) {
                 Box(
-                    modifier = Modifier
-                        .fillMaxWidth(progressFraction),
+                    modifier = Modifier.fillMaxWidth(progressFraction),
                     contentAlignment = Alignment.CenterEnd
                 ) {
                     Box(
@@ -181,12 +177,12 @@ fun ProgressBarComponent(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            // 左侧已播放时间：始终展示当前真实已播放时长
+            // 左侧已播放时间：高对比度纯白半透文本
             Text(
                 text = formatTimeMs(currentPositionMs),
-                fontSize = 13.sp,
+                fontSize = 12.sp,
                 fontWeight = FontWeight.Medium,
-                color = if (isFocused && canFocus) Color.White else Color(0xFFB0B0B8)
+                color = if (isFocused && canFocus) Color.White else Color(0xEEFFFFFF)
             )
 
             // 右侧总时长或实时流状态
@@ -211,9 +207,9 @@ fun ProgressBarComponent(
             } else {
                 Text(
                     text = formatTimeMs(totalDurationMs),
-                    fontSize = 13.sp,
+                    fontSize = 12.sp,
                     fontWeight = FontWeight.Medium,
-                    color = Color(0xFF8E8E93)
+                    color = Color(0xB3FFFFFF)
                 )
             }
         }

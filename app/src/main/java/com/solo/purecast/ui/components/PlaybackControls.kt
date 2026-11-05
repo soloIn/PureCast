@@ -27,10 +27,11 @@ import com.solo.purecast.model.PlaybackStatus
 /**
  * 💡 PureCast 遥控器专属 10-Foot 纯矢量图标控制条 (PlaybackControls)
  * 严格遵从 Apple TV HIG 工业设计美学与 AGENTS.md 规范：
- * 1. 采用官方 SF Symbols 矢量图标：上一曲 [ic_backward_fill]、播放/暂停 [ic_play_fill/ic_pause_fill]、下一曲 [ic_forward_fill] 与设置 [ic_gear]。
- * 2. 纯 androidx.tv.material3.Button 与 Icon 组合，彻底解决自绘 Canvas 缺失 contentColor 导致的隐形透明 bug。
- * 3. 获得焦点时触发 1.12x 浮起放大与白发光，前景色自动翻转为纯黑，未聚焦时为半透白底 + 高清纯白图标。
- * 4. 播放/暂停键为主键（54dp 圆形），辅键与设置键规格一致（46dp，圆角 12dp）。
+ * 1. 采用官方 SF Symbols 矢量图标：上一曲 [ic_backward_end_fill]、播放/暂停 [ic_play_fill/ic_pause_fill]、下一曲 [ic_forward_end_fill] 与设置 [ic_gear]。
+ * 2. 彻底解决色块脏暗与比例失调：
+ *    - 未获焦状态：通透毛玻璃微白底 (Color(0x22FFFFFF))，纯白高亮图标，悬浮于背景之上；
+ *    - 获得焦点时：1.12x 浮起放大并点亮纯白高光 (Color.White)，前景色翻转为高级深灰 (Color(0xFF1C1C1E))，带有柔和白色光边；
+ * 3. 严格补偿 SF Symbols 的 30% 光学留白：主播放键外框 56dp 搭配 30dp 图标；辅键 46dp 搭配 24dp 图标，比例饱满协调。
  */
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
@@ -47,11 +48,11 @@ fun PlaybackControls(
     val isPlaying = playbackStatus == PlaybackStatus.PLAYING
 
     Row(
-        modifier = modifier.padding(top = 10.dp),
+        modifier = modifier,
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(14.dp)
+        horizontalArrangement = Arrangement.spacedBy(16.dp)
     ) {
-        // 1. 上一曲按钮 (⏮)
+        // 1. 上一曲按钮 (⏮ 标准 backward.end.fill)
         Button(
             onClick = onPreviousClick,
             modifier = Modifier.size(46.dp),
@@ -60,23 +61,23 @@ fun PlaybackControls(
                 focusedScale = 1.12f
             ),
             shape = ButtonDefaults.shape(
-                shape = RoundedCornerShape(12.dp)
+                shape = RoundedCornerShape(14.dp)
             ),
             colors = ButtonDefaults.colors(
-                containerColor = Color(0x33282B38),
+                containerColor = Color(0x22FFFFFF),
                 focusedContainerColor = Color.White,
                 contentColor = Color.White,
-                focusedContentColor = Color.Black
+                focusedContentColor = Color(0xFF1C1C1E)
             ),
             border = ButtonDefaults.border(
                 focusedBorder = Border(border = BorderStroke(2.dp, Color.White))
             )
         ) {
             Icon(
-                painter = painterResource(id = R.drawable.ic_backward_fill),
+                painter = painterResource(id = R.drawable.ic_backward_end_fill),
                 contentDescription = "上一曲",
                 tint = LocalContentColor.current,
-                modifier = Modifier.size(20.dp)
+                modifier = Modifier.size(24.dp)
             )
         }
 
@@ -84,7 +85,7 @@ fun PlaybackControls(
         Button(
             onClick = onPlayPauseClick,
             modifier = Modifier
-                .size(54.dp)
+                .size(56.dp)
                 .then(
                     if (playPauseFocusRequester != null) Modifier.focusRequester(playPauseFocusRequester) else Modifier
                 ),
@@ -96,10 +97,10 @@ fun PlaybackControls(
                 shape = CircleShape
             ),
             colors = ButtonDefaults.colors(
-                containerColor = if (isPlaying) Color(0x4D282B38) else Color(0x80282B38),
+                containerColor = if (isPlaying) Color(0x33FFFFFF) else Color(0x4DFFFFFF),
                 focusedContainerColor = Color.White,
                 contentColor = Color.White,
-                focusedContentColor = Color.Black
+                focusedContentColor = Color(0xFF1C1C1E)
             ),
             border = ButtonDefaults.border(
                 focusedBorder = Border(border = BorderStroke(2.5.dp, Color.White))
@@ -111,11 +112,11 @@ fun PlaybackControls(
                 ),
                 contentDescription = if (isPlaying) "暂停" else "播放",
                 tint = LocalContentColor.current,
-                modifier = Modifier.size(24.dp)
+                modifier = Modifier.size(30.dp)
             )
         }
 
-        // 3. 下一曲按钮 (⏭)
+        // 3. 下一曲按钮 (⏭ 标准 forward.end.fill)
         Button(
             onClick = onNextClick,
             modifier = Modifier.size(46.dp),
@@ -124,23 +125,23 @@ fun PlaybackControls(
                 focusedScale = 1.12f
             ),
             shape = ButtonDefaults.shape(
-                shape = RoundedCornerShape(12.dp)
+                shape = RoundedCornerShape(14.dp)
             ),
             colors = ButtonDefaults.colors(
-                containerColor = Color(0x33282B38),
+                containerColor = Color(0x22FFFFFF),
                 focusedContainerColor = Color.White,
                 contentColor = Color.White,
-                focusedContentColor = Color.Black
+                focusedContentColor = Color(0xFF1C1C1E)
             ),
             border = ButtonDefaults.border(
                 focusedBorder = Border(border = BorderStroke(2.dp, Color.White))
             )
         ) {
             Icon(
-                painter = painterResource(id = R.drawable.ic_forward_fill),
+                painter = painterResource(id = R.drawable.ic_forward_end_fill),
                 contentDescription = "下一曲",
                 tint = LocalContentColor.current,
-                modifier = Modifier.size(20.dp)
+                modifier = Modifier.size(24.dp)
             )
         }
 
@@ -153,13 +154,13 @@ fun PlaybackControls(
                 focusedScale = 1.12f
             ),
             shape = ButtonDefaults.shape(
-                shape = RoundedCornerShape(12.dp)
+                shape = RoundedCornerShape(14.dp)
             ),
             colors = ButtonDefaults.colors(
-                containerColor = Color(0x33282B38),
+                containerColor = Color(0x22FFFFFF),
                 focusedContainerColor = Color.White,
                 contentColor = Color.White,
-                focusedContentColor = Color.Black
+                focusedContentColor = Color(0xFF1C1C1E)
             ),
             border = ButtonDefaults.border(
                 focusedBorder = Border(border = BorderStroke(2.dp, Color.White))
@@ -167,9 +168,9 @@ fun PlaybackControls(
         ) {
             Icon(
                 painter = painterResource(id = R.drawable.ic_gear),
-                contentDescription = "设置与硬件",
+                contentDescription = "设置",
                 tint = LocalContentColor.current,
-                modifier = Modifier.size(20.dp)
+                modifier = Modifier.size(24.dp)
             )
         }
     }
