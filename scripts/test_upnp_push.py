@@ -178,11 +178,10 @@ def main():
 
     stream_url = f"http://{local_ip}:{TEST_PORT}/{file_name}"
     cover_url = f"http://{local_ip}:{TEST_PORT}/cover.png"
-    if not os.path.exists(os.path.join(temp_dir, "cover.png")):
-        try:
-            subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=size=512x512:rate=1", "-frames:v", "1", "-update", "1", os.path.join(temp_dir, "cover.png")], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception:
-            pass
+    try:
+        subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "gradients=s=512x512:c0=0x0A84FF:c1=0xFA233B:c2=0x30D158:c3=0x5E5CE6", "-frames:v", "1", "-update", "1", os.path.join(temp_dir, "cover.png")], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
 
     didl_metadata = f"""&lt;DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/"&gt;&lt;item id="1" parentID="0" restricted="1"&gt;&lt;dc:title&gt;PureCast 440Hz Test Tone ({sample_rate}Hz/{bit_depth}bit {fmt.upper()})&lt;/dc:title&gt;&lt;upnp:artist&gt;PureCast Test Suite&lt;/upnp:artist&gt;&lt;upnp:album&gt;Lossless Benchmark&lt;/upnp:album&gt;&lt;upnp:albumArtURI&gt;{cover_url}&lt;/upnp:albumArtURI&gt;&lt;res protocolInfo="http-get:*:{mime}:*"&gt;""" + stream_url + """&lt;/res&gt;&lt;/item&gt;&lt;/DIDL-Lite&gt;"""
 

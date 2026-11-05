@@ -12,6 +12,7 @@ class PureCastApp : Application() {
     override fun onCreate() {
         super.onCreate()
         instance = this
+        com.solo.purecast.ui.theme.AppPalette.init(this)
         Logger.service.i(TAG, "PureCast 应用程序启动，准备初始化 Native 库与服务...")
 
         try {

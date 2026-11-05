@@ -84,7 +84,7 @@ fun MainTvScreen(
     onTogglePlayPause: () -> Unit,
     onPreviousTrack: () -> Unit,
     onNextTrack: () -> Unit,
-    menuKeyTrigger: Long = 0L,
+    onOpenSettings: () -> Unit,
     userInteractionTrigger: Long = 0L,
     modifier: Modifier = Modifier
 ) {
@@ -93,15 +93,7 @@ fun MainTvScreen(
     val audioPathState by PlaybackService.audioPathState.collectAsState()
     val serverError by PlaybackService.serverError.collectAsState()
 
-    var isSettingsOpen by remember { mutableStateOf(false) }
     val playPauseFocusRequester = remember { FocusRequester() }
-
-    // 💡 遥控器 MENU 键响应：呼出/收起设置全屏页面
-    LaunchedEffect(menuKeyTrigger) {
-        if (menuKeyTrigger > 0L) {
-            isSettingsOpen = !isSettingsOpen
-        }
-    }
 
     // ==========================================
     // 1. 防烧屏引擎: 微像素平移 + 3分钟自动淡出控制栏
@@ -149,9 +141,9 @@ fun MainTvScreen(
         }
     }
 
-    // 💡 控制栏显现或设置关闭时自动将遥控器焦点恢复至播放/暂停按钮
-    LaunchedEffect(isControlsVisible, isSettingsOpen) {
-        if (isControlsVisible && !isSettingsOpen) {
+    // 💡 控制栏显现时自动将遥控器焦点恢复至播放/暂停按钮
+    LaunchedEffect(isControlsVisible) {
+        if (isControlsVisible) {
             delay(150)
             try {
                 playPauseFocusRequester.requestFocus()
@@ -205,15 +197,15 @@ fun MainTvScreen(
                     .fillMaxHeight(),
                 contentAlignment = Alignment.Center
             ) {
+                val coverShape = RoundedCornerShape(12.dp)
                 Box(
                     modifier = Modifier
                         .fillMaxWidth(0.88f)
                         .aspectRatio(1f)
                         .scale(coverScale)
-                        .shadow(36.dp, RoundedCornerShape(24.dp), spotColor = Color(0x80000000))
-                        .clip(RoundedCornerShape(24.dp))
-                        .background(Color(0xFF1E202B))
-                        .border(1.dp, Color(0xFF32364A), RoundedCornerShape(24.dp)),
+                        .shadow(24.dp, coverShape, spotColor = Color(0x66000000))
+                        .clip(coverShape)
+                        .background(Color(0xFF161822)),
                     contentAlignment = Alignment.Center
                 ) {
                     val uri = metadata.coverUri
@@ -339,7 +331,7 @@ fun MainTvScreen(
                             onPlayPauseClick = onTogglePlayPause,
                             onPreviousClick = onPreviousTrack,
                             onNextClick = onNextTrack,
-                            onSettingsClick = { isSettingsOpen = true },
+                            onSettingsClick = onOpenSettings,
                             playPauseFocusRequester = playPauseFocusRequester
                         )
                     }
@@ -347,19 +339,7 @@ fun MainTvScreen(
             }
         }
 
-        // 3. Apple TV 原生全屏分类双栏设置界面
-        AnimatedVisibility(
-            visible = isSettingsOpen,
-            enter = fadeIn(animationSpec = tween(300)),
-            exit = fadeOut(animationSpec = tween(250))
-        ) {
-            SettingsScreen(
-                audioState = audioPathState,
-                onDismiss = { isSettingsOpen = false }
-            )
-        }
-
-        // 4. 首次开机/权限自检向导
+        // 3. 首次开机/权限自检向导
         var showOnboarding by remember { mutableStateOf(false) }
         val context = LocalContext.current
         val settingsRepo = remember { SettingsRepository(context) }
