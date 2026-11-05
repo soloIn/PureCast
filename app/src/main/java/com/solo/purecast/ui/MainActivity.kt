@@ -2,6 +2,7 @@ package com.solo.purecast.ui
 
 import android.os.Bundle
 import android.view.KeyEvent
+import android.view.WindowManager
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -37,6 +38,7 @@ class MainActivity : ComponentActivity() {
     // 💡 遥控器 MENU 键与全局按键触发器 (以时间戳驱动 Compose 响应)
     private val menuKeyTrigger = mutableLongStateOf(0L)
     private val userInteractionTrigger = mutableLongStateOf(0L)
+    private var currentNavScreen: TvNavScreen = TvNavScreen.PLAYBACK
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -52,6 +54,15 @@ class MainActivity : ComponentActivity() {
             PureCastTheme {
                 var currentScreen by remember { mutableStateOf(TvNavScreen.PLAYBACK) }
                 val audioPathState by PlaybackService.audioPathState.collectAsState()
+                val playbackStatus by PlaybackService.playbackStatus.collectAsState()
+
+                // 💡 屏保智能防休眠联动：
+                // 仅当位于播放界面 (PLAYBACK) 且实际处于播放中 (PLAYING) 时，持有 FLAG_KEEP_SCREEN_ON 阻止系统屏保介入；
+                // 一旦暂停 (PAUSED)、停止 (STOPPED)、无流空闲 (IDLE) 或进入设置界面 (SETTINGS)，立即清除常亮标志，恢复系统标准屏保倒计时
+                LaunchedEffect(currentScreen, playbackStatus) {
+                    currentNavScreen = currentScreen
+                    updateKeepScreenOn()
+                }
 
                 // 物理 MENU 键响应：在播放页与设置页之间平滑切换
                 LaunchedEffect(menuKeyTrigger.longValue) {
@@ -89,8 +100,27 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        Logger.ui.i(TAG, "MainActivity onResume: 检查 USB DAC 授权状态...")
+        Logger.ui.i(TAG, "MainActivity onResume: 检查 USB DAC 授权状态与屏保常亮状态...")
         PlaybackService.instance?.requestUsbPermission(this)
+        updateKeepScreenOn()
+    }
+
+    private fun updateKeepScreenOn() {
+        val shouldKeepScreenOn = currentNavScreen == TvNavScreen.PLAYBACK &&
+                PlaybackService.playbackStatus.value == PlaybackStatus.PLAYING
+        if (shouldKeepScreenOn) {
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            Logger.ui.i(TAG, "大屏处于有效播放中: 激活 FLAG_KEEP_SCREEN_ON (保持屏幕常亮)")
+        } else {
+            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            Logger.ui.i(TAG, "非播放状态或离开播放主页: 清除 FLAG_KEEP_SCREEN_ON (恢复系统屏保)")
+        }
+    }
+
+    override fun onStop() {
+        super.onStop()
+        Logger.ui.i(TAG, "MainActivity onStop: 退入后台，清除 FLAG_KEEP_SCREEN_ON 释放屏保控制权")
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
     }
 
     override fun onNewIntent(intent: android.content.Intent) {

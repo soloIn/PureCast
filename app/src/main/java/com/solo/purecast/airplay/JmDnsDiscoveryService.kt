@@ -27,6 +27,7 @@ class JmDnsDiscoveryService(private val context: Context) {
         private const val TAG = "JmDnsDiscovery"
         const val AIRPLAY_SERVICE_TYPE = "_airplay._tcp.local."
         const val RAOP_SERVICE_TYPE = "_raop._tcp.local."
+        const val DACP_SERVICE_TYPE = "_dacp._tcp.local."
         const val DEFAULT_AIRPLAY_PORT = 7000
         const val DEFAULT_RAOP_PORT = 5000
     }
@@ -35,6 +36,12 @@ class JmDnsDiscoveryService(private val context: Context) {
     private var multicastLock: WifiManager.MulticastLock? = null
     private var airPlayServiceInfo: ServiceInfo? = null
     private var raopServiceInfo: ServiceInfo? = null
+
+    // 💡 DACP 动态端口发现监听器与目标凭证匹配
+    private var dacpListener: javax.jmdns.ServiceListener? = null
+    private var targetDacpId: String? = null
+    private var targetClientIp: String? = null
+    private var onDacpPortResolvedCallback: ((Int) -> Unit)? = null
 
     @Volatile
     private var isBroadcasting = false
@@ -122,6 +129,9 @@ class JmDnsDiscoveryService(private val context: Context) {
 
             jmdns?.registerService(raopServiceInfo)
 
+            // 💡 注册 DACP 服务监听器，实时捕获 iPhone / iPad 在局域网中广播的临时 DACP 端口
+            setupDacpServiceListener()
+
             isBroadcasting = true
             Logger.service.i(TAG, "AirPlay 1 (AirTunes / RAOP) 纯音频广播已成功注册: Instance=$raopInstanceName, Target=$hostName.local.:$raopPort, am=AirRecever3,1")
             true
@@ -140,6 +150,9 @@ class JmDnsDiscoveryService(private val context: Context) {
 
         Logger.service.i(TAG, "正在停止 JmDNS 广播并注销 Bonjour 服务...")
         try {
+            dacpListener?.let { jmdns?.removeServiceListener(DACP_SERVICE_TYPE, it) }
+            dacpListener = null
+            clearDacpTarget()
             airPlayServiceInfo?.let { jmdns?.unregisterService(it) }
             raopServiceInfo?.let { jmdns?.unregisterService(it) }
             jmdns?.unregisterAllServices()
@@ -274,5 +287,86 @@ class JmDnsDiscoveryService(private val context: Context) {
         } else {
             mac
         }
+    }
+
+    /**
+     * 💡 设置 DACP 服务监听器，实时捕获 iOS 设备注册的 _dacp._tcp 广播
+     */
+    private fun setupDacpServiceListener() {
+        val listener = object : javax.jmdns.ServiceListener {
+            override fun serviceAdded(event: javax.jmdns.ServiceEvent) {
+                Logger.service.d(TAG, "发现 _dacp._tcp 服务加入: ${event.name}")
+                event.dns.requestServiceInfo(event.type, event.name, 1500)
+            }
+
+            override fun serviceRemoved(event: javax.jmdns.ServiceEvent) {
+                Logger.service.d(TAG, "_dacp._tcp 服务移除: ${event.name}")
+            }
+
+            override fun serviceResolved(event: javax.jmdns.ServiceEvent) {
+                val info = event.info ?: return
+                Logger.service.i(TAG, "已解析 _dacp._tcp 服务: Name=${info.name}, Port=${info.port}")
+                inspectDacpServiceInfo(info)
+            }
+        }
+        dacpListener = listener
+        jmdns?.addServiceListener(DACP_SERVICE_TYPE, listener)
+    }
+
+    /**
+     * 💡 注册 DACP 目标客户端信息，并启动端口匹配
+     */
+    fun resolveDacpPort(dacpId: String, clientIp: String, onPortResolved: (Int) -> Unit) {
+        targetDacpId = dacpId
+        targetClientIp = clientIp
+        onDacpPortResolvedCallback = onPortResolved
+
+        Logger.service.i(TAG, "注册 DACP 监听目标: dacpId=$dacpId, clientIp=$clientIp，启动动态匹配")
+
+        // 优先检查 JmDNS 当前已缓存的服务
+        jmdns?.let { dns ->
+            try {
+                val existingServices = dns.list(DACP_SERVICE_TYPE)
+                for (info in existingServices) {
+                    if (inspectDacpServiceInfo(info)) {
+                        return
+                    }
+                }
+            } catch (e: Exception) {
+                Logger.service.w(TAG, "遍历已缓存 DACP 服务异常: ${e.message}")
+            }
+        }
+    }
+
+    /**
+     * 💡 匹配 DACP 服务的 IP、DACP-ID (通过服务名或 DbId 属性)
+     */
+    private fun inspectDacpServiceInfo(info: javax.jmdns.ServiceInfo): Boolean {
+        val port = info.port
+        if (port <= 0) return false
+
+        val targetIp = targetClientIp
+        val targetId = targetDacpId
+
+        val matchesIp = targetIp != null && info.inet4Addresses.any { it.hostAddress == targetIp }
+        val matchesName = targetId != null && info.name.contains(targetId, ignoreCase = true)
+        val matchesDbId = targetId != null && info.getPropertyString("DbId")?.equals(targetId, ignoreCase = true) == true
+
+        if (matchesIp || matchesName || matchesDbId) {
+            val ips = info.inet4Addresses.joinToString { it.hostAddress ?: "" }
+            Logger.service.i(TAG, "🎉 成功锁定 DACP 真实端口: $port (Name=${info.name}, IPs=[$ips])")
+            onDacpPortResolvedCallback?.invoke(port)
+            return true
+        }
+        return false
+    }
+
+    /**
+     * 清理 DACP 匹配目标
+     */
+    fun clearDacpTarget() {
+        targetDacpId = null
+        targetClientIp = null
+        onDacpPortResolvedCallback = null
     }
 }

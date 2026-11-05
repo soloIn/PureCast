@@ -22,7 +22,9 @@ class AirPlayServerManager(
     private val onStreamRequestedListener: (sampleRate: Int, bitDepth: Int, channels: Int, clientIp: String, dacpPort: Int, token: String) -> Boolean,
     private val onStreamStoppedListener: () -> Unit,
     private val onMetadataReceivedListener: (title: String, artist: String, album: String, durationMs: Long, coverArt: ByteArray?) -> Unit,
-    private val onProgressUpdatedListener: (positionMs: Long, durationMs: Long) -> Unit = { _, _ -> }
+    private val onProgressUpdatedListener: (positionMs: Long, durationMs: Long) -> Unit = { _, _ -> },
+    private val onStreamPausedListener: () -> Unit = {},
+    private val onStreamResumedListener: () -> Unit = {}
 ) {
     companion object {
         private const val TAG = "AirPlayServerManager"
@@ -76,9 +78,14 @@ class AirPlayServerManager(
                     }
                 }
 
-                // 2. 更新 DACP 反向控制凭证
+                // 2. 更新 DACP 反向控制凭证与启动 mDNS 动态端口解析
                 if (clientIp.isNotEmpty()) {
                     dacpClient.updateSession(clientIp, dacpPort, activeRemoteToken)
+                    if (dacpId.isNotEmpty()) {
+                        jmdnsDiscoveryService.resolveDacpPort(dacpId, clientIp) { port ->
+                            dacpClient.updatePort(port)
+                        }
+                    }
                 }
 
                 // 3. 回调上层申请音频焦点与 USB 声卡独占
@@ -87,8 +94,19 @@ class AirPlayServerManager(
 
             override fun onStreamStopped() {
                 Logger.airplay.i(TAG, "AirPlay 推流连接断开或停止")
+                jmdnsDiscoveryService.clearDacpTarget()
                 dacpClient.clearSession()
                 onStreamStoppedListener()
+            }
+
+            override fun onStreamPaused() {
+                Logger.airplay.i(TAG, "AirPlay 推流暂停")
+                onStreamPausedListener()
+            }
+
+            override fun onStreamResumed() {
+                Logger.airplay.i(TAG, "AirPlay 推流恢复")
+                onStreamResumedListener()
             }
 
             override fun onChallengeRequested(challengeBase64: String): String? {

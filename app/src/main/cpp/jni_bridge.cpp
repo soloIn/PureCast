@@ -100,6 +100,58 @@ static void notify_java_stream_stopped() {
     }
 }
 
+static void notify_java_stream_paused() {
+    std::lock_guard<std::recursive_mutex> lock(g_airplay_mutex);
+    if (!g_jvm || !g_airplay_callback) return;
+
+    JNIEnv* env = nullptr;
+    bool attached = false;
+    jint res = g_jvm->GetEnv((void**)&env, JNI_VERSION_1_6);
+    if (res == JNI_EDETACHED) {
+        if (g_jvm->AttachCurrentThread(&env, nullptr) != JNI_OK) {
+            return;
+        }
+        attached = true;
+    }
+
+    jclass cls = env->GetObjectClass(g_airplay_callback);
+    jmethodID mid = env->GetMethodID(cls, "onStreamPaused", "()V");
+    if (mid) {
+        env->CallVoidMethod(g_airplay_callback, mid);
+    }
+    env->DeleteLocalRef(cls);
+
+    if (attached) {
+        g_jvm->DetachCurrentThread();
+    }
+}
+
+static void notify_java_stream_resumed() {
+    std::lock_guard<std::recursive_mutex> lock(g_airplay_mutex);
+    if (!g_jvm || !g_airplay_callback) return;
+
+    JNIEnv* env = nullptr;
+    bool attached = false;
+    jint res = g_jvm->GetEnv((void**)&env, JNI_VERSION_1_6);
+    if (res == JNI_EDETACHED) {
+        if (g_jvm->AttachCurrentThread(&env, nullptr) != JNI_OK) {
+            return;
+        }
+        attached = true;
+    }
+
+    jclass cls = env->GetObjectClass(g_airplay_callback);
+    jmethodID mid = env->GetMethodID(cls, "onStreamResumed", "()V");
+    if (mid) {
+        env->CallVoidMethod(g_airplay_callback, mid);
+    }
+    env->DeleteLocalRef(cls);
+
+    if (attached) {
+        g_jvm->DetachCurrentThread();
+    }
+}
+
 static void notify_java_metadata(
     const std::string& title,
     const std::string& artist,
@@ -419,6 +471,8 @@ Java_com_solo_purecast_core_nativebridge_NativeAudioEngine_startAirPlayServer(
 
     g_raop_server->set_stream_request_callback(notify_java_stream_requested);
     g_raop_server->set_stream_stop_callback(notify_java_stream_stopped);
+    g_raop_server->set_stream_pause_callback(notify_java_stream_paused);
+    g_raop_server->set_stream_resume_callback(notify_java_stream_resumed);
     g_raop_server->set_metadata_callback(notify_java_metadata);
     g_raop_server->set_challenge_callback(notify_java_challenge_requested);
     g_raop_server->set_progress_callback(notify_java_progress_updated);

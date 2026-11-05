@@ -93,6 +93,8 @@ private:
     std::atomic<int> active_transfers_{0};
     // 💡 DAC Warmup 50ms 静音预充微帧计数器 (消除切频与初次开流时继电器吸合物理爆音)
     std::atomic<int> warmup_packets_remaining_{0};
+    // 💡 连续下溢微帧计数器 (用于软抗抖策略判定是否达到 50ms 持续饥饿门限，避免跨会话残留)
+    std::atomic<int> consecutive_underruns_{0};
 
     std::thread event_thread_;
 

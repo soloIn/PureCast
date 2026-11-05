@@ -51,6 +51,14 @@ You are a Senior Android TV & Native Audio Systems Architect
 
 ## ADB & Hardware Testing (真机联调与测试速查)
 
+- **强制规则 (Mandatory Rule)**:
+  - **凡是 Debug / 问题排查 / 功能修复 / 逻辑变更，必须使用 ADB 连接真机进行实机测试与验证！**
+  - 严禁仅靠单元测试或静态分析即宣称修复完成；必须完成：
+    1. 确保 ADB 隧道与真机连接畅通 (`python3 scripts/adb_tunnel.py &` 后执行 `adb connect 127.0.0.1:5555`)；
+    2. 编译并推包安装至真机 (`./gradlew assembleDebug && adb -s 127.0.0.1:5555 install -r app/build/outputs/apk/debug/app-debug.apk`)；
+    3. 重启 App 并通过 logcat (`adb -s 127.0.0.1:5555 logcat`) 核验实际日志输出与硬件行为（USB DAC 锁相时钟、AirPlay/UPnP 状态机、大屏屏保及按键响应）；
+    4. 只有真机验证通过后方可交付。
+
 - **设备连接**:
   - 直连: `adb connect 192.168.2.179:5555`
   - VPN/Surge 路由拦截 (Errno 65) 代理穿透: 运行 `python3 scripts/adb_tunnel.py &` 后执行 `adb connect 127.0.0.1:5555`

@@ -257,4 +257,130 @@ class RaopProtocolIntegrationTest {
         // 推进到末尾封顶
         assertEquals(240000L, calculatePosition(400000L))
     }
+
+    @Test
+    fun testProtocolBroadcastNameFormatting() {
+        val baseName = "PureCast TV"
+        val airPlayName = com.solo.purecast.service.PlaybackService.formatAirPlayName(baseName)
+        val upnpName = com.solo.purecast.service.PlaybackService.formatUpnpName(baseName)
+
+        assertEquals("PureCast TV [AirPlay]", airPlayName)
+        assertEquals("PureCast TV [UPnP]", upnpName)
+
+        // 避免重复追加后缀测试
+        assertEquals("PureCast TV [AirPlay]", com.solo.purecast.service.PlaybackService.formatAirPlayName(airPlayName))
+        assertEquals("PureCast TV [UPnP]", com.solo.purecast.service.PlaybackService.formatUpnpName(upnpName))
+    }
+
+    @Test
+    fun testRtpPacketGapDetectionAndResendCalculation() {
+        // 模拟 RaopRtp 数据包空洞检测与重传区间算法
+        fun detectGap(lastSeq: Int, curSeq: Int): Pair<Int, Int>? {
+            val diff = ((curSeq - lastSeq).toShort()).toInt()
+            return if (diff in 2..32) {
+                val missingStart = (lastSeq + 1) and 0xFFFF
+                val missingCount = diff - 1
+                Pair(missingStart, missingCount)
+            } else {
+                null
+            }
+        }
+
+        // 连续正常包序列
+        assertEquals(null, detectGap(100, 101))
+
+        // 丢 1 个包 (跳过 102，到达 103)
+        val gap1 = detectGap(101, 103)
+        assertNotNull(gap1)
+        assertEquals(102, gap1!!.first)
+        assertEquals(1, gap1.second)
+
+        // 丢 3 个包 (跳过 102, 103, 104，到达 105)
+        val gap3 = detectGap(101, 105)
+        assertNotNull(gap3)
+        assertEquals(102, gap3!!.first)
+        assertEquals(3, gap3.second)
+
+        // 跨越 16 位序列号回环回转 (65534 -> 1，跳过 65535 与 0)
+        val gapRollover = detectGap(65534, 1)
+        assertNotNull(gapRollover)
+        assertEquals(65535, gapRollover!!.first)
+        assertEquals(2, gapRollover.second)
+
+        // 乱序迟到包 (100 -> 99)
+        assertEquals(null, detectGap(100, 99))
+
+        // 异常大跳跃 (>32 突发丢包)，不发重传避免雪崩风暴
+        assertEquals(null, detectGap(100, 150))
+    }
+
+    @Test
+    fun testRaop0xd5RetransmitPacketEncoding() {
+        // 验证 8 字节 Apple RAOP 0xd5 重传报文组包规范
+        fun encodeResendRequest(rseq: Int, firstSeq: Int, count: Int): ByteArray {
+            val req = ByteArray(8)
+            req[0] = 0x80.toByte()
+            req[1] = 0xD5.toByte()
+            req[2] = ((rseq shr 8) and 0xFF).toByte()
+            req[3] = (rseq and 0xFF).toByte()
+            req[4] = ((firstSeq shr 8) and 0xFF).toByte()
+            req[5] = (firstSeq and 0xFF).toByte()
+            req[6] = ((count shr 8) and 0xFF).toByte()
+            req[7] = (count and 0xFF).toByte()
+            return req
+        }
+
+        val packet = encodeResendRequest(1, 102, 2)
+        assertEquals(8, packet.size)
+        assertEquals(0x80.toByte(), packet[0])
+        assertEquals(0xD5.toByte(), packet[1])
+        assertEquals(0x00.toByte(), packet[2])
+        assertEquals(0x01.toByte(), packet[3])
+        assertEquals(0x00.toByte(), packet[4])
+        assertEquals(102.toByte(), packet[5])
+        assertEquals(0x00.toByte(), packet[6])
+        assertEquals(2.toByte(), packet[7])
+    }
+
+    @Test
+    fun testWatchdogInactivityStateLogic() {
+        // 验证无数据超时看门狗与流状态机恢复模型
+        var isStreamPaused = false
+        var lastAudioTimeMs = 1000L
+
+        fun checkWatchdog(currentTimeMs: Long): Boolean {
+            if (lastAudioTimeMs > 0 && !isStreamPaused) {
+                if (currentTimeMs > lastAudioTimeMs && (currentTimeMs - lastAudioTimeMs) >= 600) {
+                    isStreamPaused = true
+                    return true // 触发暂停回调
+                }
+            }
+            return false
+        }
+
+        fun onNewPacket(currentTimeMs: Long): Boolean {
+            lastAudioTimeMs = currentTimeMs
+            if (isStreamPaused) {
+                isStreamPaused = false
+                return true // 触发恢复回调
+            }
+            return false
+        }
+
+        // 推进 400ms，未超差 600ms
+        assertFalse(checkWatchdog(1400L))
+        assertFalse(isStreamPaused)
+
+        // 推进至 1600ms (停顿 600ms)，触发暂停
+        assertTrue(checkWatchdog(1600L))
+        assertTrue(isStreamPaused)
+
+        // 再次检查保持暂停，不重复触发
+        assertFalse(checkWatchdog(1700L))
+        assertTrue(isStreamPaused)
+
+        // 新包到达，触发恢复
+        assertTrue(onNewPacket(1750L))
+        assertFalse(isStreamPaused)
+    }
 }

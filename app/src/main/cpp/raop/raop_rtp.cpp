@@ -107,6 +107,7 @@ bool RaopRtp::start(int& out_data_port, int& out_ctrl_port, int& out_timing_port
     data_thread_ = std::thread(&RaopRtp::data_loop, this);
     ctrl_thread_ = std::thread(&RaopRtp::ctrl_loop, this);
     timing_thread_ = std::thread(&RaopRtp::timing_loop, this);
+    watchdog_thread_ = std::thread(&RaopRtp::watchdog_loop, this);
 
     LOGI("RAOP RTP 服务启动成功: Data=%d, Control=%d, Timing=%d", data_port_, ctrl_port_, timing_port_);
     return true;
@@ -128,6 +129,7 @@ void RaopRtp::stop() {
     if (data_thread_.joinable()) data_thread_.join();
     if (ctrl_thread_.joinable()) ctrl_thread_.join();
     if (timing_thread_.joinable()) timing_thread_.join();
+    if (watchdog_thread_.joinable()) watchdog_thread_.join();
 
     // 💡 步骤 3: 线程完全终止后，再统一执行 close 释放文件描述符，彻底杜绝并发竞态
     if (data_fd_ >= 0) {
@@ -144,6 +146,12 @@ void RaopRtp::stop() {
     }
 
     jitter_buffer_.reset();
+    first_data_seq_ = true;
+    last_data_seq_ = 0;
+    has_client_ctrl_.store(false, std::memory_order_release);
+    resend_req_seq_.store(0, std::memory_order_relaxed);
+    last_audio_packet_time_ms_.store(0, std::memory_order_relaxed);
+    is_stream_paused_.store(false, std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> lock(crypto_mutex_);
         aes_key_.clear();
@@ -151,6 +159,44 @@ void RaopRtp::stop() {
         has_crypto_.store(false, std::memory_order_release);
     }
     LOGI("RAOP RTP 接收引擎已完全停止");
+}
+
+void RaopRtp::set_client_control_endpoint(const std::string& client_ip, int client_ctrl_port) {
+    if (client_ip.empty() || client_ctrl_port <= 0) return;
+    std::memset(&client_ctrl_addr_, 0, sizeof(client_ctrl_addr_));
+    client_ctrl_addr_.sin_family = AF_INET;
+    client_ctrl_addr_.sin_port = htons(client_ctrl_port);
+    if (inet_pton(AF_INET, client_ip.c_str(), &client_ctrl_addr_.sin_addr) > 0) {
+        has_client_ctrl_.store(true, std::memory_order_release);
+        LOGI("显式配置客户端控制端点: %s:%d (用于 RAOP 丢包重传)", client_ip.c_str(), client_ctrl_port);
+    }
+}
+
+void RaopRtp::send_resend_request(uint16_t first_seq, uint16_t count) {
+    if (!has_client_ctrl_.load(std::memory_order_acquire) || ctrl_fd_ < 0 || count == 0) {
+        return;
+    }
+
+    // 💡 遵循 Apple RAOP 8 字节重传请求报文规范 (0x80, 0xd5, req_seq, first_seq, count)
+    uint8_t req[8];
+    req[0] = 0x80;
+    req[1] = 0xd5;
+    uint16_t rseq = resend_req_seq_.fetch_add(1, std::memory_order_relaxed);
+    req[2] = static_cast<uint8_t>((rseq >> 8) & 0xFF);
+    req[3] = static_cast<uint8_t>(rseq & 0xFF);
+    req[4] = static_cast<uint8_t>((first_seq >> 8) & 0xFF);
+    req[5] = static_cast<uint8_t>(first_seq & 0xFF);
+    req[6] = static_cast<uint8_t>((count >> 8) & 0xFF);
+    req[7] = static_cast<uint8_t>(count & 0xFF);
+
+    ssize_t ret = sendto(ctrl_fd_, req, sizeof(req), 0,
+                         reinterpret_cast<const struct sockaddr*>(&client_ctrl_addr_),
+                         sizeof(client_ctrl_addr_));
+    if (ret < 0) {
+        LOGW("发送 RAOP 丢包重传请求失败: errno=%d", errno);
+    } else {
+        LOGI("⚡ 发送 RAOP 丢包重传请求: first_seq=%u, count=%u, req_seq=%u", first_seq, count, rseq);
+    }
 }
 
 void RaopRtp::set_crypto_key(const std::vector<uint8_t>& aes_key, const std::vector<uint8_t>& aes_iv) {
@@ -165,6 +211,46 @@ void RaopRtp::set_alac_config(int frame_length, int bit_depth, int channels, int
     alac_decoder_.init(frame_length, bit_depth, channels, sample_rate);
     LOGI("RAOP RTP 更新 ALAC 配置: frame=%d, depth=%d, ch=%d, rate=%d",
          frame_length, bit_depth, channels, sample_rate);
+}
+
+uint64_t RaopRtp::get_monotonic_time_ms() {
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+void RaopRtp::watchdog_loop() {
+    LOGI("RAOP RTP 数据流无数据看门狗已启动");
+    while (is_running_.load(std::memory_order_relaxed)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        if (!is_running_.load(std::memory_order_relaxed)) break;
+
+        uint64_t last_time = last_audio_packet_time_ms_.load(std::memory_order_relaxed);
+        if (last_time > 0 && !is_stream_paused_.load(std::memory_order_relaxed)) {
+            uint64_t now = get_monotonic_time_ms();
+            if (now > last_time && (now - last_time) >= 600) {
+                // 💡 二次双检与原子 CAS 切换：确保在与新包到达的微秒级竞态中不产生状态颠簸
+                bool expected = false;
+                if (is_stream_paused_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+                    uint64_t recheck_time = last_audio_packet_time_ms_.load(std::memory_order_relaxed);
+                    if (recheck_time == last_time) {
+                        LOGI("⚠️ 检测到 RTP 音频流停顿超 600ms (iPhone 暂停推流)，通知上层暂停");
+                        if (state_cb_) state_cb_(true);
+                    } else {
+                        // 在 CAS 切换瞬间新数据包到达并更新了时间戳，撤销暂停标记
+                        is_stream_paused_.store(false, std::memory_order_release);
+                    }
+                }
+            }
+        }
+    }
+    LOGI("RAOP RTP 数据流无数据看门狗已退出");
+}
+
+void RaopRtp::mark_paused_manually(bool paused) {
+    is_stream_paused_.store(paused, std::memory_order_release);
+    if (!paused) {
+        last_audio_packet_time_ms_.store(get_monotonic_time_ms(), std::memory_order_relaxed);
+    }
 }
 
 uint64_t RaopRtp::get_ntp_timestamp() {
@@ -207,6 +293,15 @@ void RaopRtp::data_loop() {
             continue;
         }
 
+        // 💡 更新最近音频数据包时间戳，若此前处于暂停状态则即时唤醒恢复播放
+        uint64_t now_ms = get_monotonic_time_ms();
+        last_audio_packet_time_ms_.store(now_ms, std::memory_order_relaxed);
+        if (is_stream_paused_.load(std::memory_order_relaxed)) {
+            is_stream_paused_.store(false, std::memory_order_release);
+            LOGI("▶️ 检测到 RTP 新音频包到达，通知上层流已恢复播放");
+            if (state_cb_) state_cb_(false);
+        }
+
         const uint8_t* pktp = buffer.data();
         ssize_t plen = n;
 
@@ -223,6 +318,24 @@ void RaopRtp::data_loop() {
                       (static_cast<uint32_t>(pktp[5]) << 16) |
                       (static_cast<uint32_t>(pktp[6]) << 8)  |
                       pktp[7];
+
+        // 💡 实时丢包空洞检测: 发现主干音频包序列号跳跃时，立即向 iPhone 发送重传请求
+        if (payload_type == 96) {
+            if (first_data_seq_) {
+                last_data_seq_ = seq;
+                first_data_seq_ = false;
+            } else {
+                int16_t diff = static_cast<int16_t>(seq - last_data_seq_);
+                if (diff > 1 && diff <= 32) {
+                    uint16_t missing_start = static_cast<uint16_t>(last_data_seq_ + 1);
+                    uint16_t missing_count = static_cast<uint16_t>(diff - 1);
+                    send_resend_request(missing_start, missing_count);
+                }
+                if (diff > 0) {
+                    last_data_seq_ = seq;
+                }
+            }
+        }
 
         const uint8_t* payload = pktp + 12;
         size_t payload_len = static_cast<size_t>(plen - 12);
@@ -293,6 +406,16 @@ void RaopRtp::ctrl_loop() {
         }
 
         if (n < 4) continue;
+
+        // 💡 动态学习客户端控制端点地址与端口，确保丢包重传通道畅通
+        if (!has_client_ctrl_.load(std::memory_order_relaxed)) {
+            client_ctrl_addr_ = client_addr;
+            has_client_ctrl_.store(true, std::memory_order_release);
+            char ip_str[INET_ADDRSTRLEN] = {0};
+            inet_ntop(AF_INET, &(client_addr.sin_addr), ip_str, INET_ADDRSTRLEN);
+            LOGI("通过控制端口学习到客户端端点: %s:%d", ip_str, ntohs(client_addr.sin_port));
+        }
+
         uint8_t payload_type = buffer[1] & 0x7F;
         if (payload_type == 84) {
             // RTP Sync 同步包 (包含 RTP 时间戳与 NTP 时间戳映射)
@@ -325,6 +448,10 @@ void RaopRtp::timing_loop() {
             // 回复报文: payload type 设置为 0x53 (带 marker 0xD3)
             buffer[0] = 0x80;
             buffer[1] = 0xD3;
+
+            // 💡 关键修复: 将客户端请求中的 Transmit Timestamp (offset 24..31)
+            // 原样写回回复报文的 Originate Timestamp (offset 8..15)，满足 RFC 5905 与 Apple RAOP 严格时钟校准规范
+            std::memcpy(&buffer[8], &buffer[24], 8);
 
             // 写入接收时间戳 (offset 16)
             for (int i = 0; i < 8; ++i) {
