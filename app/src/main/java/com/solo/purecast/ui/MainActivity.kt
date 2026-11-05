@@ -5,12 +5,24 @@ import android.view.KeyEvent
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.compose.animation.Crossfade
+import androidx.compose.animation.core.tween
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import com.solo.purecast.model.PlaybackStatus
 import com.solo.purecast.service.PlaybackService
 import com.solo.purecast.ui.screen.MainTvScreen
+import com.solo.purecast.ui.screen.SettingsScreen
 import com.solo.purecast.ui.theme.PureCastTheme
 import com.solo.purecast.util.Logger
+
+/** 顶层页面枚举 */
+enum class TvNavScreen { PLAYBACK, SETTINGS }
 
 /**
  * 💡 PureCast 大屏主入口 Activity
@@ -18,6 +30,7 @@ import com.solo.purecast.util.Logger
  * 1. 物理遥控器按键全局拦截：精准响应 KEYCODE_MENU（呼出/收起侧边栏）及媒体播放按键。
  * 2. 实时流保护：遥控器切歌键在 airupnp 等外部实时流时拦截并弹出温和 Toast 提示。
  * 3. 防烧屏按键重置：任意遥控器按键输入即刻唤醒控制栏并重置 3 分钟无操作计时器。
+ * 4. 顶层页面导航架构：在播放页面与设置页面之间平滑切换，设置页面具备 100% 实心背景。
  */
 class MainActivity : ComponentActivity() {
 
@@ -29,18 +42,47 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         Logger.ui.i(TAG, "MainActivity onCreate: 启动 Apple TV 风格大屏交互界面")
 
+        // 初始化外观色彩系统
+        com.solo.purecast.ui.theme.AppPalette.init(this)
+
         // 确保后台音频前台服务与 UPnP 监听已就绪
         PlaybackService.start(this)
 
         setContent {
             PureCastTheme {
-                MainTvScreen(
-                    onTogglePlayPause = { togglePlayPause() },
-                    onPreviousTrack = { handlePreviousTrack() },
-                    onNextTrack = { handleNextTrack() },
-                    menuKeyTrigger = menuKeyTrigger.longValue,
-                    userInteractionTrigger = userInteractionTrigger.longValue
-                )
+                var currentScreen by remember { mutableStateOf(TvNavScreen.PLAYBACK) }
+                val audioPathState by PlaybackService.audioPathState.collectAsState()
+
+                // 物理 MENU 键响应：在播放页与设置页之间平滑切换
+                LaunchedEffect(menuKeyTrigger.longValue) {
+                    if (menuKeyTrigger.longValue > 0L) {
+                        currentScreen = if (currentScreen == TvNavScreen.PLAYBACK) TvNavScreen.SETTINGS else TvNavScreen.PLAYBACK
+                    }
+                }
+
+                Crossfade(
+                    targetState = currentScreen,
+                    animationSpec = tween(300),
+                    label = "PageNavigation"
+                ) { screen ->
+                    when (screen) {
+                        TvNavScreen.PLAYBACK -> {
+                            MainTvScreen(
+                                onTogglePlayPause = { togglePlayPause() },
+                                onPreviousTrack = { handlePreviousTrack() },
+                                onNextTrack = { handleNextTrack() },
+                                onOpenSettings = { currentScreen = TvNavScreen.SETTINGS },
+                                userInteractionTrigger = userInteractionTrigger.longValue
+                            )
+                        }
+                        TvNavScreen.SETTINGS -> {
+                            SettingsScreen(
+                                audioState = audioPathState,
+                                onDismiss = { currentScreen = TvNavScreen.PLAYBACK }
+                            )
+                        }
+                    }
+                }
             }
         }
     }

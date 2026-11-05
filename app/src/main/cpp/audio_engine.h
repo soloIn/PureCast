@@ -47,6 +47,8 @@ public:
 
     int stop_stream();
 
+    void flush_buffer();
+
     int release_device();
 
     [[nodiscard]] bool is_streaming() const;
@@ -94,9 +96,10 @@ private:
 
     std::thread event_thread_;
 
-    // 💡 适配低延迟 USB DAC (如 ZX300A 4ms target/16ms buffer)，调优并发 URB 队列至 2ms 深度，杜绝 Overrun
-    static constexpr int NUM_TRANSFERS = 4;
-    static constexpr int PACKETS_PER_TRANSFER = 4;
+    // 💡 适配 USB DAC (如 ZX300A Explicit Feedback)，配置 8 个并发 URB，每个包含 8 个微帧 (1ms)
+    // 总硬件队列深度达 8ms，彻底杜绝 Android TV 偶发 2~3ms 线程调度延迟导致的 USB 硬件欠载与 ERROR 累加
+    static constexpr int NUM_TRANSFERS = 8;
+    static constexpr int PACKETS_PER_TRANSFER = 8;
     std::vector<struct libusb_transfer*> transfers_;
     std::vector<std::vector<uint8_t>> transfer_buffers_;
 

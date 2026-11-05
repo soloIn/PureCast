@@ -24,6 +24,12 @@ class SettingsRepository(context: Context) {
     private val _friendlyNameFlow = MutableStateFlow(getFriendlyName())
     val friendlyNameFlow: StateFlow<String> = _friendlyNameFlow.asStateFlow()
 
+    private val _airPlayEnabledFlow = MutableStateFlow(isAirPlayEnabled())
+    val airPlayEnabledFlow: StateFlow<Boolean> = _airPlayEnabledFlow.asStateFlow()
+
+    private val _upnpEnabledFlow = MutableStateFlow(isUpnpEnabled())
+    val upnpEnabledFlow: StateFlow<Boolean> = _upnpEnabledFlow.asStateFlow()
+
     /**
      * 获取 UPnP 设备局域网广播名，默认 "PureCast TV"
      */
@@ -57,6 +63,38 @@ class SettingsRepository(context: Context) {
     }
 
     /**
+     * 检查是否启用 AirPlay 1 服务，默认 true
+     */
+    fun isAirPlayEnabled(): Boolean {
+        return prefs.getBoolean(KEY_AIRPLAY_ENABLED, true)
+    }
+
+    /**
+     * 设置并持久化 AirPlay 1 服务开关状态
+     */
+    fun setAirPlayEnabled(enabled: Boolean) {
+        Logger.service.i(TAG, "更新 AirPlay 1 服务开关状态: $enabled")
+        prefs.edit().putBoolean(KEY_AIRPLAY_ENABLED, enabled).apply()
+        _airPlayEnabledFlow.value = enabled
+    }
+
+    /**
+     * 检查是否启用 UPnP / DLNA 服务，默认 true
+     */
+    fun isUpnpEnabled(): Boolean {
+        return prefs.getBoolean(KEY_UPNP_ENABLED, true)
+    }
+
+    /**
+     * 设置并持久化 UPnP / DLNA 服务开关状态
+     */
+    fun setUpnpEnabled(enabled: Boolean) {
+        Logger.service.i(TAG, "更新 UPnP / DLNA 服务开关状态: $enabled")
+        prefs.edit().putBoolean(KEY_UPNP_ENABLED, enabled).apply()
+        _upnpEnabledFlow.value = enabled
+    }
+
+    /**
      * 检查首次启动自检向导是否已由用户完成或确认
      */
     fun isOnboardingCompleted(): Boolean {
@@ -78,6 +116,8 @@ class SettingsRepository(context: Context) {
         private const val KEY_FRIENDLY_NAME = "upnp_friendly_name"
         private const val KEY_IDLE_TIMEOUT_SECONDS = "usb_idle_timeout_seconds"
         private const val KEY_ONBOARDING_COMPLETED = "onboarding_completed"
+        private const val KEY_AIRPLAY_ENABLED = "airplay_enabled"
+        private const val KEY_UPNP_ENABLED = "upnp_enabled"
 
         const val DEFAULT_FRIENDLY_NAME = "PureCast TV"
         const val DEFAULT_IDLE_TIMEOUT = 10

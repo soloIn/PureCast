@@ -21,7 +21,6 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
@@ -40,14 +39,14 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.tv.material3.ExperimentalTvMaterial3Api
 import androidx.tv.material3.Text
-import com.solo.purecast.ui.theme.PureCastPrimary
 
 /**
  * 💡 PureCast 纤细圆角进度条与时间轴组件 (ProgressBarComponent)
  * 遵循 Apple TV 极简工业美学设计：
- * 1. 轨道高度默认为 4dp，D-Pad 获得焦点时动态平滑展开至 6dp 并点亮白色微光发光边框。
- * 2. 左侧展示当前播放时间 (mm:ss)，右侧展示总时长或实时流 "LIVE / 实时直通" 状态。
- * 3. 针对非实时流支持遥控器 D-Pad 左右键快进 / 快退 10 秒；针对实时广播流自适应禁用寻道。
+ * 1. 轨道高度默认为 4dp，D-Pad 获得焦点时动态平滑展开至 6dp 并点亮白色微光发光边框与游标。
+ * 2. 悬浮对比度保护：轨道底槽采用高透半白 [Color(0x40FFFFFF)]，填充条使用高纯亮白 [Color.White]，在任意流光背景下清晰可见。
+ * 3. 左侧展示当前播放时间 (mm:ss)，右侧展示总时长或实时流 "LIVE / 实时直通" 状态。
+ * 4. 针对非实时流支持遥控器 D-Pad 左右键快进 / 快退 10 秒；针对实时广播流自适应禁用寻道。
  */
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
@@ -57,12 +56,25 @@ fun ProgressBarComponent(
     isLiveStream: Boolean,
     onSeek: (newPositionMs: Long) -> Unit,
     modifier: Modifier = Modifier,
+    hasDarkBackground: Boolean = true,
     focusRequester: FocusRequester? = null,
     onPlayPauseClick: (() -> Unit)? = null
 ) {
     val canFocus = !isLiveStream && totalDurationMs > 0L
     val interactionSource = remember { MutableInteractionSource() }
     val isFocused by interactionSource.collectIsFocusedAsState()
+
+    // 💡 视觉对比度自适应色彩
+    val trackBgColor = if (hasDarkBackground) Color(0x40FFFFFF) else Color(0x18000000)
+    val trackBorderColor = if (hasDarkBackground) Color.White.copy(alpha = 0.6f) else Color(0x4D000000)
+    val progressFillColor = if (hasDarkBackground) Color.White else Color(0xFF1C1C1E)
+    val thumbColor = if (hasDarkBackground) Color.White else Color(0xFF1C1C1E)
+    val currentTimeColor = if (hasDarkBackground) {
+        if (isFocused && canFocus) Color.White else Color(0xEEFFFFFF)
+    } else {
+        if (isFocused && canFocus) Color(0xFF1C1C1E) else Color(0xFF3C3C43)
+    }
+    val totalTimeColor = if (hasDarkBackground) Color(0xB3FFFFFF) else Color(0xFF6E6E73)
 
     // 💡 焦点展开动画：获得焦点时轨道由 4dp 增至 6dp，带来沉浸式反馈
     val animatedHeight by animateDpAsState(
@@ -83,12 +95,12 @@ fun ProgressBarComponent(
         label = "liveDotAlpha"
     )
 
-    // 计算进度比例 (0.0f ~ 1.0f)
-    val progressFraction = if (isLiveStream || totalDurationMs <= 0L) {
-        1.0f
-    } else {
-        (currentPositionMs.toFloat() / totalDurationMs.toFloat()).coerceIn(0.0f, 1.0f)
-    }
+    // 计算进度比例 (0.0f ~ 1.0f) - 待机状态下展示 0 进度，活跃实时流展示满条
+    val progressFraction = calculateProgressFraction(
+        currentPositionMs = currentPositionMs,
+        totalDurationMs = totalDurationMs,
+        isLiveStream = isLiveStream
+    )
 
     Column(
         modifier = modifier
@@ -117,7 +129,7 @@ fun ProgressBarComponent(
                 }
                 false
             }
-            .padding(vertical = 4.dp)
+            .padding(vertical = 2.dp)
     ) {
         // 进度条轨道容器
         Box(
@@ -132,12 +144,12 @@ fun ProgressBarComponent(
                     .fillMaxWidth()
                     .height(animatedHeight)
                     .clip(RoundedCornerShape(animatedHeight / 2))
-                    .background(Color(0x33FFFFFF))
+                    .background(trackBgColor)
                     .then(
                         if (isFocused) {
                             Modifier.border(
                                 width = 1.dp,
-                                color = Color.White.copy(alpha = 0.5f),
+                                color = trackBorderColor,
                                 shape = RoundedCornerShape(animatedHeight / 2)
                             )
                         } else Modifier
@@ -150,24 +162,21 @@ fun ProgressBarComponent(
                     .fillMaxWidth(progressFraction)
                     .height(animatedHeight)
                     .clip(RoundedCornerShape(animatedHeight / 2))
-                    .background(
-                        if (isFocused) Color.White else PureCastPrimary
-                    )
+                    .background(progressFillColor)
             )
 
             // 💡 获得焦点时的进度发光游标点 (Thumb Indicator)
             if (isFocused && !isLiveStream && totalDurationMs > 0L) {
                 Box(
-                    modifier = Modifier
-                        .fillMaxWidth(progressFraction),
+                    modifier = Modifier.fillMaxWidth(progressFraction),
                     contentAlignment = Alignment.CenterEnd
                 ) {
                     Box(
                         modifier = Modifier
                             .size(12.dp)
-                            .shadow(6.dp, CircleShape, spotColor = Color.White)
+                            .shadow(6.dp, CircleShape, spotColor = thumbColor)
                             .clip(CircleShape)
-                            .background(Color.White)
+                            .background(thumbColor)
                     )
                 }
             }
@@ -181,12 +190,12 @@ fun ProgressBarComponent(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            // 左侧已播放时间：始终展示当前真实已播放时长
+            // 左侧已播放时间
             Text(
                 text = formatTimeMs(currentPositionMs),
-                fontSize = 13.sp,
+                fontSize = 12.sp,
                 fontWeight = FontWeight.Medium,
-                color = if (isFocused && canFocus) Color.White else Color(0xFFB0B0B8)
+                color = currentTimeColor
             )
 
             // 右侧总时长或实时流状态
@@ -211,9 +220,9 @@ fun ProgressBarComponent(
             } else {
                 Text(
                     text = formatTimeMs(totalDurationMs),
-                    fontSize = 13.sp,
+                    fontSize = 12.sp,
                     fontWeight = FontWeight.Medium,
-                    color = Color(0xFF8E8E93)
+                    color = totalTimeColor
                 )
             }
         }
@@ -229,4 +238,22 @@ private fun formatTimeMs(ms: Long): String {
     val minutes = totalSeconds / 60
     val seconds = totalSeconds % 60
     return "%02d:%02d".format(minutes, seconds)
+}
+
+/**
+ * 💡 纯函数：计算进度百分比 (0.0f ~ 1.0f)
+ * - 待机或未播放 (totalDurationMs <= 0L 且 currentPositionMs <= 0L)：归零为 0.0f；
+ * - 活跃实时流 (isLiveStream 为 true 且当前有推流时长/时间戳推进)：满条为 1.0f；
+ * - 普通点播流：按当前播放位置比例推进。
+ */
+internal fun calculateProgressFraction(
+    currentPositionMs: Long,
+    totalDurationMs: Long,
+    isLiveStream: Boolean
+): Float {
+    return when {
+        totalDurationMs <= 0L && currentPositionMs <= 0L -> 0.0f
+        isLiveStream || totalDurationMs <= 0L -> 1.0f
+        else -> (currentPositionMs.toFloat() / totalDurationMs.toFloat()).coerceIn(0.0f, 1.0f)
+    }
 }

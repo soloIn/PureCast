@@ -94,6 +94,15 @@ class UpnpRendererServer(
         genaNotifier.notifyTransportState("TRANSITIONING")
     }
 
+    /**
+     * 💡 主动中止当前 UPnP 解复用器与流传输
+     */
+    fun stopPlayback() {
+        Logger.upnp.i(TAG, "主动中止 UPnP 流播放")
+        demuxer?.stop()
+        notifyTransportState("STOPPED")
+    }
+
     fun start() {
         stop()
         localIpAddress = getActiveLocalIpAddress()

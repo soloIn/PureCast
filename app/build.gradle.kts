@@ -72,6 +72,10 @@ android {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
     }
+
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+    }
 }
 
 dependencies {
@@ -95,6 +99,7 @@ dependencies {
     implementation(libs.mmupnp)
     implementation(libs.ktor.client.core)
     implementation(libs.ktor.client.cio)
+    implementation(libs.jmdns)
 
     // Testing
     testImplementation(libs.junit)

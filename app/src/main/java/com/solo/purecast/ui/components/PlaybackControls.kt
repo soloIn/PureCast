@@ -2,33 +2,44 @@ package com.solo.purecast.ui.components
 
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.tv.material3.Border
-import androidx.tv.material3.Button
-import androidx.tv.material3.ButtonDefaults
+import androidx.tv.material3.ClickableSurfaceDefaults
 import androidx.tv.material3.ExperimentalTvMaterial3Api
-import androidx.tv.material3.Text
+import androidx.tv.material3.Glow
+import androidx.tv.material3.Icon
+import androidx.tv.material3.Surface
+import com.solo.purecast.R
 import com.solo.purecast.model.PlaybackStatus
-import com.solo.purecast.ui.theme.PureCastPrimary
 
 /**
- * 💡 PureCast 遥控器专属 10-Foot 交互控制条
- * 严格遵从 AGENTS.md 约束：
- * 1. 纯 androidx.tv.material3 组件体系，遥控器 D-Pad 获得焦点时触发 Scale 1.12x 浮起放大与外发光轮廓。
- * 2. 补齐「上一曲 (⏮)」、「播放/暂停 (▶/❚❚)」、「下一曲 (⏭)」、「设置 (⚙)」四组核心按键。
- * 3. 播放/暂停键绑定默认 FocusRequester，保障遥控器 OK 键直接响应与焦点自愈。
- * 4. 紧凑弹性布局，防止小尺寸或特殊分辨率下设置按钮被挤压折行。
+ * 💡 PureCast 遥控器专属播放控制栏 (PlaybackControls)
+ * 严格按照 lavande16/Apple-Music-For-Android-TV 与 Apple TV (tvOS) 原生质感重构：
+ * 1. 彻底移除沉重的白色描边 (border = None) 与外层光晕 (glow = None)；
+ * 2. 纯粹遵循 Apple 视觉反馈层级：
+ *    - 非焦点按钮：稍低亮度 (White 55% alpha)，纯平半透悬浮，优雅不喧宾夺主；
+ *    - 焦点按钮：点亮至 100% 纯白正常亮度 + 1.12x 浮起放大 + 极微弱的纯平微白磨砂底 (Color(0x22FFFFFF))；
+ * 3. 几何对称居中：SF Symbols 矢量 100% 绝对置于几何中心，消除默认 Padding 偏心；
+ * 4. 严谨标准图标：上一曲 [ic_backward_end_fill]、播放/暂停 [ic_play_fill/ic_pause_fill]、下一曲 [ic_forward_end_fill] 与设置 [ic_gear]。
  */
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
@@ -40,135 +51,128 @@ fun PlaybackControls(
     onNextClick: () -> Unit,
     onSettingsClick: () -> Unit,
     modifier: Modifier = Modifier,
+    hasDarkBackground: Boolean = true,
     playPauseFocusRequester: FocusRequester? = null
 ) {
     val isPlaying = playbackStatus == PlaybackStatus.PLAYING
 
     Row(
-        modifier = modifier.padding(top = 10.dp),
+        modifier = modifier,
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(10.dp)
+        horizontalArrangement = Arrangement.spacedBy(16.dp)
     ) {
         // 1. 上一曲按钮 (⏮)
-        Button(
-            onClick = onPreviousClick,
-            scale = ButtonDefaults.scale(
-                scale = 1.0f,
-                focusedScale = 1.10f
-            ),
-            shape = ButtonDefaults.shape(
-                shape = RoundedCornerShape(14.dp)
-            ),
-            colors = ButtonDefaults.colors(
-                containerColor = Color(0xFF262833),
-                focusedContainerColor = Color.White,
-                contentColor = Color(0xFFE5E5EA),
-                focusedContentColor = Color.Black
-            ),
-            border = ButtonDefaults.border(
-                focusedBorder = Border(border = BorderStroke(2.dp, Color.White))
-            )
-        ) {
-            Text(
-                text = "⏮ 上一曲",
-                fontSize = 13.sp,
-                fontWeight = FontWeight.Medium,
-                maxLines = 1,
-                softWrap = false,
-                modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
-            )
-        }
+        TransportIconButton(
+            iconResId = R.drawable.ic_backward_end_fill,
+            contentDescription = "上一曲",
+            buttonSize = 46.dp,
+            iconSize = 22.dp,
+            hasDarkBackground = hasDarkBackground,
+            onClick = onPreviousClick
+        )
 
-        // 2. 播放 / 暂停按钮 (▶ / ❚❚) - 绑定默认 FocusRequester
-        Button(
-            onClick = onPlayPauseClick,
-            modifier = Modifier.then(
-                if (playPauseFocusRequester != null) Modifier.focusRequester(playPauseFocusRequester) else Modifier
-            ),
-            scale = ButtonDefaults.scale(
-                scale = 1.0f,
-                focusedScale = 1.10f
-            ),
-            shape = ButtonDefaults.shape(
-                shape = RoundedCornerShape(14.dp)
-            ),
-            colors = ButtonDefaults.colors(
-                containerColor = PureCastPrimary,
-                focusedContainerColor = Color.White,
-                contentColor = Color.White,
-                focusedContentColor = Color.Black
-            ),
-            border = ButtonDefaults.border(
-                focusedBorder = Border(border = BorderStroke(2.dp, Color.White))
-            )
-        ) {
-            Text(
-                text = if (isPlaying) "❚❚ 暂停" else "▶ 播放",
-                fontSize = 14.sp,
-                fontWeight = FontWeight.SemiBold,
-                maxLines = 1,
-                softWrap = false,
-                modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp)
-            )
-        }
+        // 2. 播放 / 暂停主按钮 (▶ / ❚❚) - 绑定默认 FocusRequester
+        TransportIconButton(
+            iconResId = if (isPlaying) R.drawable.ic_pause_fill else R.drawable.ic_play_fill,
+            contentDescription = if (isPlaying) "暂停" else "播放",
+            buttonSize = 56.dp,
+            iconSize = 28.dp,
+            isCircle = true,
+            hasDarkBackground = hasDarkBackground,
+            focusRequester = playPauseFocusRequester,
+            onClick = onPlayPauseClick
+        )
 
         // 3. 下一曲按钮 (⏭)
-        Button(
-            onClick = onNextClick,
-            scale = ButtonDefaults.scale(
-                scale = 1.0f,
-                focusedScale = 1.10f
-            ),
-            shape = ButtonDefaults.shape(
-                shape = RoundedCornerShape(14.dp)
-            ),
-            colors = ButtonDefaults.colors(
-                containerColor = Color(0xFF262833),
-                focusedContainerColor = Color.White,
-                contentColor = Color(0xFFE5E5EA),
-                focusedContentColor = Color.Black
-            ),
-            border = ButtonDefaults.border(
-                focusedBorder = Border(border = BorderStroke(2.dp, Color.White))
-            )
-        ) {
-            Text(
-                text = "⏭ 下一曲",
-                fontSize = 13.sp,
-                fontWeight = FontWeight.Medium,
-                maxLines = 1,
-                softWrap = false,
-                modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
-            )
-        }
+        TransportIconButton(
+            iconResId = R.drawable.ic_forward_end_fill,
+            contentDescription = "下一曲",
+            buttonSize = 46.dp,
+            iconSize = 22.dp,
+            hasDarkBackground = hasDarkBackground,
+            onClick = onNextClick
+        )
 
-        // 4. 设置与硬件监控侧边栏按钮 (⚙)
-        Button(
-            onClick = onSettingsClick,
-            scale = ButtonDefaults.scale(
-                scale = 1.0f,
-                focusedScale = 1.10f
-            ),
-            shape = ButtonDefaults.shape(
-                shape = RoundedCornerShape(14.dp)
-            ),
-            colors = ButtonDefaults.colors(
-                containerColor = Color(0xFF262833),
-                focusedContainerColor = Color.White,
-                contentColor = Color(0xFFE5E5EA),
-                focusedContentColor = Color.Black
-            ),
-            border = ButtonDefaults.border(
-                focusedBorder = Border(border = BorderStroke(2.dp, Color.White))
-            )
+        // 4. 系统与硬件设置按钮 (⚙)
+        TransportIconButton(
+            iconResId = R.drawable.ic_gear,
+            contentDescription = "设置",
+            buttonSize = 46.dp,
+            iconSize = 22.dp,
+            hasDarkBackground = hasDarkBackground,
+            onClick = onSettingsClick
+        )
+    }
+}
+
+/**
+ * 💡 Apple TV 极简通透媒体按键 (TransportIconButton)
+ * 采用 Surface + Box(fillMaxSize, Alignment.Center)：
+ * - 去除任何厚重描边与发光轮廓；
+ * - 焦点态：1.12x 放大 + 柔和通透底色；
+ * - 自适应深/浅背景：有彩色流光或深色待机时为亮白，浅色待机时为纯净深黑。
+ */
+@OptIn(ExperimentalTvMaterial3Api::class)
+@Composable
+private fun TransportIconButton(
+    iconResId: Int,
+    contentDescription: String,
+    buttonSize: Dp,
+    iconSize: Dp,
+    isCircle: Boolean = false,
+    hasDarkBackground: Boolean = true,
+    focusRequester: FocusRequester? = null,
+    onClick: () -> Unit
+) {
+    var isFocused by remember { mutableStateOf(false) }
+    val shape = if (isCircle) CircleShape else RoundedCornerShape(12.dp)
+    val noBorder = Border(BorderStroke(0.dp, Color.Transparent))
+
+    val focusedContainerColor = if (hasDarkBackground) Color(0x22FFFFFF) else Color(0x18000000)
+    val pressedContainerColor = if (hasDarkBackground) Color(0x3DFFFFFF) else Color(0x26000000)
+    val iconColor = if (hasDarkBackground) {
+        if (isFocused) Color.White else Color.White.copy(alpha = 0.55f)
+    } else {
+        if (isFocused) Color(0xFF1C1C1E) else Color(0xFF1C1C1E).copy(alpha = 0.55f)
+    }
+
+    Surface(
+        onClick = onClick,
+        modifier = Modifier
+            .size(buttonSize)
+            .then(if (focusRequester != null) Modifier.focusRequester(focusRequester) else Modifier)
+            .onFocusChanged { isFocused = it.isFocused },
+        shape = ClickableSurfaceDefaults.shape(shape),
+        scale = ClickableSurfaceDefaults.scale(
+            scale = 1.0f,
+            focusedScale = 1.12f,
+            pressedScale = 1.05f
+        ),
+        colors = ClickableSurfaceDefaults.colors(
+            containerColor = Color.Transparent,
+            focusedContainerColor = focusedContainerColor,
+            pressedContainerColor = pressedContainerColor
+        ),
+        border = ClickableSurfaceDefaults.border(
+            border = noBorder,
+            focusedBorder = noBorder
+        ),
+        glow = ClickableSurfaceDefaults.glow(
+            glow = Glow.None,
+            focusedGlow = Glow.None,
+            pressedGlow = Glow.None
+        )
+    ) {
+        // 💡 100% 绝对置于几何中心，杜绝任何 Padding 偏心
+        Box(
+            modifier = Modifier.fillMaxSize(),
+            contentAlignment = Alignment.Center
         ) {
-            Text(
-                text = "⚙ 设置",
-                fontSize = 13.sp,
-                fontWeight = FontWeight.Medium,
-                maxLines = 1,
-                softWrap = false,
-                modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
+            Icon(
+                painter = painterResource(id = iconResId),
+                contentDescription = contentDescription,
+                tint = iconColor,
+                modifier = Modifier.size(iconSize)
             )
         }
     }

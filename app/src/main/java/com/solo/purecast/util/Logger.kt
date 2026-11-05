@@ -37,6 +37,7 @@ object Logger {
     val usb = Category("USB")
     val audio = Category("Audio")
     val upnp = Category("UPnP")
+    val airplay = Category("AirPlay")
     val service = Category("Service")
     val ui = Category("UI")
 }

@@ -26,9 +26,14 @@ import com.solo.purecast.model.PlaybackStatus
 import com.solo.purecast.model.TrackMetadata
 import com.solo.purecast.ui.MainActivity
 import com.solo.purecast.util.Logger
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 
 /**
  * 💡 PureCast 核心播放前台服务
@@ -46,6 +51,16 @@ class PlaybackService : LifecycleService() {
     private lateinit var audioFocusManager: AudioFocusManager
     private lateinit var settingsRepository: SettingsRepository
     private var upnpServer: com.solo.purecast.upnp.UpnpRendererServer? = null
+    var airPlayServer: com.solo.purecast.airplay.AirPlayServerManager? = null
+        private set
+
+    enum class StreamSource {
+        IDLE,
+        UPNP,
+        AIRPLAY
+    }
+
+    private var currentStreamSource = StreamSource.IDLE
 
     private var multicastLock: WifiManager.MulticastLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
@@ -53,6 +68,11 @@ class PlaybackService : LifecycleService() {
 
     // 💡 系统级 MediaSession 会话管理器
     private var mediaSession: MediaSession? = null
+
+    // 💡 AirPlay 进度平滑推进器 (基于单调时钟推算，补偿 iOS 连续播放时不发 RTSP progress 的特性)
+    private var airPlayProgressJob: kotlinx.coroutines.Job? = null
+    private var airPlayAnchorRealtimeMs: Long = 0L
+    private var airPlayBasePositionMs: Long = 0L
 
     override fun onCreate() {
         super.onCreate()
@@ -91,12 +111,36 @@ class PlaybackService : LifecycleService() {
 
         // 💡 启动 UPnP / DLNA MediaRenderer 服务端 (采用用户持久化的 friendlyName)
         val friendlyName = settingsRepository.getFriendlyName()
-        upnpServer = com.solo.purecast.upnp.UpnpRendererServer(
+        if (settingsRepository.isUpnpEnabled()) {
+            upnpServer = com.solo.purecast.upnp.UpnpRendererServer(
+                scope = lifecycleScope,
+                playbackService = this,
+                friendlyName = friendlyName
+            ).apply {
+                start()
+            }
+        }
+
+        // 💡 启动原生 AirPlay 1 (RAOP) 接收服务端 (若配置开启)
+        airPlayServer = com.solo.purecast.airplay.AirPlayServerManager(
+            context = this,
             scope = lifecycleScope,
-            playbackService = this,
-            friendlyName = friendlyName
-        ).apply {
-            start()
+            onStreamRequestedListener = { sampleRate, bitDepth, channels, clientIp, dacpPort, token ->
+                onAirPlayStreamRequested(sampleRate, bitDepth, channels, clientIp, dacpPort, token)
+            },
+            onStreamStoppedListener = {
+                onAirPlayStreamStopped()
+            },
+            onMetadataReceivedListener = { title, artist, album, durationMs, coverArt ->
+                onAirPlayMetadataReceived(title, artist, album, durationMs, coverArt)
+            },
+            onProgressUpdatedListener = { positionMs, durationMs ->
+                onAirPlayProgressUpdated(positionMs, durationMs)
+            }
+        )
+
+        if (settingsRepository.isAirPlayEnabled()) {
+            airPlayServer?.start(friendlyName)
         }
     }
 
@@ -109,30 +153,47 @@ class PlaybackService : LifecycleService() {
                 setCallback(object : MediaSession.Callback() {
                     override fun onPlay() {
                         Logger.service.i(TAG, "MediaSession 收到 onPlay 回调")
+                        if (currentStreamSource == StreamSource.AIRPLAY) {
+                            airPlayServer?.dacpClient?.play()
+                        }
                         resumePlayback()
                         upnpServer?.genaNotifier?.notifyTransportState("PLAYING")
                     }
 
                     override fun onPause() {
                         Logger.service.i(TAG, "MediaSession 收到 onPause 回调")
+                        if (currentStreamSource == StreamSource.AIRPLAY) {
+                            airPlayServer?.dacpClient?.pause()
+                        }
                         pausePlayback()
                         upnpServer?.genaNotifier?.notifyTransportState("PAUSED_PLAYBACK")
                     }
 
                     override fun onStop() {
                         Logger.service.i(TAG, "MediaSession 收到 onStop 回调")
+                        if (currentStreamSource == StreamSource.AIRPLAY) {
+                            airPlayServer?.dacpClient?.stop()
+                        }
                         stopPlayback()
                         upnpServer?.genaNotifier?.notifyTransportState("STOPPED")
                     }
 
                     override fun onSkipToNext() {
                         Logger.service.i(TAG, "MediaSession 收到 onSkipToNext 回调")
-                        handleNextTrack()
+                        if (currentStreamSource == StreamSource.AIRPLAY) {
+                            airPlayServer?.dacpClient?.next()
+                        } else {
+                            handleNextTrack()
+                        }
                     }
 
                     override fun onSkipToPrevious() {
                         Logger.service.i(TAG, "MediaSession 收到 onSkipToPrevious 回调")
-                        handlePreviousTrack()
+                        if (currentStreamSource == StreamSource.AIRPLAY) {
+                            airPlayServer?.dacpClient?.previous()
+                        } else {
+                            handlePreviousTrack()
+                        }
                     }
 
                     override fun onSeekTo(pos: Long) {
@@ -175,7 +236,10 @@ class PlaybackService : LifecycleService() {
             baseActions or PlaybackState.ACTION_SEEK_TO
         }
 
-        val currentPosMs = (upnpServer?.getCurrentPlayPositionSeconds() ?: 0L) * 1000L
+        val currentPosMs = when (currentStreamSource) {
+            StreamSource.AIRPLAY -> _playbackPositionMs.value
+            else -> (upnpServer?.getCurrentPlayPositionSeconds() ?: 0L) * 1000L
+        }
         val playbackSpeed = if (status == PlaybackStatus.PLAYING) 1.0f else 0.0f
 
         val playbackState = PlaybackState.Builder()
@@ -331,20 +395,155 @@ class PlaybackService : LifecycleService() {
         NativeAudioEngine.resumeStream()
 
         _playbackStatus.value = PlaybackStatus.PLAYING
+        val currentProto = if (currentStreamSource == StreamSource.AIRPLAY) {
+            com.solo.purecast.model.StreamProtocol.AIRPLAY_1
+        } else {
+            com.solo.purecast.model.StreamProtocol.UPNP_DLNA
+        }
         _audioPathState.value = _audioPathState.value.copy(
             isExclusive = true,
             sampleRate = sampleRate,
             bitDepth = bitDepth,
-            channels = channels
+            channels = channels,
+            protocol = currentProto
         )
+
+        // 💡 若为 AirPlay 会话，启动单调时钟平滑进度推进器
+        if (currentStreamSource == StreamSource.AIRPLAY) {
+            airPlayBasePositionMs = 0L
+            airPlayAnchorRealtimeMs = android.os.SystemClock.elapsedRealtime()
+            launchAirPlayProgressTicker()
+        }
 
         updateMediaSessionState()
         updateNotification()
         return true
     }
 
+    /**
+     * 💡 原生 AirPlay 1 推流请求事件 (SETUP 触发)
+     */
+    private fun onAirPlayStreamRequested(
+        sampleRate: Int,
+        bitDepth: Int,
+        channels: Int,
+        clientIp: String,
+        dacpPort: Int,
+        token: String
+    ): Boolean {
+        Logger.service.i(TAG, "处理 AirPlay 推流请求 (后发抢占): client=$clientIp")
+
+        // 💡 后发抢占：若当前正在运行 UPnP 流，立即优雅中止旧流
+        if (currentStreamSource == StreamSource.UPNP) {
+            Logger.service.i(TAG, "AirPlay 新流到达，执行后发抢占中止旧 UPnP 流")
+            upnpServer?.stopPlayback()
+            upnpServer?.notifyTransportState("STOPPED")
+        }
+
+        currentStreamSource = StreamSource.AIRPLAY
+        val started = startStreaming(sampleRate, bitDepth, channels)
+        if (!started) {
+            currentStreamSource = StreamSource.IDLE
+        }
+        return started
+    }
+
+    /**
+     * 💡 原生 AirPlay 1 推流停止事件 (TEARDOWN 触发)
+     */
+    private fun onAirPlayStreamStopped() {
+        if (currentStreamSource == StreamSource.AIRPLAY) {
+            Logger.service.i(TAG, "AirPlay 会话结束，停止播放")
+            currentStreamSource = StreamSource.IDLE
+            stopPlayback()
+            _audioPathState.value = _audioPathState.value.copy(
+                protocol = com.solo.purecast.model.StreamProtocol.NONE
+            )
+        }
+    }
+
+    /**
+     * 💡 原生 AirPlay 1 DMAP 元数据更新事件 (SET_PARAMETER 触发)
+     * 支持多包增量合并 (Smart Merge)，杜绝后序元数据包将封面或歌名相互覆盖冲刷
+     */
+    private fun onAirPlayMetadataReceived(
+        title: String,
+        artist: String,
+        album: String,
+        durationMs: Long,
+        coverArt: ByteArray?
+    ) {
+        val current = _currentMetadata.value
+        val mergedTitle = when {
+            title.isNotEmpty() -> title
+            current.title.isNotEmpty() && current.title != "AirPlay 音频直通" -> current.title
+            else -> "AirPlay 音频直通"
+        }
+        val mergedArtist = when {
+            artist.isNotEmpty() -> artist
+            current.artist.isNotEmpty() && current.artist != "AirPlay 设备" -> current.artist
+            else -> "AirPlay 设备"
+        }
+        val mergedAlbum = if (album.isNotEmpty()) album else current.album
+        val mergedCover = if (coverArt != null && coverArt.isNotEmpty()) coverArt else current.coverBytes
+        val mergedDuration = if (durationMs > 0) durationMs else current.durationMs
+
+        val meta = TrackMetadata(
+            title = mergedTitle,
+            artist = mergedArtist,
+            album = mergedAlbum,
+            coverBytes = mergedCover,
+            durationMs = mergedDuration,
+            isLiveStream = (mergedDuration <= 0)
+        )
+        updateMetadata(meta)
+    }
+
+    /**
+     * 💡 原生 AirPlay 1 播放进度与总时长更新 (SET_PARAMETER progress: start/curr/end 触发)
+     */
+    private fun onAirPlayProgressUpdated(positionMs: Long, durationMs: Long) {
+        val current = _currentMetadata.value
+        if (durationMs > 0 && current.durationMs != durationMs) {
+            val updated = current.copy(durationMs = durationMs, isLiveStream = false)
+            updateMetadata(updated)
+        }
+        startOrUpdateAirPlayProgress(positionMs, durationMs)
+        updateMediaSessionState()
+    }
+
+    private fun startOrUpdateAirPlayProgress(positionMs: Long, durationMs: Long) {
+        airPlayBasePositionMs = positionMs
+        airPlayAnchorRealtimeMs = android.os.SystemClock.elapsedRealtime()
+        _playbackPositionMs.value = positionMs
+
+        if (_playbackStatus.value == PlaybackStatus.PLAYING && currentStreamSource == StreamSource.AIRPLAY) {
+            launchAirPlayProgressTicker()
+        }
+    }
+
+    private fun launchAirPlayProgressTicker() {
+        airPlayProgressJob?.cancel()
+        airPlayProgressJob = lifecycleScope.launch(Dispatchers.Default) {
+            while (isActive && _playbackStatus.value == PlaybackStatus.PLAYING && currentStreamSource == StreamSource.AIRPLAY) {
+                delay(500)
+                val elapsed = android.os.SystemClock.elapsedRealtime() - airPlayAnchorRealtimeMs
+                val duration = _currentMetadata.value.durationMs
+                var calculatedPos = airPlayBasePositionMs + elapsed
+                if (duration > 0 && calculatedPos > duration) {
+                    calculatedPos = duration
+                }
+                _playbackPositionMs.value = calculatedPos
+            }
+        }
+    }
+
     fun pausePlayback() {
         Logger.service.i(TAG, "暂停音频播放...")
+        airPlayProgressJob?.cancel()
+        airPlayProgressJob = null
+        airPlayBasePositionMs = _playbackPositionMs.value
+
         NativeAudioEngine.pauseStream()
         _playbackStatus.value = PlaybackStatus.PAUSED
         releaseWifiLowLatencyLock()
@@ -364,6 +563,12 @@ class PlaybackService : LifecycleService() {
         }
         NativeAudioEngine.resumeStream()
         _playbackStatus.value = PlaybackStatus.PLAYING
+
+        if (currentStreamSource == StreamSource.AIRPLAY) {
+            airPlayAnchorRealtimeMs = android.os.SystemClock.elapsedRealtime()
+            launchAirPlayProgressTicker()
+        }
+
         upnpServer?.notifyTransportState("PLAYING")
         updateMediaSessionState()
         updateNotification()
@@ -371,6 +576,11 @@ class PlaybackService : LifecycleService() {
 
     fun stopPlayback() {
         Logger.service.i(TAG, "停止音频播放...")
+        airPlayProgressJob?.cancel()
+        airPlayProgressJob = null
+        airPlayBasePositionMs = 0L
+        airPlayAnchorRealtimeMs = 0L
+
         NativeAudioEngine.stopStream()
         _playbackStatus.value = PlaybackStatus.STOPPED
         _playbackPositionMs.value = 0L
@@ -407,11 +617,45 @@ class PlaybackService : LifecycleService() {
     }
 
     /**
-     * 💡 更新 UPnP 友好广播名称并即时通知 SSDP 重启
+     * 💡 更新 UPnP 与 AirPlay 局域网广播名称并即时通知服务更新
      */
     fun updateFriendlyName(newName: String) {
         settingsRepository.setFriendlyName(newName)
         upnpServer?.updateFriendlyName(newName)
+        airPlayServer?.updateDeviceName(newName)
+    }
+
+    /**
+     * 💡 动态开启或关闭原生 AirPlay 1 服务
+     */
+    fun setAirPlayEnabled(enabled: Boolean) {
+        settingsRepository.setAirPlayEnabled(enabled)
+        if (enabled) {
+            val name = settingsRepository.getFriendlyName()
+            airPlayServer?.start(name)
+        } else {
+            airPlayServer?.stop()
+        }
+    }
+
+    /**
+     * 💡 动态开启或关闭 UPnP / DLNA 服务
+     */
+    fun setUpnpEnabled(enabled: Boolean) {
+        settingsRepository.setUpnpEnabled(enabled)
+        if (enabled) {
+            val name = settingsRepository.getFriendlyName()
+            if (upnpServer == null) {
+                upnpServer = com.solo.purecast.upnp.UpnpRendererServer(
+                    scope = lifecycleScope,
+                    playbackService = this,
+                    friendlyName = name
+                )
+            }
+            upnpServer?.start()
+        } else {
+            upnpServer?.stop()
+        }
     }
 
     fun setIdleTimeoutSeconds(seconds: Int) {
@@ -500,6 +744,8 @@ class PlaybackService : LifecycleService() {
     override fun onDestroy() {
         Logger.service.i(TAG, "PlaybackService onDestroy: 彻底清理服务...")
         instance = null
+        airPlayProgressJob?.cancel()
+        airPlayProgressJob = null
         mediaSession?.apply {
             isActive = false
             release()
@@ -507,6 +753,8 @@ class PlaybackService : LifecycleService() {
         mediaSession = null
         upnpServer?.stop()
         upnpServer = null
+        airPlayServer?.stop()
+        airPlayServer = null
         releaseWifiLowLatencyLock()
         releaseSystemLocks()
         audioFocusManager.abandonFocus()

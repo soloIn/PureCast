@@ -658,12 +658,12 @@ void AudioEngine::fill_isoc_transfer(struct libusb_transfer* transfer) {
     // 💡 动态根据输入位深确定单采样字节数 (16-bit: 2 bytes, 24-bit: 3 bytes)
     const size_t input_bytes_per_sample = (current_bit_depth_ > 0) ? static_cast<size_t>(current_bit_depth_ / 8) : 2;
 
-    // 💡 预留预充缓冲区门限 (50ms) 避免网络抖动微下溢
-    const size_t pre_roll_threshold = (current_sample_rate_ * current_channels_ * input_bytes_per_sample) / 20;
+    // 💡 预留预充缓冲区门限 (100ms) 彻底避免网络抖动微下溢
+    const size_t pre_roll_threshold = (current_sample_rate_ * current_channels_ * input_bytes_per_sample) / 10;
     if (!has_pre_rolled_.load(std::memory_order_relaxed)) {
         if (ring_buffer_ && ring_buffer_->available_read() >= pre_roll_threshold) {
             has_pre_rolled_.store(true, std::memory_order_release);
-            LOGI("环形缓冲区预充就绪 (已缓冲 >= 50ms PCM)，开启平滑输出");
+            LOGI("环形缓冲区预充就绪 (已缓冲 >= 100ms PCM: %zu 字节)，开启平滑输出", ring_buffer_->available_read());
         }
     }
     const bool ready_to_play = has_pre_rolled_.load(std::memory_order_relaxed);
@@ -715,6 +715,15 @@ void AudioEngine::fill_isoc_transfer(struct libusb_transfer* transfer) {
         } else if (paused || !ready_to_play || !ring_buffer_ || ring_buffer_->available_read() < raw_input_bytes) {
             // 💡 暂停、预充中或下溢时填充静音帧，保持等时时钟锁相不丢步
             std::memset(pkt_buf, 0, target_pkt_bytes);
+            if (ready_to_play && ring_buffer_ && ring_buffer_->available_read() < raw_input_bytes) {
+                // 💡 发生下溢！立即重置预充标志，进入 100ms 重新蓄水，杜绝微下溢恶性方波振荡！
+                has_pre_rolled_.store(false, std::memory_order_release);
+                static int underrun_log_count = 0;
+                if (underrun_log_count++ % 500 == 0) {
+                    LOGW("环形缓冲区发生下溢 (Underrun)，重新进入 100ms 预充保护 (当前剩余: %zu 字节)",
+                         ring_buffer_->available_read());
+                }
+            }
         } else {
             temp_pcm_in.resize(raw_input_bytes);
             // 从无锁环形缓冲区读取纯 PCM 数据
@@ -755,6 +764,13 @@ void AudioEngine::process_isoc_transfer(struct libusb_transfer* transfer) {
         transfer->status == LIBUSB_TRANSFER_NO_DEVICE) {
         active_transfers_.fetch_sub(1, std::memory_order_acq_rel);
         return;
+    }
+
+    if (transfer->status != LIBUSB_TRANSFER_COMPLETED) {
+        static int transfer_err_count = 0;
+        if (transfer_err_count++ % 100 == 0) {
+            LOGW("等时传输 URB 状态异常: status=%d", transfer->status);
+        }
     }
 
     fill_isoc_transfer(transfer);
@@ -854,8 +870,17 @@ void AudioEngine::process_feedback_transfer(struct libusb_transfer* transfer) {
 }
 
 int AudioEngine::write_pcm(const uint8_t* data, size_t size) {
-    if (!ring_buffer_ || !is_running_.load(std::memory_order_relaxed)) {
+    if (!ring_buffer_ || !is_running_.load(std::memory_order_relaxed) || !data || size == 0) {
         return -1;
+    }
+    const size_t available = ring_buffer_->available_write();
+    // 💡 保护原则：剩余空间不足以写入整包时执行整包丢弃 (Drop Whole Packet)，绝不截断半帧拼接破坏连续声波
+    if (available < size) {
+        static int overrun_log = 0;
+        if (overrun_log++ % 100 == 0) {
+            LOGW("环形缓冲区高水位饱和 (可用: %zu < 需求: %zu)，整包丢弃以消除波形断裂爆音", available, size);
+        }
+        return 0;
     }
     return static_cast<int>(ring_buffer_->write(data, size));
 }
@@ -882,6 +907,17 @@ int AudioEngine::stop_stream() {
     }
     is_paused_.store(true, std::memory_order_release);
     return 0;
+}
+
+void AudioEngine::flush_buffer() {
+    std::lock_guard<std::recursive_mutex> lock(op_mutex_);
+    LOGI("AudioEngine 刷新环形缓冲区并重置预充门限 (FLUSH/Seek)");
+    if (ring_buffer_) {
+        ring_buffer_->clear();
+    }
+    has_pre_rolled_.store(false, std::memory_order_release);
+    phase_accumulator_ = 0;
+    bresenham_accum_ = 0;
 }
 
 int AudioEngine::release_device() {

@@ -1,16 +1,11 @@
 package com.solo.purecast.ui.screen
 
-import android.graphics.drawable.BitmapDrawable
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
-import androidx.compose.animation.core.tween
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
-import androidx.compose.foundation.basicMarquee
 import androidx.compose.foundation.border
+import androidx.compose.foundation.basicMarquee
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -41,8 +36,6 @@ import androidx.compose.ui.draw.scale
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.toArgb
-import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
@@ -50,13 +43,10 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.palette.graphics.Palette
 import androidx.tv.material3.ExperimentalTvMaterial3Api
 import androidx.tv.material3.Text
 import coil.compose.SubcomposeAsyncImage
-import coil.imageLoader
 import coil.request.ImageRequest
-import coil.request.SuccessResult
 import com.solo.purecast.data.SettingsRepository
 import com.solo.purecast.model.PlaybackStatus
 import com.solo.purecast.service.PlaybackService
@@ -64,24 +54,22 @@ import com.solo.purecast.ui.components.FluidBackground
 import com.solo.purecast.ui.components.PlaybackControls
 import com.solo.purecast.ui.components.ProgressBarComponent
 import com.solo.purecast.ui.components.SignalPathPill
-import com.solo.purecast.ui.theme.PureCastPrimary
+import com.solo.purecast.ui.theme.AppPalette
 import com.solo.purecast.util.Logger
 import com.solo.purecast.util.PermissionHelper
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.withContext
 import kotlin.math.sin
 
 /**
  * 💡 PureCast 大屏主界面 (MainTvScreen)
- * 严格遵循 Apple TV (tvOS) 极简工业美学与 10-Foot 遥控器大屏交互规范：
- * 1. 42% / 58% 黄金比例布局：左侧呈现 24dp 浮动圆角高清网络封面与弹簧缩放；右侧居中展示排版信息与控制项。
- * 2. Coil + Palette 动态流光背景：异步加载网络封面，并在后台提取主次色板无缝驱动流体背景，无封面优雅降级深邃夜空灰。
- * 3. 歌曲标题平滑跑马灯：通过 Modifier.basicMarquee() 保证超长标题永不截断。
- * 4. 纤细圆角进度条：支持 D-Pad 上下键聚焦、左右键步进快进/快退 10 秒；实时流显示 "LIVE / 实时直通" 并禁用寻道。
- * 5. 防烧屏双重防护引擎：
- *    - 微像素正弦平移 (Pixel Shift): 每 10 秒平滑微移 2~3 像素。
- *    - 3 分钟无操作控制栏自动淡出，按任意方向键即刻唤醒。
+ * 严格按照 Apple TV (tvOS) 原生设计与 lavande16/Apple-Music-For-Android-TV 实现：
+ * 1. 彻底去除人造 Dock 外框，恢复通透、纯净、无界面的自然呼吸感；
+ * 2. 文字与控件“悬浮”于背景之上：
+ *    - 纯白标题 (Color.White) 与柔和半透白副标题 (Color.White.copy(alpha = 0.70f))；
+ *    - 进度条与播放按钮直接通透漂浮，没有任何生硬的底色补丁；
+ *    - 背景层覆盖柔和的高透保护遮罩，杜绝任何背景高亮对文字的对比度污染；
+ * 3. 控制栏与进度条常驻显示，永不自动淡出；
+ * 4. 42% / 58% Apple TV 黄金比例布局 + OLED 微像素平移保护。
  */
 @OptIn(ExperimentalTvMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
@@ -89,7 +77,7 @@ fun MainTvScreen(
     onTogglePlayPause: () -> Unit,
     onPreviousTrack: () -> Unit,
     onNextTrack: () -> Unit,
-    menuKeyTrigger: Long = 0L,
+    onOpenSettings: () -> Unit,
     userInteractionTrigger: Long = 0L,
     modifier: Modifier = Modifier
 ) {
@@ -98,25 +86,14 @@ fun MainTvScreen(
     val audioPathState by PlaybackService.audioPathState.collectAsState()
     val serverError by PlaybackService.serverError.collectAsState()
 
-    var showDrawer by remember { mutableStateOf(false) }
     val playPauseFocusRequester = remember { FocusRequester() }
 
-    // 💡 遥控器 MENU 键响应：呼出/收起侧边栏
-    LaunchedEffect(menuKeyTrigger) {
-        if (menuKeyTrigger > 0L) {
-            showDrawer = !showDrawer
-        }
-    }
-
     // ==========================================
-    // 1. 防烧屏引擎: 微像素平移 + 3分钟自动淡出控制栏
+    // 1. OLED 防烧屏引擎: 微像素正弦平移 (每 10 秒平滑微移 2~3 像素)
     // ==========================================
     var pixelShiftX by remember { mutableFloatStateOf(0f) }
     var pixelShiftY by remember { mutableFloatStateOf(0f) }
-    var lastInteractionTimestamp by remember { mutableLongStateOf(System.currentTimeMillis()) }
-    var isControlsVisible by remember { mutableStateOf(true) }
 
-    // 10 秒周期性正弦微移，有效保护 OLED / LCD 电视屏幕
     LaunchedEffect(Unit) {
         var tick = 0.0
         while (true) {
@@ -127,75 +104,52 @@ fun MainTvScreen(
         }
     }
 
-    // 响应 Activity 全局按键分发：重置倒计时并即时唤醒控制栏
-    LaunchedEffect(userInteractionTrigger) {
-        if (userInteractionTrigger > 0L) {
-            lastInteractionTimestamp = System.currentTimeMillis()
-            if (!isControlsVisible) {
-                isControlsVisible = true
-            }
-        }
-    }
-
-    // 3 分钟无操作自动淡出控制栏检查
-    LaunchedEffect(playbackStatus) {
-        while (true) {
-            delay(2000)
-            if (playbackStatus == PlaybackStatus.PLAYING) {
-                val elapsed = System.currentTimeMillis() - lastInteractionTimestamp
-                if (elapsed >= 180_000L && isControlsVisible) {
-                    isControlsVisible = false
-                }
-            } else {
-                if (!isControlsVisible) {
-                    isControlsVisible = true
-                }
-            }
-        }
-    }
-
-    // 💡 控制栏显现或抽屉关闭时自动将遥控器焦点恢复至播放/暂停按钮
-    LaunchedEffect(isControlsVisible, showDrawer) {
-        if (isControlsVisible && !showDrawer) {
-            delay(150)
-            try {
-                playPauseFocusRequester.requestFocus()
-            } catch (e: Exception) {
-                // ignore
-            }
-        }
+    // 💡 页面初次进入时自动请求焦点至播放/暂停按钮
+    LaunchedEffect(Unit) {
+        delay(200)
+        try {
+            playPauseFocusRequester.requestFocus()
+        } catch (_: Exception) {}
     }
 
     // ==========================================
-    // 2. Coil + Palette 动态流光背景提取
+    // 2. 封面与着色器动态流光背景
     // ==========================================
-    val (palettePrimary, paletteSecondary) = rememberPaletteFromUri(metadata.coverUri)
+    val coverData: Any? = metadata.coverBytes ?: metadata.coverUri
+    val isPlaying = playbackStatus == PlaybackStatus.PLAYING
+    val hasActiveCover = coverData != null
+    // 💡 视觉上下文：推流时始终为动态彩色暗场，待机时完整自适应深/浅色模式
+    val hasDarkBackground = hasActiveCover || AppPalette.isDark
 
     // 封面放大弹簧动画
-    val isPlaying = playbackStatus == PlaybackStatus.PLAYING
     val coverScale by animateFloatAsState(
         targetValue = if (isPlaying) 1.0f else 0.94f,
-        animationSpec = spring(dampingRatio = 0.8f, stiffness = 300f),
-        label = "coverScale"
+        animationSpec = spring(
+            dampingRatio = 0.8f,
+            stiffness = 300f
+        ),
+        label = "coverScaleAnim"
     )
 
     Box(
         modifier = modifier
             .fillMaxSize()
-            .onPreviewKeyEvent {
-                // 💡 界面内任意遥控器按键事件触发时即刻唤醒控制栏并重置防烧屏倒计时
-                lastInteractionTimestamp = System.currentTimeMillis()
-                if (!isControlsVisible) {
-                    isControlsVisible = true
-                }
-                false
-            }
+            .background(AppPalette.background)
     ) {
-        // 1. 流光动态背景 (结合 Palette 色调与 API 31+ 硬件模糊 / API 30 StackBlur)
+        // 1. GLES2 材质网格动态流光背景 (无推流时 MacBackground 优雅呈现自适应纯净背景)
         FluidBackground(
-            primaryColor = palettePrimary,
-            secondaryColor = paletteSecondary
+            coverData = coverData,
+            isPlaying = isPlaying
         )
+
+        // 💡 柔和暗化层：仅在推流播放动态流光背景时启用，防止高饱和流光吞没文字；待机时关闭以呈现原汁原味的深/浅主题
+        if (hasActiveCover) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black.copy(alpha = 0.22f))
+            )
+        }
 
         // 2. 主体 42% / 58% Apple TV 黄金比例布局
         Row(
@@ -205,53 +159,78 @@ fun MainTvScreen(
                 .padding(horizontal = 72.dp, vertical = 48.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            // 左侧 38% 封面区
+            // 左侧 42% 封面区
             Box(
                 modifier = Modifier
-                    .weight(0.38f)
+                    .weight(0.42f)
                     .fillMaxHeight(),
                 contentAlignment = Alignment.Center
             ) {
+                val coverShape = RoundedCornerShape(16.dp)
                 Box(
                     modifier = Modifier
-                        .fillMaxWidth(0.85f)
+                        .fillMaxWidth(0.88f)
                         .aspectRatio(1f)
                         .scale(coverScale)
-                        .shadow(32.dp, RoundedCornerShape(24.dp), spotColor = Color(0x66000000))
-                        .clip(RoundedCornerShape(24.dp))
-                        .background(Color(0xFF1E202B))
-                        .border(1.dp, Color(0xFF32364A), RoundedCornerShape(24.dp)),
+                        .shadow(
+                            elevation = 28.dp,
+                            shape = coverShape,
+                            spotColor = if (hasDarkBackground) Color(0x80000000) else Color(0x20000000)
+                        )
+                        .clip(coverShape)
+                        .background(if (hasDarkBackground) Color(0xFF161822) else Color.White)
+                        .then(
+                            if (!hasDarkBackground) {
+                                Modifier.border(1.dp, Color(0xFFE5E5EA), coverShape)
+                            } else Modifier
+                        ),
                     contentAlignment = Alignment.Center
                 ) {
-                    // 💡 Coil 异步加载高清网络封面，仅允许合法 http/https 协议以防异常 scheme 导致崩溃
-                    val cover = metadata.coverUri
-                    val isSafeCoverUri = !cover.isNullOrEmpty() &&
-                            (cover.startsWith("http://", ignoreCase = true) || cover.startsWith("https://", ignoreCase = true))
+                    val uri = metadata.coverUri
+                    val hasValidCover = metadata.coverBytes != null ||
+                            (!uri.isNullOrEmpty() &&
+                                    (uri.startsWith("http://", ignoreCase = true) || uri.startsWith("https://", ignoreCase = true)))
 
-                    if (isSafeCoverUri) {
+                    if (hasValidCover && coverData != null) {
                         SubcomposeAsyncImage(
                             model = ImageRequest.Builder(LocalContext.current)
-                                .data(cover)
+                                .data(coverData)
                                 .crossfade(true)
                                 .build(),
                             contentDescription = "Album Cover",
                             contentScale = ContentScale.Crop,
                             modifier = Modifier.fillMaxSize(),
-                            loading = { DefaultCoverCard(isPlaying = isPlaying, album = metadata.album) },
-                            error = { DefaultCoverCard(isPlaying = isPlaying, album = metadata.album) }
+                            loading = {
+                                DefaultCoverCard(
+                                    isPlaying = isPlaying,
+                                    album = metadata.album,
+                                    hasDarkBackground = hasDarkBackground
+                                )
+                            },
+                            error = {
+                                DefaultCoverCard(
+                                    isPlaying = isPlaying,
+                                    album = metadata.album,
+                                    hasDarkBackground = hasDarkBackground
+                                )
+                            }
                         )
                     } else {
-                        DefaultCoverCard(isPlaying = isPlaying, album = metadata.album)
+                        DefaultCoverCard(
+                            isPlaying = isPlaying,
+                            album = metadata.album,
+                            hasDarkBackground = hasDarkBackground
+                        )
                     }
                 }
             }
 
-            Spacer(modifier = Modifier.width(36.dp))
+            Spacer(modifier = Modifier.width(48.dp))
 
-            // 右侧 62% 控制与元数据区
+            // 右侧 58% 控制与元数据区 (直接通透悬浮于背景之上，无任何死板 Dock)
             Column(
                 modifier = Modifier
-                    .weight(0.62f)
+                    .weight(0.58f)
                     .fillMaxHeight(),
                 verticalArrangement = Arrangement.Center
             ) {
@@ -273,23 +252,22 @@ fun MainTvScreen(
                     }
                 }
 
-                // 链路状态指示徽章
+                // 纯色彩语义的实时音频品质胶囊 (格式: 协议 · 音频格式 | 设备名)
                 SignalPathPill(audioState = audioPathState)
 
-                Spacer(modifier = Modifier.height(24.dp))
+                Spacer(modifier = Modifier.height(20.dp))
 
-                // 💡 歌曲标题：启用 basicMarquee 实现超长平滑横向滚动
+                // 歌曲标题：推流时纯白高亮，待机浅色时纯黑；平滑跑马灯永不截断
                 Text(
                     text = metadata.title,
-                    fontSize = 38.sp,
+                    fontSize = 40.sp,
                     fontWeight = FontWeight.Bold,
-                    color = Color.White,
+                    color = if (hasDarkBackground) Color.White else AppPalette.primaryText,
                     maxLines = 1,
-                    lineHeight = 46.sp,
+                    lineHeight = 48.sp,
                     modifier = Modifier
                         .fillMaxWidth()
                         .basicMarquee(
-                            iterations = Int.MAX_VALUE,
                             initialDelayMillis = 2000,
                             delayMillis = 1500
                         )
@@ -297,12 +275,12 @@ fun MainTvScreen(
 
                 Spacer(modifier = Modifier.height(8.dp))
 
-                // 艺术家
+                // 艺术家：次级色彩自适应
                 Text(
                     text = metadata.artist,
-                    fontSize = 22.sp,
+                    fontSize = 24.sp,
                     fontWeight = FontWeight.Medium,
-                    color = Color(0xFFB0B0B8),
+                    color = if (hasDarkBackground) Color.White.copy(alpha = 0.70f) else AppPalette.secondaryText,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
@@ -313,56 +291,39 @@ fun MainTvScreen(
                     Text(
                         text = metadata.album,
                         fontSize = 16.sp,
-                        color = Color(0xFFA1A1A6),
+                        color = if (hasDarkBackground) Color.White.copy(alpha = 0.50f) else AppPalette.secondaryText.copy(alpha = 0.70f),
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
                 }
 
-                Spacer(modifier = Modifier.height(28.dp))
+                Spacer(modifier = Modifier.height(32.dp))
 
-                // 💡 底部控制区域：支持 3 分钟防烧屏平滑淡出与按键即刻唤醒
-                AnimatedVisibility(
-                    visible = isControlsVisible,
-                    enter = fadeIn(animationSpec = tween(400)),
-                    exit = fadeOut(animationSpec = tween(800))
-                ) {
-                    Column(
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        // 纤细圆角进度条 (隔离 500ms 重组作用域至叶子节点)
-                        IsolatedProgressBar(
-                            totalDurationMs = metadata.durationMs,
-                            isLiveStream = metadata.isLiveStream,
-                            onPlayPauseClick = onTogglePlayPause
-                        )
+                // 💡 纤细圆角进度条 (自适应深浅，直接透明悬浮于背景上)
+                IsolatedProgressBar(
+                    totalDurationMs = metadata.durationMs,
+                    isLiveStream = metadata.isLiveStream,
+                    hasDarkBackground = hasDarkBackground,
+                    onPlayPauseClick = onTogglePlayPause
+                )
 
-                        Spacer(modifier = Modifier.height(14.dp))
+                Spacer(modifier = Modifier.height(16.dp))
 
-                        // 交互控制按钮组 (上一曲 / 播放暂停 / 下一曲 / 设置)
-                        PlaybackControls(
-                            playbackStatus = playbackStatus,
-                            isLiveStream = metadata.isLiveStream,
-                            onPlayPauseClick = onTogglePlayPause,
-                            onPreviousClick = onPreviousTrack,
-                            onNextClick = onNextTrack,
-                            onSettingsClick = { showDrawer = true },
-                            playPauseFocusRequester = playPauseFocusRequester
-                        )
-                    }
-                }
+                // 💡 纯几何图标交互控制按钮组 (上一曲 / 播放暂停 / 下一曲 / 设置，绝对居中自适应深浅)
+                PlaybackControls(
+                    playbackStatus = playbackStatus,
+                    isLiveStream = metadata.isLiveStream,
+                    hasDarkBackground = hasDarkBackground,
+                    onPlayPauseClick = onTogglePlayPause,
+                    onPreviousClick = onPreviousTrack,
+                    onNextClick = onNextTrack,
+                    onSettingsClick = onOpenSettings,
+                    playPauseFocusRequester = playPauseFocusRequester
+                )
             }
         }
 
-        // 3. 全功能设置侧边栏抽屉
-        if (showDrawer) {
-            SettingsDrawer(
-                audioState = audioPathState,
-                onClose = { showDrawer = false }
-            )
-        }
-
-        // 4. 首次开机/权限自检向导 (当存在未就绪的关键权限且未标记已完成时自动弹出)
+        // 3. 首次开机/权限自检向导
         var showOnboarding by remember { mutableStateOf(false) }
         val context = LocalContext.current
         val settingsRepo = remember { SettingsRepository(context) }
@@ -389,6 +350,7 @@ fun MainTvScreen(
 private fun IsolatedProgressBar(
     totalDurationMs: Long,
     isLiveStream: Boolean,
+    hasDarkBackground: Boolean = true,
     onPlayPauseClick: () -> Unit
 ) {
     val servicePositionMs by PlaybackService.playbackPositionMs.collectAsState()
@@ -401,6 +363,7 @@ private fun IsolatedProgressBar(
         currentPositionMs = seekPositionMs,
         totalDurationMs = totalDurationMs,
         isLiveStream = isLiveStream,
+        hasDarkBackground = hasDarkBackground,
         onSeek = { newPositionMs ->
             seekPositionMs = newPositionMs
             Logger.ui.i("MainTvScreen", "D-Pad 寻道至: ${newPositionMs / 1000} 秒")
@@ -410,83 +373,47 @@ private fun IsolatedProgressBar(
 }
 
 /**
- * 💡 辅助组件：默认唱片占位卡片 (无封面或加载中时使用)
+ * 💡 辅助组件：默认唱片封面占位卡片 (自适应深浅)
  */
 @Composable
 private fun DefaultCoverCard(
     isPlaying: Boolean,
-    album: String
+    album: String,
+    hasDarkBackground: Boolean = true,
+    modifier: Modifier = Modifier
 ) {
-    Column(
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(8.dp)
+    val cardBg = if (hasDarkBackground) Color(0xFF1E202B) else Color.White
+    val iconColor = if (hasDarkBackground) {
+        if (isPlaying) Color.White else Color(0xFF6E6E73)
+    } else {
+        if (isPlaying) Color(0xFF1C1C1E) else Color(0xFF8E8E93)
+    }
+    val textColor = if (hasDarkBackground) Color.White.copy(alpha = 0.60f) else Color(0xFF6E6E73)
+
+    Box(
+        modifier = modifier
+            .fillMaxSize()
+            .background(cardBg),
+        contentAlignment = Alignment.Center
     ) {
-        Text(
-            text = if (isPlaying) "♪" else "♫",
-            fontSize = 64.sp,
-            color = PureCastPrimary
-        )
-        Text(
-            text = if (album.isNotEmpty()) album else "PureCast Lossless",
-            fontSize = 14.sp,
-            color = Color(0xFFA1A1A6),
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis
-        )
-    }
-}
-
-/**
- * 💡 异步从封面 Uri 提取 Palette 调色板主色调与次色调
- * 注意：必须通过 allowHardware(false) 获取软件位图，否则 API 28+ 访问硬件位图会抛出异常
- */
-@Composable
-private fun rememberPaletteFromUri(
-    coverUri: String?,
-    defaultPrimary: Color = Color(0xFF1E2838),
-    defaultSecondary: Color = Color(0xFF0F121C)
-): Pair<Color, Color> {
-    val context = LocalContext.current
-    var colors by remember(coverUri) {
-        mutableStateOf(Pair(defaultPrimary, defaultSecondary))
-    }
-
-    LaunchedEffect(coverUri) {
-        val isValidScheme = coverUri?.startsWith("http://", ignoreCase = true) == true ||
-                coverUri?.startsWith("https://", ignoreCase = true) == true
-        if (coverUri.isNullOrEmpty() || !isValidScheme) {
-            colors = Pair(defaultPrimary, defaultSecondary)
-            return@LaunchedEffect
-        }
-
-        withContext(Dispatchers.IO) {
-            try {
-                val imageLoader = context.imageLoader
-                val request = ImageRequest.Builder(context)
-                    .data(coverUri)
-                    .allowHardware(false) // 💡 必须禁用硬件位图，Palette 提取像素需要软件 Bitmap
-                    .size(256, 256) // 缩放解析以加速提取并降低电视内存占用
-                    .build()
-
-                val result = (imageLoader.execute(request) as? SuccessResult)?.drawable
-                val bitmap = (result as? BitmapDrawable)?.bitmap
-                if (bitmap != null) {
-                    val palette = Palette.from(bitmap).generate()
-                    val dominantColor = palette.getDominantColor(defaultPrimary.toArgb())
-                    val secondaryColor = palette.getVibrantColor(
-                        palette.getDarkVibrantColor(
-                            palette.getMutedColor(defaultSecondary.toArgb())
-                        )
-                    )
-                    colors = Pair(Color(dominantColor), Color(secondaryColor))
-                    Logger.ui.i("MainTvScreen", "成功从封面提取 Palette 调色板: primary=$dominantColor")
-                }
-            } catch (e: Exception) {
-                Logger.ui.w("MainTvScreen", "Palette 提取封面色彩失败，回退暗夜灰", e)
-                colors = Pair(defaultPrimary, defaultSecondary)
-            }
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            androidx.tv.material3.Icon(
+                painter = androidx.compose.ui.res.painterResource(id = com.solo.purecast.R.drawable.ic_waveform),
+                contentDescription = "Default Music Icon",
+                tint = iconColor,
+                modifier = Modifier.width(64.dp).height(48.dp)
+            )
+            Text(
+                text = album.ifEmpty { "PureCast Hi-Fi" },
+                fontSize = 15.sp,
+                fontWeight = FontWeight.Medium,
+                color = textColor,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
         }
     }
-
-    return colors
 }
