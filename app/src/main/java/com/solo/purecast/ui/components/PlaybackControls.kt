@@ -51,6 +51,7 @@ fun PlaybackControls(
     onNextClick: () -> Unit,
     onSettingsClick: () -> Unit,
     modifier: Modifier = Modifier,
+    hasDarkBackground: Boolean = true,
     playPauseFocusRequester: FocusRequester? = null
 ) {
     val isPlaying = playbackStatus == PlaybackStatus.PLAYING
@@ -66,6 +67,7 @@ fun PlaybackControls(
             contentDescription = "上一曲",
             buttonSize = 46.dp,
             iconSize = 22.dp,
+            hasDarkBackground = hasDarkBackground,
             onClick = onPreviousClick
         )
 
@@ -76,6 +78,7 @@ fun PlaybackControls(
             buttonSize = 56.dp,
             iconSize = 28.dp,
             isCircle = true,
+            hasDarkBackground = hasDarkBackground,
             focusRequester = playPauseFocusRequester,
             onClick = onPlayPauseClick
         )
@@ -86,6 +89,7 @@ fun PlaybackControls(
             contentDescription = "下一曲",
             buttonSize = 46.dp,
             iconSize = 22.dp,
+            hasDarkBackground = hasDarkBackground,
             onClick = onNextClick
         )
 
@@ -95,6 +99,7 @@ fun PlaybackControls(
             contentDescription = "设置",
             buttonSize = 46.dp,
             iconSize = 22.dp,
+            hasDarkBackground = hasDarkBackground,
             onClick = onSettingsClick
         )
     }
@@ -104,8 +109,8 @@ fun PlaybackControls(
  * 💡 Apple TV 极简通透媒体按键 (TransportIconButton)
  * 采用 Surface + Box(fillMaxSize, Alignment.Center)：
  * - 去除任何厚重描边与发光轮廓；
- * - 焦点态：100% 亮白 + 1.12x 放大 + 极微弱微透底色 (Color(0x22FFFFFF))；
- * - 非焦点态：55% 柔和白 (Color.White.copy(0.55f)) + 完全透明背景。
+ * - 焦点态：1.12x 放大 + 柔和通透底色；
+ * - 自适应深/浅背景：有彩色流光或深色待机时为亮白，浅色待机时为纯净深黑。
  */
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
@@ -115,12 +120,21 @@ private fun TransportIconButton(
     buttonSize: Dp,
     iconSize: Dp,
     isCircle: Boolean = false,
+    hasDarkBackground: Boolean = true,
     focusRequester: FocusRequester? = null,
     onClick: () -> Unit
 ) {
     var isFocused by remember { mutableStateOf(false) }
     val shape = if (isCircle) CircleShape else RoundedCornerShape(12.dp)
     val noBorder = Border(BorderStroke(0.dp, Color.Transparent))
+
+    val focusedContainerColor = if (hasDarkBackground) Color(0x22FFFFFF) else Color(0x18000000)
+    val pressedContainerColor = if (hasDarkBackground) Color(0x3DFFFFFF) else Color(0x26000000)
+    val iconColor = if (hasDarkBackground) {
+        if (isFocused) Color.White else Color.White.copy(alpha = 0.55f)
+    } else {
+        if (isFocused) Color(0xFF1C1C1E) else Color(0xFF1C1C1E).copy(alpha = 0.55f)
+    }
 
     Surface(
         onClick = onClick,
@@ -136,8 +150,8 @@ private fun TransportIconButton(
         ),
         colors = ClickableSurfaceDefaults.colors(
             containerColor = Color.Transparent,
-            focusedContainerColor = Color(0x22FFFFFF),
-            pressedContainerColor = Color(0x3DFFFFFF)
+            focusedContainerColor = focusedContainerColor,
+            pressedContainerColor = pressedContainerColor
         ),
         border = ClickableSurfaceDefaults.border(
             border = noBorder,
@@ -157,7 +171,7 @@ private fun TransportIconButton(
             Icon(
                 painter = painterResource(id = iconResId),
                 contentDescription = contentDescription,
-                tint = if (isFocused) Color.White else Color.White.copy(alpha = 0.55f),
+                tint = iconColor,
                 modifier = Modifier.size(iconSize)
             )
         }

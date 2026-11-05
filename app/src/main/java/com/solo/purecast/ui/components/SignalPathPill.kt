@@ -25,6 +25,7 @@ import androidx.tv.material3.ExperimentalTvMaterial3Api
 import androidx.tv.material3.Text
 import com.solo.purecast.model.AudioPathState
 import com.solo.purecast.model.StreamProtocol
+import com.solo.purecast.ui.theme.AppPalette
 import java.util.Locale
 
 /**
@@ -35,7 +36,8 @@ import java.util.Locale
  * 3. 彻底去除 (独占) / (非独占) 等文字后缀，完全通过「设备名称」的颜色传达硬件状态：
  *    - 绿色 (#30D158)：USB DAC 硬件独占接管成功，处于 Bit-Perfect 源码直通状态；
  *    - 红色 (#FF453A)：未独占 / 声卡让渡 / 共享系统输出 / 设备异常；
- *    - 中性灰 (#8E8E93)：待机空闲状态。
+ *    - 中性灰：待机空闲状态。
+ * 4. 完整适配无推流待机状态下的浅色模式自适应外观。
  */
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
@@ -45,29 +47,33 @@ fun SignalPathPill(
 ) {
     val isExclusive = audioState.isDacConnected && audioState.isExclusive
     val isPlayingStream = audioState.protocol != StreamProtocol.NONE && audioState.sampleRate > 0
+    val isDark = AppPalette.isDark
 
-    // 设备名着色：独占为亮绿，未独占为亮红，待机为浅灰
+    // 设备名着色：独占为亮绿，未独占为亮红，待机为自适应次级灰
     val deviceNameColor = when {
-        !isPlayingStream -> Color(0xFF8E8E93)
+        !isPlayingStream -> if (isDark) Color(0xFF8E8E93) else Color(0xFF6E6E73)
         isExclusive -> Color(0xFF30D158) // Apple Green
         else -> Color(0xFFFF453A) // Apple Red
     }
 
     // 状态呼吸小圆点颜色
     val dotColor = when {
-        !isPlayingStream -> Color(0xFF636366)
+        !isPlayingStream -> if (isDark) Color(0xFF636366) else Color(0xFF8E8E93)
         isExclusive -> Color(0xFF30D158)
         else -> Color(0xFFFF453A)
     }
 
     // 格式化文本：协议 · 音频格式 | 设备名称
-    val pillAnnotatedText = remember(audioState) {
+    val pillAnnotatedText = remember(audioState, isPlayingStream, isDark) {
         buildAnnotatedString {
             if (!isPlayingStream) {
-                withStyle(SpanStyle(color = Color(0xFFD1D1D6), fontWeight = FontWeight.Normal)) {
+                val statusTextColor = if (isDark) Color(0xFFD1D1D6) else Color(0xFF3C3C43)
+                val dividerColor = if (isDark) Color(0xFF636366) else Color(0xFFAEB0B5)
+
+                withStyle(SpanStyle(color = statusTextColor, fontWeight = FontWeight.Normal)) {
                     append("就绪 · 等待推流")
                 }
-                withStyle(SpanStyle(color = Color(0xFF636366))) {
+                withStyle(SpanStyle(color = dividerColor)) {
                     append("  |  ")
                 }
                 withStyle(SpanStyle(color = deviceNameColor, fontWeight = FontWeight.SemiBold)) {
@@ -108,11 +114,23 @@ fun SignalPathPill(
         }
     }
 
+    // 胶囊背景与边框色彩（推流时为半透黑底，待机时自适应深浅）
+    val pillBg = when {
+        isPlayingStream -> Color(0xFF161823).copy(alpha = 0.85f)
+        isDark -> Color(0xFF161823).copy(alpha = 0.85f)
+        else -> Color.White
+    }
+    val pillBorderColor = when {
+        isPlayingStream -> Color(0xFF2C2F3E)
+        isDark -> Color(0xFF2C2F3E)
+        else -> Color(0xFFE5E5EA)
+    }
+
     Row(
         modifier = modifier
             .clip(RoundedCornerShape(20.dp))
-            .background(Color(0xFF161823).copy(alpha = 0.85f))
-            .border(1.dp, Color(0xFF2C2F3E), RoundedCornerShape(20.dp))
+            .background(pillBg)
+            .border(1.dp, pillBorderColor, RoundedCornerShape(20.dp))
             .padding(horizontal = 14.dp, vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(8.dp)

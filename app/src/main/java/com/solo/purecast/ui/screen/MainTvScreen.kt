@@ -4,6 +4,7 @@ import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.basicMarquee
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -53,6 +54,7 @@ import com.solo.purecast.ui.components.FluidBackground
 import com.solo.purecast.ui.components.PlaybackControls
 import com.solo.purecast.ui.components.ProgressBarComponent
 import com.solo.purecast.ui.components.SignalPathPill
+import com.solo.purecast.ui.theme.AppPalette
 import com.solo.purecast.util.Logger
 import com.solo.purecast.util.PermissionHelper
 import kotlinx.coroutines.delay
@@ -115,6 +117,9 @@ fun MainTvScreen(
     // ==========================================
     val coverData: Any? = metadata.coverBytes ?: metadata.coverUri
     val isPlaying = playbackStatus == PlaybackStatus.PLAYING
+    val hasActiveCover = coverData != null
+    // 💡 视觉上下文：推流时始终为动态彩色暗场，待机时完整自适应深/浅色模式
+    val hasDarkBackground = hasActiveCover || AppPalette.isDark
 
     // 封面放大弹簧动画
     val coverScale by animateFloatAsState(
@@ -129,20 +134,22 @@ fun MainTvScreen(
     Box(
         modifier = modifier
             .fillMaxSize()
-            .background(Color(0xFF0D0E15))
+            .background(AppPalette.background)
     ) {
-        // 1. GLES2 材质网格动态流光背景
+        // 1. GLES2 材质网格动态流光背景 (无推流时 MacBackground 优雅呈现自适应纯净背景)
         FluidBackground(
             coverData = coverData,
             isPlaying = isPlaying
         )
 
-        // 💡 柔和暗化层：保护前景文字与图标不被高饱和流光背景吞没，使所有前景自然“悬浮”
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(Color.Black.copy(alpha = 0.22f))
-        )
+        // 💡 柔和暗化层：仅在推流播放动态流光背景时启用，防止高饱和流光吞没文字；待机时关闭以呈现原汁原味的深/浅主题
+        if (hasActiveCover) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black.copy(alpha = 0.22f))
+            )
+        }
 
         // 2. 主体 42% / 58% Apple TV 黄金比例布局
         Row(
@@ -165,9 +172,18 @@ fun MainTvScreen(
                         .fillMaxWidth(0.88f)
                         .aspectRatio(1f)
                         .scale(coverScale)
-                        .shadow(28.dp, coverShape, spotColor = Color(0x80000000))
+                        .shadow(
+                            elevation = 28.dp,
+                            shape = coverShape,
+                            spotColor = if (hasDarkBackground) Color(0x80000000) else Color(0x20000000)
+                        )
                         .clip(coverShape)
-                        .background(Color(0xFF161822)),
+                        .background(if (hasDarkBackground) Color(0xFF161822) else Color.White)
+                        .then(
+                            if (!hasDarkBackground) {
+                                Modifier.border(1.dp, Color(0xFFE5E5EA), coverShape)
+                            } else Modifier
+                        ),
                     contentAlignment = Alignment.Center
                 ) {
                     val uri = metadata.coverUri
@@ -184,11 +200,27 @@ fun MainTvScreen(
                             contentDescription = "Album Cover",
                             contentScale = ContentScale.Crop,
                             modifier = Modifier.fillMaxSize(),
-                            loading = { DefaultCoverCard(isPlaying = isPlaying, album = metadata.album) },
-                            error = { DefaultCoverCard(isPlaying = isPlaying, album = metadata.album) }
+                            loading = {
+                                DefaultCoverCard(
+                                    isPlaying = isPlaying,
+                                    album = metadata.album,
+                                    hasDarkBackground = hasDarkBackground
+                                )
+                            },
+                            error = {
+                                DefaultCoverCard(
+                                    isPlaying = isPlaying,
+                                    album = metadata.album,
+                                    hasDarkBackground = hasDarkBackground
+                                )
+                            }
                         )
                     } else {
-                        DefaultCoverCard(isPlaying = isPlaying, album = metadata.album)
+                        DefaultCoverCard(
+                            isPlaying = isPlaying,
+                            album = metadata.album,
+                            hasDarkBackground = hasDarkBackground
+                        )
                     }
                 }
             }
@@ -225,12 +257,12 @@ fun MainTvScreen(
 
                 Spacer(modifier = Modifier.height(20.dp))
 
-                // 歌曲标题：纯白高亮，平滑跑马灯永不截断
+                // 歌曲标题：推流时纯白高亮，待机浅色时纯黑；平滑跑马灯永不截断
                 Text(
                     text = metadata.title,
                     fontSize = 40.sp,
                     fontWeight = FontWeight.Bold,
-                    color = Color.White,
+                    color = if (hasDarkBackground) Color.White else AppPalette.primaryText,
                     maxLines = 1,
                     lineHeight = 48.sp,
                     modifier = Modifier
@@ -244,12 +276,12 @@ fun MainTvScreen(
 
                 Spacer(modifier = Modifier.height(8.dp))
 
-                // 艺术家：纯净次级白 (White 70% alpha)
+                // 艺术家：次级色彩自适应
                 Text(
                     text = metadata.artist,
                     fontSize = 24.sp,
                     fontWeight = FontWeight.Medium,
-                    color = Color.White.copy(alpha = 0.70f),
+                    color = if (hasDarkBackground) Color.White.copy(alpha = 0.70f) else AppPalette.secondaryText,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
@@ -260,7 +292,7 @@ fun MainTvScreen(
                     Text(
                         text = metadata.album,
                         fontSize = 16.sp,
-                        color = Color.White.copy(alpha = 0.50f),
+                        color = if (hasDarkBackground) Color.White.copy(alpha = 0.50f) else AppPalette.secondaryText.copy(alpha = 0.70f),
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
@@ -268,19 +300,21 @@ fun MainTvScreen(
 
                 Spacer(modifier = Modifier.height(32.dp))
 
-                // 💡 纤细圆角进度条 (直接透明悬浮于背景上)
+                // 💡 纤细圆角进度条 (自适应深浅，直接透明悬浮于背景上)
                 IsolatedProgressBar(
                     totalDurationMs = metadata.durationMs,
                     isLiveStream = metadata.isLiveStream,
+                    hasDarkBackground = hasDarkBackground,
                     onPlayPauseClick = onTogglePlayPause
                 )
 
                 Spacer(modifier = Modifier.height(16.dp))
 
-                // 💡 纯几何图标交互控制按钮组 (上一曲 / 播放暂停 / 下一曲 / 设置，绝对居中自适应)
+                // 💡 纯几何图标交互控制按钮组 (上一曲 / 播放暂停 / 下一曲 / 设置，绝对居中自适应深浅)
                 PlaybackControls(
                     playbackStatus = playbackStatus,
                     isLiveStream = metadata.isLiveStream,
+                    hasDarkBackground = hasDarkBackground,
                     onPlayPauseClick = onTogglePlayPause,
                     onPreviousClick = onPreviousTrack,
                     onNextClick = onNextTrack,
@@ -317,6 +351,7 @@ fun MainTvScreen(
 private fun IsolatedProgressBar(
     totalDurationMs: Long,
     isLiveStream: Boolean,
+    hasDarkBackground: Boolean = true,
     onPlayPauseClick: () -> Unit
 ) {
     val servicePositionMs by PlaybackService.playbackPositionMs.collectAsState()
@@ -329,6 +364,7 @@ private fun IsolatedProgressBar(
         currentPositionMs = seekPositionMs,
         totalDurationMs = totalDurationMs,
         isLiveStream = isLiveStream,
+        hasDarkBackground = hasDarkBackground,
         onSeek = { newPositionMs ->
             seekPositionMs = newPositionMs
             Logger.ui.i("MainTvScreen", "D-Pad 寻道至: ${newPositionMs / 1000} 秒")
@@ -338,18 +374,27 @@ private fun IsolatedProgressBar(
 }
 
 /**
- * 💡 辅助组件：默认唱片封面占位卡片
+ * 💡 辅助组件：默认唱片封面占位卡片 (自适应深浅)
  */
 @Composable
 private fun DefaultCoverCard(
     isPlaying: Boolean,
     album: String,
+    hasDarkBackground: Boolean = true,
     modifier: Modifier = Modifier
 ) {
+    val cardBg = if (hasDarkBackground) Color(0xFF1E202B) else Color.White
+    val iconColor = if (hasDarkBackground) {
+        if (isPlaying) Color.White else Color(0xFF6E6E73)
+    } else {
+        if (isPlaying) Color(0xFF1C1C1E) else Color(0xFF8E8E93)
+    }
+    val textColor = if (hasDarkBackground) Color.White.copy(alpha = 0.60f) else Color(0xFF6E6E73)
+
     Box(
         modifier = modifier
             .fillMaxSize()
-            .background(Color(0xFF1E202B)),
+            .background(cardBg),
         contentAlignment = Alignment.Center
     ) {
         Column(
@@ -359,14 +404,14 @@ private fun DefaultCoverCard(
             androidx.tv.material3.Icon(
                 painter = androidx.compose.ui.res.painterResource(id = com.solo.purecast.R.drawable.ic_waveform),
                 contentDescription = "Default Music Icon",
-                tint = if (isPlaying) Color.White else Color(0xFF6E6E73),
+                tint = iconColor,
                 modifier = Modifier.width(64.dp).height(48.dp)
             )
             Text(
                 text = album.ifEmpty { "PureCast Hi-Fi" },
                 fontSize = 15.sp,
                 fontWeight = FontWeight.Medium,
-                color = Color.White.copy(alpha = 0.60f),
+                color = textColor,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
             )

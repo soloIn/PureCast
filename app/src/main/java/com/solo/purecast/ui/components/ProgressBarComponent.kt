@@ -56,12 +56,25 @@ fun ProgressBarComponent(
     isLiveStream: Boolean,
     onSeek: (newPositionMs: Long) -> Unit,
     modifier: Modifier = Modifier,
+    hasDarkBackground: Boolean = true,
     focusRequester: FocusRequester? = null,
     onPlayPauseClick: (() -> Unit)? = null
 ) {
     val canFocus = !isLiveStream && totalDurationMs > 0L
     val interactionSource = remember { MutableInteractionSource() }
     val isFocused by interactionSource.collectIsFocusedAsState()
+
+    // 💡 视觉对比度自适应色彩
+    val trackBgColor = if (hasDarkBackground) Color(0x40FFFFFF) else Color(0x18000000)
+    val trackBorderColor = if (hasDarkBackground) Color.White.copy(alpha = 0.6f) else Color(0x4D000000)
+    val progressFillColor = if (hasDarkBackground) Color.White else Color(0xFF1C1C1E)
+    val thumbColor = if (hasDarkBackground) Color.White else Color(0xFF1C1C1E)
+    val currentTimeColor = if (hasDarkBackground) {
+        if (isFocused && canFocus) Color.White else Color(0xEEFFFFFF)
+    } else {
+        if (isFocused && canFocus) Color(0xFF1C1C1E) else Color(0xFF3C3C43)
+    }
+    val totalTimeColor = if (hasDarkBackground) Color(0xB3FFFFFF) else Color(0xFF6E6E73)
 
     // 💡 焦点展开动画：获得焦点时轨道由 4dp 增至 6dp，带来沉浸式反馈
     val animatedHeight by animateDpAsState(
@@ -125,31 +138,31 @@ fun ProgressBarComponent(
                 .padding(vertical = if (isFocused) 2.dp else 3.dp),
             contentAlignment = Alignment.CenterStart
         ) {
-            // 背景槽（未播放部分：半透明纯白底）
+            // 背景槽（未播放部分）
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(animatedHeight)
                     .clip(RoundedCornerShape(animatedHeight / 2))
-                    .background(Color(0x40FFFFFF))
+                    .background(trackBgColor)
                     .then(
                         if (isFocused) {
                             Modifier.border(
                                 width = 1.dp,
-                                color = Color.White.copy(alpha = 0.6f),
+                                color = trackBorderColor,
                                 shape = RoundedCornerShape(animatedHeight / 2)
                             )
                         } else Modifier
                     )
             )
 
-            // 高亮填充条（已播放部分：纯净高亮白）
+            // 高亮填充条（已播放部分）
             Box(
                 modifier = Modifier
                     .fillMaxWidth(progressFraction)
                     .height(animatedHeight)
                     .clip(RoundedCornerShape(animatedHeight / 2))
-                    .background(Color.White)
+                    .background(progressFillColor)
             )
 
             // 💡 获得焦点时的进度发光游标点 (Thumb Indicator)
@@ -161,9 +174,9 @@ fun ProgressBarComponent(
                     Box(
                         modifier = Modifier
                             .size(12.dp)
-                            .shadow(6.dp, CircleShape, spotColor = Color.White)
+                            .shadow(6.dp, CircleShape, spotColor = thumbColor)
                             .clip(CircleShape)
-                            .background(Color.White)
+                            .background(thumbColor)
                     )
                 }
             }
@@ -177,12 +190,12 @@ fun ProgressBarComponent(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            // 左侧已播放时间：高对比度纯白半透文本
+            // 左侧已播放时间
             Text(
                 text = formatTimeMs(currentPositionMs),
                 fontSize = 12.sp,
                 fontWeight = FontWeight.Medium,
-                color = if (isFocused && canFocus) Color.White else Color(0xEEFFFFFF)
+                color = currentTimeColor
             )
 
             // 右侧总时长或实时流状态
@@ -209,7 +222,7 @@ fun ProgressBarComponent(
                     text = formatTimeMs(totalDurationMs),
                     fontSize = 12.sp,
                     fontWeight = FontWeight.Medium,
-                    color = Color(0xB3FFFFFF)
+                    color = totalTimeColor
                 )
             }
         }

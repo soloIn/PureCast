@@ -28,6 +28,7 @@ import androidx.lifecycle.LifecycleEventObserver
 import coil.imageLoader
 import coil.request.ImageRequest
 import coil.request.SuccessResult
+import com.solo.purecast.ui.theme.AppPalette
 import com.solo.purecast.util.Logger
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -54,7 +55,7 @@ fun MacBackground(
     modifier: Modifier = Modifier
 ) {
     if (quality == FluidQuality.OFF || coverData == null) {
-        Box(modifier.fillMaxSize().background(Color(0xFF101014)))
+        Box(modifier.fillMaxSize().background(AppPalette.background))
         return
     }
 
