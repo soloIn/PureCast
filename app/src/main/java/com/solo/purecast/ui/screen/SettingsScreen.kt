@@ -9,12 +9,14 @@ import android.hardware.usb.UsbManager
 import android.os.PowerManager
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
@@ -26,6 +28,7 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.wrapContentWidth
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -55,7 +58,10 @@ import androidx.core.content.ContextCompat
 import androidx.tv.material3.Border
 import androidx.tv.material3.Button
 import androidx.tv.material3.ButtonDefaults
+import androidx.tv.material3.ClickableSurfaceDefaults
 import androidx.tv.material3.ExperimentalTvMaterial3Api
+import androidx.tv.material3.Glow
+import androidx.tv.material3.Surface
 import androidx.tv.material3.Text
 import com.solo.purecast.data.SettingsRepository
 import com.solo.purecast.model.AudioPathState
@@ -83,12 +89,17 @@ enum class SettingsCategory(val title: String, val subtitle: String) {
 
 /**
  * 💡 PureCast 全屏双栏 Apple TV 系统级设置界面 (SettingsScreen)
- * 严格遵循 10-Foot 电视大屏与 Apple TV HIG 工业设计规范：
- * 1. 100% 实心不透明背景 (AppPalette.background)，彻底解决半透明穿透播放界面的问题；
- * 2. 完整支持自动模式 (跟随系统 uiMode)、深色模式与浅色模式切换与持久化；
- * 3. 彻底重构设置行排版：采用垂直分层 (SettingTieredRow) 与紧凑行 (SettingInlineRow)，
- *    彻底根治因多按钮横塞导致的恶性 6 行逐字换行与空白大卡片 Bug；
- * 4. 严守 TV Safe Area 安全区域：顶部 padding 提升至 76dp，消除任何电视 Overscan 削头截断。
+ * 严格按照 Apple TV HIG 与 Android TV 双栏导航规范重构：
+ * 1. 严格层级 Back 导航路由：
+ *    - 焦点在右侧配置项时按 Back 键：交还焦点给左侧当前选中分类项，不退出页面；
+ *    - 正在编辑输入框时按 Back 键：退出编辑模式，不退出页面；
+ *    - 只有焦点在左侧分类导航时按 Back 键：平滑退出设置返回播放页；
+ * 2. 彻底移除左下角多余突兀的长条按钮；
+ * 3. 规范焦点与深/浅模式高亮：
+ *    - 深色模式获焦：纯白底 (Color.White) + 纯黑字；
+ *    - 浅色模式获焦：纯黑底 (Color(0xFF1C1C1E)) + 纯白字；
+ *    - 彻底消灭浅色模式下变黄绿色的恶性视觉割裂；
+ * 4. 自适应内边距与换行防护：分段按钮文字横向完全包裹，杜绝“✏️ 自定义”折行。
  */
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
@@ -100,12 +111,13 @@ fun SettingsScreen(
     val context = LocalContext.current
     val settingsRepo = remember { SettingsRepository(context) }
 
-    // 遥控器返回键平滑退回播放主页
-    BackHandler {
-        onDismiss()
-    }
-
     var selectedCategory by remember { mutableStateOf(SettingsCategory.APPEARANCE_AND_GENERAL) }
+    var isFocusInRightContent by remember { mutableStateOf(false) }
+
+    // 左侧导航栏各项的 FocusRequester
+    val navFocusRequesters = remember {
+        Array(SettingsCategory.entries.size) { FocusRequester() }
+    }
 
     // 1. 设备广播名与外观状态
     var currentThemeMode by remember { mutableStateOf(AppPalette.mode) }
@@ -115,6 +127,24 @@ fun SettingsScreen(
     var isAirPlayEnabled by remember { mutableStateOf(settingsRepo.isAirPlayEnabled()) }
     var isUpnpEnabled by remember { mutableStateOf(settingsRepo.isUpnpEnabled()) }
     var idleTimeoutSeconds by remember { mutableIntStateOf(settingsRepo.getIdleTimeoutSeconds()) }
+
+    // 💡 严谨的 Apple TV 双栏 Back 键层级路由
+    BackHandler(enabled = isFocusInRightContent || isEditingCustomName) {
+        if (isEditingCustomName) {
+            isEditingCustomName = false
+        } else if (isFocusInRightContent) {
+            // 右侧按 Back：将焦点请求回左侧当前分类项
+            try {
+                navFocusRequesters[selectedCategory.ordinal].requestFocus()
+            } catch (_: Exception) {}
+            isFocusInRightContent = false
+        }
+    }
+
+    // 当焦点已经在左侧时，按 Back 退出设置页
+    BackHandler(enabled = !isFocusInRightContent && !isEditingCustomName) {
+        onDismiss()
+    }
 
     // 2. 硬件缓冲区与时钟动态监控状态 (每秒轮询一次)
     var bufferCapacity by remember { mutableIntStateOf(65536) }
@@ -154,15 +184,15 @@ fun SettingsScreen(
         android.provider.Settings.canDrawOverlays(context)
     }
 
-    val defaultFocusRequester = remember { FocusRequester() }
+    // 页面进入时聚焦左侧第 1 项
     LaunchedEffect(Unit) {
         delay(120)
         try {
-            defaultFocusRequester.requestFocus()
+            navFocusRequesters[0].requestFocus()
         } catch (_: Exception) {}
     }
 
-    // 100% 实心不透明背景，杜绝半透明穿透播放界面的问题
+    // 100% 实心不透明背景
     Box(
         modifier = modifier
             .fillMaxSize()
@@ -175,7 +205,7 @@ fun SettingsScreen(
             horizontalArrangement = Arrangement.spacedBy(48.dp)
         ) {
             // ==========================================
-            // 左侧：固定 300dp 纵向分类导航栏
+            // 左侧：纯粹的固定 300dp 分类导航栏 (彻底去除底部突兀长条)
             // ==========================================
             Column(
                 modifier = Modifier
@@ -193,15 +223,23 @@ fun SettingsScreen(
 
                 SettingsCategory.entries.forEachIndexed { index, cat ->
                     val isSelected = selectedCategory == cat
-                    Button(
+                    var isCatFocused by remember { mutableStateOf(false) }
+
+                    Surface(
                         onClick = { selectedCategory = cat },
                         modifier = Modifier
                             .fillMaxWidth()
-                            .then(if (index == 0) Modifier.focusRequester(defaultFocusRequester) else Modifier)
-                            .onFocusChanged { if (it.isFocused) selectedCategory = cat },
-                        scale = ButtonDefaults.scale(scale = 1.0f, focusedScale = 1.05f),
-                        shape = ButtonDefaults.shape(RoundedCornerShape(12.dp)),
-                        colors = ButtonDefaults.colors(
+                            .focusRequester(navFocusRequesters[index])
+                            .onFocusChanged {
+                                isCatFocused = it.isFocused
+                                if (it.isFocused) {
+                                    selectedCategory = cat
+                                    isFocusInRightContent = false
+                                }
+                            },
+                        scale = ClickableSurfaceDefaults.scale(scale = 1.0f, focusedScale = 1.05f),
+                        shape = ClickableSurfaceDefaults.shape(RoundedCornerShape(12.dp)),
+                        colors = ClickableSurfaceDefaults.colors(
                             containerColor = if (isSelected) AppPalette.surfaceSecondary else Color.Transparent,
                             focusedContainerColor = AppPalette.accent,
                             contentColor = if (isSelected) AppPalette.primaryText else AppPalette.secondaryText,
@@ -212,32 +250,9 @@ fun SettingsScreen(
                             text = cat.title,
                             fontSize = 15.sp,
                             fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal,
-                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp)
+                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)
                         )
                     }
-                }
-
-                Spacer(modifier = Modifier.weight(1f))
-
-                // 返回大屏播放主页按钮
-                Button(
-                    onClick = onDismiss,
-                    modifier = Modifier.fillMaxWidth(),
-                    scale = ButtonDefaults.scale(scale = 1.0f, focusedScale = 1.05f),
-                    shape = ButtonDefaults.shape(RoundedCornerShape(12.dp)),
-                    colors = ButtonDefaults.colors(
-                        containerColor = AppPalette.surfaceSecondary,
-                        focusedContainerColor = AppPalette.accent,
-                        contentColor = AppPalette.primaryText,
-                        focusedContentColor = Color.White
-                    )
-                ) {
-                    Text(
-                        text = "← 返回播放页面",
-                        fontSize = 15.sp,
-                        fontWeight = FontWeight.Medium,
-                        modifier = Modifier.padding(vertical = 6.dp)
-                    )
                 }
             }
 
@@ -249,7 +264,12 @@ fun SettingsScreen(
                 modifier = Modifier
                     .weight(1f)
                     .fillMaxHeight()
-                    .verticalScroll(scrollState),
+                    .verticalScroll(scrollState)
+                    .onFocusChanged {
+                        if (it.hasFocus) {
+                            isFocusInRightContent = true
+                        }
+                    },
                 verticalArrangement = Arrangement.spacedBy(24.dp)
             ) {
                 // 分类标题与副标
@@ -269,7 +289,7 @@ fun SettingsScreen(
 
                 when (selectedCategory) {
                     SettingsCategory.APPEARANCE_AND_GENERAL -> {
-                        // 1. 界面外观深浅模式 (提供 自动/深色/浅色 3 档)
+                        // 1. 界面外观深浅模式
                         SettingsSection(title = "界面主题模式") {
                             SettingTieredRow(
                                 title = "外观色彩模式",
@@ -304,7 +324,7 @@ fun SettingsScreen(
                             }
                         }
 
-                        // 2. 局域网广播名称 (垂直分层布局，彻底杜绝横向挤压与逐字折行)
+                        // 2. 局域网广播名称
                         SettingsSection(title = "局域网广播设备标识") {
                             SettingTieredRow(
                                 title = "设备广播发现名称",
@@ -362,7 +382,9 @@ fun SettingsScreen(
                                                 modifier = Modifier.fillMaxWidth()
                                             )
                                         }
-                                        Button(
+                                        SegmentOptionButton(
+                                            label = "保存",
+                                            isSelected = true,
                                             onClick = {
                                                 val t = customNameInput.trim()
                                                 if (t.isNotEmpty()) {
@@ -372,29 +394,13 @@ fun SettingsScreen(
                                                     isEditingCustomName = false
                                                     Toast.makeText(context, "已保存广播名为: $t", Toast.LENGTH_SHORT).show()
                                                 }
-                                            },
-                                            shape = ButtonDefaults.shape(RoundedCornerShape(8.dp)),
-                                            colors = ButtonDefaults.colors(
-                                                containerColor = AppPalette.accent,
-                                                focusedContainerColor = Color.White,
-                                                contentColor = Color.White,
-                                                focusedContentColor = Color.Black
-                                            )
-                                        ) {
-                                            Text(text = "保存", fontSize = 13.sp)
-                                        }
-                                        Button(
-                                            onClick = { isEditingCustomName = false },
-                                            shape = ButtonDefaults.shape(RoundedCornerShape(8.dp)),
-                                            colors = ButtonDefaults.colors(
-                                                containerColor = AppPalette.surfaceSecondary,
-                                                focusedContainerColor = Color.White,
-                                                contentColor = AppPalette.primaryText,
-                                                focusedContentColor = Color.Black
-                                            )
-                                        ) {
-                                            Text(text = "取消", fontSize = 13.sp)
-                                        }
+                                            }
+                                        )
+                                        SegmentOptionButton(
+                                            label = "取消",
+                                            isSelected = false,
+                                            onClick = { isEditingCustomName = false }
+                                        )
                                     }
                                 }
                             }
@@ -403,7 +409,6 @@ fun SettingsScreen(
 
                     SettingsCategory.USB_DAC -> {
                         SettingsSection(title = "USB DAC 硬件独占接管") {
-                            // 紧凑行：声卡端点与独占状态
                             SettingInlineRow(
                                 title = "声卡端点与驱动状态",
                                 subtitle = if (audioState.isExclusive) "已解绑 Linux snd-usb-audio 内核驱动，直通 UAC2 硬件 (绕过 48kHz SRC)" else "声卡处于待机让渡或系统共享状态"
@@ -418,7 +423,9 @@ fun SettingsScreen(
                                         fontWeight = FontWeight.SemiBold,
                                         color = if (audioState.isExclusive) AppPalette.success else AppPalette.warning
                                     )
-                                    Button(
+                                    SegmentOptionButton(
+                                        label = if (audioState.isExclusive) "🔄 让渡声卡" else "⚡ 独占接管",
+                                        isSelected = !audioState.isExclusive,
                                         onClick = {
                                             if (audioState.isExclusive) {
                                                 PlaybackService.instance?.pausePlayback()
@@ -430,28 +437,13 @@ fun SettingsScreen(
                                                 PlaybackService.instance?.resumePlayback()
                                                 Toast.makeText(context, "正在尝试接管 USB DAC...", Toast.LENGTH_SHORT).show()
                                             }
-                                        },
-                                        scale = ButtonDefaults.scale(scale = 1.0f, focusedScale = 1.08f),
-                                        shape = ButtonDefaults.shape(RoundedCornerShape(10.dp)),
-                                        colors = ButtonDefaults.colors(
-                                            containerColor = if (audioState.isExclusive) AppPalette.surfaceSecondary else AppPalette.accent,
-                                            focusedContainerColor = Color.White,
-                                            contentColor = if (audioState.isExclusive) AppPalette.primaryText else Color.White,
-                                            focusedContentColor = Color.Black
-                                        )
-                                    ) {
-                                        Text(
-                                            text = if (audioState.isExclusive) "🔄 让渡声卡" else "⚡ 独占接管",
-                                            fontSize = 13.sp,
-                                            fontWeight = FontWeight.Medium
-                                        )
-                                    }
+                                        }
+                                    )
                                 }
                             }
 
                             SettingDivider()
 
-                            // 分层行：空闲自动让渡时机 (解决 4 个按钮挤爆文字导致 6 行换行的 Bug)
                             SettingTieredRow(
                                 title = "空闲自动让渡时机",
                                 subtitle = "停止播放后，等待指定秒数自动解除声卡独占并归还系统"
@@ -551,7 +543,6 @@ fun SettingsScreen(
 
 /**
  * 💡 标准 HIG 分组容器 (SettingsSection)
- * 连续圆角卡片包装内部所有配置行，消除碎片化卡片与遮挡
  */
 @Composable
 private fun SettingsSection(
@@ -593,8 +584,6 @@ private fun SettingDivider() {
 
 /**
  * 💡 垂直分层配置行 (SettingTieredRow)
- * 上层：100% 宽度展示标题与副标说明，保证长说明文字自然横向排版，永不折叠挤压；
- * 下层：放置分段选择器或按钮组，彻底解决横向空间拥挤与空白卡片撑爆 Bug。
  */
 @Composable
 private fun SettingTieredRow(
@@ -628,7 +617,6 @@ private fun SettingTieredRow(
 
 /**
  * 💡 水平紧凑配置行 (SettingInlineRow)
- * 适用于右侧仅有单个紧凑操作控件（如开关或按钮）的条目
  */
 @Composable
 private fun SettingInlineRow(
@@ -668,7 +656,12 @@ private fun SettingInlineRow(
 }
 
 /**
- * 💡 分段式选项按钮 (SegmentOptionButton)
+ * 💡 严格适配深/浅模式的 Apple TV 分段按钮 (SegmentOptionButton)
+ * 采用 Surface + 规范焦点色彩：
+ * - 深色模式获焦：纯白底 (Color.White) + 纯黑字；
+ * - 浅色模式获焦：纯黑底 (Color(0xFF1C1C1E)) + 纯白字；
+ * - 杜绝任何荧光黄绿混乱色块；
+ * - 文本自适应包裹宽度 (wrapContentWidth)，杜绝“✏️ 自定义”折行。
  */
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
@@ -677,31 +670,49 @@ private fun SegmentOptionButton(
     isSelected: Boolean,
     onClick: () -> Unit
 ) {
-    Button(
+    val isDark = AppPalette.isDark
+    val normalBg = if (isSelected) AppPalette.accent else AppPalette.surfaceSecondary
+    val normalContent = if (isSelected) Color.White else AppPalette.primaryText
+
+    // 严谨适配深/浅模式的获焦底色与前景色
+    val focusedBg = if (isDark) Color.White else Color(0xFF1C1C1E)
+    val focusedContent = if (isDark) Color(0xFF1C1C1E) else Color.White
+
+    val shape = RoundedCornerShape(10.dp)
+    val noBorder = Border(BorderStroke(0.dp, Color.Transparent))
+    val focusedBorder = Border(BorderStroke(2.dp, if (isDark) Color.White else Color(0xFF1C1C1E)))
+
+    Surface(
         onClick = onClick,
-        scale = ButtonDefaults.scale(scale = 1.0f, focusedScale = 1.08f),
-        shape = ButtonDefaults.shape(RoundedCornerShape(10.dp)),
-        colors = ButtonDefaults.colors(
-            containerColor = if (isSelected) AppPalette.accent else AppPalette.surfaceSecondary,
-            focusedContainerColor = Color.White,
-            contentColor = if (isSelected) Color.White else AppPalette.primaryText,
-            focusedContentColor = Color.Black
+        modifier = Modifier.wrapContentWidth(),
+        shape = ClickableSurfaceDefaults.shape(shape),
+        scale = ClickableSurfaceDefaults.scale(scale = 1.0f, focusedScale = 1.06f),
+        colors = ClickableSurfaceDefaults.colors(
+            containerColor = normalBg,
+            focusedContainerColor = focusedBg,
+            contentColor = normalContent,
+            focusedContentColor = focusedContent
         ),
-        border = ButtonDefaults.border(
-            focusedBorder = Border(border = androidx.compose.foundation.BorderStroke(2.dp, Color.White))
+        border = ClickableSurfaceDefaults.border(
+            border = noBorder,
+            focusedBorder = focusedBorder
+        ),
+        glow = ClickableSurfaceDefaults.glow(
+            glow = Glow.None,
+            focusedGlow = Glow(elevationColor = focusedBg.copy(alpha = 0.35f), elevation = 6.dp)
         )
     ) {
         Text(
             text = label,
             fontSize = 13.sp,
             fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal,
-            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)
         )
     }
 }
 
 /**
- * 💡 开关切换按钮 (ToggleSwitchButton)
+ * 💡 严格适配深/浅模式的开关切换按钮 (ToggleSwitchButton)
  */
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
@@ -709,25 +720,42 @@ private fun ToggleSwitchButton(
     isEnabled: Boolean,
     onToggle: () -> Unit
 ) {
-    Button(
+    val isDark = AppPalette.isDark
+    val normalBg = if (isEnabled) AppPalette.success else AppPalette.surfaceSecondary
+    val normalContent = if (isEnabled) Color.White else AppPalette.secondaryText
+
+    val focusedBg = if (isDark) Color.White else Color(0xFF1C1C1E)
+    val focusedContent = if (isDark) Color(0xFF1C1C1E) else Color.White
+
+    val shape = RoundedCornerShape(10.dp)
+    val noBorder = Border(BorderStroke(0.dp, Color.Transparent))
+    val focusedBorder = Border(BorderStroke(2.dp, if (isDark) Color.White else Color(0xFF1C1C1E)))
+
+    Surface(
         onClick = onToggle,
-        scale = ButtonDefaults.scale(scale = 1.0f, focusedScale = 1.08f),
-        shape = ButtonDefaults.shape(RoundedCornerShape(10.dp)),
-        colors = ButtonDefaults.colors(
-            containerColor = if (isEnabled) AppPalette.success else AppPalette.surfaceSecondary,
-            focusedContainerColor = Color.White,
-            contentColor = if (isEnabled) Color.White else AppPalette.secondaryText,
-            focusedContentColor = Color.Black
+        modifier = Modifier.wrapContentWidth(),
+        shape = ClickableSurfaceDefaults.shape(shape),
+        scale = ClickableSurfaceDefaults.scale(scale = 1.0f, focusedScale = 1.06f),
+        colors = ClickableSurfaceDefaults.colors(
+            containerColor = normalBg,
+            focusedContainerColor = focusedBg,
+            contentColor = normalContent,
+            focusedContentColor = focusedContent
         ),
-        border = ButtonDefaults.border(
-            focusedBorder = Border(border = androidx.compose.foundation.BorderStroke(2.dp, Color.White))
+        border = ClickableSurfaceDefaults.border(
+            border = noBorder,
+            focusedBorder = focusedBorder
+        ),
+        glow = ClickableSurfaceDefaults.glow(
+            glow = Glow.None,
+            focusedGlow = Glow(elevationColor = focusedBg.copy(alpha = 0.35f), elevation = 6.dp)
         )
     ) {
         Text(
             text = if (isEnabled) "已启用" else "已禁用",
             fontSize = 13.sp,
             fontWeight = FontWeight.SemiBold,
-            modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp)
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)
         )
     }
 }

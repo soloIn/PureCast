@@ -5,7 +5,6 @@ import androidx.compose.animation.core.spring
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.basicMarquee
-import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -61,14 +60,14 @@ import kotlin.math.sin
 
 /**
  * 💡 PureCast 大屏主界面 (MainTvScreen)
- * 严格遵循 Apple TV (tvOS) 极简工业美学与 10-Foot 遥控器大屏交互规范：
- * 1. 42% / 58% 黄金比例布局：左侧呈现 24dp 浮动圆角高清网络封面与弹簧缩放；右侧居中展示排版信息与控制项。
- * 2. GLES2 动态流光交融着色器背景：自适应从封面萃取多色并执行网格流动交融，优雅降级深邃夜空灰。
- * 3. 歌曲标题平滑跑马灯：通过 Modifier.basicMarquee() 保证超长标题永不截断。
- * 4. 浮岛悬浮 Dock (Floating Dock)：将进度条、时间戳、上一曲/播放/下一曲/设置整体包裹于毛玻璃半透底座内，
- *    彻底解决背景色彩与文字融合、时间戳悬空孤立问题，在任意绚丽流光背景下都具有极高对比度。
- * 5. 控制栏与进度条常驻显示：完全去掉自动隐藏功能，遥控器即按即响，交互零等待。
- * 6. 微像素正弦平移 (Pixel Shift)：每 10 秒平滑微移 2~3 像素，防止 OLED / LCD 大屏烧屏。
+ * 严格按照 Apple TV (tvOS) 原生设计与 lavande16/Apple-Music-For-Android-TV 实现：
+ * 1. 彻底去除人造 Dock 外框，恢复通透、纯净、无界面的自然呼吸感；
+ * 2. 文字与控件“悬浮”于背景之上：
+ *    - 纯白标题 (Color.White) 与柔和半透白副标题 (Color.White.copy(alpha = 0.70f))；
+ *    - 进度条与播放按钮直接通透漂浮，没有任何生硬的底色补丁；
+ *    - 背景层覆盖柔和的高透保护遮罩，杜绝任何背景高亮对文字的对比度污染；
+ * 3. 控制栏与进度条常驻显示，永不自动淡出；
+ * 4. 42% / 58% Apple TV 黄金比例布局 + OLED 微像素平移保护。
  */
 @OptIn(ExperimentalTvMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
@@ -138,6 +137,13 @@ fun MainTvScreen(
             isPlaying = isPlaying
         )
 
+        // 💡 柔和暗化层：保护前景文字与图标不被高饱和流光背景吞没，使所有前景自然“悬浮”
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color.Black.copy(alpha = 0.22f))
+        )
+
         // 2. 主体 42% / 58% Apple TV 黄金比例布局
         Row(
             modifier = Modifier
@@ -189,7 +195,7 @@ fun MainTvScreen(
 
             Spacer(modifier = Modifier.width(48.dp))
 
-            // 右侧 58% 控制与元数据区
+            // 右侧 58% 控制与元数据区 (直接通透悬浮于背景之上，无任何死板 Dock)
             Column(
                 modifier = Modifier
                     .weight(0.58f)
@@ -219,14 +225,14 @@ fun MainTvScreen(
 
                 Spacer(modifier = Modifier.height(20.dp))
 
-                // 歌曲标题：启用 basicMarquee 实现超长平滑横向滚动，带有柔和阴影防融底
+                // 歌曲标题：纯白高亮，平滑跑马灯永不截断
                 Text(
                     text = metadata.title,
-                    fontSize = 38.sp,
+                    fontSize = 40.sp,
                     fontWeight = FontWeight.Bold,
                     color = Color.White,
                     maxLines = 1,
-                    lineHeight = 46.sp,
+                    lineHeight = 48.sp,
                     modifier = Modifier
                         .fillMaxWidth()
                         .basicMarquee(
@@ -238,12 +244,12 @@ fun MainTvScreen(
 
                 Spacer(modifier = Modifier.height(8.dp))
 
-                // 艺术家
+                // 艺术家：纯净次级白 (White 70% alpha)
                 Text(
                     text = metadata.artist,
-                    fontSize = 22.sp,
+                    fontSize = 24.sp,
                     fontWeight = FontWeight.Medium,
-                    color = Color(0xFFD1D1D6),
+                    color = Color.White.copy(alpha = 0.70f),
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
@@ -254,48 +260,33 @@ fun MainTvScreen(
                     Text(
                         text = metadata.album,
                         fontSize = 16.sp,
-                        color = Color(0xFFA1A1A6),
+                        color = Color.White.copy(alpha = 0.50f),
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
                 }
 
-                Spacer(modifier = Modifier.height(28.dp))
+                Spacer(modifier = Modifier.height(32.dp))
 
-                // 💡 遵循 Apple TV HIG 的毛玻璃悬浮 Dock (Frosted Glass Floating Dock)
-                // 将进度条、时间轴、操作控制栏统一承载于悬浮浮岛中，彻底解决文字与背景融合隐形的问题，且常驻显示
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clip(RoundedCornerShape(20.dp))
-                        .background(Color(0x2E000000))
-                        .border(1.dp, Color(0x1FFFFFFF), RoundedCornerShape(20.dp))
-                        .padding(horizontal = 22.dp, vertical = 18.dp)
-                ) {
-                    Column(
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        // 纤细圆角进度条 (隔离 500ms 重组作用域至叶子节点)
-                        IsolatedProgressBar(
-                            totalDurationMs = metadata.durationMs,
-                            isLiveStream = metadata.isLiveStream,
-                            onPlayPauseClick = onTogglePlayPause
-                        )
+                // 💡 纤细圆角进度条 (直接透明悬浮于背景上)
+                IsolatedProgressBar(
+                    totalDurationMs = metadata.durationMs,
+                    isLiveStream = metadata.isLiveStream,
+                    onPlayPauseClick = onTogglePlayPause
+                )
 
-                        Spacer(modifier = Modifier.height(14.dp))
+                Spacer(modifier = Modifier.height(16.dp))
 
-                        // 纯几何图标交互控制按钮组 (上一曲 / 播放暂停 / 下一曲 / 风格统一设置键)
-                        PlaybackControls(
-                            playbackStatus = playbackStatus,
-                            isLiveStream = metadata.isLiveStream,
-                            onPlayPauseClick = onTogglePlayPause,
-                            onPreviousClick = onPreviousTrack,
-                            onNextClick = onNextTrack,
-                            onSettingsClick = onOpenSettings,
-                            playPauseFocusRequester = playPauseFocusRequester
-                        )
-                    }
-                }
+                // 💡 纯几何图标交互控制按钮组 (上一曲 / 播放暂停 / 下一曲 / 设置，绝对居中自适应)
+                PlaybackControls(
+                    playbackStatus = playbackStatus,
+                    isLiveStream = metadata.isLiveStream,
+                    onPlayPauseClick = onTogglePlayPause,
+                    onPreviousClick = onPreviousTrack,
+                    onNextClick = onNextTrack,
+                    onSettingsClick = onOpenSettings,
+                    playPauseFocusRequester = playPauseFocusRequester
+                )
             }
         }
 
@@ -347,7 +338,7 @@ private fun IsolatedProgressBar(
 }
 
 /**
- * 💡 辅助组件：默认唱片封面占位卡片 (采用 Apple 纯净微渐变与声波纹理)
+ * 💡 辅助组件：默认唱片封面占位卡片
  */
 @Composable
 private fun DefaultCoverCard(
@@ -375,7 +366,7 @@ private fun DefaultCoverCard(
                 text = album.ifEmpty { "PureCast Hi-Fi" },
                 fontSize = 15.sp,
                 fontWeight = FontWeight.Medium,
-                color = Color(0xFF8E8E93),
+                color = Color.White.copy(alpha = 0.60f),
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
             )
