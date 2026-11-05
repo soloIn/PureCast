@@ -35,5 +35,9 @@ A read-only, non-interactive TV UI status badge placed above the track title, fo
 *Aliases: 音频品质胶囊, 链路状态指示徽章*
 
 ### Dynamic Mesh Fluid Background
-An OpenGL ES 2.0 distortion-mesh background renderer adapted from Apple Music for Android TV (`MacBackground`). It extracts characteristic palette colors from the current album artwork and runs continuous, subtle low-poly mesh rotation and multi-pass Gaussian blur to create an organic liquid-light immersion on big screens with minimal SoC overhead.
+An OpenGL ES 2.0 distortion-mesh background renderer adapted from Apple Music for Android TV (`MacBackground`). It extracts characteristic palette colors from the current album artwork and runs continuous, subtle low-poly mesh rotation and multi-pass Gaussian blur to create an organic liquid-light immersion on big screens with zero-allocation VSYNC frames and dual-mode theme adaptation.
 *Aliases: GLES2 动态材质流光背景, 封面动态液态流光*
+
+### D-Pad Focus Engine
+A directional navigation model for Android TV split-pane layouts that couples focus-change observation with hierarchical BackHandler interceptors to ensure the remote's Back button retreats up the navigation tree rather than exiting the screen.
+*Aliases: Hierarchical Back Navigation, D-Pad 层级焦点导航*
