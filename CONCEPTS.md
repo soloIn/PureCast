@@ -29,3 +29,11 @@ A multi-packet resequencing buffer in network streaming receivers that absorbs v
 ### Drop Whole Packet
 An acoustic protection invariant in real-time PCM ring buffers where any incoming packet that exceeds remaining buffer capacity is dropped entirely rather than partially written, preventing stereo channel misalignment and phase-discontinuity pops.
 *Aliases: 整包丢弃原则, 完整帧原子写入*
+
+### Signal Path Capsule
+A read-only, non-interactive TV UI status badge placed above the track title, formatted as `协议 · 音频格式 | 设备名称`. It conveys real-time streaming protocol, sample rate/bit depth, and USB DAC exclusive claim state purely through color semantics (green text for bit-perfect exclusive claim, red text for shared output/let-go/error) without redundant textual suffixes.
+*Aliases: 音频品质胶囊, 链路状态指示徽章*
+
+### Dynamic Mesh Fluid Background
+An OpenGL ES 2.0 distortion-mesh background renderer adapted from Apple Music for Android TV (`MacBackground`). It extracts characteristic palette colors from the current album artwork and runs continuous, subtle low-poly mesh rotation and multi-pass Gaussian blur to create an organic liquid-light immersion on big screens with minimal SoC overhead.
+*Aliases: GLES2 动态材质流光背景, 封面动态液态流光*
