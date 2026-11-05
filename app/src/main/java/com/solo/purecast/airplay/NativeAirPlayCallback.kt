@@ -35,6 +35,16 @@ interface NativeAirPlayCallback {
     fun onStreamStopped()
 
     /**
+     * 💡 接收到推流端暂停请求或检测到音频流中断 (PAUSE / Stream Inactivity 触发)
+     */
+    fun onStreamPaused()
+
+    /**
+     * 💡 接收到推流端恢复请求或检测到新音频包到达 (RECORD / Stream Resumed 触发)
+     */
+    fun onStreamResumed()
+
+    /**
      * 收到 Apple-Challenge 挑战握手请求 (OPTIONS / ANNOUNCE 阶段)
      * @param challengeBase64 Apple 设备发来的 Base64 编码随机挑战
      * @return 经 RSA 私钥签名的 Apple-Response Base64 字符串，失败返回 null

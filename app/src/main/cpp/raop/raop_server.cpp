@@ -32,7 +32,15 @@ static size_t safe_parse_content_length(const std::string& str) {
     }
 }
 
-RaopServer::RaopServer() = default;
+RaopServer::RaopServer() {
+    rtp_.set_stream_state_callback([this](bool is_paused) {
+        if (is_paused) {
+            if (stream_pause_cb_) stream_pause_cb_();
+        } else {
+            if (stream_resume_cb_) stream_resume_cb_();
+        }
+    });
+}
 
 RaopServer::~RaopServer() {
     stop();
@@ -316,11 +324,19 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
         }
     } else if (method == "RECORD") {
         rtp_.reset_buffer();
+        rtp_.mark_paused_manually(false);
+        if (stream_resume_cb_) stream_resume_cb_();
         if (flush_cb_) flush_cb_();
         response << "RTSP/1.0 200 OK\r\n"
                  << "CSeq: " << cseq << "\r\n"
                  << "Audio-Latency: 11025\r\n"
                  << "Server: AirTunes/105.1\r\n\r\n";
+    } else if (method == "PAUSE") {
+        LOGI("收到 RTSP PAUSE 请求，执行推流暂停");
+        rtp_.mark_paused_manually(true);
+        if (stream_pause_cb_) stream_pause_cb_();
+        response << "RTSP/1.0 200 OK\r\n"
+                 << "CSeq: " << cseq << "\r\n\r\n";
     } else if (method == "SET_PARAMETER") {
         std::string content_type = parse_header(request, "Content-Type");
         size_t header_end = request.find("\r\n\r\n");

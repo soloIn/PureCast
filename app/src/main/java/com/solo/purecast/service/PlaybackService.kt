@@ -109,19 +109,19 @@ class PlaybackService : LifecycleService() {
         // 冷启动扫描已连接的 USB DAC
         usbDeviceManager.scanAndAttachDevice()
 
-        // 💡 启动 UPnP / DLNA MediaRenderer 服务端 (采用用户持久化的 friendlyName)
+        // 💡 启动 UPnP / DLNA MediaRenderer 服务端 (友好名称末尾追加 [UPnP] 协议后缀)
         val friendlyName = settingsRepository.getFriendlyName()
         if (settingsRepository.isUpnpEnabled()) {
             upnpServer = com.solo.purecast.upnp.UpnpRendererServer(
                 scope = lifecycleScope,
                 playbackService = this,
-                friendlyName = friendlyName
+                friendlyName = formatUpnpName(friendlyName)
             ).apply {
                 start()
             }
         }
 
-        // 💡 启动原生 AirPlay 1 (RAOP) 接收服务端 (若配置开启)
+        // 💡 启动原生 AirPlay 1 (RAOP) 接收服务端 (友好名称末尾追加 [AirPlay] 协议后缀)
         airPlayServer = com.solo.purecast.airplay.AirPlayServerManager(
             context = this,
             scope = lifecycleScope,
@@ -136,11 +136,17 @@ class PlaybackService : LifecycleService() {
             },
             onProgressUpdatedListener = { positionMs, durationMs ->
                 onAirPlayProgressUpdated(positionMs, durationMs)
+            },
+            onStreamPausedListener = {
+                onAirPlayStreamPaused()
+            },
+            onStreamResumedListener = {
+                onAirPlayStreamResumed()
             }
         )
 
         if (settingsRepository.isAirPlayEnabled()) {
-            airPlayServer?.start(friendlyName)
+            airPlayServer?.start(formatAirPlayName(friendlyName))
         }
     }
 
@@ -463,6 +469,46 @@ class PlaybackService : LifecycleService() {
     }
 
     /**
+     * 💡 原生 AirPlay 1 推流暂停事件 (iPhone 点击暂停或断流触发)
+     */
+    private fun onAirPlayStreamPaused() {
+        if (currentStreamSource == StreamSource.AIRPLAY && _playbackStatus.value == PlaybackStatus.PLAYING) {
+            Logger.service.i(TAG, "AirPlay 数据流暂停 (iPhone 暂停推流)，同步 TV 端播放状态机为 PAUSED")
+            airPlayProgressJob?.cancel()
+            airPlayProgressJob = null
+            airPlayBasePositionMs = _playbackPositionMs.value
+
+            NativeAudioEngine.pauseStream()
+            _playbackStatus.value = PlaybackStatus.PAUSED
+            releaseWifiLowLatencyLock()
+            usbDeviceManager.scheduleIdleRelease()
+            updateMediaSessionState()
+            updateNotification()
+        }
+    }
+
+    /**
+     * 💡 原生 AirPlay 1 推流恢复事件 (iPhone 恢复播放触发)
+     */
+    private fun onAirPlayStreamResumed() {
+        if (currentStreamSource == StreamSource.AIRPLAY && _playbackStatus.value == PlaybackStatus.PAUSED) {
+            Logger.service.i(TAG, "AirPlay 数据流恢复 (iPhone 恢复推流)，同步 TV 端播放状态机为 PLAYING")
+            acquireWifiLowLatencyLock()
+            usbDeviceManager.cancelIdleRelease()
+            if (!usbDeviceManager.isExclusive()) {
+                val state = _audioPathState.value
+                usbDeviceManager.claimUsbExclusive(state.sampleRate, state.bitDepth, state.channels)
+            }
+            NativeAudioEngine.resumeStream()
+            _playbackStatus.value = PlaybackStatus.PLAYING
+            airPlayAnchorRealtimeMs = android.os.SystemClock.elapsedRealtime()
+            launchAirPlayProgressTicker()
+            updateMediaSessionState()
+            updateNotification()
+        }
+    }
+
+    /**
      * 💡 原生 AirPlay 1 DMAP 元数据更新事件 (SET_PARAMETER 触发)
      * 支持多包增量合并 (Smart Merge)，杜绝后序元数据包将封面或歌名相互覆盖冲刷
      */
@@ -635,12 +681,12 @@ class PlaybackService : LifecycleService() {
     }
 
     /**
-     * 💡 更新 UPnP 与 AirPlay 局域网广播名称并即时通知服务更新
+     * 💡 更新 UPnP 与 AirPlay 局域网广播名称并即时通知服务更新 (自动追加 [UPnP] / [AirPlay] 协议后缀)
      */
     fun updateFriendlyName(newName: String) {
         settingsRepository.setFriendlyName(newName)
-        upnpServer?.updateFriendlyName(newName)
-        airPlayServer?.updateDeviceName(newName)
+        upnpServer?.updateFriendlyName(formatUpnpName(newName))
+        airPlayServer?.updateDeviceName(formatAirPlayName(newName))
     }
 
     /**
@@ -650,7 +696,7 @@ class PlaybackService : LifecycleService() {
         settingsRepository.setAirPlayEnabled(enabled)
         if (enabled) {
             val name = settingsRepository.getFriendlyName()
-            airPlayServer?.start(name)
+            airPlayServer?.start(formatAirPlayName(name))
         } else {
             airPlayServer?.stop()
         }
@@ -667,8 +713,10 @@ class PlaybackService : LifecycleService() {
                 upnpServer = com.solo.purecast.upnp.UpnpRendererServer(
                     scope = lifecycleScope,
                     playbackService = this,
-                    friendlyName = name
+                    friendlyName = formatUpnpName(name)
                 )
+            } else {
+                upnpServer?.updateFriendlyName(formatUpnpName(name))
             }
             upnpServer?.start()
         } else {
@@ -810,6 +858,22 @@ class PlaybackService : LifecycleService() {
             } else {
                 context.startService(intent)
             }
+        }
+
+        /**
+         * 💡 为自定义广播名称追加 AirPlay 协议标识后缀 (如 PureCast TV [AirPlay])
+         */
+        fun formatAirPlayName(baseName: String): String {
+            val clean = baseName.removeSuffix(" [AirPlay]").removeSuffix(" [UPnP]").trim()
+            return "$clean [AirPlay]"
+        }
+
+        /**
+         * 💡 为自定义广播名称追加 UPnP 协议标识后缀 (如 PureCast TV [UPnP])
+         */
+        fun formatUpnpName(baseName: String): String {
+            val clean = baseName.removeSuffix(" [AirPlay]").removeSuffix(" [UPnP]").trim()
+            return "$clean [UPnP]"
         }
     }
 }

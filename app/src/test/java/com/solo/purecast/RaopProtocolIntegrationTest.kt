@@ -257,4 +257,18 @@ class RaopProtocolIntegrationTest {
         // 推进到末尾封顶
         assertEquals(240000L, calculatePosition(400000L))
     }
+
+    @Test
+    fun testProtocolBroadcastNameFormatting() {
+        val baseName = "PureCast TV"
+        val airPlayName = com.solo.purecast.service.PlaybackService.formatAirPlayName(baseName)
+        val upnpName = com.solo.purecast.service.PlaybackService.formatUpnpName(baseName)
+
+        assertEquals("PureCast TV [AirPlay]", airPlayName)
+        assertEquals("PureCast TV [UPnP]", upnpName)
+
+        // 避免重复追加后缀测试
+        assertEquals("PureCast TV [AirPlay]", com.solo.purecast.service.PlaybackService.formatAirPlayName(airPlayName))
+        assertEquals("PureCast TV [UPnP]", com.solo.purecast.service.PlaybackService.formatUpnpName(upnpName))
+    }
 }

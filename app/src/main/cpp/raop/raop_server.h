@@ -34,6 +34,8 @@ public:
     using ChallengeCallback = std::function<std::string(const std::string& challenge_b64)>;
     using ProgressCallback = std::function<void(long position_ms, long duration_ms)>;
     using FlushCallback = std::function<void()>;
+    using StreamPauseCallback = std::function<void()>;
+    using StreamResumeCallback = std::function<void()>;
 
     RaopServer();
     ~RaopServer();
@@ -45,6 +47,8 @@ public:
 
     void set_stream_request_callback(StreamRequestCallback cb) { stream_request_cb_ = std::move(cb); }
     void set_stream_stop_callback(StreamStopCallback cb) { stream_stop_cb_ = std::move(cb); }
+    void set_stream_pause_callback(StreamPauseCallback cb) { stream_pause_cb_ = std::move(cb); }
+    void set_stream_resume_callback(StreamResumeCallback cb) { stream_resume_cb_ = std::move(cb); }
     void set_metadata_callback(MetadataCallback cb) { metadata_cb_ = std::move(cb); }
     void set_challenge_callback(ChallengeCallback cb) { challenge_cb_ = std::move(cb); }
     void set_progress_callback(ProgressCallback cb) { progress_cb_ = std::move(cb); }
@@ -76,6 +80,8 @@ private:
 
     StreamRequestCallback stream_request_cb_{nullptr};
     StreamStopCallback stream_stop_cb_{nullptr};
+    StreamPauseCallback stream_pause_cb_{nullptr};
+    StreamResumeCallback stream_resume_cb_{nullptr};
     MetadataCallback metadata_cb_{nullptr};
     ChallengeCallback challenge_cb_{nullptr};
     ProgressCallback progress_cb_{nullptr};

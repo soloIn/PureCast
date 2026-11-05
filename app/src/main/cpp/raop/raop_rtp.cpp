@@ -107,6 +107,7 @@ bool RaopRtp::start(int& out_data_port, int& out_ctrl_port, int& out_timing_port
     data_thread_ = std::thread(&RaopRtp::data_loop, this);
     ctrl_thread_ = std::thread(&RaopRtp::ctrl_loop, this);
     timing_thread_ = std::thread(&RaopRtp::timing_loop, this);
+    watchdog_thread_ = std::thread(&RaopRtp::watchdog_loop, this);
 
     LOGI("RAOP RTP 服务启动成功: Data=%d, Control=%d, Timing=%d", data_port_, ctrl_port_, timing_port_);
     return true;
@@ -128,6 +129,7 @@ void RaopRtp::stop() {
     if (data_thread_.joinable()) data_thread_.join();
     if (ctrl_thread_.joinable()) ctrl_thread_.join();
     if (timing_thread_.joinable()) timing_thread_.join();
+    if (watchdog_thread_.joinable()) watchdog_thread_.join();
 
     // 💡 步骤 3: 线程完全终止后，再统一执行 close 释放文件描述符，彻底杜绝并发竞态
     if (data_fd_ >= 0) {
@@ -148,6 +150,8 @@ void RaopRtp::stop() {
     last_data_seq_ = 0;
     has_client_ctrl_.store(false, std::memory_order_release);
     resend_req_seq_.store(0, std::memory_order_relaxed);
+    last_audio_packet_time_ms_.store(0, std::memory_order_relaxed);
+    is_stream_paused_.store(false, std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> lock(crypto_mutex_);
         aes_key_.clear();
@@ -205,6 +209,37 @@ void RaopRtp::set_alac_config(int frame_length, int bit_depth, int channels, int
          frame_length, bit_depth, channels, sample_rate);
 }
 
+uint64_t RaopRtp::get_monotonic_time_ms() {
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+void RaopRtp::watchdog_loop() {
+    LOGI("RAOP RTP 数据流无数据看门狗已启动");
+    while (is_running_.load(std::memory_order_relaxed)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        if (!is_running_.load(std::memory_order_relaxed)) break;
+
+        uint64_t last_time = last_audio_packet_time_ms_.load(std::memory_order_relaxed);
+        if (last_time > 0 && !is_stream_paused_.load(std::memory_order_relaxed)) {
+            uint64_t now = get_monotonic_time_ms();
+            if (now > last_time && (now - last_time) >= 600) {
+                is_stream_paused_.store(true, std::memory_order_release);
+                LOGI("⚠️ 检测到 RTP 音频流停顿超 600ms (iPhone 暂停推流)，通知上层暂停");
+                if (state_cb_) state_cb_(true);
+            }
+        }
+    }
+    LOGI("RAOP RTP 数据流无数据看门狗已退出");
+}
+
+void RaopRtp::mark_paused_manually(bool paused) {
+    is_stream_paused_.store(paused, std::memory_order_release);
+    if (!paused) {
+        last_audio_packet_time_ms_.store(get_monotonic_time_ms(), std::memory_order_relaxed);
+    }
+}
+
 uint64_t RaopRtp::get_ntp_timestamp() {
     struct timeval tv{};
     gettimeofday(&tv, nullptr);
@@ -243,6 +278,15 @@ void RaopRtp::data_loop() {
         // 0x54 (84): Sync 控制包 (非音频数据，直接忽略)
         if (payload_type != 96 && payload_type != 86) {
             continue;
+        }
+
+        // 💡 更新最近音频数据包时间戳，若此前处于暂停状态则即时唤醒恢复播放
+        uint64_t now_ms = get_monotonic_time_ms();
+        last_audio_packet_time_ms_.store(now_ms, std::memory_order_relaxed);
+        if (is_stream_paused_.load(std::memory_order_relaxed)) {
+            is_stream_paused_.store(false, std::memory_order_release);
+            LOGI("▶️ 检测到 RTP 新音频包到达，通知上层流已恢复播放");
+            if (state_cb_) state_cb_(false);
         }
 
         const uint8_t* pktp = buffer.data();
