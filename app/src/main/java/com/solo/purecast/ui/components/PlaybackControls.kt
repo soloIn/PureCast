@@ -33,13 +33,13 @@ import com.solo.purecast.model.PlaybackStatus
 
 /**
  * 💡 PureCast 遥控器专属播放控制栏 (PlaybackControls)
- * 严格按照 Apple TV (tvOS) 与 lavande16/Apple-Music-For-Android-TV 原生规范重构：
- * 1. 废弃带有默认不对称 ContentPadding 的 Button，全面采用 Surface + Box(fillMaxSize, Alignment.Center)；
- * 2. 彻底解决图标未居中问题：无论何种分辨率与缩放，SF Symbols 矢量均 100% 绝对置于几何中心；
- * 3. 悬浮呼吸质感：
- *    - 未获焦时：完全纯净透明 (Color.Transparent)，图标为纯白 (Color.White)；
- *    - 获焦时：1.12x 浮起放大并点亮 Apple 纯正微白毛玻璃高光 (Color(0x2EFFFFFF))，辅以柔和微发光边框；
- * 4. 严谨图标资源：上一曲 [ic_backward_end_fill]、播放/暂停 [ic_play_fill/ic_pause_fill]、下一曲 [ic_forward_end_fill] 与设置 [ic_gear]。
+ * 严格按照 lavande16/Apple-Music-For-Android-TV 与 Apple TV (tvOS) 原生质感重构：
+ * 1. 彻底移除沉重的白色描边 (border = None) 与外层光晕 (glow = None)；
+ * 2. 纯粹遵循 Apple 视觉反馈层级：
+ *    - 非焦点按钮：稍低亮度 (White 55% alpha)，纯平半透悬浮，优雅不喧宾夺主；
+ *    - 焦点按钮：点亮至 100% 纯白正常亮度 + 1.12x 浮起放大 + 极微弱的纯平微白磨砂底 (Color(0x22FFFFFF))；
+ * 3. 几何对称居中：SF Symbols 矢量 100% 绝对置于几何中心，消除默认 Padding 偏心；
+ * 4. 严谨标准图标：上一曲 [ic_backward_end_fill]、播放/暂停 [ic_play_fill/ic_pause_fill]、下一曲 [ic_forward_end_fill] 与设置 [ic_gear]。
  */
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
@@ -101,8 +101,11 @@ fun PlaybackControls(
 }
 
 /**
- * 💡 自适应完美居中的 Apple TV 风格媒体按键 (TransportIconButton)
- * 采用 Surface + Box(fillMaxSize, Alignment.Center)，彻底消除系统默认 Button 内边距导致的图标偏位
+ * 💡 Apple TV 极简通透媒体按键 (TransportIconButton)
+ * 采用 Surface + Box(fillMaxSize, Alignment.Center)：
+ * - 去除任何厚重描边与发光轮廓；
+ * - 焦点态：100% 亮白 + 1.12x 放大 + 极微弱微透底色 (Color(0x22FFFFFF))；
+ * - 非焦点态：55% 柔和白 (Color.White.copy(0.55f)) + 完全透明背景。
  */
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
@@ -116,9 +119,8 @@ private fun TransportIconButton(
     onClick: () -> Unit
 ) {
     var isFocused by remember { mutableStateOf(false) }
-    val shape = if (isCircle) CircleShape else RoundedCornerShape(14.dp)
+    val shape = if (isCircle) CircleShape else RoundedCornerShape(12.dp)
     val noBorder = Border(BorderStroke(0.dp, Color.Transparent))
-    val focusedBorder = Border(BorderStroke(1.5.dp, Color.White.copy(alpha = 0.85f)))
 
     Surface(
         onClick = onClick,
@@ -134,16 +136,17 @@ private fun TransportIconButton(
         ),
         colors = ClickableSurfaceDefaults.colors(
             containerColor = Color.Transparent,
-            focusedContainerColor = Color(0x33FFFFFF),
-            pressedContainerColor = Color(0x55FFFFFF)
+            focusedContainerColor = Color(0x22FFFFFF),
+            pressedContainerColor = Color(0x3DFFFFFF)
         ),
         border = ClickableSurfaceDefaults.border(
             border = noBorder,
-            focusedBorder = focusedBorder
+            focusedBorder = noBorder
         ),
         glow = ClickableSurfaceDefaults.glow(
             glow = Glow.None,
-            focusedGlow = Glow(elevationColor = Color.White.copy(alpha = 0.3f), elevation = 8.dp)
+            focusedGlow = Glow.None,
+            pressedGlow = Glow.None
         )
     ) {
         // 💡 100% 绝对置于几何中心，杜绝任何 Padding 偏心
@@ -154,7 +157,7 @@ private fun TransportIconButton(
             Icon(
                 painter = painterResource(id = iconResId),
                 contentDescription = contentDescription,
-                tint = Color.White,
+                tint = if (isFocused) Color.White else Color.White.copy(alpha = 0.55f),
                 modifier = Modifier.size(iconSize)
             )
         }
