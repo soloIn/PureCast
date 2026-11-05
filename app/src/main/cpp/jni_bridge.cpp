@@ -422,6 +422,9 @@ Java_com_solo_purecast_core_nativebridge_NativeAudioEngine_startAirPlayServer(
     g_raop_server->set_metadata_callback(notify_java_metadata);
     g_raop_server->set_challenge_callback(notify_java_challenge_requested);
     g_raop_server->set_progress_callback(notify_java_progress_updated);
+    g_raop_server->set_flush_callback([]() {
+        purecast::AudioEngine::instance().flush_buffer();
+    });
 
     bool ok = g_raop_server->start(port);
     return ok ? JNI_TRUE : JNI_FALSE;

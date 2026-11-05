@@ -90,6 +90,7 @@ private:
     std::thread ctrl_thread_;
     std::thread timing_thread_;
 
+    std::mutex crypto_mutex_;
     std::vector<uint8_t> aes_key_;
     std::vector<uint8_t> aes_iv_;
     std::atomic<bool> has_crypto_{false};

@@ -22,10 +22,11 @@ struct DmapMetadata {
  */
 class DmapParser {
 public:
+    static constexpr int MAX_DMAP_DEPTH = 16;
     static bool parse(const uint8_t* data, size_t size, DmapMetadata& out_metadata);
 
 private:
-    static void parse_recursive(const uint8_t* data, size_t size, DmapMetadata& out_metadata);
+    static void parse_recursive(const uint8_t* data, size_t size, DmapMetadata& out_metadata, int depth = 0);
     static uint32_t read_uint32_be(const uint8_t* p);
 };
 

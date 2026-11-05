@@ -1,6 +1,5 @@
 #include "raop_server.h"
 #include "dmap_parser.h"
-#include "../audio_engine.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -8,19 +7,7 @@
 #include <fcntl.h>
 #include <sstream>
 #include <android/log.h>
-
-#ifdef LOGD
-#undef LOGD
-#endif
-#ifdef LOGI
-#undef LOGI
-#endif
-#ifdef LOGW
-#undef LOGW
-#endif
-#ifdef LOGE
-#undef LOGE
-#endif
+#include <cctype>
 
 #define RAOP_TAG "PureCastRAOP"
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, RAOP_TAG, __VA_ARGS__)
@@ -29,6 +16,21 @@
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, RAOP_TAG, __VA_ARGS__)
 
 namespace purecast::raop {
+
+static size_t safe_parse_content_length(const std::string& str) {
+    if (str.empty()) return 0;
+    try {
+        size_t idx = 0;
+        while (idx < str.size() && std::isspace(static_cast<unsigned char>(str[idx]))) idx++;
+        if (idx >= str.size() || !std::isdigit(static_cast<unsigned char>(str[idx]))) return 0;
+        unsigned long val = std::stoul(str.substr(idx));
+        if (val > 16 * 1024 * 1024) return 0; // 限制最大 16MB，防止恶意畸形超大报文引发 OOM
+        return static_cast<size_t>(val);
+    } catch (...) {
+        LOGW("Content-Length 格式非法，安全回退为 0: %s", str.c_str());
+        return 0;
+    }
+}
 
 RaopServer::RaopServer() = default;
 
@@ -119,28 +121,34 @@ void RaopServer::handle_client(int client_fd) {
     std::vector<char> buffer(8192);
     std::string accumulated_data;
 
-    while (is_running_.load()) {
-        ssize_t bytes_read = recv(client_fd, buffer.data(), buffer.size() - 1, 0);
-        if (bytes_read <= 0) {
-            LOGI("RTSP 客户端连接已关闭或断开");
-            break;
-        }
-        buffer[bytes_read] = '\0';
-        accumulated_data.append(buffer.data(), bytes_read);
+    try {
+        while (is_running_.load()) {
+            ssize_t bytes_read = recv(client_fd, buffer.data(), buffer.size() - 1, 0);
+            if (bytes_read <= 0) {
+                LOGI("RTSP 客户端连接已关闭或断开");
+                break;
+            }
+            buffer[bytes_read] = '\0';
+            accumulated_data.append(buffer.data(), bytes_read);
 
-        // 检查是否包含完整 RTSP 请求头 \r\n\r\n
-        size_t header_end = accumulated_data.find("\r\n\r\n");
-        if (header_end != std::string::npos) {
-            std::string content_length_str = parse_header(accumulated_data, "Content-Length");
-            size_t content_length = content_length_str.empty() ? 0 : std::stoul(content_length_str);
+            // 检查是否包含完整 RTSP 请求头 \r\n\r\n
+            size_t header_end = accumulated_data.find("\r\n\r\n");
+            if (header_end != std::string::npos) {
+                std::string content_length_str = parse_header(accumulated_data, "Content-Length");
+                size_t content_length = safe_parse_content_length(content_length_str);
 
-            size_t total_expected = header_end + 4 + content_length;
-            if (accumulated_data.size() >= total_expected) {
-                std::string full_request = accumulated_data.substr(0, total_expected);
-                accumulated_data.erase(0, total_expected);
-                handle_rtsp_request(client_fd, full_request);
+                size_t total_expected = header_end + 4 + content_length;
+                if (accumulated_data.size() >= total_expected) {
+                    std::string full_request = accumulated_data.substr(0, total_expected);
+                    accumulated_data.erase(0, total_expected);
+                    handle_rtsp_request(client_fd, full_request);
+                }
             }
         }
+    } catch (const std::exception& e) {
+        LOGE("处理 RTSP 客户端数据时捕获异常: %s，安全关闭客户端连接", e.what());
+    } catch (...) {
+        LOGE("处理 RTSP 客户端数据时捕获未知异常，安全关闭客户端连接");
     }
 }
 
@@ -213,7 +221,7 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
         }
     } else if (method == "FLUSH") {
         rtp_.reset_buffer(); // 💡 收到 FLUSH 立即重置 JitterBuffer 与 AudioEngine 环形缓冲，杜绝残音爆音与断层
-        AudioEngine::instance().flush_buffer();
+        if (flush_cb_) flush_cb_();
         response << "RTSP/1.0 200 OK\r\n"
                  << "CSeq: " << cseq << "\r\n"
                  << "RTP-Info: rtptime=0\r\n"
@@ -305,7 +313,7 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
         }
     } else if (method == "RECORD") {
         rtp_.reset_buffer();
-        AudioEngine::instance().flush_buffer();
+        if (flush_cb_) flush_cb_();
         response << "RTSP/1.0 200 OK\r\n"
                  << "CSeq: " << cseq << "\r\n"
                  << "Audio-Latency: 11025\r\n"
@@ -371,7 +379,7 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
                  << "CSeq: " << cseq << "\r\n\r\n";
     } else if (method == "TEARDOWN") {
         rtp_.stop();
-        AudioEngine::instance().flush_buffer();
+        if (flush_cb_) flush_cb_();
         if (stream_stop_cb_) {
             stream_stop_cb_();
         }

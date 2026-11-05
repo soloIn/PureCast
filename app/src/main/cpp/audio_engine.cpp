@@ -870,22 +870,19 @@ void AudioEngine::process_feedback_transfer(struct libusb_transfer* transfer) {
 }
 
 int AudioEngine::write_pcm(const uint8_t* data, size_t size) {
-    if (!ring_buffer_ || !is_running_.load(std::memory_order_relaxed)) {
+    if (!ring_buffer_ || !is_running_.load(std::memory_order_relaxed) || !data || size == 0) {
         return -1;
     }
-    // 💡 保证以单采样帧对齐 (4 字节) 进行写入，防止非完整帧导致声道/位深位移白噪音
-    const size_t frame_align = static_cast<size_t>(current_channels_ * ((current_bit_depth_ > 0) ? (current_bit_depth_ / 8) : 2));
-    const size_t align = frame_align > 0 ? frame_align : 4;
     const size_t available = ring_buffer_->available_write();
-    const size_t safe_to_write = (available >= size) ? size : (available - (available % align));
-    if (safe_to_write == 0) {
+    // 💡 保护原则：剩余空间不足以写入整包时执行整包丢弃 (Drop Whole Packet)，绝不截断半帧拼接破坏连续声波
+    if (available < size) {
         static int overrun_log = 0;
         if (overrun_log++ % 100 == 0) {
-            LOGW("环形缓冲区已满 (Overrun 预警)，丢弃当前音频帧");
+            LOGW("环形缓冲区高水位饱和 (可用: %zu < 需求: %zu)，整包丢弃以消除波形断裂爆音", available, size);
         }
         return 0;
     }
-    return static_cast<int>(ring_buffer_->write(data, safe_to_write));
+    return static_cast<int>(ring_buffer_->write(data, size));
 }
 
 int AudioEngine::pause_stream() {

@@ -5,6 +5,7 @@
 #define DMAP_TAG "PureCastDmap"
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, DMAP_TAG, __VA_ARGS__)
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, DMAP_TAG, __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, DMAP_TAG, __VA_ARGS__)
 
 namespace purecast::raop {
 
@@ -17,11 +18,16 @@ uint32_t DmapParser::read_uint32_be(const uint8_t* p) {
 
 bool DmapParser::parse(const uint8_t* data, size_t size, DmapMetadata& out_metadata) {
     if (!data || size < 8) return false;
-    parse_recursive(data, size, out_metadata);
+    parse_recursive(data, size, out_metadata, 0);
     return !out_metadata.title.empty() || !out_metadata.artist.empty() || !out_metadata.cover_art.empty();
 }
 
-void DmapParser::parse_recursive(const uint8_t* data, size_t size, DmapMetadata& out_metadata) {
+void DmapParser::parse_recursive(const uint8_t* data, size_t size, DmapMetadata& out_metadata, int depth) {
+    if (depth >= MAX_DMAP_DEPTH) {
+        LOGW("DMAP 嵌套层级超过安全深度上限 (%d)，中止向下递归防爆栈", MAX_DMAP_DEPTH);
+        return;
+    }
+
     size_t offset = 0;
     while (offset + 8 <= size) {
         char tag[5] = {
@@ -60,7 +66,7 @@ void DmapParser::parse_recursive(const uint8_t* data, size_t size, DmapMetadata&
                    std::strcmp(tag, "mshl") == 0 ||
                    std::strcmp(tag, "mlcl") == 0) {
             // 复合容器标签，递归解析内部子元素
-            parse_recursive(val_ptr, len, out_metadata);
+            parse_recursive(val_ptr, len, out_metadata, depth + 1);
         }
 
         offset += len;

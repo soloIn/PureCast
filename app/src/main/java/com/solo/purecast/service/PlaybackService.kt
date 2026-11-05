@@ -744,6 +744,8 @@ class PlaybackService : LifecycleService() {
     override fun onDestroy() {
         Logger.service.i(TAG, "PlaybackService onDestroy: 彻底清理服务...")
         instance = null
+        airPlayProgressJob?.cancel()
+        airPlayProgressJob = null
         mediaSession?.apply {
             isActive = false
             release()

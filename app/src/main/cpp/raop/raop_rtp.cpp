@@ -119,33 +119,42 @@ void RaopRtp::stop() {
 
     LOGI("正在停止 RAOP RTP 接收引擎...");
 
-    // 关闭 Socket 唤醒接收阻塞
-    if (data_fd_ >= 0) {
-        shutdown(data_fd_, SHUT_RDWR);
-        close(data_fd_);
-        data_fd_ = -1;
-    }
-    if (ctrl_fd_ >= 0) {
-        shutdown(ctrl_fd_, SHUT_RDWR);
-        close(ctrl_fd_);
-        ctrl_fd_ = -1;
-    }
-    if (timing_fd_ >= 0) {
-        shutdown(timing_fd_, SHUT_RDWR);
-        close(timing_fd_);
-        timing_fd_ = -1;
-    }
+    // 💡 步骤 1: 仅调用 shutdown 唤醒阻塞在 recvfrom 上的接收线程，切勿立即 close(fd) 产生竞态
+    if (data_fd_ >= 0) shutdown(data_fd_, SHUT_RDWR);
+    if (ctrl_fd_ >= 0) shutdown(ctrl_fd_, SHUT_RDWR);
+    if (timing_fd_ >= 0) shutdown(timing_fd_, SHUT_RDWR);
 
+    // 💡 步骤 2: 等待所有后台接收线程彻底退出并完成系统调用
     if (data_thread_.joinable()) data_thread_.join();
     if (ctrl_thread_.joinable()) ctrl_thread_.join();
     if (timing_thread_.joinable()) timing_thread_.join();
 
+    // 💡 步骤 3: 线程完全终止后，再统一执行 close 释放文件描述符，彻底杜绝并发竞态
+    if (data_fd_ >= 0) {
+        close(data_fd_);
+        data_fd_ = -1;
+    }
+    if (ctrl_fd_ >= 0) {
+        close(ctrl_fd_);
+        ctrl_fd_ = -1;
+    }
+    if (timing_fd_ >= 0) {
+        close(timing_fd_);
+        timing_fd_ = -1;
+    }
+
     jitter_buffer_.reset();
-    has_crypto_.store(false, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(crypto_mutex_);
+        aes_key_.clear();
+        aes_iv_.clear();
+        has_crypto_.store(false, std::memory_order_release);
+    }
     LOGI("RAOP RTP 接收引擎已完全停止");
 }
 
 void RaopRtp::set_crypto_key(const std::vector<uint8_t>& aes_key, const std::vector<uint8_t>& aes_iv) {
+    std::lock_guard<std::mutex> lock(crypto_mutex_);
     aes_key_ = aes_key;
     aes_iv_ = aes_iv;
     has_crypto_.store(!aes_key_.empty() && !aes_iv_.empty(), std::memory_order_release);
@@ -226,14 +235,25 @@ void RaopRtp::data_loop() {
         decrypted_payload.resize(payload_len);
         memcpy(decrypted_payload.data(), payload, payload_len);
 
-        if (has_crypto_.load(std::memory_order_relaxed)) {
+        if (has_crypto_.load(std::memory_order_acquire)) {
             size_t aeslen = payload_len & ~0xf;
             if (aeslen > 0) {
+                uint8_t key[16];
                 uint8_t iv[16];
-                memcpy(iv, aes_iv_.data(), 16);
-                struct AES_ctx ctx;
-                AES_init_ctx_iv(&ctx, aes_key_.data(), iv);
-                AES_CBC_decrypt_buffer(&ctx, decrypted_payload.data(), aeslen);
+                bool key_valid = false;
+                {
+                    std::lock_guard<std::mutex> lock(crypto_mutex_);
+                    if (aes_key_.size() >= 16 && aes_iv_.size() >= 16) {
+                        memcpy(key, aes_key_.data(), 16);
+                        memcpy(iv, aes_iv_.data(), 16);
+                        key_valid = true;
+                    }
+                }
+                if (key_valid) {
+                    struct AES_ctx ctx;
+                    AES_init_ctx_iv(&ctx, key, iv);
+                    AES_CBC_decrypt_buffer(&ctx, decrypted_payload.data(), aeslen);
+                }
             }
         }
 

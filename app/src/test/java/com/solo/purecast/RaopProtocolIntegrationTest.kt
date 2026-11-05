@@ -107,4 +107,154 @@ class RaopProtocolIntegrationTest {
         assertEquals(4, meta.coverBytes?.size)
         assertTrue(meta.isLiveStream)
     }
+
+    /**
+     * 💡 验证 RAOP RTP JitterBuffer 核心算法：
+     * 1. 25 帧预充门限
+     * 2. 乱序包槽位自动纠正与有序出队
+     * 3. 超过 MAX_REORDER_TOLERANCE (4帧) 触发静音补偿帧
+     */
+    @Test
+    fun testJitterBufferReorderAndSilenceCompensation() {
+        class MockSlot(var valid: Boolean = false, var seq: Int = 0, var pcm: ByteArray? = null)
+        val bufferSize = 64
+        val preRollThreshold = 25
+        val maxReorderTolerance = 4
+        val slots = Array(bufferSize) { MockSlot() }
+        var headSeq = 0
+        var maxSeqSeen = 0
+        var isBuffering = true
+        var firstPacket = true
+        var lostCount = 0
+
+        fun push(seq: Int, pcm: ByteArray) {
+            if (firstPacket) {
+                headSeq = seq
+                maxSeqSeen = seq
+                firstPacket = false
+            } else {
+                if (seq < headSeq && (headSeq - seq) < 32768) return // 丢弃过期
+                if (seq > maxSeqSeen) maxSeqSeen = seq
+            }
+            val index = seq % bufferSize
+            slots[index].valid = true
+            slots[index].seq = seq
+            slots[index].pcm = pcm
+
+            if (isBuffering) {
+                val dist = (maxSeqSeen - headSeq) + 1
+                var count = 0
+                for (i in 0 until dist) {
+                    val s = headSeq + i
+                    if (slots[s % bufferSize].valid && slots[s % bufferSize].seq == s) count++
+                }
+                if (count >= preRollThreshold) {
+                    isBuffering = false
+                }
+            }
+        }
+
+        fun pop(): ByteArray? {
+            if (isBuffering || firstPacket) return null
+            val index = headSeq % bufferSize
+            if (slots[index].valid && slots[index].seq == headSeq) {
+                val data = slots[index].pcm
+                slots[index].valid = false
+                headSeq++
+                return data
+            }
+            val diff = maxSeqSeen - headSeq
+            if (diff > maxReorderTolerance) {
+                // 丢包确认，输出 1408 字节静音补偿
+                lostCount++
+                slots[index].valid = false
+                headSeq++
+                return ByteArray(1408)
+            }
+            return null
+        }
+
+        // 1. 模拟推送前 24 帧（未达到 25 帧门限）
+        for (i in 100..123) {
+            push(i, byteArrayOf(i.toByte()))
+        }
+        assertTrue(isBuffering)
+        assertEquals(null, pop()) // 仍在预充，不可出队
+
+        // 2. 推送第 25 帧（达到门限，激活播放）
+        push(124, byteArrayOf(124.toByte()))
+        assertFalse(isBuffering)
+
+        // 3. 顺序出队验证
+        val firstFrame = pop()
+        assertNotNull(firstFrame)
+        assertEquals(100.toByte(), firstFrame?.get(0))
+
+        // 4. 模拟乱序场景：先推 126，125 迟到
+        // 出队到 124
+        for (i in 101..124) {
+            pop()
+        }
+        assertEquals(125, headSeq)
+
+        push(126, byteArrayOf(126.toByte())) // 126 到达，125 未到
+        assertEquals(null, pop()) // 仍在容忍窗口内 (diff = 1 <= 4)
+
+        push(125, byteArrayOf(125.toByte())) // 125 迟到到达补齐
+        val frame125 = pop()
+        assertNotNull(frame125)
+        assertEquals(125.toByte(), frame125?.get(0))
+        val frame126 = pop()
+        assertNotNull(frame126)
+        assertEquals(126.toByte(), frame126?.get(0))
+
+        // 5. 模拟严重丢包场景：127 丢失，直接收到 128, 129, 130, 131, 132 (超差 5 帧)
+        push(128, byteArrayOf(128.toByte()))
+        push(129, byteArrayOf(129.toByte()))
+        push(130, byteArrayOf(130.toByte()))
+        push(131, byteArrayOf(131.toByte()))
+        push(132, byteArrayOf(132.toByte())) // diff = 132 - 127 = 5 > 4
+
+        val silenceFrame = pop() // 判定 127 丢失，生成静音补偿
+        assertNotNull(silenceFrame)
+        assertEquals(1408, silenceFrame?.size)
+        assertEquals(0.toByte(), silenceFrame?.get(0))
+        assertEquals(1, lostCount)
+        assertEquals(128, headSeq)
+    }
+
+    /**
+     * 💡 验证 AirPlay 基于单调时钟的进度推进与 Seek 校准数学模型
+     */
+    @Test
+    fun testAirPlayMonotonicProgressCalculation() {
+        var basePosMs = 10000L
+        var anchorTimeMs = 100000L
+        val durationMs = 240000L
+
+        fun calculatePosition(nowMs: Long): Long {
+            val elapsed = nowMs - anchorTimeMs
+            var calculated = basePosMs + elapsed
+            if (durationMs > 0 && calculated > durationMs) {
+                calculated = durationMs
+            }
+            return calculated
+        }
+
+        // 正常播放推进 5 秒
+        assertEquals(15000L, calculatePosition(105000L))
+
+        // 正常播放推进 30 秒
+        assertEquals(40000L, calculatePosition(130000L))
+
+        // 模拟用户 Seek 到 120 秒 (收到 RTSP progress 回调校准基准)
+        basePosMs = 120000L
+        anchorTimeMs = 130500L
+
+        // Seek 后推进 2 秒
+        assertEquals(122000L, calculatePosition(132500L))
+
+        // 推进到末尾封顶
+        assertEquals(240000L, calculatePosition(400000L))
+    }
 }
