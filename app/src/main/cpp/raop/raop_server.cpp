@@ -285,6 +285,9 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
         size_t cport_pos = transport.find("control_port=");
         if (cport_pos != std::string::npos) {
             current_params_.client_control_port = std::stoi(transport.substr(cport_pos + 13));
+            if (!current_params_.client_ip.empty() && current_params_.client_control_port > 0) {
+                rtp_.set_client_control_endpoint(current_params_.client_ip, current_params_.client_control_port);
+            }
         }
 
         bool accepted = true;

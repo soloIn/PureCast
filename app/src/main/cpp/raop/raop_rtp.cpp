@@ -144,6 +144,10 @@ void RaopRtp::stop() {
     }
 
     jitter_buffer_.reset();
+    first_data_seq_ = true;
+    last_data_seq_ = 0;
+    has_client_ctrl_.store(false, std::memory_order_release);
+    resend_req_seq_.store(0, std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> lock(crypto_mutex_);
         aes_key_.clear();
@@ -151,6 +155,40 @@ void RaopRtp::stop() {
         has_crypto_.store(false, std::memory_order_release);
     }
     LOGI("RAOP RTP 接收引擎已完全停止");
+}
+
+void RaopRtp::set_client_control_endpoint(const std::string& client_ip, int client_ctrl_port) {
+    if (client_ip.empty() || client_ctrl_port <= 0) return;
+    std::memset(&client_ctrl_addr_, 0, sizeof(client_ctrl_addr_));
+    client_ctrl_addr_.sin_family = AF_INET;
+    client_ctrl_addr_.sin_port = htons(client_ctrl_port);
+    if (inet_pton(AF_INET, client_ip.c_str(), &client_ctrl_addr_.sin_addr) > 0) {
+        has_client_ctrl_.store(true, std::memory_order_release);
+        LOGI("显式配置客户端控制端点: %s:%d (用于 RAOP 丢包重传)", client_ip.c_str(), client_ctrl_port);
+    }
+}
+
+void RaopRtp::send_resend_request(uint16_t first_seq, uint16_t count) {
+    if (!has_client_ctrl_.load(std::memory_order_relaxed) || ctrl_fd_ < 0 || count == 0) {
+        return;
+    }
+
+    // 💡 遵循 Apple RAOP 8 字节重传请求报文规范 (0x80, 0xd5, req_seq, first_seq, count)
+    uint8_t req[8];
+    req[0] = 0x80;
+    req[1] = 0xd5;
+    uint16_t rseq = resend_req_seq_.fetch_add(1, std::memory_order_relaxed);
+    req[2] = static_cast<uint8_t>((rseq >> 8) & 0xFF);
+    req[3] = static_cast<uint8_t>(rseq & 0xFF);
+    req[4] = static_cast<uint8_t>((first_seq >> 8) & 0xFF);
+    req[5] = static_cast<uint8_t>(first_seq & 0xFF);
+    req[6] = static_cast<uint8_t>((count >> 8) & 0xFF);
+    req[7] = static_cast<uint8_t>(count & 0xFF);
+
+    sendto(ctrl_fd_, req, sizeof(req), 0,
+           reinterpret_cast<const struct sockaddr*>(&client_ctrl_addr_),
+           sizeof(client_ctrl_addr_));
+    LOGI("⚡ 发送 RAOP 丢包重传请求: first_seq=%u, count=%u, req_seq=%u", first_seq, count, rseq);
 }
 
 void RaopRtp::set_crypto_key(const std::vector<uint8_t>& aes_key, const std::vector<uint8_t>& aes_iv) {
@@ -224,6 +262,24 @@ void RaopRtp::data_loop() {
                       (static_cast<uint32_t>(pktp[6]) << 8)  |
                       pktp[7];
 
+        // 💡 实时丢包空洞检测: 发现主干音频包序列号跳跃时，立即向 iPhone 发送重传请求
+        if (payload_type == 96) {
+            if (first_data_seq_) {
+                last_data_seq_ = seq;
+                first_data_seq_ = false;
+            } else {
+                int16_t diff = static_cast<int16_t>(seq - last_data_seq_);
+                if (diff > 1 && diff <= 32) {
+                    uint16_t missing_start = static_cast<uint16_t>(last_data_seq_ + 1);
+                    uint16_t missing_count = static_cast<uint16_t>(diff - 1);
+                    send_resend_request(missing_start, missing_count);
+                }
+                if (diff > 0) {
+                    last_data_seq_ = seq;
+                }
+            }
+        }
+
         const uint8_t* payload = pktp + 12;
         size_t payload_len = static_cast<size_t>(plen - 12);
         if (payload_len < 16) continue;
@@ -293,6 +349,16 @@ void RaopRtp::ctrl_loop() {
         }
 
         if (n < 4) continue;
+
+        // 💡 动态学习客户端控制端点地址与端口，确保丢包重传通道畅通
+        if (!has_client_ctrl_.load(std::memory_order_relaxed)) {
+            client_ctrl_addr_ = client_addr;
+            has_client_ctrl_.store(true, std::memory_order_release);
+            char ip_str[INET_ADDRSTRLEN] = {0};
+            inet_ntop(AF_INET, &(client_addr.sin_addr), ip_str, INET_ADDRSTRLEN);
+            LOGI("通过控制端口学习到客户端端点: %s:%d", ip_str, ntohs(client_addr.sin_port));
+        }
+
         uint8_t payload_type = buffer[1] & 0x7F;
         if (payload_type == 84) {
             // RTP Sync 同步包 (包含 RTP 时间戳与 NTP 时间戳映射)
@@ -325,6 +391,10 @@ void RaopRtp::timing_loop() {
             // 回复报文: payload type 设置为 0x53 (带 marker 0xD3)
             buffer[0] = 0x80;
             buffer[1] = 0xD3;
+
+            // 💡 关键修复: 将客户端请求中的 Transmit Timestamp (offset 24..31)
+            // 原样写回回复报文的 Originate Timestamp (offset 8..15)，满足 RFC 5905 与 Apple RAOP 严格时钟校准规范
+            std::memcpy(&buffer[8], &buffer[24], 8);
 
             // 写入接收时间戳 (offset 16)
             for (int i = 0; i < 8; ++i) {

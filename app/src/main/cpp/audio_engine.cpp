@@ -715,14 +715,18 @@ void AudioEngine::fill_isoc_transfer(struct libusb_transfer* transfer) {
         } else if (paused || !ready_to_play || !ring_buffer_ || ring_buffer_->available_read() < raw_input_bytes) {
             // 💡 暂停、预充中或下溢时填充静音帧，保持等时时钟锁相不丢步
             std::memset(pkt_buf, 0, target_pkt_bytes);
+            static int consecutive_underruns = 0;
             if (ready_to_play && ring_buffer_ && ring_buffer_->available_read() < raw_input_bytes) {
-                // 💡 发生下溢！立即重置预充标志，进入 100ms 重新蓄水，杜绝微下溢恶性方波振荡！
-                has_pre_rolled_.store(false, std::memory_order_release);
-                static int underrun_log_count = 0;
-                if (underrun_log_count++ % 500 == 0) {
-                    LOGW("环形缓冲区发生下溢 (Underrun)，重新进入 100ms 预充保护 (当前剩余: %zu 字节)",
-                         ring_buffer_->available_read());
+                consecutive_underruns++;
+                // 💡 软抗抖策略：偶发微下溢仅填补单微帧静音垫步保活，避免人为制造 100ms 停顿跳跃；
+                // 仅当连续 50 个微帧 (~50ms) 持续读空时，才判定为网络断流并重新触发 100ms 蓄水保护
+                if (consecutive_underruns >= 50) {
+                    has_pre_rolled_.store(false, std::memory_order_release);
+                    consecutive_underruns = 0;
+                    LOGW("环形缓冲区持续下溢超 50ms，重新进入 100ms 预充保护");
                 }
+            } else {
+                consecutive_underruns = 0;
             }
         } else {
             temp_pcm_in.resize(raw_input_bytes);

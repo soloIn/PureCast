@@ -76,9 +76,14 @@ class AirPlayServerManager(
                     }
                 }
 
-                // 2. 更新 DACP 反向控制凭证
+                // 2. 更新 DACP 反向控制凭证与启动 mDNS 动态端口解析
                 if (clientIp.isNotEmpty()) {
                     dacpClient.updateSession(clientIp, dacpPort, activeRemoteToken)
+                    if (dacpId.isNotEmpty()) {
+                        jmdnsDiscoveryService.resolveDacpPort(dacpId, clientIp) { port ->
+                            dacpClient.updatePort(port)
+                        }
+                    }
                 }
 
                 // 3. 回调上层申请音频焦点与 USB 声卡独占
@@ -87,6 +92,7 @@ class AirPlayServerManager(
 
             override fun onStreamStopped() {
                 Logger.airplay.i(TAG, "AirPlay 推流连接断开或停止")
+                jmdnsDiscoveryService.clearDacpTarget()
                 dacpClient.clearSession()
                 onStreamStoppedListener()
             }

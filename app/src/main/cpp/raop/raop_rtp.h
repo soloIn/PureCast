@@ -67,6 +67,16 @@ public:
      */
     void reset_buffer() { jitter_buffer_.reset(); }
 
+    /**
+     * 💡 设置客户端控制端口端点，用于发送 RAOP 丢包重传请求 (0xd5)
+     */
+    void set_client_control_endpoint(const std::string& client_ip, int client_ctrl_port);
+
+    /**
+     * 💡 向客户端发送 RAOP 标准 8 字节丢包重传请求
+     */
+    void send_resend_request(uint16_t first_seq, uint16_t count);
+
 private:
     void data_loop();
     void ctrl_loop();
@@ -97,6 +107,13 @@ private:
 
     alac::AlacDecoder alac_decoder_;
     RaopJitterBuffer jitter_buffer_;
+
+    // 💡 客户端控制端点与重传状态维护
+    struct sockaddr_in client_ctrl_addr_{};
+    std::atomic<bool> has_client_ctrl_{false};
+    std::atomic<uint16_t> resend_req_seq_{0};
+    uint16_t last_data_seq_{0};
+    bool first_data_seq_{true};
 };
 
 } // namespace purecast::raop

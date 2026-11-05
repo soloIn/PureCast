@@ -539,10 +539,14 @@ class PlaybackService : LifecycleService() {
     }
 
     fun pausePlayback() {
-        Logger.service.i(TAG, "暂停音频播放...")
+        Logger.service.i(TAG, "暂停音频播放 (流源: $currentStreamSource)...")
         airPlayProgressJob?.cancel()
         airPlayProgressJob = null
         airPlayBasePositionMs = _playbackPositionMs.value
+
+        if (currentStreamSource == StreamSource.AIRPLAY) {
+            airPlayServer?.dacpClient?.pause()
+        }
 
         NativeAudioEngine.pauseStream()
         _playbackStatus.value = PlaybackStatus.PAUSED
@@ -554,20 +558,22 @@ class PlaybackService : LifecycleService() {
     }
 
     fun resumePlayback() {
-        Logger.service.i(TAG, "恢复音频播放...")
+        Logger.service.i(TAG, "恢复音频播放 (流源: $currentStreamSource)...")
         acquireWifiLowLatencyLock()
         usbDeviceManager.cancelIdleRelease()
         if (!usbDeviceManager.isExclusive()) {
             val state = _audioPathState.value
             usbDeviceManager.claimUsbExclusive(state.sampleRate, state.bitDepth, state.channels)
         }
-        NativeAudioEngine.resumeStream()
-        _playbackStatus.value = PlaybackStatus.PLAYING
 
         if (currentStreamSource == StreamSource.AIRPLAY) {
+            airPlayServer?.dacpClient?.play()
             airPlayAnchorRealtimeMs = android.os.SystemClock.elapsedRealtime()
             launchAirPlayProgressTicker()
         }
+
+        NativeAudioEngine.resumeStream()
+        _playbackStatus.value = PlaybackStatus.PLAYING
 
         upnpServer?.notifyTransportState("PLAYING")
         updateMediaSessionState()
@@ -575,11 +581,15 @@ class PlaybackService : LifecycleService() {
     }
 
     fun stopPlayback() {
-        Logger.service.i(TAG, "停止音频播放...")
+        Logger.service.i(TAG, "停止音频播放 (流源: $currentStreamSource)...")
         airPlayProgressJob?.cancel()
         airPlayProgressJob = null
         airPlayBasePositionMs = 0L
         airPlayAnchorRealtimeMs = 0L
+
+        if (currentStreamSource == StreamSource.AIRPLAY) {
+            airPlayServer?.dacpClient?.stop()
+        }
 
         NativeAudioEngine.stopStream()
         _playbackStatus.value = PlaybackStatus.STOPPED
@@ -593,13 +603,21 @@ class PlaybackService : LifecycleService() {
     }
 
     fun handleNextTrack() {
-        Logger.service.i(TAG, "用户触发切下一曲")
-        upnpServer?.notifyNextTrack()
+        Logger.service.i(TAG, "用户触发切下一曲 (流源: $currentStreamSource)")
+        if (currentStreamSource == StreamSource.AIRPLAY) {
+            airPlayServer?.dacpClient?.next()
+        } else {
+            upnpServer?.notifyNextTrack()
+        }
     }
 
     fun handlePreviousTrack() {
-        Logger.service.i(TAG, "用户触发切上一曲")
-        upnpServer?.notifyPreviousTrack()
+        Logger.service.i(TAG, "用户触发切上一曲 (流源: $currentStreamSource)")
+        if (currentStreamSource == StreamSource.AIRPLAY) {
+            airPlayServer?.dacpClient?.previous()
+        } else {
+            upnpServer?.notifyPreviousTrack()
+        }
     }
 
     fun updatePlaybackPosition(posMs: Long) {

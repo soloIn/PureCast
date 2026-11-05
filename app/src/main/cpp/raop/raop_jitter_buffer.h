@@ -28,7 +28,7 @@ class RaopJitterBuffer {
 public:
     static constexpr size_t BUFFER_SIZE = 128; // 128 帧 * 352 采样 / 44100 = 约 1021ms 容量
     static constexpr size_t PRE_ROLL_PACKETS = 25; // 25 帧 * 8ms = 约 200ms 预充 (对齐 AirPlay 标称延迟，彻底杜绝水位过浅造成的声卡 Underrun)
-    static constexpr int16_t MAX_REORDER_TOLERANCE = 4; // 乱序等待上限 4 帧 (~32ms，超差立即插补静音帧垫步，杜绝 RingBuffer 饿死 128ms 产生爆音)
+    static constexpr int16_t MAX_REORDER_TOLERANCE = 8; // 乱序等待上限 8 帧 (~64ms，预留充足局域网 RTT 供 RAOP 0xd5 重传包返回，超差后插补静音帧垫步)
     static constexpr size_t FRAME_BYTES = 352 * 2 * 2; // 352 采样 * 2 声道 * 16-bit (2 字节) = 1408 字节
 
     RaopJitterBuffer();
