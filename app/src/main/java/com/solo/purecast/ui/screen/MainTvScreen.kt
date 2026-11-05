@@ -268,7 +268,6 @@ fun MainTvScreen(
                     modifier = Modifier
                         .fillMaxWidth()
                         .basicMarquee(
-                            iterations = Int.MAX_VALUE,
                             initialDelayMillis = 2000,
                             delayMillis = 1500
                         )

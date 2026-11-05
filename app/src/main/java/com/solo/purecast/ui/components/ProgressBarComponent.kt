@@ -95,12 +95,12 @@ fun ProgressBarComponent(
         label = "liveDotAlpha"
     )
 
-    // 计算进度比例 (0.0f ~ 1.0f)
-    val progressFraction = if (isLiveStream || totalDurationMs <= 0L) {
-        1.0f
-    } else {
-        (currentPositionMs.toFloat() / totalDurationMs.toFloat()).coerceIn(0.0f, 1.0f)
-    }
+    // 计算进度比例 (0.0f ~ 1.0f) - 待机状态下展示 0 进度，活跃实时流展示满条
+    val progressFraction = calculateProgressFraction(
+        currentPositionMs = currentPositionMs,
+        totalDurationMs = totalDurationMs,
+        isLiveStream = isLiveStream
+    )
 
     Column(
         modifier = modifier
@@ -238,4 +238,22 @@ private fun formatTimeMs(ms: Long): String {
     val minutes = totalSeconds / 60
     val seconds = totalSeconds % 60
     return "%02d:%02d".format(minutes, seconds)
+}
+
+/**
+ * 💡 纯函数：计算进度百分比 (0.0f ~ 1.0f)
+ * - 待机或未播放 (totalDurationMs <= 0L 且 currentPositionMs <= 0L)：归零为 0.0f；
+ * - 活跃实时流 (isLiveStream 为 true 且当前有推流时长/时间戳推进)：满条为 1.0f；
+ * - 普通点播流：按当前播放位置比例推进。
+ */
+internal fun calculateProgressFraction(
+    currentPositionMs: Long,
+    totalDurationMs: Long,
+    isLiveStream: Boolean
+): Float {
+    return when {
+        totalDurationMs <= 0L && currentPositionMs <= 0L -> 0.0f
+        isLiveStream || totalDurationMs <= 0L -> 1.0f
+        else -> (currentPositionMs.toFloat() / totalDurationMs.toFloat()).coerceIn(0.0f, 1.0f)
+    }
 }

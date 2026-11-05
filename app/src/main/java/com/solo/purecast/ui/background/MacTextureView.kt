@@ -130,6 +130,10 @@ internal class MacTextureView(
         private var eglSurface: EGLSurface = EGL14.EGL_NO_SURFACE
         private var eglConfig: EGLConfig? = null
         private var outputSize: BackgroundOutputSize? = null
+        private var cachedViewWidth = -1
+        private var cachedViewHeight = -1
+        private var cachedQuality: FluidQuality? = null
+        private var cachedOutputSize: BackgroundOutputSize? = null
         private var outputGeneration = -1
         private var reportedQuality: FluidQuality? = null
         private var window: Surface? = null
@@ -192,7 +196,16 @@ internal class MacTextureView(
                 val state = renderState
                 val viewWidth = surfaceWidth
                 val viewHeight = surfaceHeight
-                val requested = backgroundOutputSize(viewWidth, viewHeight, state.quality)
+                val requested = if (viewWidth == cachedViewWidth && viewHeight == cachedViewHeight && state.quality == cachedQuality && cachedOutputSize != null) {
+                    cachedOutputSize!!
+                } else {
+                    backgroundOutputSize(viewWidth, viewHeight, state.quality).also {
+                        cachedViewWidth = viewWidth
+                        cachedViewHeight = viewHeight
+                        cachedQuality = state.quality
+                        cachedOutputSize = it
+                    }
+                }
                 ensureOutputSurface(requested)
                 visibleFrame = r.render(viewWidth, viewHeight, state, now, requested.width, requested.height)
                 if (reportedQuality != state.quality) {
@@ -279,6 +292,10 @@ internal class MacTextureView(
             eglContext = EGL14.EGL_NO_CONTEXT
             eglConfig = null
             outputSize = null
+            cachedViewWidth = -1
+            cachedViewHeight = -1
+            cachedQuality = null
+            cachedOutputSize = null
             outputGeneration = -1
             reportedQuality = null
             display = EGL14.EGL_NO_DISPLAY

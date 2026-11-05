@@ -133,10 +133,14 @@ fun SettingsScreen(
         if (isEditingCustomName) {
             isEditingCustomName = false
         } else if (isFocusInRightContent) {
-            // 右侧按 Back：将焦点请求回左侧当前分类项
+            // 右侧按 Back：将焦点请求回左侧当前分类项 (附带首项回退兜底，杜绝焦点丢失)
             try {
                 navFocusRequesters[selectedCategory.ordinal].requestFocus()
-            } catch (_: Exception) {}
+            } catch (_: Exception) {
+                try {
+                    navFocusRequesters.firstOrNull()?.requestFocus()
+                } catch (_: Exception) {}
+            }
             isFocusInRightContent = false
         }
     }
