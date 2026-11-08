@@ -45,6 +45,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
@@ -120,6 +121,16 @@ fun SettingsScreen(
         Array(SettingsCategory.entries.size) { FocusRequester() }
     }
 
+    // 💡 为每个分类在右侧的首个可获焦项绑定确定性的 FocusRequester (解决跨栏导航错位)
+    val categoryFirstFocusRequesters = remember {
+        mapOf(
+            SettingsCategory.APPEARANCE_AND_GENERAL to FocusRequester(),
+            SettingsCategory.USB_DAC to FocusRequester(),
+            SettingsCategory.PROTOCOLS to FocusRequester(),
+            SettingsCategory.HEALTH_CHECK to FocusRequester()
+        )
+    }
+
     // 1. 设备广播名与外观状态
     var currentThemeMode by remember { mutableStateOf(AppPalette.mode) }
     var friendlyName by remember { mutableStateOf(settingsRepo.getFriendlyName()) }
@@ -187,7 +198,6 @@ fun SettingsScreen(
     var isOverlayGranted by remember {
         mutableStateOf(PermissionHelper.isOverlayGranted(context))
     }
-    var showOnboardingWizard by remember { mutableStateOf(false) }
 
     val lifecycleOwner = androidx.compose.ui.platform.LocalLifecycleOwner.current
     androidx.compose.runtime.DisposableEffect(lifecycleOwner) {
@@ -250,6 +260,12 @@ fun SettingsScreen(
                         modifier = Modifier
                             .fillMaxWidth()
                             .focusRequester(navFocusRequesters[index])
+                            .focusProperties {
+                                val target = categoryFirstFocusRequesters[cat]
+                                if (target != null) {
+                                    right = target
+                                }
+                            }
                             .onFocusChanged {
                                 isCatFocused = it.isFocused
                                 if (it.isFocused) {
@@ -280,6 +296,9 @@ fun SettingsScreen(
             // 右侧：遵循 HIG 分组列表的配置区域
             // ==========================================
             val scrollState = rememberScrollState()
+            LaunchedEffect(selectedCategory) {
+                scrollState.scrollTo(0)
+            }
             Column(
                 modifier = Modifier
                     .weight(1f)
@@ -319,6 +338,8 @@ fun SettingsScreen(
                                     SegmentOptionButton(
                                         label = "⚡️ 自动 (跟随系统)",
                                         isSelected = currentThemeMode == ThemeMode.AUTO,
+                                        focusRequester = categoryFirstFocusRequesters[SettingsCategory.APPEARANCE_AND_GENERAL],
+                                        leftNavFocusRequester = navFocusRequesters[selectedCategory.ordinal],
                                         onClick = {
                                             currentThemeMode = ThemeMode.AUTO
                                             AppPalette.setThemeMode(context, ThemeMode.AUTO)
@@ -351,11 +372,12 @@ fun SettingsScreen(
                                 subtitle = "当前网络标识: \"$friendlyName\" (用于 AirPlay 1 与 UPnP 广播)"
                             ) {
                                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                    listOf("PureCast TV", "客厅 Hi-Fi", "影音室 TV").forEach { preset ->
+                                    listOf("PureCast TV", "客厅 Hi-Fi", "影音室 TV").forEachIndexed { pIdx, preset ->
                                         val isCur = friendlyName == preset && !isEditingCustomName
                                         SegmentOptionButton(
                                             label = preset,
                                             isSelected = isCur,
+                                            leftNavFocusRequester = if (pIdx == 0) navFocusRequesters[selectedCategory.ordinal] else null,
                                             onClick = {
                                                 isEditingCustomName = false
                                                 friendlyName = preset
@@ -446,6 +468,8 @@ fun SettingsScreen(
                                     SegmentOptionButton(
                                         label = if (audioState.isExclusive) "🔄 让渡声卡" else "⚡ 独占接管",
                                         isSelected = !audioState.isExclusive,
+                                        focusRequester = categoryFirstFocusRequesters[SettingsCategory.USB_DAC],
+                                        leftNavFocusRequester = navFocusRequesters[selectedCategory.ordinal],
                                         onClick = {
                                             if (audioState.isExclusive) {
                                                 PlaybackService.instance?.pausePlayback()
@@ -469,11 +493,12 @@ fun SettingsScreen(
                                 subtitle = "停止播放后，等待指定秒数自动解除声卡独占并归还系统"
                             ) {
                                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                    listOf(Pair(5, "5秒"), Pair(10, "10秒 (推荐)"), Pair(30, "30秒"), Pair(0, "常驻独占")).forEach { (sec, label) ->
+                                    listOf(Pair(5, "5秒"), Pair(10, "10秒 (推荐)"), Pair(30, "30秒"), Pair(0, "常驻独占")).forEachIndexed { optIdx, (sec, label) ->
                                         val isSelected = idleTimeoutSeconds == sec
                                         SegmentOptionButton(
                                             label = label,
                                             isSelected = isSelected,
+                                            leftNavFocusRequester = if (optIdx == 0) navFocusRequesters[selectedCategory.ordinal] else null,
                                             onClick = {
                                                 idleTimeoutSeconds = sec
                                                 settingsRepo.setIdleTimeoutSeconds(sec)
@@ -495,6 +520,8 @@ fun SettingsScreen(
                             ) {
                                 ToggleSwitchButton(
                                     isEnabled = isAirPlayEnabled,
+                                    focusRequester = categoryFirstFocusRequesters[SettingsCategory.PROTOCOLS],
+                                    leftNavFocusRequester = navFocusRequesters[selectedCategory.ordinal],
                                     onToggle = {
                                         val target = !isAirPlayEnabled
                                         isAirPlayEnabled = target
@@ -511,6 +538,7 @@ fun SettingsScreen(
                             ) {
                                 ToggleSwitchButton(
                                     isEnabled = isUpnpEnabled,
+                                    leftNavFocusRequester = navFocusRequesters[selectedCategory.ordinal],
                                     onToggle = {
                                         val target = !isUpnpEnabled
                                         isUpnpEnabled = target
@@ -548,7 +576,10 @@ fun SettingsScreen(
                         SettingsSection(title = "Android 权限与系统保活自检") {
                             PermissionCheckRow(
                                 label = "USB 硬件直接访问权限",
+                                description = "直通 UAC2 异步时钟与 Linux usbfs 底层声卡驱动",
                                 isGranted = isUsbGranted,
+                                focusRequester = categoryFirstFocusRequesters[SettingsCategory.HEALTH_CHECK],
+                                leftNavFocusRequester = navFocusRequesters[selectedCategory.ordinal],
                                 onClick = {
                                     val act = context as? Activity
                                     if (act != null) {
@@ -561,7 +592,9 @@ fun SettingsScreen(
                             SettingDivider()
                             PermissionCheckRow(
                                 label = "后台无限制与电池优化白名单",
+                                description = "防止大屏熄屏或空闲时系统清理后台推流服务",
                                 isGranted = isIgnoringBattery,
+                                leftNavFocusRequester = navFocusRequesters[selectedCategory.ordinal],
                                 onClick = {
                                     PermissionHelper.openBatteryOptimizationSettings(context)
                                 }
@@ -569,57 +602,36 @@ fun SettingsScreen(
                             SettingDivider()
                             PermissionCheckRow(
                                 label = "核心录音权限 (RECORD_AUDIO)",
+                                description = "仅用于系统免弹窗接管，工程绝不调用录音硬件",
                                 isGranted = isRecordAudioGranted,
+                                leftNavFocusRequester = navFocusRequesters[selectedCategory.ordinal],
                                 onClick = {
-                                    PermissionHelper.openAppDetailsSettings(context)
+                                    val act = context as? Activity
+                                    if (act != null && !isRecordAudioGranted) {
+                                        androidx.core.app.ActivityCompat.requestPermissions(
+                                            act,
+                                            arrayOf(Manifest.permission.RECORD_AUDIO),
+                                            1001
+                                        )
+                                    } else {
+                                        PermissionHelper.openAppDetailsSettings(context)
+                                    }
                                 }
                             )
                             SettingDivider()
                             PermissionCheckRow(
                                 label = "悬浮窗与前台拉起权限 (OVERLAY)",
+                                description = "支持局域网接收推流时自动拉起大屏播放界面",
                                 isGranted = isOverlayGranted,
+                                leftNavFocusRequester = navFocusRequesters[selectedCategory.ordinal],
                                 onClick = {
                                     PermissionHelper.openOverlaySettings(context)
                                 }
                             )
                         }
-
-                        Spacer(modifier = Modifier.height(20.dp))
-
-                        // 💡 底部增加“重新打开开箱权限自检向导”按钮，形成完整权限诊断与修复闭环
-                        Button(
-                            onClick = { showOnboardingWizard = true },
-                            colors = ButtonDefaults.colors(
-                                containerColor = if (AppPalette.isDark) Color(0xFF2C3042) else Color(0xFFE5E5EA),
-                                contentColor = AppPalette.primaryText,
-                                focusedContainerColor = if (AppPalette.isDark) Color.White else Color(0xFF1C1C1E),
-                                focusedContentColor = if (AppPalette.isDark) Color(0xFF1C1C1E) else Color.White
-                            ),
-                            shape = ButtonDefaults.shape(RoundedCornerShape(12.dp)),
-                            scale = ButtonDefaults.scale(scale = 1.0f, focusedScale = 1.04f),
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Text(
-                                text = "重新打开开箱权限自检向导",
-                                fontSize = 14.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                modifier = Modifier.padding(vertical = 4.dp)
-                            )
-                        }
                     }
                 }
             }
-        }
-
-        if (showOnboardingWizard) {
-            OnboardingWizard(
-                onDismiss = {
-                    showOnboardingWizard = false
-                    isRecordAudioGranted = PermissionHelper.isRecordAudioGranted(context)
-                    isIgnoringBattery = PermissionHelper.isBatteryOptimizationIgnored(context)
-                    isOverlayGranted = PermissionHelper.isOverlayGranted(context)
-                }
-            )
         }
     }
 }
@@ -744,13 +756,17 @@ private fun SettingInlineRow(
  * - 深色模式获焦：纯白底 (Color.White) + 纯黑字；
  * - 浅色模式获焦：纯黑底 (Color(0xFF1C1C1E)) + 纯白字；
  * - 杜绝任何荧光黄绿混乱色块；
- * - 文本自适应包裹宽度 (wrapContentWidth)，杜绝“✏️ 自定义”折行。
+ * - 文本自适应包裹宽度 (wrapContentWidth)，杜绝“✏️ 自定义”折行；
+ * - 支持 focusRequester 首项锚定与 leftNavFocusRequester 确定性返回。
  */
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
 private fun SegmentOptionButton(
     label: String,
     isSelected: Boolean,
+    modifier: Modifier = Modifier,
+    focusRequester: FocusRequester? = null,
+    leftNavFocusRequester: FocusRequester? = null,
     onClick: () -> Unit
 ) {
     val isDark = AppPalette.isDark
@@ -762,12 +778,13 @@ private fun SegmentOptionButton(
     val focusedContent = if (isDark) Color(0xFF1C1C1E) else Color.White
 
     val shape = RoundedCornerShape(10.dp)
-    val noBorder = Border(BorderStroke(0.dp, Color.Transparent))
-    val focusedBorder = Border(BorderStroke(2.dp, if (isDark) Color.White else Color(0xFF1C1C1E)))
 
     Surface(
         onClick = onClick,
-        modifier = Modifier.wrapContentWidth(),
+        modifier = modifier
+            .wrapContentWidth()
+            .then(if (focusRequester != null) Modifier.focusRequester(focusRequester) else Modifier)
+            .then(if (leftNavFocusRequester != null) Modifier.focusProperties { left = leftNavFocusRequester } else Modifier),
         shape = ClickableSurfaceDefaults.shape(shape),
         scale = ClickableSurfaceDefaults.scale(scale = 1.0f, focusedScale = 1.06f),
         colors = ClickableSurfaceDefaults.colors(
@@ -777,8 +794,8 @@ private fun SegmentOptionButton(
             focusedContentColor = focusedContent
         ),
         border = ClickableSurfaceDefaults.border(
-            border = noBorder,
-            focusedBorder = focusedBorder
+            border = Border.None,
+            focusedBorder = Border.None
         ),
         glow = ClickableSurfaceDefaults.glow(
             glow = Glow.None,
@@ -801,6 +818,9 @@ private fun SegmentOptionButton(
 @Composable
 private fun ToggleSwitchButton(
     isEnabled: Boolean,
+    modifier: Modifier = Modifier,
+    focusRequester: FocusRequester? = null,
+    leftNavFocusRequester: FocusRequester? = null,
     onToggle: () -> Unit
 ) {
     val isDark = AppPalette.isDark
@@ -811,12 +831,13 @@ private fun ToggleSwitchButton(
     val focusedContent = if (isDark) Color(0xFF1C1C1E) else Color.White
 
     val shape = RoundedCornerShape(10.dp)
-    val noBorder = Border(BorderStroke(0.dp, Color.Transparent))
-    val focusedBorder = Border(BorderStroke(2.dp, if (isDark) Color.White else Color(0xFF1C1C1E)))
 
     Surface(
         onClick = onToggle,
-        modifier = Modifier.wrapContentWidth(),
+        modifier = modifier
+            .wrapContentWidth()
+            .then(if (focusRequester != null) Modifier.focusRequester(focusRequester) else Modifier)
+            .then(if (leftNavFocusRequester != null) Modifier.focusProperties { left = leftNavFocusRequester } else Modifier),
         shape = ClickableSurfaceDefaults.shape(shape),
         scale = ClickableSurfaceDefaults.scale(scale = 1.0f, focusedScale = 1.06f),
         colors = ClickableSurfaceDefaults.colors(
@@ -826,8 +847,8 @@ private fun ToggleSwitchButton(
             focusedContentColor = focusedContent
         ),
         border = ClickableSurfaceDefaults.border(
-            border = noBorder,
-            focusedBorder = focusedBorder
+            border = Border.None,
+            focusedBorder = Border.None
         ),
         glow = ClickableSurfaceDefaults.glow(
             glow = Glow.None,
@@ -865,63 +886,121 @@ private fun MetricDataRow(
 
 /**
  * 💡 辅助权限检查行 (Surface 可获焦组件，支持遥控器一键跳转修复)
+ * 严格遵从 Apple TV HIG 列表项焦点规范：
+ * 1. 彻底移除生硬突兀的 2dp 黑色外框与放缩撕裂 (scale=1.0f, border=None)；
+ * 2. 规范深/浅模式高反差焦点设计：
+ *    - 深色模式获焦：纯白底 (Color.White) + 纯黑字 (0xFF1C1C1E) + 深绿/深橙状态指示；
+ *    - 浅色模式获焦：纯黑底 (0xFF1C1C1E) + 纯白字 (Color.White) + 鲜绿/鲜橙状态指示；
+ *    - 未获焦时：透明底色，优雅嵌入卡片；
+ * 3. 悬浮圆角药丸质感 (RoundedCornerShape(10.dp) + 内嵌边距)，与外层圆角卡片完美贴合；
+ * 4. 显式绑定向左导航至左侧当前分类项，杜绝焦点跑飞与误切分类。
  */
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
 private fun PermissionCheckRow(
     label: String,
+    description: String,
     isGranted: Boolean,
+    modifier: Modifier = Modifier,
+    focusRequester: FocusRequester? = null,
+    leftNavFocusRequester: FocusRequester? = null,
     onClick: () -> Unit
 ) {
     val isDark = AppPalette.isDark
+    var isFocused by remember { mutableStateOf(false) }
+
     val normalBg = Color.Transparent
-    val focusedBg = if (isDark) Color(0xFF2C3042) else Color(0xFFE5E5EA)
-    val focusedBorder = Border(BorderStroke(2.dp, if (isDark) Color.White else Color(0xFF1C1C1E)))
-    val noBorder = Border(BorderStroke(0.dp, Color.Transparent))
+    val focusedBg = if (isDark) Color.White else Color(0xFF1C1C1E)
+
+    // 动态文字高反差
+    val titleColor = if (isFocused) {
+        if (isDark) Color(0xFF1C1C1E) else Color.White
+    } else {
+        AppPalette.primaryText
+    }
+
+    val descColor = if (isFocused) {
+        if (isDark) Color(0xFF6E6E73) else Color(0xFFE5E5EA)
+    } else {
+        AppPalette.secondaryText
+    }
+
+    // 状态指示色 (已就绪 / 去授权)
+    val statusColor = if (isFocused) {
+        if (isDark) {
+            if (isGranted) Color(0xFF1B5E20) else Color(0xFFE65100)
+        } else {
+            if (isGranted) Color(0xFF30D158) else Color(0xFFFF9F0A)
+        }
+    } else {
+        if (isGranted) AppPalette.success else AppPalette.warning
+    }
 
     Surface(
         onClick = onClick,
-        modifier = Modifier.fillMaxWidth(),
-        shape = ClickableSurfaceDefaults.shape(RoundedCornerShape(8.dp)),
-        scale = ClickableSurfaceDefaults.scale(scale = 1.0f, focusedScale = 1.02f),
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(horizontal = 6.dp, vertical = 3.dp)
+            .then(if (focusRequester != null) Modifier.focusRequester(focusRequester) else Modifier)
+            .then(if (leftNavFocusRequester != null) Modifier.focusProperties { left = leftNavFocusRequester } else Modifier)
+            .onFocusChanged { isFocused = it.isFocused },
+        shape = ClickableSurfaceDefaults.shape(RoundedCornerShape(10.dp)),
+        scale = ClickableSurfaceDefaults.scale(scale = 1.0f, focusedScale = 1.0f),
         colors = ClickableSurfaceDefaults.colors(
             containerColor = normalBg,
             focusedContainerColor = focusedBg,
-            contentColor = AppPalette.primaryText,
-            focusedContentColor = AppPalette.primaryText
+            contentColor = if (isDark) Color(0xFF1C1C1E) else Color.White,
+            focusedContentColor = if (isDark) Color(0xFF1C1C1E) else Color.White
         ),
         border = ClickableSurfaceDefaults.border(
-            border = noBorder,
-            focusedBorder = focusedBorder
+            border = Border.None,
+            focusedBorder = Border.None
         ),
         glow = ClickableSurfaceDefaults.glow(
             glow = Glow.None,
-            focusedGlow = Glow(elevationColor = focusedBg.copy(alpha = 0.3f), elevation = 4.dp)
+            focusedGlow = Glow(elevationColor = focusedBg.copy(alpha = 0.35f), elevation = 6.dp)
         )
     ) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 20.dp, vertical = 14.dp),
+                .padding(horizontal = 14.dp, vertical = 12.dp),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Text(text = label, fontSize = 14.sp, color = AppPalette.primaryText)
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(3.dp)
+            ) {
+                Text(
+                    text = label,
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = titleColor
+                )
+                Text(
+                    text = description,
+                    fontSize = 12.sp,
+                    color = descColor
+                )
+            }
+
             Row(
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.padding(start = 12.dp)
             ) {
                 Box(
                     modifier = Modifier
-                        .size(7.dp)
+                        .size(8.dp)
                         .clip(CircleShape)
-                        .background(if (isGranted) AppPalette.success else AppPalette.warning)
+                        .background(statusColor)
                 )
                 Text(
-                    text = if (isGranted) "已就绪" else "去修复 / 授权",
+                    text = if (isGranted) "已就绪" else "去授权 ›",
                     fontSize = 13.sp,
-                    fontWeight = FontWeight.Medium,
-                    color = if (isGranted) AppPalette.success else AppPalette.warning
+                    fontWeight = FontWeight.SemiBold,
+                    color = statusColor
                 )
             }
         }
