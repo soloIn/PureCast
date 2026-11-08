@@ -2,6 +2,7 @@ package com.solo.purecast.data
 
 import android.content.Context
 import android.content.SharedPreferences
+import com.solo.purecast.ui.background.FluidQuality
 import com.solo.purecast.util.Logger
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -13,6 +14,7 @@ import kotlinx.coroutines.flow.asStateFlow
  * 1. UPnP / DLNA 局域网友好广播名称 (friendlyName)
  * 2. USB 声卡 10 秒空闲让渡策略 (idleTimeoutSeconds)
  * 3. 首次开箱自检向导展示标记 (onboardingCompleted)
+ * 4. 动态流光背景画质档位 (fluidQuality)
  */
 class SettingsRepository(context: Context) {
 
@@ -29,6 +31,9 @@ class SettingsRepository(context: Context) {
 
     private val _upnpEnabledFlow = MutableStateFlow(isUpnpEnabled())
     val upnpEnabledFlow: StateFlow<Boolean> = _upnpEnabledFlow.asStateFlow()
+
+    private val _fluidQualityFlow = MutableStateFlow(getFluidQuality())
+    val fluidQualityFlow: StateFlow<FluidQuality> = _fluidQualityFlow.asStateFlow()
 
     /**
      * 获取 UPnP 设备局域网广播名，默认 "PureCast TV"
@@ -109,6 +114,23 @@ class SettingsRepository(context: Context) {
         prefs.edit().putBoolean(KEY_ONBOARDING_COMPLETED, completed).apply()
     }
 
+    /**
+     * 获取动态流光背景画质档位，默认 STANDARD (960, 60fps)
+     */
+    fun getFluidQuality(): FluidQuality {
+        val name = prefs.getString(KEY_FLUID_QUALITY, FluidQuality.STANDARD.name)
+        return FluidQuality.fromName(name)
+    }
+
+    /**
+     * 设置并持久化动态流光背景画质档位
+     */
+    fun setFluidQuality(quality: FluidQuality) {
+        Logger.service.i(TAG, "更新动态流光背景画质档位: ${quality.name}")
+        prefs.edit().putString(KEY_FLUID_QUALITY, quality.name).apply()
+        _fluidQualityFlow.value = quality
+    }
+
     companion object {
         private const val TAG = "SettingsRepository"
         private const val PREFS_NAME = "purecast_settings"
@@ -118,6 +140,7 @@ class SettingsRepository(context: Context) {
         private const val KEY_ONBOARDING_COMPLETED = "onboarding_completed"
         private const val KEY_AIRPLAY_ENABLED = "airplay_enabled"
         private const val KEY_UPNP_ENABLED = "upnp_enabled"
+        private const val KEY_FLUID_QUALITY = "fluid_quality"
 
         const val DEFAULT_FRIENDLY_NAME = "PureCast TV"
         const val DEFAULT_IDLE_TIMEOUT = 10

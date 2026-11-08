@@ -74,5 +74,6 @@ data class AudioPathState(
     val bitDepth: Int = 16,
     val channels: Int = 2,
     val bufferAvailablePercent: Int = 100,
-    val protocol: StreamProtocol = StreamProtocol.NONE
+    val protocol: StreamProtocol = StreamProtocol.NONE,
+    val codec: String = "PCM"
 )

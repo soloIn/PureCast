@@ -29,7 +29,7 @@ import java.nio.ByteOrder
  */
 class StreamDemuxer(
     private val scope: CoroutineScope,
-    private val onStreamStarted: (sampleRate: Int, bitDepth: Int, channels: Int) -> Unit,
+    private val onStreamStarted: (sampleRate: Int, bitDepth: Int, channels: Int, codec: String) -> Unit,
     private val onStreamEnded: () -> Unit,
     private val onError: (String) -> Unit,
     private val onMetadataParsed: ((title: String?, artist: String?, album: String?) -> Unit)? = null,
@@ -152,7 +152,7 @@ class StreamDemuxer(
                         if (thisSession == sessionToken.get()) {
                             Logger.upnp.i(TAG, "Native dr_flac 解析音频规格成功: $rate Hz, $bits bit, $ch ch")
                             bytesPerSecond = (rate * ch * (bits / 8)).toLong()
-                            onStreamStarted(rate, bits, ch)
+                            onStreamStarted(rate, bits, ch, "FLAC")
                         }
                     }
                     if (!ok) {
@@ -176,7 +176,7 @@ class StreamDemuxer(
 
                     // 通知主服务开启硬件独占与时钟锁定
                     if (thisSession == sessionToken.get()) {
-                        onStreamStarted(format.sampleRate, format.bitDepth, format.channels)
+                        onStreamStarted(format.sampleRate, format.bitDepth, format.channels, "WAV")
                     }
 
                     // 💡 流式搬运纯 PCM 数据包直接灌入 Native SPSC RingBuffer

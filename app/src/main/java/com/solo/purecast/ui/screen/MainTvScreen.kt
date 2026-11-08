@@ -28,6 +28,7 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -57,7 +58,9 @@ import com.solo.purecast.ui.components.SignalPathPill
 import com.solo.purecast.ui.theme.AppPalette
 import com.solo.purecast.util.Logger
 import com.solo.purecast.util.PermissionHelper
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlin.math.sin
 
 /**
@@ -78,15 +81,20 @@ fun MainTvScreen(
     onPreviousTrack: () -> Unit,
     onNextTrack: () -> Unit,
     onOpenSettings: () -> Unit,
-    userInteractionTrigger: Long = 0L,
     modifier: Modifier = Modifier
 ) {
+    val context = LocalContext.current
+    val settingsRepo = remember { SettingsRepository(context) }
+    val friendlyName by settingsRepo.friendlyNameFlow.collectAsState()
+    val fluidQuality by settingsRepo.fluidQualityFlow.collectAsState()
+
     val playbackStatus by PlaybackService.playbackStatus.collectAsState()
     val metadata by PlaybackService.currentMetadata.collectAsState()
     val audioPathState by PlaybackService.audioPathState.collectAsState()
     val serverError by PlaybackService.serverError.collectAsState()
 
     val playPauseFocusRequester = remember { FocusRequester() }
+    val settingsFocusRequester = remember { FocusRequester() }
 
     // ==========================================
     // 1. OLED 防烧屏引擎: 微像素正弦平移 (每 10 秒平滑微移 2~3 像素)
@@ -104,11 +112,15 @@ fun MainTvScreen(
         }
     }
 
-    // 💡 页面初次进入时自动请求焦点至播放/暂停按钮
-    LaunchedEffect(Unit) {
+    // 💡 焦点路由：待机空闲态聚焦在“设置”按钮；播放态聚焦在“播放/暂停”主按钮
+    LaunchedEffect(playbackStatus) {
         delay(200)
         try {
-            playPauseFocusRequester.requestFocus()
+            if (playbackStatus == PlaybackStatus.IDLE) {
+                settingsFocusRequester.requestFocus()
+            } else {
+                playPauseFocusRequester.requestFocus()
+            }
         } catch (_: Exception) {}
     }
 
@@ -139,7 +151,8 @@ fun MainTvScreen(
         // 1. GLES2 材质网格动态流光背景 (无推流时 MacBackground 优雅呈现自适应纯净背景)
         FluidBackground(
             coverData = coverData,
-            isPlaying = isPlaying
+            isPlaying = isPlaying,
+            quality = fluidQuality
         )
 
         // 💡 柔和暗化层：仅在推流播放动态流光背景时启用，防止高饱和流光吞没文字；待机时关闭以呈现原汁原味的深/浅主题
@@ -257,9 +270,12 @@ fun MainTvScreen(
 
                 Spacer(modifier = Modifier.height(20.dp))
 
+                val isIdle = playbackStatus == PlaybackStatus.IDLE
+                val displayTitle = if (isIdle) "等待音频投屏接入" else metadata.title
+
                 // 歌曲标题：推流时纯白高亮，待机浅色时纯黑；平滑跑马灯永不截断
                 Text(
-                    text = metadata.title,
+                    text = displayTitle,
                     fontSize = 40.sp,
                     fontWeight = FontWeight.Bold,
                     color = if (hasDarkBackground) Color.White else AppPalette.primaryText,
@@ -275,18 +291,26 @@ fun MainTvScreen(
 
                 Spacer(modifier = Modifier.height(8.dp))
 
-                // 艺术家：次级色彩自适应
+                // 艺术家 / 待机投屏引导：次级色彩自适应
+                val airPlayGuide = PlaybackService.formatAirPlayName(friendlyName)
+                val upnpGuide = PlaybackService.formatUpnpName(friendlyName)
+                val displayArtist = if (isIdle) {
+                    "AirPlay: $airPlayGuide  ·  UPnP: $upnpGuide"
+                } else {
+                    metadata.artist
+                }
+
                 Text(
-                    text = metadata.artist,
-                    fontSize = 24.sp,
+                    text = displayArtist,
+                    fontSize = if (isIdle) 18.sp else 24.sp,
                     fontWeight = FontWeight.Medium,
                     color = if (hasDarkBackground) Color.White.copy(alpha = 0.70f) else AppPalette.secondaryText,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
 
-                // 专辑名称 (若存在)
-                if (metadata.album.isNotEmpty()) {
+                // 专辑名称 (若存在且非待机)
+                if (!isIdle && metadata.album.isNotEmpty()) {
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
                         text = metadata.album,
@@ -303,6 +327,8 @@ fun MainTvScreen(
                 IsolatedProgressBar(
                     totalDurationMs = metadata.durationMs,
                     isLiveStream = metadata.isLiveStream,
+                    playbackStatus = playbackStatus,
+                    canSeek = false,
                     hasDarkBackground = hasDarkBackground,
                     onPlayPauseClick = onTogglePlayPause
                 )
@@ -318,7 +344,8 @@ fun MainTvScreen(
                     onPreviousClick = onPreviousTrack,
                     onNextClick = onNextTrack,
                     onSettingsClick = onOpenSettings,
-                    playPauseFocusRequester = playPauseFocusRequester
+                    playPauseFocusRequester = playPauseFocusRequester,
+                    settingsFocusRequester = settingsFocusRequester
                 )
             }
         }
@@ -350,23 +377,40 @@ fun MainTvScreen(
 private fun IsolatedProgressBar(
     totalDurationMs: Long,
     isLiveStream: Boolean,
+    playbackStatus: PlaybackStatus,
+    canSeek: Boolean = false,
     hasDarkBackground: Boolean = true,
     onPlayPauseClick: () -> Unit
 ) {
     val servicePositionMs by PlaybackService.playbackPositionMs.collectAsState()
     var seekPositionMs by remember { mutableLongStateOf(0L) }
+    var isScrubbing by remember { mutableStateOf(false) }
+    val coroutineScope = rememberCoroutineScope()
+    var debounceJob by remember { mutableStateOf<Job?>(null) }
+
+    // 💡 只有在非用户拖拽寻道防抖期间，才接受 servicePositionMs 的覆盖
     LaunchedEffect(servicePositionMs) {
-        seekPositionMs = servicePositionMs
+        if (!isScrubbing) {
+            seekPositionMs = servicePositionMs
+        }
     }
 
     ProgressBarComponent(
         currentPositionMs = seekPositionMs,
         totalDurationMs = totalDurationMs,
         isLiveStream = isLiveStream,
+        playbackStatus = playbackStatus,
+        canSeek = canSeek,
         hasDarkBackground = hasDarkBackground,
         onSeek = { newPositionMs ->
             seekPositionMs = newPositionMs
-            Logger.ui.i("MainTvScreen", "D-Pad 寻道至: ${newPositionMs / 1000} 秒")
+            isScrubbing = true
+            debounceJob?.cancel()
+            debounceJob = coroutineScope.launch {
+                delay(300)
+                isScrubbing = false
+                Logger.ui.i("MainTvScreen", "D-Pad 寻道防抖完成，提交 Seek: ${newPositionMs / 1000} 秒")
+            }
         },
         onPlayPauseClick = onPlayPauseClick
     )

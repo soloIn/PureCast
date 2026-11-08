@@ -126,8 +126,8 @@ class UpnpRendererServer(
 
         demuxer = StreamDemuxer(
             scope = scope,
-            onStreamStarted = { sampleRate, bitDepth, channels ->
-                Logger.upnp.i(TAG, "StreamDemuxer 回调流启动: $sampleRate Hz, $bitDepth bit")
+            onStreamStarted = { sampleRate, bitDepth, channels, codec ->
+                Logger.upnp.i(TAG, "StreamDemuxer 回调流启动: $sampleRate Hz, $bitDepth bit, $codec")
                 val totalDur = demuxer?.getTotalDurationSeconds() ?: 0L
                 if (totalDur > 0L && currentTrackMetadata.durationMs == 0L) {
                     currentTrackMetadata = currentTrackMetadata.copy(
@@ -136,7 +136,7 @@ class UpnpRendererServer(
                     )
                     playbackService.updateMetadata(currentTrackMetadata)
                 }
-                playbackService.startStreaming(sampleRate, bitDepth, channels, PlaybackService.StreamSource.UPNP)
+                playbackService.startStreaming(sampleRate, bitDepth, channels, PlaybackService.StreamSource.UPNP, codec = codec)
                 genaNotifier.notifyTransportState("PLAYING")
             },
             onStreamEnded = {

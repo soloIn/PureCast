@@ -89,13 +89,14 @@ fun SignalPathPill(
                 }
 
                 // 2. 音频编码格式与指标
-                val codecName = when (audioState.protocol) {
-                    StreamProtocol.AIRPLAY_1 -> "ALAC"
-                    StreamProtocol.UPNP_DLNA -> if (audioState.bitDepth > 16 || audioState.sampleRate > 48000) "PCM Hi-Res" else "PCM"
-                    StreamProtocol.NONE -> "PCM"
+                val codecName = when {
+                    audioState.protocol == StreamProtocol.AIRPLAY_1 -> "ALAC"
+                    audioState.codec.isNotBlank() -> audioState.codec
+                    audioState.protocol == StreamProtocol.UPNP_DLNA -> if (audioState.bitDepth > 16 || audioState.sampleRate > 48000) "PCM Hi-Res" else "PCM"
+                    else -> "PCM"
                 }
-                val sampleRateKhz = String.format(Locale.US, "%.1f", audioState.sampleRate / 1000.0)
-                val formatSpec = "${sampleRateKhz}kHz/${audioState.bitDepth}bit"
+                val sampleRateText = formatSampleRate(audioState.sampleRate)
+                val formatSpec = "$sampleRateText/${audioState.bitDepth}bit"
 
                 withStyle(SpanStyle(color = Color(0xFFE5E5EA), fontWeight = FontWeight.Medium)) {
                     append("$protocolName · $codecName · $formatSpec")
@@ -149,5 +150,20 @@ fun SignalPathPill(
             fontSize = 13.sp,
             letterSpacing = 0.3.sp
         )
+    }
+}
+
+/**
+ * 💡 辅助工具：将音频采样率 (Hz) 格式化为标准音频工程规格文本
+ * 如：44100 -> "44.1kHz"、48000 -> "48kHz"、96000 -> "96kHz"、192000 -> "192kHz"
+ */
+internal fun formatSampleRate(sampleRate: Int): String {
+    if (sampleRate <= 0) return "0kHz"
+    return if (sampleRate % 1000 == 0) {
+        "${sampleRate / 1000}kHz"
+    } else {
+        val khz = sampleRate / 1000.0
+        val formatted = String.format(Locale.US, "%.1f", khz)
+        "${formatted.removeSuffix(".0")}kHz"
     }
 }

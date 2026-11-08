@@ -52,54 +52,62 @@ fun PlaybackControls(
     onSettingsClick: () -> Unit,
     modifier: Modifier = Modifier,
     hasDarkBackground: Boolean = true,
-    playPauseFocusRequester: FocusRequester? = null
+    playPauseFocusRequester: FocusRequester? = null,
+    settingsFocusRequester: FocusRequester? = null
 ) {
     val isPlaying = playbackStatus == PlaybackStatus.PLAYING
+    val isIdle = playbackStatus == PlaybackStatus.IDLE
+    val transportButtonsEnabled = !isIdle
 
     Row(
         modifier = modifier,
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(16.dp)
     ) {
-        // 1. 上一曲按钮 (⏮)
+        // 1. 上一曲按钮 (⏮) - 待机状态下半透明禁用
         TransportIconButton(
             iconResId = R.drawable.ic_backward_end_fill,
             contentDescription = "上一曲",
             buttonSize = 46.dp,
             iconSize = 22.dp,
+            enabled = transportButtonsEnabled,
             hasDarkBackground = hasDarkBackground,
             onClick = onPreviousClick
         )
 
-        // 2. 播放 / 暂停主按钮 (▶ / ❚❚) - 绑定默认 FocusRequester
+        // 2. 播放 / 暂停主按钮 (▶ / ❚❚) - 待机状态下半透明禁用，非待机绑定 playPauseFocusRequester
         TransportIconButton(
             iconResId = if (isPlaying) R.drawable.ic_pause_fill else R.drawable.ic_play_fill,
             contentDescription = if (isPlaying) "暂停" else "播放",
             buttonSize = 56.dp,
             iconSize = 28.dp,
             isCircle = true,
+            enabled = transportButtonsEnabled,
             hasDarkBackground = hasDarkBackground,
-            focusRequester = playPauseFocusRequester,
+            focusRequester = if (transportButtonsEnabled) playPauseFocusRequester else null,
             onClick = onPlayPauseClick
         )
 
-        // 3. 下一曲按钮 (⏭)
+        // 3. 下一曲按钮 (⏭) - 待机状态下半透明禁用
         TransportIconButton(
             iconResId = R.drawable.ic_forward_end_fill,
             contentDescription = "下一曲",
             buttonSize = 46.dp,
             iconSize = 22.dp,
+            enabled = transportButtonsEnabled,
             hasDarkBackground = hasDarkBackground,
             onClick = onNextClick
         )
 
-        // 4. 系统与硬件设置按钮 (⚙)
+        // 4. 系统与硬件设置按钮 (⚙) - 始终保持可用，待机时绑定 settingsFocusRequester
         TransportIconButton(
             iconResId = R.drawable.ic_gear,
             contentDescription = "设置",
             buttonSize = 46.dp,
             iconSize = 22.dp,
+            enabled = true,
             hasDarkBackground = hasDarkBackground,
+            focusRequester = settingsFocusRequester,
             onClick = onSettingsClick
         )
     }
@@ -110,7 +118,8 @@ fun PlaybackControls(
  * 采用 Surface + Box(fillMaxSize, Alignment.Center)：
  * - 去除任何厚重描边与发光轮廓；
  * - 焦点态：1.12x 放大 + 柔和通透底色；
- * - 自适应深/浅背景：有彩色流光或深色待机时为亮白，浅色待机时为纯净深黑。
+ * - 自适应深/浅背景：有彩色流光或深色待机时为亮白，浅色待机时为纯净深黑；
+ * - 禁用态：半透明低对比度，不可获焦。
  */
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
@@ -119,6 +128,7 @@ private fun TransportIconButton(
     contentDescription: String,
     buttonSize: Dp,
     iconSize: Dp,
+    enabled: Boolean = true,
     isCircle: Boolean = false,
     hasDarkBackground: Boolean = true,
     focusRequester: FocusRequester? = null,
@@ -130,7 +140,9 @@ private fun TransportIconButton(
 
     val focusedContainerColor = if (hasDarkBackground) Color(0x22FFFFFF) else Color(0x18000000)
     val pressedContainerColor = if (hasDarkBackground) Color(0x3DFFFFFF) else Color(0x26000000)
-    val iconColor = if (hasDarkBackground) {
+    val iconColor = if (!enabled) {
+        if (hasDarkBackground) Color.White.copy(alpha = 0.22f) else Color(0xFF1C1C1E).copy(alpha = 0.22f)
+    } else if (hasDarkBackground) {
         if (isFocused) Color.White else Color.White.copy(alpha = 0.55f)
     } else {
         if (isFocused) Color(0xFF1C1C1E) else Color(0xFF1C1C1E).copy(alpha = 0.55f)
@@ -138,15 +150,16 @@ private fun TransportIconButton(
 
     Surface(
         onClick = onClick,
+        enabled = enabled,
         modifier = Modifier
             .size(buttonSize)
-            .then(if (focusRequester != null) Modifier.focusRequester(focusRequester) else Modifier)
-            .onFocusChanged { isFocused = it.isFocused },
+            .then(if (enabled && focusRequester != null) Modifier.focusRequester(focusRequester) else Modifier)
+            .onFocusChanged { if (enabled) isFocused = it.isFocused },
         shape = ClickableSurfaceDefaults.shape(shape),
         scale = ClickableSurfaceDefaults.scale(
             scale = 1.0f,
-            focusedScale = 1.12f,
-            pressedScale = 1.05f
+            focusedScale = if (enabled) 1.12f else 1.0f,
+            pressedScale = if (enabled) 1.05f else 1.0f
         ),
         colors = ClickableSurfaceDefaults.colors(
             containerColor = Color.Transparent,

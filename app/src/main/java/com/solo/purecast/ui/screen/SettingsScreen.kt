@@ -33,6 +33,8 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -53,6 +55,7 @@ import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
@@ -69,6 +72,8 @@ import com.solo.purecast.model.AudioPathState
 import com.solo.purecast.model.StreamProtocol
 import com.solo.purecast.core.nativebridge.NativeAudioEngine
 import com.solo.purecast.service.PlaybackService
+import com.solo.purecast.ui.background.FluidQuality
+import com.solo.purecast.ui.components.formatSampleRate
 import com.solo.purecast.ui.theme.AppPalette
 import com.solo.purecast.ui.theme.ThemeMode
 import com.solo.purecast.util.Logger
@@ -136,9 +141,22 @@ fun SettingsScreen(
     var friendlyName by remember { mutableStateOf(settingsRepo.getFriendlyName()) }
     var isEditingCustomName by remember { mutableStateOf(false) }
     var customNameInput by remember { mutableStateOf(friendlyName) }
+    var currentFluidQuality by remember { mutableStateOf(settingsRepo.getFluidQuality()) }
+    val customNameFocusRequester = remember { FocusRequester() }
+    var isTextFieldFocused by remember { mutableStateOf(false) }
     var isAirPlayEnabled by remember { mutableStateOf(settingsRepo.isAirPlayEnabled()) }
     var isUpnpEnabled by remember { mutableStateOf(settingsRepo.isUpnpEnabled()) }
     var idleTimeoutSeconds by remember { mutableIntStateOf(settingsRepo.getIdleTimeoutSeconds()) }
+
+    // 💡 自定义输入框展开时，主动将遥控器焦点请求至 BasicTextField，避免落入焦点陷阱
+    LaunchedEffect(isEditingCustomName) {
+        if (isEditingCustomName) {
+            delay(150)
+            try {
+                customNameFocusRequester.requestFocus()
+            } catch (_: Exception) {}
+        }
+    }
 
     // 💡 严谨的 Apple TV 双栏 Back 键层级路由
     BackHandler(enabled = isFocusInRightContent || isEditingCustomName) {
@@ -413,6 +431,11 @@ fun SettingsScreen(
                                                 .width(260.dp)
                                                 .clip(RoundedCornerShape(8.dp))
                                                 .background(AppPalette.surfaceSecondary)
+                                                .border(
+                                                    width = if (isTextFieldFocused) 2.dp else 1.dp,
+                                                    color = if (isTextFieldFocused) AppPalette.accent else Color.Transparent,
+                                                    shape = RoundedCornerShape(8.dp)
+                                                )
                                                 .padding(horizontal = 14.dp, vertical = 8.dp)
                                         ) {
                                             BasicTextField(
@@ -421,7 +444,23 @@ fun SettingsScreen(
                                                 singleLine = true,
                                                 textStyle = TextStyle(color = AppPalette.primaryText, fontSize = 14.sp),
                                                 cursorBrush = SolidColor(AppPalette.primaryText),
-                                                modifier = Modifier.fillMaxWidth()
+                                                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                                                keyboardActions = KeyboardActions(
+                                                    onDone = {
+                                                        val t = customNameInput.trim()
+                                                        if (t.isNotEmpty()) {
+                                                            friendlyName = t
+                                                            settingsRepo.setFriendlyName(t)
+                                                            PlaybackService.instance?.updateFriendlyName(t)
+                                                            isEditingCustomName = false
+                                                            Toast.makeText(context, "已保存广播名为: $t", Toast.LENGTH_SHORT).show()
+                                                        }
+                                                    }
+                                                ),
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .focusRequester(customNameFocusRequester)
+                                                    .onFocusChanged { isTextFieldFocused = it.isFocused }
                                             )
                                         }
                                         SegmentOptionButton(
@@ -442,6 +481,34 @@ fun SettingsScreen(
                                             label = "取消",
                                             isSelected = false,
                                             onClick = { isEditingCustomName = false }
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        // 3. 动态流光背景画质
+                        SettingsSection(title = "动态流光背景画质") {
+                            SettingTieredRow(
+                                title = "GLES2 着色器渲染档位",
+                                subtitle = "根据电视芯片性能调节流光分辨率与帧率节拍 (高配推荐极佳/标准，低配推荐省电或静态)"
+                            ) {
+                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    listOf(
+                                        FluidQuality.HIGH_QUALITY to "极佳 (60fps)",
+                                        FluidQuality.STANDARD to "标准 (60fps)",
+                                        FluidQuality.POWER_SAVE to "省电 (30fps)",
+                                        FluidQuality.STATIC to "静态磨砂",
+                                        FluidQuality.OFF to "关闭"
+                                    ).forEach { (quality, label) ->
+                                        SegmentOptionButton(
+                                            label = label,
+                                            isSelected = currentFluidQuality == quality,
+                                            onClick = {
+                                                currentFluidQuality = quality
+                                                settingsRepo.setFluidQuality(quality)
+                                                Toast.makeText(context, "已设置流光画质: $label", Toast.LENGTH_SHORT).show()
+                                            }
                                         )
                                     }
                                 }
@@ -551,9 +618,8 @@ fun SettingsScreen(
 
                     SettingsCategory.HARDWARE_MONITOR -> {
                         SettingsSection(title = "SPSC 无锁环形缓冲与时钟仪表盘") {
-                            val sampleRateKhz = String.format(Locale.US, "%.1f", audioState.sampleRate / 1000.0)
                             val formatSpec = if (audioState.protocol != StreamProtocol.NONE && audioState.sampleRate > 0) {
-                                "$sampleRateKhz kHz / ${audioState.bitDepth}-bit (${audioState.channels} 声道)"
+                                "${formatSampleRate(audioState.sampleRate)} / ${audioState.bitDepth}-bit (${audioState.channels} 声道)"
                             } else {
                                 "待机无推流"
                             }
@@ -562,9 +628,20 @@ fun SettingsScreen(
                                 (bufferAvailableRead * 100L / bufferCapacity).toInt()
                             } else 0
 
+                            val bufferAvailableKb = bufferAvailableRead / 1024
+                            val bufferCapacityKb = bufferCapacity / 1024
+                            val effectiveSampleRate = if (audioState.sampleRate > 0) audioState.sampleRate else 44100
+                            val effectiveChannels = if (audioState.channels > 0) audioState.channels else 2
+                            val effectiveBits = if (audioState.bitDepth > 0) audioState.bitDepth else 16
+                            val bytesPerSec = effectiveSampleRate * effectiveChannels * (effectiveBits / 8)
+                            val bufferMs = if (bytesPerSec > 0) (bufferAvailableRead * 1000L / bytesPerSec) else 0L
+
                             MetricDataRow(label = "当前实时采样率与位深", value = formatSpec)
                             SettingDivider()
-                            MetricDataRow(label = "SPSC 环形缓冲区", value = "$bufferAvailableRead 采样 / $bufferCapacity 采样 ($bufferUsagePercent% 水位)")
+                            MetricDataRow(
+                                label = "SPSC 环形缓冲区",
+                                value = "${bufferAvailableKb} KB / ${bufferCapacityKb} KB (${bufferMs}ms / $bufferUsagePercent% 水位)"
+                            )
                             SettingDivider()
                             MetricDataRow(label = "UAC 物理时钟锁定", value = if (audioState.isExclusive) "UAC2 Explicit Feedback 闭环物理时钟 (SOF 纳秒级同步)" else "让渡共享时钟")
                             SettingDivider()
@@ -802,12 +879,24 @@ private fun SegmentOptionButton(
             focusedGlow = Glow(elevationColor = focusedBg.copy(alpha = 0.35f), elevation = 6.dp)
         )
     ) {
-        Text(
-            text = label,
-            fontSize = 13.sp,
-            fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal,
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
             modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)
-        )
+        ) {
+            if (isSelected) {
+                Text(
+                    text = "●",
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+            Text(
+                text = label,
+                fontSize = 13.sp,
+                fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal
+            )
+        }
     }
 }
 

@@ -419,9 +419,10 @@ class PlaybackService : LifecycleService() {
         sampleRate: Int,
         bitDepth: Int,
         channels: Int = 2,
-        source: StreamSource = StreamSource.UPNP
+        source: StreamSource = StreamSource.UPNP,
+        codec: String = "PCM"
     ): Boolean {
-        Logger.service.i(TAG, "收到流式播放请求 (source=$source): $sampleRate Hz, $bitDepth bit, $channels ch")
+        Logger.service.i(TAG, "收到流式播放请求 (source=$source, codec=$codec): $sampleRate Hz, $bitDepth bit, $channels ch")
 
         // 💡 跨协议后发抢占保护：若 UPnP 推流启动而 AirPlay 正在播放，优雅中止 AirPlay
         if (source == StreamSource.UPNP && currentStreamSource == StreamSource.AIRPLAY) {
@@ -459,12 +460,18 @@ class PlaybackService : LifecycleService() {
         } else {
             com.solo.purecast.model.StreamProtocol.UPNP_DLNA
         }
+        val resolvedCodec = when (source) {
+            StreamSource.AIRPLAY -> "ALAC"
+            StreamSource.UPNP -> if (codec.isNotBlank()) codec else "PCM"
+            else -> codec
+        }
         _audioPathState.value = _audioPathState.value.copy(
             isExclusive = true,
             sampleRate = sampleRate,
             bitDepth = bitDepth,
             channels = channels,
-            protocol = currentProto
+            protocol = currentProto,
+            codec = resolvedCodec
         )
 
         // 💡 若为 AirPlay 会话，启动单调时钟平滑进度推进器
@@ -500,7 +507,7 @@ class PlaybackService : LifecycleService() {
         }
 
         currentStreamSource = StreamSource.AIRPLAY
-        val started = startStreaming(sampleRate, bitDepth, channels, StreamSource.AIRPLAY)
+        val started = startStreaming(sampleRate, bitDepth, channels, StreamSource.AIRPLAY, codec = "ALAC")
         if (!started) {
             currentStreamSource = StreamSource.IDLE
         }
