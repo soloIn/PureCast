@@ -380,6 +380,6 @@ class UsbDeviceManager(
     companion object {
         private const val TAG = "UsbDeviceManager"
         private const val ACTION_USB_PERMISSION = "com.solo.purecast.USB_PERMISSION"
-        private const val SONY_VENDOR_ID = 0x054c // 索尼 Vendor ID (十进制 1356)
+        const val SONY_VENDOR_ID = 0x054c // 索尼 Vendor ID (十进制 1356)
     }
 }

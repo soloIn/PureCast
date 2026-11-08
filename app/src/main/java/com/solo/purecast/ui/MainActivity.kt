@@ -102,10 +102,7 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         Logger.ui.i(TAG, "MainActivity onResume: 检查 USB DAC 授权状态与屏保常亮状态...")
-        val audioState = PlaybackService.audioPathState.value
-        if (!audioState.isDacConnected) {
-            PlaybackService.instance?.requestUsbPermission(this)
-        }
+        checkAndRequestUsbPermission()
         updateKeepScreenOn()
     }
 
@@ -120,6 +117,34 @@ class MainActivity : ComponentActivity() {
                 Logger.ui.i(TAG, "从 Intent 捕获到 USB 设备插入: ${device.productName ?: device.deviceName}")
                 PlaybackService.instance?.handleUsbDeviceAttachedFromIntent(device)
             }
+        }
+    }
+
+    private fun checkAndRequestUsbPermission() {
+        val audioState = PlaybackService.audioPathState.value
+        if (audioState.isDacConnected) {
+            Logger.ui.d(TAG, "当前 USB DAC 已就绪连接 (${audioState.dacName})，无需再次请求授权")
+            return
+        }
+
+        // 优先通过静默扫描自愈已有授权
+        val attached = PlaybackService.instance?.scanUsbDevice() == true
+        if (attached) {
+            Logger.ui.i(TAG, "通过静默扫描成功自愈连接 USB DAC")
+            return
+        }
+
+        // 检查系统当前是否连接了 USB 音频类设备
+        val usbManager = getSystemService(android.content.Context.USB_SERVICE) as? android.hardware.usb.UsbManager ?: return
+        val hasAudioDevice = usbManager.deviceList.values.any { device ->
+            device.vendorId == com.solo.purecast.core.usb.UsbDeviceManager.SONY_VENDOR_ID ||
+                    device.deviceClass == android.hardware.usb.UsbConstants.USB_CLASS_AUDIO ||
+                    (0 until device.interfaceCount).any { device.getInterface(it).interfaceClass == android.hardware.usb.UsbConstants.USB_CLASS_AUDIO }
+        }
+
+        // 仅当确实有物理插入且未获授权时才发起，防止无设备时空跑弹窗或并发重入
+        if (hasAudioDevice) {
+            PlaybackService.instance?.requestUsbPermission(this)
         }
     }
 
@@ -146,11 +171,7 @@ class MainActivity : ComponentActivity() {
         setIntent(intent)
         Logger.ui.i(TAG, "MainActivity onNewIntent, action=${intent.action}")
         handleUsbAttachedIntent(intent)
-        val audioState = PlaybackService.audioPathState.value
-        if (!audioState.isDacConnected) {
-            PlaybackService.instance?.scanUsbDevice()
-            PlaybackService.instance?.requestUsbPermission(this)
-        }
+        checkAndRequestUsbPermission()
     }
 
     private fun togglePlayPause() {

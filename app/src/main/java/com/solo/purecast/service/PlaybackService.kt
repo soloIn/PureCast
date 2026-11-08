@@ -759,8 +759,8 @@ class PlaybackService : LifecycleService() {
         usbDeviceManager.requestPermissionWithActivity(activity)
     }
 
-    fun scanUsbDevice() {
-        usbDeviceManager.scanAndAttachDevice()
+    fun scanUsbDevice(): Boolean {
+        return usbDeviceManager.scanAndAttachDevice()
     }
 
     private fun createNotificationChannel() {
