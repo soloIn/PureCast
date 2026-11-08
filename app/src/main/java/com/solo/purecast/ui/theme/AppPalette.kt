@@ -35,19 +35,35 @@ object AppPalette {
         }
 
     fun init(context: Context) {
-        val prefs = context.getSharedPreferences("purecast_appearance", Context.MODE_PRIVATE)
-        val savedModeStr = prefs.getString("theme_mode", null)
-        mode = if (savedModeStr != null) {
-            try {
-                ThemeMode.valueOf(savedModeStr)
-            } catch (_: Exception) {
+        try {
+            // 💡 针对 Android N+ Direct Boot 模式安全处理：设备锁定时使用设备保护存储上下文，防止 IllegalStateException 崩溃
+            val safeContext = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N) {
+                val userManager = context.getSystemService(Context.USER_SERVICE) as? android.os.UserManager
+                if (userManager?.isUserUnlocked == false) {
+                    context.createDeviceProtectedStorageContext()
+                } else {
+                    context
+                }
+            } else {
+                context
+            }
+            val prefs = safeContext.getSharedPreferences("purecast_appearance", Context.MODE_PRIVATE)
+            val savedModeStr = prefs.getString("theme_mode", null)
+            mode = if (savedModeStr != null) {
+                try {
+                    ThemeMode.valueOf(savedModeStr)
+                } catch (_: Exception) {
+                    ThemeMode.AUTO
+                }
+            } else if (prefs.contains("is_dark_mode")) {
+                // 兼容迁移旧版本布尔值
+                if (prefs.getBoolean("is_dark_mode", true)) ThemeMode.DARK else ThemeMode.LIGHT
+            } else {
                 ThemeMode.AUTO
             }
-        } else if (prefs.contains("is_dark_mode")) {
-            // 兼容迁移旧版本布尔值
-            if (prefs.getBoolean("is_dark_mode", true)) ThemeMode.DARK else ThemeMode.LIGHT
-        } else {
-            ThemeMode.AUTO
+        } catch (_: Exception) {
+            // 💡 若 Direct Boot 阶段或读取异常，回退至默认 AUTO 模式
+            mode = ThemeMode.AUTO
         }
         updateSystemNightMode(context)
     }

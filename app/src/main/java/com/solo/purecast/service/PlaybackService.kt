@@ -39,6 +39,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * 💡 PureCast 核心播放前台服务
@@ -156,6 +157,37 @@ class PlaybackService : LifecycleService() {
 
         if (settingsRepository.isAirPlayEnabled()) {
             airPlayServer?.start(formatAirPlayName(friendlyName))
+        }
+
+        startBootNetworkWatchdog()
+    }
+
+    /**
+     * 💡 开机冷启动阶段 Wi-Fi 就绪兜底守护：前 60 秒每隔 2~5 秒自检并尝试刷新一次网络广播
+     * 防止 Android TV 固件在开机瞬间 Wi-Fi 建立连通时漏发或延迟派发 NetworkCallback
+     */
+    private fun startBootNetworkWatchdog() {
+        lifecycleScope.launch(Dispatchers.IO) {
+            val checkDelays = listOf(2000L, 3000L, 5000L, 5000L, 10000L, 15000L, 20000L)
+            for (d in checkDelays) {
+                delay(d)
+                val airplayBound = airPlayServer?.getCurrentBoundIp()
+                val upnpBound = upnpServer?.getActiveIpAddress()
+
+                val isAirplayOk = airplayBound != null &&
+                        airplayBound.hostAddress?.startsWith("192.168.48.") != true &&
+                        airplayBound.hostAddress?.startsWith("127.") != true
+                val isUpnpOk = upnpBound != null &&
+                        !upnpBound.startsWith("192.168.48.") &&
+                        upnpBound != "127.0.0.1"
+
+                if (!isAirplayOk || !isUpnpOk) {
+                    Logger.service.i(TAG, "开机广播网络巡检守护：检测到未绑定至有效局域网 IP (AirPlay=${airplayBound?.hostAddress}, UPnP=$upnpBound)，触发自愈刷新...")
+                    withContext(Dispatchers.Main) {
+                        refreshNetworkServices()
+                    }
+                }
+            }
         }
     }
 

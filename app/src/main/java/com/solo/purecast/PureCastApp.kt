@@ -12,7 +12,11 @@ class PureCastApp : Application() {
     override fun onCreate() {
         super.onCreate()
         instance = this
-        com.solo.purecast.ui.theme.AppPalette.init(this)
+        try {
+            com.solo.purecast.ui.theme.AppPalette.init(this)
+        } catch (e: Exception) {
+            Logger.service.w(TAG, "初始化 AppPalette 异常 (可能处于 Direct Boot 状态): ${e.message}")
+        }
         Logger.service.i(TAG, "PureCast 应用程序启动，准备初始化 Native 库与服务...")
 
         try {

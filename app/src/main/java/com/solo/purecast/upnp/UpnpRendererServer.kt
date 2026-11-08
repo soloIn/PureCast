@@ -19,6 +19,7 @@ import java.net.MulticastSocket
 import java.net.NetworkInterface
 import java.net.ServerSocket
 import java.net.Socket
+import java.util.Collections
 import java.util.Locale
 import java.util.UUID
 import java.util.regex.Pattern
@@ -57,6 +58,8 @@ class UpnpRendererServer(
      * 💡 获取当前流播放进度秒数
      */
     fun getCurrentPlayPositionSeconds(): Long = demuxer?.getCurrentPlayPositionSeconds() ?: 0L
+
+    fun getActiveIpAddress(): String = localIpAddress
 
     /**
      * 💡 获取音轨总时长秒数
@@ -633,10 +636,22 @@ class UpnpRendererServer(
         ssdpJob = scope.launch(Dispatchers.IO) {
             try {
                 val group = InetAddress.getByName("239.255.255.250")
+                val activeInterface = getActiveNetworkInterface()
                 multicastSocket = MulticastSocket(1900).apply {
                     timeToLive = 4
                     reuseAddress = true
-                    joinGroup(group)
+                    if (activeInterface != null) {
+                        try {
+                            networkInterface = activeInterface
+                            joinGroup(InetSocketAddress(group, 1900), activeInterface)
+                            Logger.upnp.i(TAG, "SSDP 成功加入组播组并显式绑定到局域网接口: ${activeInterface.name}")
+                        } catch (e: Exception) {
+                            Logger.upnp.w(TAG, "显式绑定 activeInterface 失败，回退默认 joinGroup: ${e.message}")
+                            joinGroup(group)
+                        }
+                    } else {
+                        joinGroup(group)
+                    }
                 }
 
                 // 启动周期性广播心跳任务 (每 30 秒)
@@ -734,14 +749,60 @@ class UpnpRendererServer(
         }
     }
 
+    private fun getActiveNetworkInterface(): NetworkInterface? {
+        try {
+            val interfaces = Collections.list(NetworkInterface.getNetworkInterfaces())
+            val sorted = interfaces.sortedWith(compareByDescending { iface ->
+                when {
+                    iface.name.startsWith("wlan") -> 3
+                    iface.name.startsWith("eth") -> 2
+                    else -> 0
+                }
+            })
+            for (iface in sorted) {
+                if (iface.isLoopback || !iface.isUp) continue
+                val name = iface.name.lowercase()
+                if (name.startsWith("usb") || name.startsWith("dummy") || name.startsWith("p2p") || name.startsWith("tun")) {
+                    continue
+                }
+                for (addr in iface.inetAddresses) {
+                    if (!addr.isLoopbackAddress && addr is java.net.Inet4Address) {
+                        val host = addr.hostAddress ?: ""
+                        if (!host.startsWith("127.") && !host.startsWith("169.254.") && !host.startsWith("192.168.48.")) {
+                            return iface
+                        }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            // fallback
+        }
+        return null
+    }
+
     private fun getActiveLocalIpAddress(): String {
         try {
-            val interfaces = NetworkInterface.getNetworkInterfaces()
-            for (iface in interfaces) {
+            val interfaces = Collections.list(NetworkInterface.getNetworkInterfaces())
+            // 💡 严格优先选择物理 Wi-Fi (wlan*) 或以太网 (eth*)，坚决排除投影仪内部主板通信的 usb0 (192.168.48.x) 与虚拟网卡
+            val sorted = interfaces.sortedWith(compareByDescending { iface ->
+                when {
+                    iface.name.startsWith("wlan") -> 3
+                    iface.name.startsWith("eth") -> 2
+                    else -> 0
+                }
+            })
+            for (iface in sorted) {
                 if (iface.isLoopback || !iface.isUp) continue
+                val name = iface.name.lowercase()
+                if (name.startsWith("usb") || name.startsWith("dummy") || name.startsWith("p2p") || name.startsWith("tun")) {
+                    continue
+                }
                 for (addr in iface.inetAddresses) {
-                    if (!addr.isLoopbackAddress && addr.address.size == 4) {
-                        return addr.hostAddress ?: "127.0.0.1"
+                    if (!addr.isLoopbackAddress && addr is java.net.Inet4Address) {
+                        val host = addr.hostAddress ?: ""
+                        if (!host.startsWith("127.") && !host.startsWith("169.254.") && !host.startsWith("192.168.48.")) {
+                            return host
+                        }
                     }
                 }
             }
