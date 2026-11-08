@@ -20,6 +20,7 @@ void alac_free(alac_file *alac);
 struct alac_file
 {
     unsigned char *input_buffer;
+    unsigned char *input_buffer_end;
     int input_buffer_bitaccumulator; /* used so we can do arbitrary bit reads */
 
     int samplesize;

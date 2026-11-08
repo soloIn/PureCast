@@ -141,9 +141,17 @@ static uint32_t readbits_16(alac_file *alac, int bits)
     uint32_t result;
     int new_accumulator;
 
-    result = (alac->input_buffer[0] << 16) |
-             (alac->input_buffer[1] << 8) |
-             (alac->input_buffer[2]);
+    if (alac->input_buffer_end && alac->input_buffer >= alac->input_buffer_end) {
+        return 0;
+    }
+
+    uint32_t b0 = (alac->input_buffer_end && alac->input_buffer >= alac->input_buffer_end) ? 0 : alac->input_buffer[0];
+    uint32_t b1 = (alac->input_buffer_end && alac->input_buffer + 1 >= alac->input_buffer_end) ? 0 : alac->input_buffer[1];
+    uint32_t b2 = (alac->input_buffer_end && alac->input_buffer + 2 >= alac->input_buffer_end) ? 0 : alac->input_buffer[2];
+
+    result = (b0 << 16) |
+             (b1 << 8) |
+             b2;
 
     /* shift left by the number of bits we've already read,
      * so that the top 'n' bits of the 24 bits we read will
@@ -188,6 +196,10 @@ static int readbit(alac_file *alac)
 {
     int result;
     int new_accumulator;
+
+    if (alac->input_buffer_end && alac->input_buffer >= alac->input_buffer_end) {
+        return 0;
+    }
 
     result = alac->input_buffer[0];
 
@@ -410,8 +422,15 @@ static void entropy_rice_decode(alac_file* alac,
             // got blockSize 0s
             if (blockSize > 0)
             {
-                memset(&outputBuffer[outputCount + 1], 0, blockSize * sizeof(*outputBuffer));
-                outputCount += blockSize;
+                if (outputCount + 1 + blockSize > outputSize)
+                {
+                    blockSize = outputSize - outputCount - 1;
+                }
+                if (blockSize > 0)
+                {
+                    memset(&outputBuffer[outputCount + 1], 0, blockSize * sizeof(*outputBuffer));
+                    outputCount += blockSize;
+                }
             }
 
             if (blockSize > 0xFFFF)
@@ -718,6 +737,11 @@ void alac_decode_frame(alac_file *alac,
     alac->input_buffer_bitaccumulator = 0;
 
     channels = readbits(alac, 3);
+    if (channels != 0 && channels != 1)
+    {
+        *outputsize = 0;
+        return;
+    }
 
     *outputsize = outputsamples * alac->bytespersample;
 
@@ -750,6 +774,11 @@ void alac_decode_frame(alac_file *alac,
             /* now read the number of samples,
              * as a 32bit integer */
             outputsamples = readbits(alac, 32);
+            if (outputsamples <= 0 || outputsamples > (int32_t)alac->setinfo_max_samples_per_frame)
+            {
+                *outputsize = 0;
+                return;
+            }
             *outputsize = outputsamples * alac->bytespersample;
         }
 
@@ -927,6 +956,11 @@ void alac_decode_frame(alac_file *alac,
             /* now read the number of samples,
              * as a 32bit integer */
             outputsamples = readbits(alac, 32);
+            if (outputsamples <= 0 || outputsamples > (int32_t)alac->setinfo_max_samples_per_frame)
+            {
+                *outputsize = 0;
+                return;
+            }
             *outputsize = outputsamples * alac->bytespersample;
         }
 
@@ -957,6 +991,11 @@ void alac_decode_frame(alac_file *alac,
 
             ricemodifier_a = readbits(alac, 3);
             predictor_coef_num_a = readbits(alac, 5);
+            if (predictor_coef_num_a > 32)
+            {
+                *outputsize = 0;
+                return;
+            }
 
             /* read the predictor table */
             for (i = 0; i < predictor_coef_num_a; i++)
@@ -970,6 +1009,11 @@ void alac_decode_frame(alac_file *alac,
 
             ricemodifier_b = readbits(alac, 3);
             predictor_coef_num_b = readbits(alac, 5);
+            if (predictor_coef_num_b > 32)
+            {
+                *outputsize = 0;
+                return;
+            }
 
             /* read the predictor table */
             for (i = 0; i < predictor_coef_num_b; i++)
@@ -1120,6 +1164,9 @@ void alac_decode_frame(alac_file *alac,
 
         break;
     }
+    default:
+        *outputsize = 0;
+        break;
     }
 }
 

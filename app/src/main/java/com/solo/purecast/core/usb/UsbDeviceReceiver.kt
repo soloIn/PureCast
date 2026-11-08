@@ -30,6 +30,7 @@ class UsbDeviceReceiver : BroadcastReceiver() {
             UsbManager.ACTION_USB_DEVICE_DETACHED -> {
                 val device: UsbDevice? = IntentCompat.getParcelableExtra(intent, UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
                 Logger.usb.i(TAG, "检测到 USB 设备拔出: ${device?.deviceName}")
+                PlaybackService.instance?.handleUsbDeviceDetached(device)
             }
 
             Intent.ACTION_BOOT_COMPLETED,

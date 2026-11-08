@@ -71,6 +71,7 @@ import com.solo.purecast.service.PlaybackService
 import com.solo.purecast.ui.theme.AppPalette
 import com.solo.purecast.ui.theme.ThemeMode
 import com.solo.purecast.util.Logger
+import com.solo.purecast.util.PermissionHelper
 import kotlinx.coroutines.delay
 import java.util.Locale
 
@@ -177,15 +178,30 @@ fun SettingsScreen(
             isAudio && usbManager.hasPermission(device)
         }
     }
-    val isRecordAudioGranted = remember {
-        ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+    var isRecordAudioGranted by remember {
+        mutableStateOf(PermissionHelper.isRecordAudioGranted(context))
     }
-    val isIgnoringBattery = remember {
-        val powerManager = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
-        powerManager?.isIgnoringBatteryOptimizations(context.packageName) ?: true
+    var isIgnoringBattery by remember {
+        mutableStateOf(PermissionHelper.isBatteryOptimizationIgnored(context))
     }
-    val isOverlayGranted = remember {
-        android.provider.Settings.canDrawOverlays(context)
+    var isOverlayGranted by remember {
+        mutableStateOf(PermissionHelper.isOverlayGranted(context))
+    }
+    var showOnboardingWizard by remember { mutableStateOf(false) }
+
+    val lifecycleOwner = androidx.compose.ui.platform.LocalLifecycleOwner.current
+    androidx.compose.runtime.DisposableEffect(lifecycleOwner) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+                isRecordAudioGranted = PermissionHelper.isRecordAudioGranted(context)
+                isIgnoringBattery = PermissionHelper.isBatteryOptimizationIgnored(context)
+                isOverlayGranted = PermissionHelper.isOverlayGranted(context)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
     }
 
     // 页面进入时聚焦左侧第 1 项
@@ -530,17 +546,80 @@ fun SettingsScreen(
 
                     SettingsCategory.HEALTH_CHECK -> {
                         SettingsSection(title = "Android 权限与系统保活自检") {
-                            PermissionCheckRow(label = "USB 硬件直接访问权限", isGranted = isUsbGranted)
+                            PermissionCheckRow(
+                                label = "USB 硬件直接访问权限",
+                                isGranted = isUsbGranted,
+                                onClick = {
+                                    val act = context as? Activity
+                                    if (act != null) {
+                                        PlaybackService.instance?.requestUsbPermission(act)
+                                    } else {
+                                        PermissionHelper.openAppDetailsSettings(context)
+                                    }
+                                }
+                            )
                             SettingDivider()
-                            PermissionCheckRow(label = "后台无限制与电池优化白名单", isGranted = isIgnoringBattery)
+                            PermissionCheckRow(
+                                label = "后台无限制与电池优化白名单",
+                                isGranted = isIgnoringBattery,
+                                onClick = {
+                                    PermissionHelper.openBatteryOptimizationSettings(context)
+                                }
+                            )
                             SettingDivider()
-                            PermissionCheckRow(label = "核心录音权限 (RECORD_AUDIO)", isGranted = isRecordAudioGranted)
+                            PermissionCheckRow(
+                                label = "核心录音权限 (RECORD_AUDIO)",
+                                isGranted = isRecordAudioGranted,
+                                onClick = {
+                                    PermissionHelper.openAppDetailsSettings(context)
+                                }
+                            )
                             SettingDivider()
-                            PermissionCheckRow(label = "悬浮窗与前台拉起权限 (OVERLAY)", isGranted = isOverlayGranted)
+                            PermissionCheckRow(
+                                label = "悬浮窗与前台拉起权限 (OVERLAY)",
+                                isGranted = isOverlayGranted,
+                                onClick = {
+                                    PermissionHelper.openOverlaySettings(context)
+                                }
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.height(20.dp))
+
+                        // 💡 底部增加“重新打开开箱权限自检向导”按钮，形成完整权限诊断与修复闭环
+                        Button(
+                            onClick = { showOnboardingWizard = true },
+                            colors = ButtonDefaults.colors(
+                                containerColor = if (AppPalette.isDark) Color(0xFF2C3042) else Color(0xFFE5E5EA),
+                                contentColor = AppPalette.primaryText,
+                                focusedContainerColor = if (AppPalette.isDark) Color.White else Color(0xFF1C1C1E),
+                                focusedContentColor = if (AppPalette.isDark) Color(0xFF1C1C1E) else Color.White
+                            ),
+                            shape = ButtonDefaults.shape(RoundedCornerShape(12.dp)),
+                            scale = ButtonDefaults.scale(scale = 1.0f, focusedScale = 1.04f),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(
+                                text = "重新打开开箱权限自检向导",
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier.padding(vertical = 4.dp)
+                            )
                         }
                     }
                 }
             }
+        }
+
+        if (showOnboardingWizard) {
+            OnboardingWizard(
+                onDismiss = {
+                    showOnboardingWizard = false
+                    isRecordAudioGranted = PermissionHelper.isRecordAudioGranted(context)
+                    isIgnoringBattery = PermissionHelper.isBatteryOptimizationIgnored(context)
+                    isOverlayGranted = PermissionHelper.isOverlayGranted(context)
+                }
+            )
         }
     }
 }
@@ -785,37 +864,66 @@ private fun MetricDataRow(
 }
 
 /**
- * 💡 辅助权限检查行
+ * 💡 辅助权限检查行 (Surface 可获焦组件，支持遥控器一键跳转修复)
  */
+@OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
 private fun PermissionCheckRow(
     label: String,
-    isGranted: Boolean
+    isGranted: Boolean,
+    onClick: () -> Unit
 ) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 20.dp, vertical = 14.dp),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically
+    val isDark = AppPalette.isDark
+    val normalBg = Color.Transparent
+    val focusedBg = if (isDark) Color(0xFF2C3042) else Color(0xFFE5E5EA)
+    val focusedBorder = Border(BorderStroke(2.dp, if (isDark) Color.White else Color(0xFF1C1C1E)))
+    val noBorder = Border(BorderStroke(0.dp, Color.Transparent))
+
+    Surface(
+        onClick = onClick,
+        modifier = Modifier.fillMaxWidth(),
+        shape = ClickableSurfaceDefaults.shape(RoundedCornerShape(8.dp)),
+        scale = ClickableSurfaceDefaults.scale(scale = 1.0f, focusedScale = 1.02f),
+        colors = ClickableSurfaceDefaults.colors(
+            containerColor = normalBg,
+            focusedContainerColor = focusedBg,
+            contentColor = AppPalette.primaryText,
+            focusedContentColor = AppPalette.primaryText
+        ),
+        border = ClickableSurfaceDefaults.border(
+            border = noBorder,
+            focusedBorder = focusedBorder
+        ),
+        glow = ClickableSurfaceDefaults.glow(
+            glow = Glow.None,
+            focusedGlow = Glow(elevationColor = focusedBg.copy(alpha = 0.3f), elevation = 4.dp)
+        )
     ) {
-        Text(text = label, fontSize = 14.sp, color = AppPalette.primaryText)
         Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp)
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 20.dp, vertical = 14.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
         ) {
-            Box(
-                modifier = Modifier
-                    .size(7.dp)
-                    .clip(CircleShape)
-                    .background(if (isGranted) AppPalette.success else AppPalette.warning)
-            )
-            Text(
-                text = if (isGranted) "已就绪" else "待授权",
-                fontSize = 13.sp,
-                fontWeight = FontWeight.Medium,
-                color = if (isGranted) AppPalette.success else AppPalette.warning
-            )
+            Text(text = label, fontSize = 14.sp, color = AppPalette.primaryText)
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(7.dp)
+                        .clip(CircleShape)
+                        .background(if (isGranted) AppPalette.success else AppPalette.warning)
+                )
+                Text(
+                    text = if (isGranted) "已就绪" else "去修复 / 授权",
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = if (isGranted) AppPalette.success else AppPalette.warning
+                )
+            }
         }
     }
 }

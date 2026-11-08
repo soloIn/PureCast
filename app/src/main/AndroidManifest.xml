@@ -73,21 +73,17 @@
             android:exported="false"
             android:foregroundServiceType="mediaPlayback|connectedDevice" />
 
-        <!-- 💡 USB 设备热插拔与开机广播监听器 -->
+        <!-- 💡 USB 设备热插拔与开机广播监听器 (移除冗余的 USB_DEVICE_ATTACHED 与 device_filter 避免与 MainActivity 冲突导致双弹窗与持久化失效) -->
         <receiver
             android:name=".core.usb.UsbDeviceReceiver"
             android:exported="true">
             <intent-filter>
-                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
                 <action android:name="android.hardware.usb.action.USB_DEVICE_DETACHED" />
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
                 <!-- 💡 电视盒子快速开机与快速唤醒广播适配 -->
                 <action android:name="android.intent.action.QUICKBOOT_POWERON" />
                 <action android:name="com.htc.intent.action.QUICKBOOT_POWERON" />
             </intent-filter>
-            <meta-data
-                android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
-                android:resource="@xml/device_filter" />
         </receiver>
 
     </application>

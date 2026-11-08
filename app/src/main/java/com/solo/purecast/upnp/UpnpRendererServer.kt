@@ -103,6 +103,19 @@ class UpnpRendererServer(
         notifyTransportState("STOPPED")
     }
 
+    /**
+     * 💡 动态检测并响应网络 IP 变更 (如开机冷启动后 Wi-Fi 建立连接)
+     */
+    fun restartIfIpChanged(): Boolean {
+        val newIp = getActiveLocalIpAddress()
+        if (newIp != "127.0.0.1" && (newIp != localIpAddress || localIpAddress == "127.0.0.1")) {
+            Logger.upnp.i(TAG, "检测到有效局域网 IP 变动 ($localIpAddress -> $newIp)，重新初始化 UPnP Server...")
+            start()
+            return true
+        }
+        return false
+    }
+
     fun start() {
         stop()
         localIpAddress = getActiveLocalIpAddress()
@@ -120,17 +133,17 @@ class UpnpRendererServer(
                     )
                     playbackService.updateMetadata(currentTrackMetadata)
                 }
-                playbackService.startStreaming(sampleRate, bitDepth, channels)
+                playbackService.startStreaming(sampleRate, bitDepth, channels, PlaybackService.StreamSource.UPNP)
                 genaNotifier.notifyTransportState("PLAYING")
             },
             onStreamEnded = {
                 Logger.upnp.i(TAG, "StreamDemuxer 回调流结束")
-                playbackService.stopPlayback()
+                playbackService.stopPlayback(PlaybackService.StreamSource.UPNP)
                 genaNotifier.notifyTransportState("STOPPED")
             },
             onError = { err ->
                 Logger.upnp.e(TAG, "StreamDemuxer 报错: $err")
-                playbackService.stopPlayback()
+                playbackService.stopPlayback(PlaybackService.StreamSource.UPNP)
                 playbackService.updateServerError(err)
                 genaNotifier.notifyTransportState("STOPPED")
             },
@@ -412,7 +425,7 @@ class UpnpRendererServer(
     private fun handleStop(): String {
         Logger.upnp.i(TAG, "SOAP Stop 指令触发")
         demuxer?.stop()
-        playbackService.stopPlayback()
+        playbackService.stopPlayback(PlaybackService.StreamSource.UPNP)
         genaNotifier.notifyTransportState("STOPPED")
         return buildSoapResponse("StopResponse", "urn:schemas-upnp-org:service:AVTransport:1", "")
     }

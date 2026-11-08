@@ -10,6 +10,11 @@ import android.content.pm.ServiceInfo
 import android.media.MediaMetadata
 import android.media.session.MediaSession
 import android.media.session.PlaybackState
+import android.net.ConnectivityManager
+import android.net.LinkProperties
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.PowerManager
@@ -74,6 +79,9 @@ class PlaybackService : LifecycleService() {
     private var airPlayAnchorRealtimeMs: Long = 0L
     private var airPlayBasePositionMs: Long = 0L
 
+    // 💡 动态网络状态监听器 (解决开机自启时 Wi-Fi 尚未就绪导致服务瘫痪的问题)
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+
     override fun onCreate() {
         super.onCreate()
         instance = this
@@ -84,6 +92,7 @@ class PlaybackService : LifecycleService() {
         setupMediaSession()
         startForegroundWithTypes()
         acquireStandingLocks()
+        registerNetworkCallback()
 
         audioFocusManager = AudioFocusManager(this) { shouldPlay ->
             if (shouldPlay) {
@@ -374,8 +383,20 @@ class PlaybackService : LifecycleService() {
     /**
      * 收到推流开始指令
      */
-    fun startStreaming(sampleRate: Int, bitDepth: Int, channels: Int = 2): Boolean {
-        Logger.service.i(TAG, "收到流式播放请求: $sampleRate Hz, $bitDepth bit, $channels ch")
+    fun startStreaming(
+        sampleRate: Int,
+        bitDepth: Int,
+        channels: Int = 2,
+        source: StreamSource = StreamSource.UPNP
+    ): Boolean {
+        Logger.service.i(TAG, "收到流式播放请求 (source=$source): $sampleRate Hz, $bitDepth bit, $channels ch")
+
+        // 💡 跨协议后发抢占保护：若 UPnP 推流启动而 AirPlay 正在播放，优雅中止 AirPlay
+        if (source == StreamSource.UPNP && currentStreamSource == StreamSource.AIRPLAY) {
+            Logger.service.i(TAG, "UPnP 新流到达，执行后发抢占中止正在运行的 AirPlay 流")
+            airPlayServer?.stop()
+        }
+        currentStreamSource = source
 
         // 1. 动态获取低延迟锁，突破 BAL 拉起界面
         acquireWifiLowLatencyLock()
@@ -447,7 +468,7 @@ class PlaybackService : LifecycleService() {
         }
 
         currentStreamSource = StreamSource.AIRPLAY
-        val started = startStreaming(sampleRate, bitDepth, channels)
+        val started = startStreaming(sampleRate, bitDepth, channels, StreamSource.AIRPLAY)
         if (!started) {
             currentStreamSource = StreamSource.IDLE
         }
@@ -460,8 +481,7 @@ class PlaybackService : LifecycleService() {
     private fun onAirPlayStreamStopped() {
         if (currentStreamSource == StreamSource.AIRPLAY) {
             Logger.service.i(TAG, "AirPlay 会话结束，停止播放")
-            currentStreamSource = StreamSource.IDLE
-            stopPlayback()
+            stopPlayback(StreamSource.AIRPLAY)
             _audioPathState.value = _audioPathState.value.copy(
                 protocol = com.solo.purecast.model.StreamProtocol.NONE
             )
@@ -626,7 +646,11 @@ class PlaybackService : LifecycleService() {
         updateNotification()
     }
 
-    fun stopPlayback() {
+    fun stopPlayback(source: StreamSource? = null) {
+        if (source != null && currentStreamSource != source && currentStreamSource != StreamSource.IDLE) {
+            Logger.service.w(TAG, "忽略非当前流源 ($source) 的 stopPlayback 请求，当前源为: $currentStreamSource")
+            return
+        }
         Logger.service.i(TAG, "停止音频播放 (流源: $currentStreamSource)...")
         airPlayProgressJob?.cancel()
         airPlayProgressJob = null
@@ -636,6 +660,8 @@ class PlaybackService : LifecycleService() {
         if (currentStreamSource == StreamSource.AIRPLAY) {
             airPlayServer?.dacpClient?.stop()
         }
+
+        currentStreamSource = StreamSource.IDLE
 
         NativeAudioEngine.stopStream()
         _playbackStatus.value = PlaybackStatus.STOPPED
@@ -807,9 +833,116 @@ class PlaybackService : LifecycleService() {
         }
     }
 
+    fun handleUsbDeviceAttachedFromIntent(device: android.hardware.usb.UsbDevice) {
+        usbDeviceManager.onDeviceAttachedFromIntent(device)
+    }
+
+    fun handleUsbDeviceDetached(device: android.hardware.usb.UsbDevice?) {
+        Logger.service.w(TAG, "收到 USB 设备拔出通知: ${device?.deviceName}")
+        usbDeviceManager.handleDeviceDetached(device)
+        if (_playbackStatus.value == PlaybackStatus.PLAYING) {
+            pausePlayback()
+        }
+    }
+
+    private fun registerNetworkCallback() {
+        val connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                Logger.service.i(TAG, "系统网络已连通，自检并刷新 UPnP / AirPlay 广播服务...")
+                lifecycleScope.launch(Dispatchers.Main) {
+                    refreshNetworkServices()
+                }
+            }
+
+            override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
+                Logger.service.i(TAG, "系统网络链路属性变更 (IP地址变动)，刷新广播服务...")
+                lifecycleScope.launch(Dispatchers.Main) {
+                    refreshNetworkServices()
+                }
+            }
+
+            override fun onLost(network: Network) {
+                Logger.service.w(TAG, "系统网络已断开")
+            }
+        }
+        networkCallback = callback
+        try {
+            val request = NetworkRequest.Builder()
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_RESTRICTED)
+                .build()
+            connectivityManager.registerNetworkCallback(request, callback)
+            Logger.service.i(TAG, "已成功注册网络状态监听器 (NetworkCallback)")
+        } catch (e: Exception) {
+            Logger.service.w(TAG, "按条件注册 NetworkCallback 失败，尝试默认注册", e)
+            try {
+                connectivityManager.registerDefaultNetworkCallback(callback)
+            } catch (e2: Exception) {
+                Logger.service.e(TAG, "注册 DefaultNetworkCallback 亦失败", e2)
+            }
+        }
+    }
+
+    private fun unregisterNetworkCallback() {
+        networkCallback?.let {
+            try {
+                val connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                connectivityManager?.unregisterNetworkCallback(it)
+                Logger.service.i(TAG, "注销 NetworkCallback 监听器")
+            } catch (e: Exception) {
+                Logger.service.w(TAG, "注销 NetworkCallback 异常", e)
+            }
+            networkCallback = null
+        }
+    }
+
+    @Synchronized
+    fun refreshNetworkServices() {
+        val friendlyName = settingsRepository.getFriendlyName()
+        if (settingsRepository.isUpnpEnabled()) {
+            if (upnpServer == null) {
+                upnpServer = com.solo.purecast.upnp.UpnpRendererServer(
+                    scope = lifecycleScope,
+                    playbackService = this,
+                    friendlyName = formatUpnpName(friendlyName)
+                ).apply {
+                    start()
+                }
+            } else {
+                upnpServer?.restartIfIpChanged()
+            }
+        }
+        if (settingsRepository.isAirPlayEnabled()) {
+            if (airPlayServer == null) {
+                airPlayServer = com.solo.purecast.airplay.AirPlayServerManager(
+                    context = this,
+                    scope = lifecycleScope,
+                    onStreamRequestedListener = { sampleRate, bitDepth, channels, clientIp, dacpPort, token ->
+                        onAirPlayStreamRequested(sampleRate, bitDepth, channels, clientIp, dacpPort, token)
+                    },
+                    onStreamStoppedListener = { onAirPlayStreamStopped() },
+                    onMetadataReceivedListener = { title, artist, album, durationMs, coverArt ->
+                        onAirPlayMetadataReceived(title, artist, album, durationMs, coverArt)
+                    },
+                    onProgressUpdatedListener = { positionMs, durationMs ->
+                        onAirPlayProgressUpdated(positionMs, durationMs)
+                    },
+                    onStreamPausedListener = { onAirPlayStreamPaused() },
+                    onStreamResumedListener = { onAirPlayStreamResumed() }
+                ).apply {
+                    start(formatAirPlayName(friendlyName))
+                }
+            } else {
+                airPlayServer?.restartIfIpChanged(formatAirPlayName(friendlyName))
+            }
+        }
+    }
+
     override fun onDestroy() {
         Logger.service.i(TAG, "PlaybackService onDestroy: 彻底清理服务...")
         instance = null
+        unregisterNetworkCallback()
         airPlayProgressJob?.cancel()
         airPlayProgressJob = null
         mediaSession?.apply {

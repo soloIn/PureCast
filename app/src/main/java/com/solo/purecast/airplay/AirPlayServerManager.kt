@@ -176,5 +176,21 @@ class AirPlayServerManager(
         }
     }
 
+    /**
+     * 💡 动态检测并响应网络 IP 变更 (如开机冷启动后 Wi-Fi 建立连接)
+     */
+    fun restartIfIpChanged(deviceName: String) {
+        if (!isRunning) {
+            start(deviceName)
+            return
+        }
+        if (!jmdnsDiscoveryService.isRunning()) {
+            Logger.airplay.i(TAG, "AirPlay Native 服务运行中但 JmDns 广播未激活，重新发起局域网广播: $deviceName")
+            scope.launch(Dispatchers.IO) {
+                jmdnsDiscoveryService.startBroadcast(deviceName, 7000, currentPort)
+            }
+        }
+    }
+
     fun isRunning(): Boolean = isRunning
 }

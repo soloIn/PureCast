@@ -1,5 +1,6 @@
 package com.solo.purecast.ui.screen
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -56,6 +57,9 @@ fun OnboardingWizard(
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
+
+    // 💡 支持物理遥控器返回键关闭向导
+    BackHandler(onBack = onDismiss)
 
     // 当前权限自检状态
     var permissionStatus by remember {

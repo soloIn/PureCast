@@ -49,6 +49,7 @@ class MainActivity : ComponentActivity() {
 
         // 确保后台音频前台服务与 UPnP 监听已就绪
         PlaybackService.start(this)
+        handleUsbAttachedIntent(intent)
 
         setContent {
             PureCastTheme {
@@ -101,8 +102,25 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         Logger.ui.i(TAG, "MainActivity onResume: 检查 USB DAC 授权状态与屏保常亮状态...")
-        PlaybackService.instance?.requestUsbPermission(this)
+        val audioState = PlaybackService.audioPathState.value
+        if (!audioState.isDacConnected) {
+            PlaybackService.instance?.requestUsbPermission(this)
+        }
         updateKeepScreenOn()
+    }
+
+    private fun handleUsbAttachedIntent(intent: android.content.Intent?) {
+        if (intent?.action == android.hardware.usb.UsbManager.ACTION_USB_DEVICE_ATTACHED) {
+            val device: android.hardware.usb.UsbDevice? = androidx.core.content.IntentCompat.getParcelableExtra(
+                intent,
+                android.hardware.usb.UsbManager.EXTRA_DEVICE,
+                android.hardware.usb.UsbDevice::class.java
+            )
+            if (device != null) {
+                Logger.ui.i(TAG, "从 Intent 捕获到 USB 设备插入: ${device.productName ?: device.deviceName}")
+                PlaybackService.instance?.handleUsbDeviceAttachedFromIntent(device)
+            }
+        }
     }
 
     private fun updateKeepScreenOn() {
@@ -127,8 +145,12 @@ class MainActivity : ComponentActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         Logger.ui.i(TAG, "MainActivity onNewIntent, action=${intent.action}")
-        PlaybackService.instance?.scanUsbDevice()
-        PlaybackService.instance?.requestUsbPermission(this)
+        handleUsbAttachedIntent(intent)
+        val audioState = PlaybackService.audioPathState.value
+        if (!audioState.isDacConnected) {
+            PlaybackService.instance?.scanUsbDevice()
+            PlaybackService.instance?.requestUsbPermission(this)
+        }
     }
 
     private fun togglePlayPause() {

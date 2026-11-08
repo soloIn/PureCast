@@ -38,6 +38,7 @@ class StreamDemuxer(
 
     private var streamingJob: Job? = null
     private var progressJob: Job? = null
+    private val sessionToken = java.util.concurrent.atomic.AtomicLong(0L)
     @Volatile
     private var isDemuxing = false
     @Volatile
@@ -82,7 +83,12 @@ class StreamDemuxer(
      * @param streamUrl HTTP 媒体流地址 (如 http://192.168.2.5:49152/stream.wav)
      */
     fun start(streamUrl: String) {
-        stop()
+        val thisSession = sessionToken.incrementAndGet()
+        progressJob?.cancel()
+        progressJob = null
+        streamingJob?.cancel()
+        streamingJob = null
+
         isDemuxing = true
         currentStreamUrl = streamUrl
         totalBytesStreamed = 0L
@@ -92,7 +98,7 @@ class StreamDemuxer(
 
         // 💡 启动播放进度定期更新任务 (每 500ms 刷新一次)
         progressJob = scope.launch(Dispatchers.Default) {
-            while (isActive && isDemuxing) {
+            while (isActive && isDemuxing && thisSession == sessionToken.get()) {
                 val posMs = getCurrentPlayPositionSeconds() * 1000L
                 onPositionUpdated?.invoke(posMs)
                 delay(500)
@@ -100,11 +106,12 @@ class StreamDemuxer(
         }
 
         streamingJob = scope.launch(Dispatchers.IO) {
-            Logger.upnp.i(TAG, "开始连接音频流: $streamUrl")
+            Logger.upnp.i(TAG, "开始连接音频流 (session=$thisSession): $streamUrl")
             var connection: HttpURLConnection? = null
             var inputStream: InputStream? = null
 
             try {
+                if (thisSession != sessionToken.get()) return@launch
                 val url = URL(streamUrl)
                 connection = (url.openConnection() as HttpURLConnection).apply {
                     connectTimeout = 8000
@@ -120,8 +127,9 @@ class StreamDemuxer(
                     throw IllegalStateException("HTTP 请求失败: 状态码 $responseCode")
                 }
 
+                if (thisSession != sessionToken.get()) return@launch
                 val contentType = connection.contentType ?: "audio/wav"
-                Logger.upnp.i(TAG, "HTTP 连接成功, Content-Type: $contentType, Content-Length: ${connection.contentLengthLong}")
+                Logger.upnp.i(TAG, "HTTP 连接成功 (session=$thisSession), Content-Type: $contentType, Content-Length: ${connection.contentLengthLong}")
 
                 inputStream = BufferedInputStream(connection.inputStream, 64 * 1024)
 
@@ -141,16 +149,19 @@ class StreamDemuxer(
                     Logger.upnp.i(TAG, "检测到 FLAC 无损流容器 (fLaC)，交由 Native dr_flac 流式无损解码...")
                     flacStartTimeMs = System.currentTimeMillis()
                     val ok = NativeAudioEngine.decodeFlacStream(inputStream) { rate, bits, ch ->
-                        Logger.upnp.i(TAG, "Native dr_flac 解析音频规格成功: $rate Hz, $bits bit, $ch ch")
-                        bytesPerSecond = (rate * ch * (bits / 8)).toLong()
-                        onStreamStarted(rate, bits, ch)
+                        if (thisSession == sessionToken.get()) {
+                            Logger.upnp.i(TAG, "Native dr_flac 解析音频规格成功: $rate Hz, $bits bit, $ch ch")
+                            bytesPerSecond = (rate * ch * (bits / 8)).toLong()
+                            onStreamStarted(rate, bits, ch)
+                        }
                     }
                     if (!ok) {
-                        Logger.upnp.w(TAG, "Native dr_flac 解码失败或提前退出")
+                        Logger.upnp.w(TAG, "Native dr_flac 解码失败或提前退出 (session=$thisSession)")
                     }
                 } else if (magicStr == "RIFF") {
                     // 💡 解析容器头 (WAV / L16)
                     val format = parseHeader(inputStream)
+                    if (thisSession != sessionToken.get()) return@launch
                     Logger.upnp.i(
                         TAG,
                         "WAV 容器头部解析完毕: 采样率=${format.sampleRate}Hz, 位深=${format.bitDepth}bit, 声道=${format.channels}, dataSize=${format.dataSize}"
@@ -164,15 +175,17 @@ class StreamDemuxer(
                     }
 
                     // 通知主服务开启硬件独占与时钟锁定
-                    onStreamStarted(format.sampleRate, format.bitDepth, format.channels)
+                    if (thisSession == sessionToken.get()) {
+                        onStreamStarted(format.sampleRate, format.bitDepth, format.channels)
+                    }
 
                     // 💡 流式搬运纯 PCM 数据包直接灌入 Native SPSC RingBuffer
                     val pcmBuffer = ByteArray(4096)
 
-                    while (isActive && isDemuxing) {
+                    while (isActive && isDemuxing && thisSession == sessionToken.get()) {
                         val bytesRead = inputStream.read(pcmBuffer, 0, pcmBuffer.size)
                         if (bytesRead == -1) {
-                            Logger.upnp.i(TAG, "音频流正常读取至 EOF 边界")
+                            Logger.upnp.i(TAG, "音频流正常读取至 EOF 边界 (session=$thisSession)")
                             break
                         }
 
@@ -180,7 +193,7 @@ class StreamDemuxer(
                             totalBytesStreamed += bytesRead
                             var offset = 0
                             var remaining = bytesRead
-                            while (remaining > 0 && isActive && isDemuxing) {
+                            while (remaining > 0 && isActive && isDemuxing && thisSession == sessionToken.get()) {
                                 val written = NativeAudioEngine.writePcm(pcmBuffer, offset, remaining)
                                 if (written > 0) {
                                     offset += written
@@ -197,35 +210,46 @@ class StreamDemuxer(
                     throw IllegalArgumentException("不支持的非 WAV/FLAC 格式流: $magicStr")
                 }
 
-                Logger.upnp.i(TAG, "音频流数据拉取完毕，等待环形缓冲排空播放...")
+                Logger.upnp.i(TAG, "音频流数据拉取完毕，等待环形缓冲排空播放 (session=$thisSession)...")
                 // 💡 等待环形缓冲区中的数据被 USB DAC 完全消费播放完毕 (最多等待 6 秒防挂起)
                 var waitCount = 0
-                while (isActive && isDemuxing && NativeAudioEngine.getAvailableRead() > 0 && waitCount < 120) {
+                while (isActive && isDemuxing && thisSession == sessionToken.get() && NativeAudioEngine.getAvailableRead() > 0 && waitCount < 120) {
                     Thread.sleep(50)
                     waitCount++
                 }
-                Logger.upnp.i(TAG, "音频流播放完毕")
+                if (thisSession == sessionToken.get()) {
+                    Logger.upnp.i(TAG, "音频流播放完毕 (session=$thisSession)")
+                }
             } catch (e: CancellationException) {
-                Logger.upnp.i(TAG, "音频拉取流被主动取消")
+                Logger.upnp.i(TAG, "音频拉取流被主动取消 (session=$thisSession)")
             } catch (e: Exception) {
-                Logger.upnp.e(TAG, "音频流拉取/解包异常", e)
-                onError("音频流传输异常: ${e.message}")
+                Logger.upnp.e(TAG, "音频流拉取/解包异常 (session=$thisSession)", e)
+                if (thisSession == sessionToken.get()) {
+                    onError("音频流传输异常: ${e.message}")
+                }
             } finally {
-                progressJob?.cancel()
-                progressJob = null
                 try {
                     inputStream?.close()
                     connection?.disconnect()
                 } catch (e: Exception) {
                     // ignore
                 }
-                isDemuxing = false
-                onStreamEnded()
+                // 💡 仅当前活跃会话有权修改全局状态与触发流结束回调，杜绝快速切歌时旧协程误杀新流
+                if (thisSession == sessionToken.get()) {
+                    progressJob?.cancel()
+                    progressJob = null
+                    isDemuxing = false
+                    onStreamEnded()
+                    Logger.upnp.i(TAG, "活跃会话 (session=$thisSession) 正常结束并回调 onStreamEnded")
+                } else {
+                    Logger.upnp.i(TAG, "旧协程 (session=$thisSession) 资源清理完成，当前活跃会话为 ${sessionToken.get()}，跳过全局状态重置")
+                }
             }
         }
     }
 
     fun stop() {
+        sessionToken.incrementAndGet()
         isDemuxing = false
         currentStreamUrl = ""
         progressJob?.cancel()
