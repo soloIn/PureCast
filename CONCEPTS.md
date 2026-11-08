@@ -41,3 +41,15 @@ An OpenGL ES 2.0 distortion-mesh background renderer adapted from Apple Music fo
 ### D-Pad Focus Engine
 A directional navigation model for Android TV split-pane layouts that couples focus-change observation with hierarchical BackHandler interceptors to ensure the remote's Back button retreats up the navigation tree rather than exiting the screen.
 *Aliases: Hierarchical Back Navigation, D-Pad 层级焦点导航*
+
+### Direct Boot Environment
+An Android execution state during system boot before the user unlocks the device, where Credential Encrypted Storage is locked and unavailable. Background components marked with `directBootAware="true"` execute within Device Protected Storage context (`createDeviceProtectedStorageContext`) and must not access standard user `SharedPreferences` to prevent startup crashes.
+*Aliases: 直启模式, 存储保护上下文*
+
+### Session Monotonic Token
+A strictly monotonically increasing atomic token (`AtomicLong`) that gates asynchronous coroutine lifecycles in stream demuxers. It ensures obsolete stream tasks in cancellation cleanup blocks cannot mutate playback state or terminate newer active playback sessions.
+*Aliases: 单调会话令牌, 切歌生命周期栅栏*
+
+### Stream Source Preemption
+An arbitration policy across heterogeneous streaming protocols (e.g., UPnP/DLNA and AirPlay) where a newer incoming stream actively shuts down the incumbent stream, resets the underlying SPSC RingBuffer, and claims exclusive USB DAC playback to prevent dual-stream mixing.
+*Aliases: 跨协议后发抢占, 推流仲裁*
