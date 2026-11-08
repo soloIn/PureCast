@@ -871,8 +871,9 @@ class PlaybackService : LifecycleService() {
 
     fun handleUsbDeviceDetached(device: android.hardware.usb.UsbDevice?) {
         Logger.service.w(TAG, "收到 USB 设备拔出通知: ${device?.deviceName}")
-        usbDeviceManager.handleDeviceDetached(device)
-        if (_playbackStatus.value == PlaybackStatus.PLAYING) {
+        val isCurrentDacDetached = usbDeviceManager.handleDeviceDetached(device)
+        if (isCurrentDacDetached && _playbackStatus.value == PlaybackStatus.PLAYING) {
+            Logger.service.i(TAG, "当前活跃的 USB DAC 已物理拔出，自动暂停当前音频播放")
             pausePlayback()
         }
     }

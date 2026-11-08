@@ -214,7 +214,7 @@ class StreamDemuxer(
                 // 💡 等待环形缓冲区中的数据被 USB DAC 完全消费播放完毕 (最多等待 6 秒防挂起)
                 var waitCount = 0
                 while (isActive && isDemuxing && thisSession == sessionToken.get() && NativeAudioEngine.getAvailableRead() > 0 && waitCount < 120) {
-                    Thread.sleep(50)
+                    delay(50)
                     waitCount++
                 }
                 if (thisSession == sessionToken.get()) {

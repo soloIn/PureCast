@@ -171,20 +171,23 @@ class UsbDeviceManager(
 
     /**
      * 💡 处理 USB 设备热插拔拔出事件
+     * @return 若被拔出的设备确实是当前连接的活跃 DAC，则释放独占并返回 true；若拔出的是无关外设或当前无连接则返回 false
      */
-    fun handleDeviceDetached(device: UsbDevice?) {
+    fun handleDeviceDetached(device: UsbDevice?): Boolean {
         synchronized(this) {
-            val current = activeDevice
-            val isCurrentDetached = device == null || current == null ||
+            val current = activeDevice ?: return false
+            val isCurrentDetached = device == null ||
                     device.deviceId == current.deviceId ||
                     (device.vendorId == current.vendorId && device.productId == current.productId)
 
             if (isCurrentDetached) {
-                Logger.usb.i(TAG, "检测到当前 USB DAC 设备已物理拔出 (${device?.productName ?: current?.productName})，执行声卡让渡与状态重置")
+                Logger.usb.i(TAG, "检测到当前 USB DAC 设备已物理拔出 (${device?.productName ?: current.productName})，执行声卡让渡与状态重置")
                 releaseUsbExclusive()
                 activeDevice = null
                 onDeviceStateChanged(false, null)
+                return true
             }
+            return false
         }
     }
 
