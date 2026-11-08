@@ -55,6 +55,14 @@ class StreamDemuxer(
     private var flacStartTimeMs: Long = 0L
     @Volatile
     private var lastPositionUpdateMs: Long = 0L
+    @Volatile
+    private var flacTotalFrames: Long = 0L
+    @Volatile
+    private var currentSampleRate: Int = 0
+    @Volatile
+    private var currentBitDepth: Int = 0
+    @Volatile
+    private var currentChannels: Int = 0
 
     fun isRunning(): Boolean = isDemuxing
     fun getCurrentUri(): String = currentStreamUrl
@@ -64,8 +72,19 @@ class StreamDemuxer(
      */
     fun getCurrentPlayPositionSeconds(): Long {
         val bps = bytesPerSecond
-        if (bps > 0L && totalBytesStreamed > 0L) {
-            return totalBytesStreamed / bps
+        if (bps > 0L) {
+            if (flacTotalFrames > 0L && currentSampleRate > 0) {
+                // 💡 FLAC 模式：根据 Native 解码实际写入帧数与环形缓冲在途有效数据帧数精准计算已播放秒数
+                val decodedFrames = NativeAudioEngine.getFlacDecodedFrames()
+                val bytesPerFrame = currentChannels * (currentBitDepth / 8)
+                val bufferedFrames = if (bytesPerFrame > 0) (NativeAudioEngine.getAvailableRead() / bytesPerFrame).toLong() else 0L
+                val playedFrames = (decodedFrames - bufferedFrames).coerceAtLeast(0L)
+                return playedFrames / currentSampleRate.toLong()
+            } else if (totalBytesStreamed > 0L) {
+                // 💡 WAV / PCM 模式：已播放字节修正为 (totalBytesStreamed - NativeAudioEngine.getAvailableRead()).coerceAtLeast(0)
+                val playedBytes = (totalBytesStreamed - NativeAudioEngine.getAvailableRead().toLong()).coerceAtLeast(0L)
+                return playedBytes / bps
+            }
         }
         if (flacStartTimeMs > 0L && isDemuxing) {
             return (System.currentTimeMillis() - flacStartTimeMs) / 1000L
@@ -95,6 +114,10 @@ class StreamDemuxer(
         bytesPerSecond = 0L
         totalDurationSeconds = 0L
         flacStartTimeMs = 0L
+        flacTotalFrames = 0L
+        currentSampleRate = 0
+        currentBitDepth = 0
+        currentChannels = 0
 
         // 💡 启动播放进度定期更新任务 (每 500ms 刷新一次)
         progressJob = scope.launch(Dispatchers.Default) {
@@ -148,10 +171,22 @@ class StreamDemuxer(
                 if (magicStr == "fLaC") {
                     Logger.upnp.i(TAG, "检测到 FLAC 无损流容器 (fLaC)，交由 Native dr_flac 流式无损解码...")
                     flacStartTimeMs = System.currentTimeMillis()
-                    val ok = NativeAudioEngine.decodeFlacStream(inputStream) { rate, bits, ch ->
+                    val ok = NativeAudioEngine.decodeFlacStream(inputStream) { rate, bits, ch, totalPcmFrames ->
                         if (thisSession == sessionToken.get()) {
-                            Logger.upnp.i(TAG, "Native dr_flac 解析音频规格成功: $rate Hz, $bits bit, $ch ch")
-                            bytesPerSecond = (rate * ch * (bits / 8)).toLong()
+                            currentSampleRate = rate
+                            currentBitDepth = bits
+                            currentChannels = ch
+                            flacTotalFrames = totalPcmFrames
+                            bytesPerSecond = (rate.toLong() * ch * (bits / 8))
+                            if (rate > 0 && totalPcmFrames > 0L) {
+                                totalDurationSeconds = totalPcmFrames / rate.toLong()
+                                Logger.upnp.i(
+                                    TAG,
+                                    "Native dr_flac 解析音频规格成功: $rate Hz, $bits bit, $ch ch, 总采样帧: $totalPcmFrames, 总时长: ${totalDurationSeconds}秒"
+                                )
+                            } else {
+                                Logger.upnp.i(TAG, "Native dr_flac 解析音频规格成功: $rate Hz, $bits bit, $ch ch")
+                            }
                             onStreamStarted(rate, bits, ch, "FLAC")
                         }
                     }
@@ -162,6 +197,10 @@ class StreamDemuxer(
                     // 💡 解析容器头 (WAV / L16)
                     val format = parseHeader(inputStream)
                     if (thisSession != sessionToken.get()) return@launch
+                    currentSampleRate = format.sampleRate
+                    currentBitDepth = format.bitDepth
+                    currentChannels = format.channels
+                    flacTotalFrames = 0L
                     Logger.upnp.i(
                         TAG,
                         "WAV 容器头部解析完毕: 采样率=${format.sampleRate}Hz, 位深=${format.bitDepth}bit, 声道=${format.channels}, dataSize=${format.dataSize}"
@@ -179,8 +218,8 @@ class StreamDemuxer(
                         onStreamStarted(format.sampleRate, format.bitDepth, format.channels, "WAV")
                     }
 
-                    // 💡 流式搬运纯 PCM 数据包直接灌入 Native SPSC RingBuffer
-                    val pcmBuffer = ByteArray(4096)
+                    // 💡 流式搬运纯 PCM 数据包直接灌入 Native SPSC RingBuffer (扩大至 32KB 减少 87.5% JNI 调用)
+                    val pcmBuffer = ByteArray(32768)
 
                     while (isActive && isDemuxing && thisSession == sessionToken.get()) {
                         val bytesRead = inputStream.read(pcmBuffer, 0, pcmBuffer.size)
@@ -199,8 +238,8 @@ class StreamDemuxer(
                                     offset += written
                                     remaining -= written
                                 } else {
-                                    // 💡 环形缓冲满载时微休眠 2ms 等待等时 URB 消费，绝对禁止丢字节以防破坏 16-bit 采样字节对齐
-                                    Thread.sleep(2)
+                                    // 💡 环形缓冲满载时非阻塞挂起 5ms 等待等时 URB 消费，彻底杜绝阻塞 Dispatchers.IO 工作线程
+                                    delay(5)
                                 }
                             }
                         }
@@ -217,6 +256,8 @@ class StreamDemuxer(
                     delay(50)
                     waitCount++
                 }
+                // 💡 环形缓冲排空后，额外增加 25ms 延时等待在途的 8ms 等时 URB 与 DAC 硬件 FIFO 完整播放完毕，彻底杜绝曲末截断
+                delay(25)
                 if (thisSession == sessionToken.get()) {
                     Logger.upnp.i(TAG, "音频流播放完毕 (session=$thisSession)")
                 }

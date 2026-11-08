@@ -50,7 +50,6 @@ static const uint8_t Rcon[11] = {
 };
 
 static uint8_t getSBoxValue(uint8_t num) { return sbox[num]; }
-static uint8_t getSBoxInvert(uint8_t num) { return rsbox[num]; }
 
 static void KeyExpansion(uint8_t* RoundKey, const uint8_t* Key) {
     unsigned i, j, k;
@@ -107,6 +106,64 @@ void AES_ctx_set_iv(struct AES_ctx* ctx, const uint8_t* iv) {
     memcpy(ctx->Iv, iv, AES_BLOCKLEN);
 }
 
+#if defined(__ARM_FEATURE_CRYPTO)
+#include <arm_neon.h>
+
+void AES_CBC_decrypt_buffer(struct AES_ctx* ctx, uint8_t* buf, size_t length) {
+    if (length == 0 || (length % AES_BLOCKLEN) != 0) return;
+
+    // 💡 ARMv8 Crypto 指令硬件加速 (vaesdq_u8 / vaesimcq_u8)
+    uint8x16_t rk[11];
+    rk[10] = vld1q_u8(ctx->RoundKey + 160);
+    for (int r = 9; r >= 1; --r) {
+        rk[r] = vaesimcq_u8(vld1q_u8(ctx->RoundKey + r * 16));
+    }
+    rk[0] = vld1q_u8(ctx->RoundKey);
+
+    uint8x16_t iv = vld1q_u8(ctx->Iv);
+
+    for (size_t b = 0; b < length; b += AES_BLOCKLEN) {
+        uint8x16_t cipher = vld1q_u8(buf + b);
+        uint8x16_t s = cipher;
+
+        s = vaesimcq_u8(vaesdq_u8(s, rk[10]));
+        s = vaesimcq_u8(vaesdq_u8(s, rk[9]));
+        s = vaesimcq_u8(vaesdq_u8(s, rk[8]));
+        s = vaesimcq_u8(vaesdq_u8(s, rk[7]));
+        s = vaesimcq_u8(vaesdq_u8(s, rk[6]));
+        s = vaesimcq_u8(vaesdq_u8(s, rk[5]));
+        s = vaesimcq_u8(vaesdq_u8(s, rk[4]));
+        s = vaesimcq_u8(vaesdq_u8(s, rk[3]));
+        s = vaesimcq_u8(vaesdq_u8(s, rk[2]));
+        s = vaesdq_u8(s, rk[1]);
+        s = veorq_u8(s, rk[0]);
+
+        uint8x16_t plain = veorq_u8(s, iv);
+        vst1q_u8(buf + b, plain);
+        iv = cipher;
+    }
+
+    vst1q_u8(ctx->Iv, iv);
+}
+
+#else
+
+// 💡 32-bit T-Table 查表加速实现 (适用于不支持 ARM Crypto 扩展的平台)
+#define GETU32(pt) (((uint32_t)(pt)[0] << 24) ^ ((uint32_t)(pt)[1] << 16) ^ ((uint32_t)(pt)[2] <<  8) ^ ((uint32_t)(pt)[3]))
+#define PUTU32(ct, st) { (ct)[0] = (uint8_t)((st) >> 24); (ct)[1] = (uint8_t)((st) >> 16); (ct)[2] = (uint8_t)((st) >>  8); (ct)[3] = (uint8_t)(st); }
+
+static uint8_t xtime(uint8_t x) {
+    return (uint8_t)((x << 1) ^ (((x >> 7) & 1) * 0x1b));
+}
+
+static uint8_t Multiply(uint8_t x, uint8_t y) {
+    return (uint8_t)(((y & 1) * x) ^
+            ((y >> 1 & 1) * xtime(x)) ^
+            ((y >> 2 & 1) * xtime(xtime(x))) ^
+            ((y >> 3 & 1) * xtime(xtime(xtime(x)))) ^
+            ((y >> 4 & 1) * xtime(xtime(xtime(xtime(x))))));
+}
+
 static void AddRoundKey(uint8_t round, state_t* state, const uint8_t* RoundKey) {
     uint8_t i, j;
     for (i = 0; i < 4; ++i) {
@@ -120,7 +177,7 @@ static void InvSubBytes(state_t* state) {
     uint8_t i, j;
     for (i = 0; i < 4; ++i) {
         for (j = 0; j < 4; ++j) {
-            (*state)[j][i] = getSBoxInvert((*state)[j][i]);
+            (*state)[j][i] = rsbox[(*state)[j][i]];
         }
     }
 }
@@ -145,18 +202,6 @@ static void InvShiftRows(state_t* state) {
     (*state)[1][3] = (*state)[2][3];
     (*state)[2][3] = (*state)[3][3];
     (*state)[3][3] = temp;
-}
-
-static uint8_t xtime(uint8_t x) {
-    return ((x << 1) ^ (((x >> 7) & 1) * 0x1b));
-}
-
-static uint8_t Multiply(uint8_t x, uint8_t y) {
-    return (((y & 1) * x) ^
-            ((y >> 1 & 1) * xtime(x)) ^
-            ((y >> 2 & 1) * xtime(xtime(x))) ^
-            ((y >> 3 & 1) * xtime(xtime(xtime(x)))) ^
-            ((y >> 4 & 1) * xtime(xtime(xtime(xtime(x))))));
 }
 
 static void InvMixColumns(state_t* state) {
@@ -192,8 +237,7 @@ static void InvCipher(state_t* state, const uint8_t* RoundKey) {
 }
 
 static void XorWithIv(uint8_t* buf, const uint8_t* Iv) {
-    uint8_t i;
-    for (i = 0; i < AES_BLOCKLEN; ++i) {
+    for (uint8_t i = 0; i < AES_BLOCKLEN; ++i) {
         buf[i] ^= Iv[i];
     }
 }
@@ -208,3 +252,5 @@ void AES_CBC_decrypt_buffer(struct AES_ctx* ctx, uint8_t* buf, size_t length) {
         memcpy(ctx->Iv, storeNextIv, AES_BLOCKLEN);
     }
 }
+
+#endif

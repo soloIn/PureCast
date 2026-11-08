@@ -407,7 +407,7 @@ struct JniFormatCallbackData {
     jmethodID callback_method;
 };
 
-static void jni_flac_format_cb(int sample_rate, int bit_depth, int channels, void* user_data) {
+static void jni_flac_format_cb(int sample_rate, int bit_depth, int channels, int64_t total_pcm_frames, void* user_data) {
     auto* cb_data = static_cast<JniFormatCallbackData*>(user_data);
     if (cb_data && cb_data->env && cb_data->callback_obj && cb_data->callback_method) {
         cb_data->env->CallVoidMethod(
@@ -415,9 +415,18 @@ static void jni_flac_format_cb(int sample_rate, int bit_depth, int channels, voi
             cb_data->callback_method,
             sample_rate,
             bit_depth,
-            channels
+            channels,
+            static_cast<jlong>(total_pcm_frames)
         );
     }
+}
+
+JNIEXPORT jlong JNICALL
+Java_com_solo_purecast_core_nativebridge_NativeAudioEngine_getFlacDecodedFrames(
+    JNIEnv* /* env */,
+    jobject /* thiz */
+) {
+    return static_cast<jlong>(purecast::FlacDecoder::get_decoded_frames());
 }
 
 JNIEXPORT jboolean JNICALL
@@ -430,7 +439,7 @@ Java_com_solo_purecast_core_nativebridge_NativeAudioEngine_decodeFlacStream(
     if (!input_stream || !on_format_callback) return JNI_FALSE;
 
     jclass cb_class = env->GetObjectClass(on_format_callback);
-    jmethodID cb_method = env->GetMethodID(cb_class, "onFormatReady", "(III)V");
+    jmethodID cb_method = env->GetMethodID(cb_class, "onFormatReady", "(IIIJ)V");
     if (!cb_method) return JNI_FALSE;
 
     JniFormatCallbackData cb_data{

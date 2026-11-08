@@ -1,5 +1,6 @@
 package com.solo.purecast.upnp
 
+import com.solo.purecast.airplay.JmDnsDiscoveryService
 import com.solo.purecast.model.TrackMetadata
 import com.solo.purecast.service.PlaybackService
 import com.solo.purecast.util.Logger
@@ -237,6 +238,8 @@ class UpnpRendererServer(
     private fun handleClientConnection(socket: Socket) {
         try {
             socket.use { s ->
+                // 💡 针对连接配置 5000ms 超时防护，防止局域网异常客户端挂起连接耗尽 Dispatchers.IO 线程池
+                s.soTimeout = 5000
                 val reader = BufferedReader(InputStreamReader(s.getInputStream()))
                 val firstLine = reader.readLine() ?: return
                 val parts = firstLine.split(" ")
@@ -781,35 +784,7 @@ class UpnpRendererServer(
     }
 
     private fun getActiveLocalIpAddress(): String {
-        try {
-            val interfaces = Collections.list(NetworkInterface.getNetworkInterfaces())
-            // 💡 严格优先选择物理 Wi-Fi (wlan*) 或以太网 (eth*)，坚决排除投影仪内部主板通信的 usb0 (192.168.48.x) 与虚拟网卡
-            val sorted = interfaces.sortedWith(compareByDescending { iface ->
-                when {
-                    iface.name.startsWith("wlan") -> 3
-                    iface.name.startsWith("eth") -> 2
-                    else -> 0
-                }
-            })
-            for (iface in sorted) {
-                if (iface.isLoopback || !iface.isUp) continue
-                val name = iface.name.lowercase()
-                if (name.startsWith("usb") || name.startsWith("dummy") || name.startsWith("p2p") || name.startsWith("tun")) {
-                    continue
-                }
-                for (addr in iface.inetAddresses) {
-                    if (!addr.isLoopbackAddress && addr is java.net.Inet4Address) {
-                        val host = addr.hostAddress ?: ""
-                        if (!host.startsWith("127.") && !host.startsWith("169.254.") && !host.startsWith("192.168.48.")) {
-                            return host
-                        }
-                    }
-                }
-            }
-        } catch (e: Exception) {
-            // fallback
-        }
-        return "127.0.0.1"
+        return JmDnsDiscoveryService.getLocalIpv4Address()?.hostAddress ?: "127.0.0.1"
     }
 
     private fun escapeXml(text: String): String {

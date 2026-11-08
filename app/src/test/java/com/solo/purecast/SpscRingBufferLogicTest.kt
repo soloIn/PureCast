@@ -24,6 +24,29 @@ class SpscRingBufferLogicTest {
     }
 
     @Test
+    fun testDynamicRingBufferCapacityCalculation() {
+        fun calcCapacity(sampleRate: Int, bitDepth: Int, channels: Int): Int {
+            val bytesPerSample = if (bitDepth > 0) bitDepth / 8 else 2
+            val byteRate = sampleRate.toLong() * channels.toLong() * bytesPerSample.toLong()
+            val minCap = Math.max(65536L, (byteRate * 0.5).toLong()).toInt()
+            var cap = 1
+            while (cap < minCap) {
+                cap = cap shl 1
+            }
+            return cap
+        }
+
+        // 44.1kHz / 16bit / 2ch (AirPlay 默认) -> 128KB (低延迟)
+        assertEquals(131072, calcCapacity(44100, 16, 2))
+
+        // 96kHz / 24bit / 2ch -> 512KB (抗网络抖动)
+        assertEquals(524288, calcCapacity(96000, 24, 2))
+
+        // 192kHz / 24bit / 2ch (UPnP 高码率) -> 1MB
+        assertEquals(1048576, calcCapacity(192000, 24, 2))
+    }
+
+    @Test
     fun testPcm16ToS24_3LE_Padding() {
         // 验证 16-bit 采样向 24-bit (3 字节) 子帧的 LSB 补零 (sample_16 << 8)
         val sample16Max = 0x7FFF.toShort() // +32767
