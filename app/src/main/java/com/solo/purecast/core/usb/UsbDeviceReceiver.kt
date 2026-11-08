@@ -30,12 +30,14 @@ class UsbDeviceReceiver : BroadcastReceiver() {
             UsbManager.ACTION_USB_DEVICE_DETACHED -> {
                 val device: UsbDevice? = IntentCompat.getParcelableExtra(intent, UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
                 Logger.usb.i(TAG, "检测到 USB 设备拔出: ${device?.deviceName}")
+                PlaybackService.instance?.handleUsbDeviceDetached(device)
             }
 
             Intent.ACTION_BOOT_COMPLETED,
             ACTION_QUICKBOOT_POWERON,
             ACTION_HTC_QUICKBOOT_POWERON -> {
-                Logger.usb.i(TAG, "电视盒子冷开机或快速开机广播触发 ($action)，拉起后台音频服务并冷启动枚举 USB 设备...")
+                Logger.usb.i(TAG, "电视盒子冷开机或快速开机广播触发 ($action)，静默拉起后台核心音频服务并枚举 USB 设备...")
+                // 💡 作为纯系统后台服务静默自启动，绝不开机主动拉起 Activity 干扰电视大屏桌面
                 PlaybackService.start(context)
             }
         }

@@ -121,6 +121,8 @@ bool AlacDecoder::decode_frame(const uint8_t* in_buffer, size_t in_bytes, uint8_
     }
 
     int outsize = 0;
+    // 💡 显式设置输入缓冲区的硬边界，防范网络乱序/残包时 ALAC 解码器越界读取
+    alac_->input_buffer_end = const_cast<unsigned char*>(in_buffer) + in_bytes;
     // 💡 遵循 Apple ALAC 标准解码时序解压单帧 RTP Payload
     alac_decode_frame(alac_, const_cast<unsigned char*>(in_buffer), out_pcm, &outsize);
 

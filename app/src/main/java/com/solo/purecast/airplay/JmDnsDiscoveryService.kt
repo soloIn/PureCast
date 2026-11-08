@@ -45,11 +45,17 @@ class JmDnsDiscoveryService(private val context: Context) {
 
     @Volatile
     private var isBroadcasting = false
+    private var boundIp: InetAddress? = null
 
     /**
      * 获取当前是否正在广播
      */
     fun isRunning(): Boolean = isBroadcasting
+
+    /**
+     * 获取当前已绑定广播的 IP 地址
+     */
+    fun getCurrentBoundIp(): InetAddress? = boundIp
 
     /**
      * 启动 AirPlay / RAOP 广播
@@ -132,6 +138,7 @@ class JmDnsDiscoveryService(private val context: Context) {
             // 💡 注册 DACP 服务监听器，实时捕获 iPhone / iPad 在局域网中广播的临时 DACP 端口
             setupDacpServiceListener()
 
+            boundIp = localIp
             isBroadcasting = true
             Logger.service.i(TAG, "AirPlay 1 (AirTunes / RAOP) 纯音频广播已成功注册: Instance=$raopInstanceName, Target=$hostName.local.:$raopPort, am=AirRecever3,1")
             true
@@ -163,6 +170,7 @@ class JmDnsDiscoveryService(private val context: Context) {
             jmdns = null
             airPlayServiceInfo = null
             raopServiceInfo = null
+            boundIp = null
             isBroadcasting = false
             releaseMulticastLock()
             Logger.service.i(TAG, "JmDNS 广播已注销，MulticastLock 已释放")
@@ -200,17 +208,21 @@ class JmDnsDiscoveryService(private val context: Context) {
                 when {
                     intf.name.startsWith("wlan") -> 3
                     intf.name.startsWith("eth") -> 2
-                    !intf.name.startsWith("usb") -> 1
                     else -> 0
                 }
             })
             for (intf in sortedInterfaces) {
                 if (intf.isLoopback || !intf.isUp) continue
+                val name = intf.name.lowercase()
+                // 💡 严格排除投影仪内部主板 usb0、虚拟网卡 dummy、p2p 等
+                if (name.startsWith("usb") || name.startsWith("dummy") || name.startsWith("p2p") || name.startsWith("tun")) {
+                    continue
+                }
                 val addrs = Collections.list(intf.inetAddresses)
                 for (addr in addrs) {
                     if (!addr.isLoopbackAddress && addr is java.net.Inet4Address) {
                         val host = addr.hostAddress ?: ""
-                        if (!host.startsWith("127.") && !host.startsWith("169.254.")) {
+                        if (!host.startsWith("127.") && !host.startsWith("169.254.") && !host.startsWith("192.168.48.")) {
                             return addr
                         }
                     }

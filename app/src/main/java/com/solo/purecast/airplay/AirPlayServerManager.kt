@@ -176,5 +176,30 @@ class AirPlayServerManager(
         }
     }
 
+    /**
+     * 💡 获取当前 JmDNS 绑定的 IP 地址
+     */
+    fun getCurrentBoundIp(): java.net.InetAddress? = jmdnsDiscoveryService.getCurrentBoundIp()
+
+    /**
+     * 💡 动态检测并响应网络 IP 变更 (如开机冷启动后 Wi-Fi 建立连接)
+     */
+    fun restartIfIpChanged(deviceName: String) {
+        val currentBoundIp = jmdnsDiscoveryService.getCurrentBoundIp()
+        val newIp = jmdnsDiscoveryService.getLocalIpv4Address()
+
+        val needRestart = newIp != null && (newIp != currentBoundIp || !jmdnsDiscoveryService.isRunning())
+        if (needRestart) {
+            Logger.airplay.i(TAG, "检测到有效局域网 IP 变动 (${currentBoundIp?.hostAddress} -> ${newIp?.hostAddress})，重新启动 AirPlay 广播...")
+            scope.launch(Dispatchers.IO) {
+                jmdnsDiscoveryService.stopBroadcast()
+                kotlinx.coroutines.delay(500)
+                jmdnsDiscoveryService.startBroadcast(deviceName, 7000, currentPort)
+            }
+        } else if (!isRunning) {
+            start(deviceName)
+        }
+    }
+
     fun isRunning(): Boolean = isRunning
 }

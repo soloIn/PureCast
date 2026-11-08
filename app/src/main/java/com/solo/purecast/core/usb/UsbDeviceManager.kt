@@ -36,6 +36,7 @@ class UsbDeviceManager(
     private var activeDevice: UsbDevice? = null
     private var activeConnection: UsbDeviceConnection? = null
     private val isExclusiveTaken = AtomicBoolean(false)
+    private val isPermissionRequesting = AtomicBoolean(false)
 
     // 💡 记录当前活跃的声卡硬件配置，切歌时比对是否需要重配底层 Native 驱动
     private var currentSampleRate: Int = 0
@@ -61,6 +62,7 @@ class UsbDeviceManager(
                     }
 
                     val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
+                    isPermissionRequesting.set(false)
                     Logger.usb.i(TAG, "收到 USB 权限申请结果: device=${device?.deviceName}, granted=$granted")
                     if (granted && device != null) {
                         activeDevice = device
@@ -126,6 +128,21 @@ class UsbDeviceManager(
     }
 
     /**
+     * 💡 从 Activity Intent 注入系统传递的 USB 设备，优先校验系统既有授权
+     */
+    fun onDeviceAttachedFromIntent(device: UsbDevice) {
+        synchronized(this) {
+            activeDevice = device
+            if (usbManager.hasPermission(device)) {
+                Logger.usb.i(TAG, "从 Intent 识别到系统已授权的 USB 设备: ${device.productName}")
+                onDeviceStateChanged(true, device.productName ?: device.deviceName)
+            } else {
+                Logger.usb.i(TAG, "从 Intent 识别到 USB 设备 (${device.productName})，尚未具备访问授权")
+            }
+        }
+    }
+
+    /**
      * 💡 由前台 Activity 发起原生 USB 授权对话框
      */
     fun requestPermissionWithActivity(activity: android.app.Activity) {
@@ -143,8 +160,35 @@ class UsbDeviceManager(
             return
         }
 
+        if (!isPermissionRequesting.compareAndSet(false, true)) {
+            Logger.usb.w(TAG, "当前已存在正在处理中的 USB 权限申请对话框，跳过重复调起")
+            return
+        }
+
         Logger.usb.i(TAG, "从 Activity (${activity.localClassName}) 发起 USB 权限申请对话框...")
         requestDevicePermission(device, activity)
+    }
+
+    /**
+     * 💡 处理 USB 设备热插拔拔出事件
+     * @return 若被拔出的设备确实是当前连接的活跃 DAC，则释放独占并返回 true；若拔出的是无关外设或当前无连接则返回 false
+     */
+    fun handleDeviceDetached(device: UsbDevice?): Boolean {
+        synchronized(this) {
+            val current = activeDevice ?: return false
+            val isCurrentDetached = device == null ||
+                    device.deviceId == current.deviceId ||
+                    (device.vendorId == current.vendorId && device.productId == current.productId)
+
+            if (isCurrentDetached) {
+                Logger.usb.i(TAG, "检测到当前 USB DAC 设备已物理拔出 (${device?.productName ?: current.productName})，执行声卡让渡与状态重置")
+                releaseUsbExclusive()
+                activeDevice = null
+                onDeviceStateChanged(false, null)
+                return true
+            }
+            return false
+        }
     }
 
     private fun requestDevicePermission(device: UsbDevice, ctx: Context = context) {
@@ -339,6 +383,6 @@ class UsbDeviceManager(
     companion object {
         private const val TAG = "UsbDeviceManager"
         private const val ACTION_USB_PERMISSION = "com.solo.purecast.USB_PERMISSION"
-        private const val SONY_VENDOR_ID = 0x054c // 索尼 Vendor ID (十进制 1356)
+        const val SONY_VENDOR_ID = 0x054c // 索尼 Vendor ID (十进制 1356)
     }
 }
