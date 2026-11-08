@@ -39,14 +39,15 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.tv.material3.ExperimentalTvMaterial3Api
 import androidx.tv.material3.Text
+import com.solo.purecast.model.PlaybackStatus
 
 /**
  * 💡 PureCast 纤细圆角进度条与时间轴组件 (ProgressBarComponent)
  * 遵循 Apple TV 极简工业美学设计：
  * 1. 轨道高度默认为 4dp，D-Pad 获得焦点时动态平滑展开至 6dp 并点亮白色微光发光边框与游标。
  * 2. 悬浮对比度保护：轨道底槽采用高透半白 [Color(0x40FFFFFF)]，填充条使用高纯亮白 [Color.White]，在任意流光背景下清晰可见。
- * 3. 左侧展示当前播放时间 (mm:ss)，右侧展示总时长或实时流 "LIVE / 实时直通" 状态。
- * 4. 针对非实时流支持遥控器 D-Pad 左右键快进 / 快退 10 秒；针对实时广播流自适应禁用寻道。
+ * 3. 左侧展示当前播放时间 (mm:ss)，右侧展示总时长、"等待投屏接入" 或实时流 "LIVE / 实时直通" 状态。
+ * 4. 针对非实时流且支持主动寻道的流支持遥控器 D-Pad 左右键快进 / 快退 10 秒；针对实时广播流自适应禁用寻道。
  */
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
@@ -58,9 +59,13 @@ fun ProgressBarComponent(
     modifier: Modifier = Modifier,
     hasDarkBackground: Boolean = true,
     focusRequester: FocusRequester? = null,
-    onPlayPauseClick: (() -> Unit)? = null
+    onPlayPauseClick: (() -> Unit)? = null,
+    playbackStatus: PlaybackStatus = PlaybackStatus.IDLE,
+    canSeek: Boolean = false
 ) {
-    val canFocus = !isLiveStream && totalDurationMs > 0L
+    val isIdle = playbackStatus == PlaybackStatus.IDLE
+    val canFocus = canSeek && !isLiveStream && totalDurationMs > 0L && !isIdle
+    val isLivePlaying = playbackStatus == PlaybackStatus.PLAYING && (isLiveStream || totalDurationMs <= 0L)
     val interactionSource = remember { MutableInteractionSource() }
     val isFocused by interactionSource.collectIsFocusedAsState()
 
@@ -99,7 +104,8 @@ fun ProgressBarComponent(
     val progressFraction = calculateProgressFraction(
         currentPositionMs = currentPositionMs,
         totalDurationMs = totalDurationMs,
-        isLiveStream = isLiveStream
+        isLiveStream = isLiveStream,
+        isIdle = isIdle
     )
 
     Column(
@@ -198,8 +204,15 @@ fun ProgressBarComponent(
                 color = currentTimeColor
             )
 
-            // 右侧总时长或实时流状态
-            if (isLiveStream || totalDurationMs <= 0L) {
+            // 右侧总时长、实时流状态或待机接入状态
+            if (isIdle) {
+                Text(
+                    text = "等待投屏接入",
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Normal,
+                    color = totalTimeColor
+                )
+            } else if (isLivePlaying) {
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(6.dp)
@@ -249,10 +262,13 @@ private fun formatTimeMs(ms: Long): String {
 internal fun calculateProgressFraction(
     currentPositionMs: Long,
     totalDurationMs: Long,
-    isLiveStream: Boolean
+    isLiveStream: Boolean,
+    isIdle: Boolean = false
 ): Float {
+    if (isIdle || (totalDurationMs <= 0L && currentPositionMs <= 0L)) {
+        return 0.0f
+    }
     return when {
-        totalDurationMs <= 0L && currentPositionMs <= 0L -> 0.0f
         isLiveStream || totalDurationMs <= 0L -> 1.0f
         else -> (currentPositionMs.toFloat() / totalDurationMs.toFloat()).coerceIn(0.0f, 1.0f)
     }

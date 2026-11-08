@@ -54,6 +54,18 @@ class ProgressBarComponentTest {
     }
 
     @Test
+    fun `idle state always returns zero fraction even with residual position`() {
+        // 待机空闲态强制归零
+        val fraction = calculateProgressFraction(
+            currentPositionMs = 25_000L,
+            totalDurationMs = 60_000L,
+            isLiveStream = false,
+            isIdle = true
+        )
+        assertEquals(0.0f, fraction, 0.001f)
+    }
+
+    @Test
     fun `progress fraction clamps cleanly between 0 and 1`() {
         val belowZero = calculateProgressFraction(
             currentPositionMs = -5000L,

@@ -30,14 +30,12 @@ enum class TvNavScreen { PLAYBACK, SETTINGS }
  * 严格遵从 AGENTS.md 约束与 10-Foot 遥控器大屏交互规范：
  * 1. 物理遥控器按键全局拦截：精准响应 KEYCODE_MENU（呼出/收起侧边栏）及媒体播放按键。
  * 2. 实时流保护：遥控器切歌键在 airupnp 等外部实时流时拦截并弹出温和 Toast 提示。
- * 3. 防烧屏按键重置：任意遥控器按键输入即刻唤醒控制栏并重置 3 分钟无操作计时器。
- * 4. 顶层页面导航架构：在播放页面与设置页面之间平滑切换，设置页面具备 100% 实心背景。
+ * 3. 顶层页面导航架构：在播放页面与设置页面之间平滑切换，设置页面具备 100% 实心背景。
  */
 class MainActivity : ComponentActivity() {
 
-    // 💡 遥控器 MENU 键与全局按键触发器 (以时间戳驱动 Compose 响应)
+    // 💡 遥控器 MENU 键全局触发器 (以时间戳驱动 Compose 响应)
     private val menuKeyTrigger = mutableLongStateOf(0L)
-    private val userInteractionTrigger = mutableLongStateOf(0L)
     private var currentNavScreen: TvNavScreen = TvNavScreen.PLAYBACK
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -83,8 +81,7 @@ class MainActivity : ComponentActivity() {
                                 onTogglePlayPause = { togglePlayPause() },
                                 onPreviousTrack = { handlePreviousTrack() },
                                 onNextTrack = { handleNextTrack() },
-                                onOpenSettings = { currentScreen = TvNavScreen.SETTINGS },
-                                userInteractionTrigger = userInteractionTrigger.longValue
+                                onOpenSettings = { currentScreen = TvNavScreen.SETTINGS }
                             )
                         }
                         TvNavScreen.SETTINGS -> {
@@ -198,12 +195,9 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * 💡 全局按键分发：按键即重置 3 分钟防烧屏休眠倒计时
+     * 💡 全局按键分发
      */
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
-        if (event.action == KeyEvent.ACTION_DOWN) {
-            userInteractionTrigger.longValue = System.currentTimeMillis()
-        }
         return super.dispatchKeyEvent(event)
     }
 
