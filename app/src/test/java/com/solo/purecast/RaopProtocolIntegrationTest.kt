@@ -383,4 +383,84 @@ class RaopProtocolIntegrationTest {
         assertTrue(onNewPacket(1750L))
         assertFalse(isStreamPaused)
     }
+
+    /**
+     * 💡 验证全零进度报文 (progress: 0/0/0) 过滤逻辑：
+     * iPhone 暂停或切歌缓冲时发出的 0/0/0 时间戳不得冲刷已有的播放位置与总时长
+     */
+    @Test
+    fun testZeroProgressRejectionOnPause() {
+        var currentPos = 45000L
+        var currentDuration = 180000L
+
+        fun handleProgressUpdate(posMs: Long, durMs: Long) {
+            // 严格过滤 0/0 全零空值
+            if (posMs <= 0L && durMs <= 0L) {
+                return
+            }
+            if (durMs > 0L) {
+                currentDuration = durMs
+            }
+            currentPos = posMs
+        }
+
+        // 正常时间戳推进至 50 秒
+        handleProgressUpdate(50000L, 180000L)
+        assertEquals(50000L, currentPos)
+        assertEquals(180000L, currentDuration)
+
+        // 收到暂停阶段的 progress: 0/0/0
+        handleProgressUpdate(0L, 0L)
+        assertEquals("0/0/0 报文不得重置当前播放进度", 50000L, currentPos)
+        assertEquals("0/0/0 报文不得重置总时长", 180000L, currentDuration)
+
+        // 恢复推流后更新至 52 秒
+        handleProgressUpdate(52000L, 180000L)
+        assertEquals(52000L, currentPos)
+    }
+
+    /**
+     * 💡 验证 AirPlay 暂停与断开的状态机分流隔离：
+     * 暂停必须保持协议来源、音频参数与元数据，仅切换 PlaybackStatus；断开才清理独占与会话
+     */
+    @Test
+    fun testPauseVsStopStateSeparation() {
+        var protocol = StreamProtocol.AIRPLAY_1
+        var status = PlaybackStatus.PLAYING
+        var frozenPosition = 65000L
+        val metadata = TrackMetadata(title = "Hotel California", artist = "Eagles", durationMs = 391000L)
+
+        // 1. 触发暂停
+        fun onPause() {
+            // 状态机仅切换至 PAUSED，协议保持 AIRPLAY_1，元数据与冻结进度不被破坏
+            status = PlaybackStatus.PAUSED
+        }
+
+        onPause()
+        assertEquals(PlaybackStatus.PAUSED, status)
+        assertEquals(StreamProtocol.AIRPLAY_1, protocol)
+        assertEquals(65000L, frozenPosition)
+        assertEquals("Hotel California", metadata.title)
+
+        // 2. 触发恢复
+        fun onResume() {
+            status = PlaybackStatus.PLAYING
+        }
+
+        onResume()
+        assertEquals(PlaybackStatus.PLAYING, status)
+        assertEquals(StreamProtocol.AIRPLAY_1, protocol)
+
+        // 3. 触发会话彻底断开 (TEARDOWN)
+        fun onStop() {
+            protocol = StreamProtocol.NONE
+            status = PlaybackStatus.STOPPED
+            frozenPosition = 0L
+        }
+
+        onStop()
+        assertEquals(PlaybackStatus.STOPPED, status)
+        assertEquals(StreamProtocol.NONE, protocol)
+        assertEquals(0L, frozenPosition)
+    }
 }

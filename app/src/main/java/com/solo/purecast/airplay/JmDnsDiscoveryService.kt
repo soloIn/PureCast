@@ -322,7 +322,7 @@ class JmDnsDiscoveryService(private val context: Context) {
 
             override fun serviceResolved(event: javax.jmdns.ServiceEvent) {
                 val info = event.info ?: return
-                Logger.service.i(TAG, "已解析 _dacp._tcp 服务: Name=${info.name}, Port=${info.port}")
+                Logger.service.d(TAG, "已解析 _dacp._tcp 服务: Name=${info.name}, Port=${info.port}")
                 inspectDacpServiceInfo(info)
             }
         }
@@ -334,24 +334,27 @@ class JmDnsDiscoveryService(private val context: Context) {
      * 💡 注册 DACP 目标客户端信息，并启动端口匹配
      */
     fun resolveDacpPort(dacpId: String, clientIp: String, onPortResolved: (Int) -> Unit) {
-        targetDacpId = dacpId
-        targetClientIp = clientIp
+        targetDacpId = dacpId.ifEmpty { null }
+        targetClientIp = clientIp.ifEmpty { null }
         onDacpPortResolvedCallback = onPortResolved
 
         Logger.service.i(TAG, "注册 DACP 监听目标: dacpId=$dacpId, clientIp=$clientIp，启动动态匹配")
 
-        // 优先检查 JmDNS 当前已缓存的服务
+        // 异步检查并解析 JmDNS 当前已缓存的服务
         jmdns?.let { dns ->
-            try {
-                val existingServices = dns.list(DACP_SERVICE_TYPE)
-                for (info in existingServices) {
-                    if (inspectDacpServiceInfo(info)) {
-                        return
+            Thread {
+                try {
+                    val existingServices = dns.list(DACP_SERVICE_TYPE)
+                    for (stub in existingServices) {
+                        val resolved = if (stub.port > 0) stub else dns.getServiceInfo(stub.type, stub.name, 1000)
+                        if (resolved != null && inspectDacpServiceInfo(resolved)) {
+                            return@Thread
+                        }
                     }
+                } catch (e: Exception) {
+                    Logger.service.w(TAG, "遍历解析已缓存 DACP 服务异常: ${e.message}")
                 }
-            } catch (e: Exception) {
-                Logger.service.w(TAG, "遍历已缓存 DACP 服务异常: ${e.message}")
-            }
+            }.start()
         }
     }
 
@@ -365,12 +368,16 @@ class JmDnsDiscoveryService(private val context: Context) {
         val targetIp = targetClientIp
         val targetId = targetDacpId
 
-        val matchesIp = targetIp != null && info.inet4Addresses.any { it.hostAddress == targetIp }
-        val matchesName = targetId != null && info.name.contains(targetId, ignoreCase = true)
-        val matchesDbId = targetId != null && info.getPropertyString("DbId")?.equals(targetId, ignoreCase = true) == true
+        val hostMatches = targetIp != null && (
+            info.hostAddresses.any { it == targetIp } ||
+            info.inetAddresses.any { it.hostAddress == targetIp } ||
+            info.inet4Addresses.any { it.hostAddress == targetIp }
+        )
+        val nameMatches = !targetId.isNullOrEmpty() && info.name.contains(targetId, ignoreCase = true)
+        val dbIdMatches = !targetId.isNullOrEmpty() && info.getPropertyString("DbId")?.equals(targetId, ignoreCase = true) == true
 
-        if (matchesIp || matchesName || matchesDbId) {
-            val ips = info.inet4Addresses.joinToString { it.hostAddress ?: "" }
+        if (hostMatches || nameMatches || dbIdMatches) {
+            val ips = (info.hostAddresses.toList() + info.inet4Addresses.mapNotNull { it.hostAddress }).distinct().joinToString()
             Logger.service.i(TAG, "🎉 成功锁定 DACP 真实端口: $port (Name=${info.name}, IPs=[$ips])")
             onDacpPortResolvedCallback?.invoke(port)
             return true

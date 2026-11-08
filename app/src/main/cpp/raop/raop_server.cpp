@@ -8,6 +8,7 @@
 #include <sstream>
 #include <android/log.h>
 #include <cctype>
+#include <algorithm>
 
 #define RAOP_TAG "PureCastRAOP"
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, RAOP_TAG, __VA_ARGS__)
@@ -167,6 +168,16 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
 
     std::string cseq = parse_header(request, "CSeq");
     LOGI("处理 RTSP 方法: %s, URI: %s, CSeq: %s", method.c_str(), uri.c_str(), cseq.c_str());
+
+    // 💡 只要请求中包含 DACP 凭据与端口信息，立即提取更新 (兼顾 ANNOUNCE, SETUP, SET_PARAMETER)
+    std::string token = parse_header(request, "Active-Remote");
+    if (!token.empty()) current_params_.active_remote_token = token;
+    std::string dacp_id = parse_header(request, "DACP-ID");
+    if (!dacp_id.empty()) current_params_.dacp_id = dacp_id;
+    std::string dacp_port = parse_header(request, "DACP-Port");
+    if (!dacp_port.empty()) {
+        try { current_params_.dacp_port = std::stoi(dacp_port); } catch (...) {}
+    }
 
     std::string challenge = parse_header(request, "Apple-Challenge");
     std::string apple_response_header;
@@ -355,15 +366,14 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
                 }
             } else if (content_type.find("image/") != std::string::npos) {
                 // 💡 2. 封面图片推送 (JPEG/PNG 原始二进制，杜绝送入 DMAP 解析器被误丢弃)
-                std::vector<uint8_t> cover_art;
                 if (content_type.find("image/none") == std::string::npos && payload_len > 0) {
-                    cover_art.assign(payload, payload + payload_len);
+                    std::vector<uint8_t> cover_art(payload, payload + payload_len);
                     LOGI("SET_PARAMETER 收到原生封面图片推送: %s, 字节数=%zu", content_type.c_str(), payload_len);
+                    if (metadata_cb_) {
+                        metadata_cb_("", "", "", 0, cover_art);
+                    }
                 } else {
-                    LOGI("SET_PARAMETER 收到清空封面请求 (image/none)");
-                }
-                if (metadata_cb_) {
-                    metadata_cb_("", "", "", 0, cover_art);
+                    LOGI("SET_PARAMETER 收到切歌过渡/空封面提示 (image/none)，保留当前封面杜绝界面黑屏跳动");
                 }
             } else if (content_type.find("text/parameters") != std::string::npos) {
                 // 💡 3. 文本参数推送 (progress: start/curr/end 播放时间进度或音量)
@@ -381,13 +391,17 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
                     char s1 = 0, s2 = 0;
                     std::istringstream pstream(prog_val);
                     if (pstream >> start_ts >> s1 >> curr_ts >> s2 >> end_ts && s1 == '/' && s2 == '/') {
-                        uint32_t rate = current_params_.sample_rate > 0 ? current_params_.sample_rate : 44100;
-                        long pos_ms = (curr_ts >= start_ts) ? static_cast<long>((curr_ts - start_ts) * 1000ULL / rate) : 0;
-                        long dur_ms = (end_ts >= start_ts) ? static_cast<long>((end_ts - start_ts) * 1000ULL / rate) : 0;
-                        LOGD("AirPlay 进度实时校准: pos=%ld ms, duration=%ld ms (RTP: %s)",
-                             pos_ms, dur_ms, prog_val.c_str());
-                        if (progress_cb_) {
-                            progress_cb_(pos_ms, dur_ms);
+                        if (start_ts == 0 && curr_ts == 0 && end_ts == 0) {
+                            LOGI("AirPlay 收到暂停/未就绪时间戳 (progress: 0/0/0)，忽略以防进度冲刷归零");
+                        } else if (end_ts > start_ts) {
+                            uint32_t rate = current_params_.sample_rate > 0 ? current_params_.sample_rate : 44100;
+                            long pos_ms = (curr_ts >= start_ts) ? static_cast<long>((curr_ts - start_ts) * 1000ULL / rate) : 0;
+                            long dur_ms = static_cast<long>((end_ts - start_ts) * 1000ULL / rate);
+                            LOGD("AirPlay 进度实时校准: pos=%ld ms, duration=%ld ms (RTP: %s)",
+                                 pos_ms, dur_ms, prog_val.c_str());
+                            if (progress_cb_) {
+                                progress_cb_(pos_ms, dur_ms);
+                            }
                         }
                     }
                 }
@@ -415,17 +429,33 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
 }
 
 std::string RaopServer::parse_header(const std::string& request, const std::string& header_name) {
-    std::string target = header_name + ":";
-    size_t pos = request.find(target);
+    std::string req_lower = request;
+    std::string hdr_lower = header_name;
+    std::transform(req_lower.begin(), req_lower.end(), req_lower.begin(), ::tolower);
+    std::transform(hdr_lower.begin(), hdr_lower.end(), hdr_lower.begin(), ::tolower);
+
+    std::string target = "\n" + hdr_lower + ":";
+    size_t pos = req_lower.find(target);
+    size_t target_len = target.size();
     if (pos == std::string::npos) {
-        target = header_name + ": ";
-        pos = request.find(target);
-        if (pos == std::string::npos) return "";
+        if (req_lower.rfind(hdr_lower + ":", 0) == 0) {
+            pos = 0;
+            target_len = hdr_lower.size() + 1;
+        } else {
+            return "";
+        }
+    } else {
+        pos += 1; // 跳过前导换行符
+        target_len -= 1;
     }
-    size_t start = pos + target.size();
-    while (start < request.size() && request[start] == ' ') start++;
-    size_t end = request.find("\r\n", start);
-    if (end == std::string::npos) end = request.size();
+
+    size_t start = pos + target_len;
+    while (start < request.size() && (request[start] == ' ' || request[start] == '\t')) start++;
+    size_t end = request.find("\r", start);
+    if (end == std::string::npos) {
+        end = request.find("\n", start);
+        if (end == std::string::npos) end = request.size();
+    }
     return request.substr(start, end - start);
 }
 

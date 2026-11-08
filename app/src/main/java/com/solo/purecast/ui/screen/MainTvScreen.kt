@@ -46,7 +46,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.tv.material3.ExperimentalTvMaterial3Api
 import androidx.tv.material3.Text
-import coil.compose.SubcomposeAsyncImage
+import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import com.solo.purecast.data.SettingsRepository
 import com.solo.purecast.model.PlaybackStatus
@@ -205,28 +205,14 @@ fun MainTvScreen(
                                     (uri.startsWith("http://", ignoreCase = true) || uri.startsWith("https://", ignoreCase = true)))
 
                     if (hasValidCover && coverData != null) {
-                        SubcomposeAsyncImage(
+                        AsyncImage(
                             model = ImageRequest.Builder(LocalContext.current)
                                 .data(coverData)
-                                .crossfade(true)
+                                .crossfade(300)
                                 .build(),
                             contentDescription = "Album Cover",
                             contentScale = ContentScale.Crop,
-                            modifier = Modifier.fillMaxSize(),
-                            loading = {
-                                DefaultCoverCard(
-                                    isPlaying = isPlaying,
-                                    album = metadata.album,
-                                    hasDarkBackground = hasDarkBackground
-                                )
-                            },
-                            error = {
-                                DefaultCoverCard(
-                                    isPlaying = isPlaying,
-                                    album = metadata.album,
-                                    hasDarkBackground = hasDarkBackground
-                                )
-                            }
+                            modifier = Modifier.fillMaxSize()
                         )
                     } else {
                         DefaultCoverCard(

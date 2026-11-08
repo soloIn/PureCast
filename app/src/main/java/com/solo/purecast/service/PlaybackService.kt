@@ -540,7 +540,7 @@ class PlaybackService : LifecycleService() {
             NativeAudioEngine.pauseStream()
             _playbackStatus.value = PlaybackStatus.PAUSED
             releaseWifiLowLatencyLock()
-            usbDeviceManager.scheduleIdleRelease()
+            // 💡 暂停期间保持 USB DAC 独占与时钟锁相，不触发 10 秒声卡让渡，确保指示胶囊常绿且支持秒级即时恢复
             updateMediaSessionState()
             updateNotification()
         }
@@ -608,6 +608,10 @@ class PlaybackService : LifecycleService() {
      * 💡 原生 AirPlay 1 播放进度与总时长更新 (SET_PARAMETER progress: start/curr/end 触发)
      */
     private fun onAirPlayProgressUpdated(positionMs: Long, durationMs: Long) {
+        // 💡 过滤全零无效时间戳 (如 progress: 0/0/0)，杜绝暂停或缓冲时将当前进度冲刷归零
+        if (positionMs <= 0L && durationMs <= 0L) {
+            return
+        }
         val current = _currentMetadata.value
         if (durationMs > 0 && current.durationMs != durationMs) {
             val updated = current.copy(durationMs = durationMs, isLiveStream = false)
@@ -656,7 +660,7 @@ class PlaybackService : LifecycleService() {
         NativeAudioEngine.pauseStream()
         _playbackStatus.value = PlaybackStatus.PAUSED
         releaseWifiLowLatencyLock()
-        usbDeviceManager.scheduleIdleRelease() // 启动 10 秒空闲让渡
+        // 💡 暂停期间不触发 10 秒激进让渡，保持 USB DAC 独占与时钟锁相
         upnpServer?.notifyTransportState("PAUSED_PLAYBACK")
         updateMediaSessionState()
         updateNotification()

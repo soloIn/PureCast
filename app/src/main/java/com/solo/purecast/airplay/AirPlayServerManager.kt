@@ -81,10 +81,9 @@ class AirPlayServerManager(
                 // 2. 更新 DACP 反向控制凭证与启动 mDNS 动态端口解析
                 if (clientIp.isNotEmpty()) {
                     dacpClient.updateSession(clientIp, dacpPort, activeRemoteToken)
-                    if (dacpId.isNotEmpty()) {
-                        jmdnsDiscoveryService.resolveDacpPort(dacpId, clientIp) { port ->
-                            dacpClient.updatePort(port)
-                        }
+                    // 💡 无论客户端是否携带 DACP-ID，只要已掌握客户端 IP，立即启动 DACP 端口监听与匹配
+                    jmdnsDiscoveryService.resolveDacpPort(dacpId, clientIp) { port ->
+                        dacpClient.updatePort(port)
                     }
                 }
 

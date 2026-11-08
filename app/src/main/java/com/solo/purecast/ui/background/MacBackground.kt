@@ -87,18 +87,20 @@ fun MacBackground(
             }
             currentCoroutineContext().ensureActive()
             val input = ((result as? SuccessResult)?.drawable as? BitmapDrawable)?.bitmap
-            value = if (input == null) null else withContext(Dispatchers.Default) {
-                val copy = Bitmap.createBitmap(256, 256, Bitmap.Config.ARGB_8888)
-                Canvas(copy).drawBitmap(input, null, Rect(0, 0, 256, 256), Paint(Paint.FILTER_BITMAP_FLAG))
-                val metrics = context.resources.displayMetrics
-                val fallback = macStaticFrame(context, copy, metrics.widthPixels, metrics.heightPixels, sceneClock.meshIndex)
-                currentCoroutineContext().ensureActive()
-                MacArtworkFrame(copy, fallback)
+            if (input != null) {
+                val newFrame = withContext(Dispatchers.Default) {
+                    val copy = Bitmap.createBitmap(256, 256, Bitmap.Config.ARGB_8888)
+                    Canvas(copy).drawBitmap(input, null, Rect(0, 0, 256, 256), Paint(Paint.FILTER_BITMAP_FLAG))
+                    val metrics = context.resources.displayMetrics
+                    val fallback = macStaticFrame(context, copy, metrics.widthPixels, metrics.heightPixels, sceneClock.meshIndex)
+                    currentCoroutineContext().ensureActive()
+                    MacArtworkFrame(copy, fallback)
+                }
+                value = newFrame
             }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            value = null
             Logger.ui.w("MacBackground", "封面位图解析异常", e)
         }
     }
