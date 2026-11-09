@@ -46,7 +46,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.tv.material3.ExperimentalTvMaterial3Api
 import androidx.tv.material3.Text
-import coil.compose.SubcomposeAsyncImage
+import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import com.solo.purecast.data.SettingsRepository
 import com.solo.purecast.model.PlaybackStatus
@@ -203,31 +203,43 @@ fun MainTvScreen(
                     val hasValidCover = metadata.coverBytes != null ||
                             (!uri.isNullOrEmpty() &&
                                     (uri.startsWith("http://", ignoreCase = true) || uri.startsWith("https://", ignoreCase = true)))
+                    var lastValidCover by remember { mutableStateOf<Any?>(null) }
+
+                    LaunchedEffect(hasValidCover, coverData) {
+                        if (!hasValidCover || coverData == null) {
+                            lastValidCover = null
+                        }
+                    }
 
                     if (hasValidCover && coverData != null) {
-                        SubcomposeAsyncImage(
-                            model = ImageRequest.Builder(LocalContext.current)
-                                .data(coverData)
-                                .crossfade(true)
-                                .build(),
-                            contentDescription = "Album Cover",
-                            contentScale = ContentScale.Crop,
-                            modifier = Modifier.fillMaxSize(),
-                            loading = {
-                                DefaultCoverCard(
-                                    isPlaying = isPlaying,
-                                    album = metadata.album,
-                                    hasDarkBackground = hasDarkBackground
-                                )
-                            },
-                            error = {
-                                DefaultCoverCard(
-                                    isPlaying = isPlaying,
-                                    album = metadata.album,
-                                    hasDarkBackground = hasDarkBackground
+                        Box(modifier = Modifier.fillMaxSize()) {
+                            // 💡 垫底保持上一首封面，防止新封面加载解码瞬间出现空白/闪烁
+                            if (lastValidCover != null && lastValidCover != coverData) {
+                                AsyncImage(
+                                    model = lastValidCover,
+                                    contentDescription = null,
+                                    contentScale = ContentScale.Crop,
+                                    modifier = Modifier.fillMaxSize()
                                 )
                             }
-                        )
+                            AsyncImage(
+                                model = ImageRequest.Builder(LocalContext.current)
+                                    .data(coverData)
+                                    .crossfade(300)
+                                    .listener(
+                                        onSuccess = { _, _ ->
+                                            lastValidCover = coverData
+                                        },
+                                        onError = { _, _ ->
+                                            lastValidCover = null
+                                        }
+                                    )
+                                    .build(),
+                                contentDescription = "Album Cover",
+                                contentScale = ContentScale.Crop,
+                                modifier = Modifier.fillMaxSize()
+                            )
+                        }
                     } else {
                         DefaultCoverCard(
                             isPlaying = isPlaying,

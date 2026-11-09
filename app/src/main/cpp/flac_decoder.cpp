@@ -54,13 +54,24 @@ static drflac_bool32 jvm_flac_seek(void* user_data, int offset, drflac_seek_orig
     return DRFLAC_FALSE;
 }
 
+static std::atomic<int64_t> s_flac_decoded_frames{0};
+
+int64_t FlacDecoder::get_decoded_frames() {
+    return s_flac_decoded_frames.load(std::memory_order_relaxed);
+}
+
+void FlacDecoder::reset_decoded_frames() {
+    s_flac_decoded_frames.store(0, std::memory_order_relaxed);
+}
+
 bool FlacDecoder::decode_stream(
     JNIEnv* env,
     jobject input_stream,
-    void (*on_format_ready)(int, int, int, void*),
+    void (*on_format_ready)(int, int, int, int64_t, void*),
     void* user_data
 ) {
     if (!env || !input_stream) return false;
+    s_flac_decoded_frames.store(0, std::memory_order_relaxed);
 
     jclass is_class = env->GetObjectClass(input_stream);
     jmethodID read_method = env->GetMethodID(is_class, "read", "([BII)I");
@@ -99,6 +110,7 @@ bool FlacDecoder::decode_stream(
         on_format_ready(static_cast<int>(pFlac->sampleRate),
                         static_cast<int>(target_bits),
                         static_cast<int>(pFlac->channels),
+                        static_cast<int64_t>(pFlac->totalPCMFrameCount),
                         user_data);
     }
 
@@ -149,6 +161,9 @@ bool FlacDecoder::decode_stream(
                     std::this_thread::sleep_for(std::chrono::milliseconds(2));
                 }
             }
+            if (written_total == bytes_to_write) {
+                s_flac_decoded_frames.fetch_add(frames_read, std::memory_order_relaxed);
+            }
         }
     } else {
         // 💡 16-bit FLAC：采用 drflac_read_pcm_frames_s16 直接直通无损还原
@@ -182,6 +197,9 @@ bool FlacDecoder::decode_stream(
                 } else {
                     std::this_thread::sleep_for(std::chrono::milliseconds(2));
                 }
+            }
+            if (written_total == bytes_to_write) {
+                s_flac_decoded_frames.fetch_add(frames_read, std::memory_order_relaxed);
             }
         }
     }

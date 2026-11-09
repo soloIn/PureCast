@@ -296,14 +296,14 @@ class UsbDeviceManager(
     /**
      * 标记进入空闲状态，启动空闲倒计时让渡 (0秒表示常驻独占，不启动倒计时)
      */
-    fun scheduleIdleRelease() {
+    fun scheduleIdleRelease(customTimeoutMillis: Long = idleTimeoutMillis) {
         mainHandler.removeCallbacks(releaseRunnable)
-        if (idleTimeoutMillis <= 0L) {
+        if (idleTimeoutMillis <= 0L || customTimeoutMillis <= 0L) {
             Logger.usb.i(TAG, "已配置常驻独占策略 (0秒)，保持声卡独占不自动让渡")
             return
         }
-        Logger.usb.i(TAG, "启动 ${idleTimeoutMillis / 1000} 秒空闲声卡让渡倒计时...")
-        mainHandler.postDelayed(releaseRunnable, idleTimeoutMillis)
+        Logger.usb.i(TAG, "启动 ${customTimeoutMillis / 1000} 秒空闲声卡让渡倒计时...")
+        mainHandler.postDelayed(releaseRunnable, customTimeoutMillis)
     }
 
     /**

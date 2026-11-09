@@ -50,7 +50,6 @@ static const uint8_t Rcon[11] = {
 };
 
 static uint8_t getSBoxValue(uint8_t num) { return sbox[num]; }
-static uint8_t getSBoxInvert(uint8_t num) { return rsbox[num]; }
 
 static void KeyExpansion(uint8_t* RoundKey, const uint8_t* Key) {
     unsigned i, j, k;
@@ -107,104 +106,165 @@ void AES_ctx_set_iv(struct AES_ctx* ctx, const uint8_t* iv) {
     memcpy(ctx->Iv, iv, AES_BLOCKLEN);
 }
 
-static void AddRoundKey(uint8_t round, state_t* state, const uint8_t* RoundKey) {
-    uint8_t i, j;
-    for (i = 0; i < 4; ++i) {
-        for (j = 0; j < 4; ++j) {
-            (*state)[i][j] ^= RoundKey[(round * Nb * 4) + (i * Nb) + j];
-        }
+#if defined(__ARM_FEATURE_CRYPTO)
+#include <arm_neon.h>
+
+void AES_CBC_decrypt_buffer(struct AES_ctx* ctx, uint8_t* buf, size_t length) {
+    if (length == 0 || (length % AES_BLOCKLEN) != 0) return;
+
+    // 💡 ARMv8 Crypto 指令硬件加速 (vaesdq_u8 / vaesimcq_u8)
+    uint8x16_t rk[11];
+    rk[10] = vld1q_u8(ctx->RoundKey + 160);
+    for (int r = 9; r >= 1; --r) {
+        rk[r] = vaesimcq_u8(vld1q_u8(ctx->RoundKey + r * 16));
     }
-}
+    rk[0] = vld1q_u8(ctx->RoundKey);
 
-static void InvSubBytes(state_t* state) {
-    uint8_t i, j;
-    for (i = 0; i < 4; ++i) {
-        for (j = 0; j < 4; ++j) {
-            (*state)[j][i] = getSBoxInvert((*state)[j][i]);
-        }
+    uint8x16_t iv = vld1q_u8(ctx->Iv);
+
+    for (size_t b = 0; b < length; b += AES_BLOCKLEN) {
+        uint8x16_t cipher = vld1q_u8(buf + b);
+        uint8x16_t s = cipher;
+
+        s = vaesimcq_u8(vaesdq_u8(s, rk[10]));
+        s = vaesimcq_u8(vaesdq_u8(s, rk[9]));
+        s = vaesimcq_u8(vaesdq_u8(s, rk[8]));
+        s = vaesimcq_u8(vaesdq_u8(s, rk[7]));
+        s = vaesimcq_u8(vaesdq_u8(s, rk[6]));
+        s = vaesimcq_u8(vaesdq_u8(s, rk[5]));
+        s = vaesimcq_u8(vaesdq_u8(s, rk[4]));
+        s = vaesimcq_u8(vaesdq_u8(s, rk[3]));
+        s = vaesimcq_u8(vaesdq_u8(s, rk[2]));
+        s = vaesdq_u8(s, rk[1]);
+        s = veorq_u8(s, rk[0]);
+
+        uint8x16_t plain = veorq_u8(s, iv);
+        vst1q_u8(buf + b, plain);
+        iv = cipher;
     }
+
+    vst1q_u8(ctx->Iv, iv);
 }
 
-static void InvShiftRows(state_t* state) {
-    uint8_t temp;
-    temp = (*state)[3][1];
-    (*state)[3][1] = (*state)[2][1];
-    (*state)[2][1] = (*state)[1][1];
-    (*state)[1][1] = (*state)[0][1];
-    (*state)[0][1] = temp;
+#else
 
-    temp = (*state)[0][2];
-    (*state)[0][2] = (*state)[2][2];
-    (*state)[2][2] = temp;
-    temp = (*state)[1][2];
-    (*state)[1][2] = (*state)[3][2];
-    (*state)[3][2] = temp;
-
-    temp = (*state)[0][3];
-    (*state)[0][3] = (*state)[1][3];
-    (*state)[1][3] = (*state)[2][3];
-    (*state)[2][3] = (*state)[3][3];
-    (*state)[3][3] = temp;
-}
+// 💡 32-bit T-Table 查表加速实现 (适用于不支持 ARM Crypto 硬件指令的架构与单元测试)
+#define GETU32(pt) (((uint32_t)(pt)[0] << 24) ^ ((uint32_t)(pt)[1] << 16) ^ ((uint32_t)(pt)[2] <<  8) ^ ((uint32_t)(pt)[3]))
+#define PUTU32(ct, st) { (ct)[0] = (uint8_t)((st) >> 24); (ct)[1] = (uint8_t)((st) >> 16); (ct)[2] = (uint8_t)((st) >>  8); (ct)[3] = (uint8_t)(st); }
 
 static uint8_t xtime(uint8_t x) {
-    return ((x << 1) ^ (((x >> 7) & 1) * 0x1b));
+    return (uint8_t)((x << 1) ^ (((x >> 7) & 1) * 0x1b));
 }
 
 static uint8_t Multiply(uint8_t x, uint8_t y) {
-    return (((y & 1) * x) ^
+    return (uint8_t)(((y & 1) * x) ^
             ((y >> 1 & 1) * xtime(x)) ^
             ((y >> 2 & 1) * xtime(xtime(x))) ^
             ((y >> 3 & 1) * xtime(xtime(xtime(x)))) ^
             ((y >> 4 & 1) * xtime(xtime(xtime(xtime(x))))));
 }
 
-static void InvMixColumns(state_t* state) {
-    int i;
-    uint8_t a, b, c, d;
-    for (i = 0; i < 4; ++i) {
-        a = (*state)[i][0];
-        b = (*state)[i][1];
-        c = (*state)[i][2];
-        d = (*state)[i][3];
+static uint32_t Td0[256];
+static uint32_t Td1[256];
+static uint32_t Td2[256];
+static uint32_t Td3[256];
+static int tables_initialized = 0;
 
-        (*state)[i][0] = Multiply(a, 0x0e) ^ Multiply(b, 0x0b) ^ Multiply(c, 0x0d) ^ Multiply(d, 0x09);
-        (*state)[i][1] = Multiply(a, 0x09) ^ Multiply(b, 0x0e) ^ Multiply(c, 0x0b) ^ Multiply(d, 0x0d);
-        (*state)[i][2] = Multiply(a, 0x0d) ^ Multiply(b, 0x09) ^ Multiply(c, 0x0e) ^ Multiply(d, 0x0b);
-        (*state)[i][3] = Multiply(a, 0x0b) ^ Multiply(b, 0x0d) ^ Multiply(c, 0x09) ^ Multiply(d, 0x0e);
+static void init_tables(void) {
+    if (tables_initialized) return;
+    for (int i = 0; i < 256; i++) {
+        uint8_t s = rsbox[i];
+        uint32_t a = Multiply(s, 0x0e);
+        uint32_t b = Multiply(s, 0x09);
+        uint32_t c = Multiply(s, 0x0d);
+        uint32_t d = Multiply(s, 0x0b);
+        uint32_t v = (a << 24) | (b << 16) | (c << 8) | d;
+        Td0[i] = v;
+        Td1[i] = (v >> 8) | (v << 24);
+        Td2[i] = (v >> 16) | (v << 16);
+        Td3[i] = (v >> 24) | (v << 8);
     }
+    tables_initialized = 1;
 }
 
-static void InvCipher(state_t* state, const uint8_t* RoundKey) {
-    uint8_t round = 0;
-    AddRoundKey(Nr, state, RoundKey);
+static void InvCipher_TTable(const uint8_t in[16], uint8_t out[16], const uint32_t rk[44], const uint32_t eq_rk[44]) {
+    uint32_t s0 = GETU32(in)      ^ rk[40];
+    uint32_t s1 = GETU32(in + 4)  ^ rk[41];
+    uint32_t s2 = GETU32(in + 8)  ^ rk[42];
+    uint32_t s3 = GETU32(in + 12) ^ rk[43];
 
-    for (round = (Nr - 1); round > 0; --round) {
-        InvShiftRows(state);
-        InvSubBytes(state);
-        AddRoundKey(round, state, RoundKey);
-        InvMixColumns(state);
+    uint32_t t0, t1, t2, t3;
+
+    for (int r = 9; r >= 1; r--) {
+        t0 = Td0[(s0 >> 24) & 0xff] ^ Td1[(s3 >> 16) & 0xff] ^ Td2[(s2 >> 8) & 0xff] ^ Td3[s1 & 0xff] ^ eq_rk[r * 4 + 0];
+        t1 = Td0[(s1 >> 24) & 0xff] ^ Td1[(s0 >> 16) & 0xff] ^ Td2[(s3 >> 8) & 0xff] ^ Td3[s2 & 0xff] ^ eq_rk[r * 4 + 1];
+        t2 = Td0[(s2 >> 24) & 0xff] ^ Td1[(s1 >> 16) & 0xff] ^ Td2[(s0 >> 8) & 0xff] ^ Td3[s3 & 0xff] ^ eq_rk[r * 4 + 2];
+        t3 = Td0[(s3 >> 24) & 0xff] ^ Td1[(s2 >> 16) & 0xff] ^ Td2[(s1 >> 8) & 0xff] ^ Td3[s0 & 0xff] ^ eq_rk[r * 4 + 3];
+        s0 = t0; s1 = t1; s2 = t2; s3 = t3;
     }
 
-    InvShiftRows(state);
-    InvSubBytes(state);
-    AddRoundKey(0, state, RoundKey);
-}
+    uint8_t b0 = rsbox[(s0 >> 24) & 0xff] ^ (uint8_t)(rk[0] >> 24);
+    uint8_t b1 = rsbox[(s3 >> 16) & 0xff] ^ (uint8_t)(rk[0] >> 16);
+    uint8_t b2 = rsbox[(s2 >> 8) & 0xff]  ^ (uint8_t)(rk[0] >> 8);
+    uint8_t b3 = rsbox[s1 & 0xff]         ^ (uint8_t)(rk[0]);
 
-static void XorWithIv(uint8_t* buf, const uint8_t* Iv) {
-    uint8_t i;
-    for (i = 0; i < AES_BLOCKLEN; ++i) {
-        buf[i] ^= Iv[i];
-    }
+    uint8_t b4 = rsbox[(s1 >> 24) & 0xff] ^ (uint8_t)(rk[1] >> 24);
+    uint8_t b5 = rsbox[(s0 >> 16) & 0xff] ^ (uint8_t)(rk[1] >> 16);
+    uint8_t b6 = rsbox[(s3 >> 8) & 0xff]  ^ (uint8_t)(rk[1] >> 8);
+    uint8_t b7 = rsbox[s2 & 0xff]         ^ (uint8_t)(rk[1]);
+
+    uint8_t b8 = rsbox[(s2 >> 24) & 0xff] ^ (uint8_t)(rk[2] >> 24);
+    uint8_t b9 = rsbox[(s1 >> 16) & 0xff] ^ (uint8_t)(rk[2] >> 16);
+    uint8_t ba = rsbox[(s0 >> 8) & 0xff]  ^ (uint8_t)(rk[2] >> 8);
+    uint8_t bb = rsbox[s3 & 0xff]         ^ (uint8_t)(rk[2]);
+
+    uint8_t bc = rsbox[(s3 >> 24) & 0xff] ^ (uint8_t)(rk[3] >> 24);
+    uint8_t bd = rsbox[(s2 >> 16) & 0xff] ^ (uint8_t)(rk[3] >> 16);
+    uint8_t be = rsbox[(s1 >> 8) & 0xff]  ^ (uint8_t)(rk[3] >> 8);
+    uint8_t bf = rsbox[s0 & 0xff]         ^ (uint8_t)(rk[3]);
+
+    out[0] = b0; out[1] = b1; out[2] = b2; out[3] = b3;
+    out[4] = b4; out[5] = b5; out[6] = b6; out[7] = b7;
+    out[8] = b8; out[9] = b9; out[10] = ba; out[11] = bb;
+    out[12] = bc; out[13] = bd; out[14] = be; out[15] = bf;
 }
 
 void AES_CBC_decrypt_buffer(struct AES_ctx* ctx, uint8_t* buf, size_t length) {
+    if (length == 0 || (length % AES_BLOCKLEN) != 0) return;
+
+    init_tables();
+
+    uint32_t rk[44];
+    for (int i = 0; i < 44; i++) {
+        rk[i] = GETU32(ctx->RoundKey + i * 4);
+    }
+
+    uint32_t eq_rk[44];
+    eq_rk[40] = rk[40]; eq_rk[41] = rk[41]; eq_rk[42] = rk[42]; eq_rk[43] = rk[43];
+    eq_rk[0]  = rk[0];  eq_rk[1]  = rk[1];  eq_rk[2]  = rk[2];  eq_rk[3]  = rk[3];
+
+    for (int r = 1; r < 10; r++) {
+        for (int c = 0; c < 4; c++) {
+            uint32_t k = rk[r * 4 + c];
+            uint8_t k0 = (uint8_t)(k >> 24);
+            uint8_t k1 = (uint8_t)(k >> 16);
+            uint8_t k2 = (uint8_t)(k >> 8);
+            uint8_t k3 = (uint8_t)(k);
+            eq_rk[r * 4 + c] = 
+                Td0[sbox[k0]] ^ Td1[sbox[k1]] ^ Td2[sbox[k2]] ^ Td3[sbox[k3]];
+        }
+    }
+
     size_t i;
     uint8_t storeNextIv[AES_BLOCKLEN];
     for (i = 0; i < length; i += AES_BLOCKLEN) {
         memcpy(storeNextIv, buf + i, AES_BLOCKLEN);
-        InvCipher((state_t*)(buf + i), ctx->RoundKey);
-        XorWithIv(buf + i, ctx->Iv);
+        InvCipher_TTable(buf + i, buf + i, rk, eq_rk);
+        for (uint8_t b = 0; b < AES_BLOCKLEN; ++b) {
+            buf[i + b] ^= ctx->Iv[b];
+        }
         memcpy(ctx->Iv, storeNextIv, AES_BLOCKLEN);
     }
 }
+
+#endif

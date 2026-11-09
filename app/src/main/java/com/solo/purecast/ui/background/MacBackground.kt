@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
@@ -74,7 +75,9 @@ fun MacBackground(
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
-    val artwork by produceState<MacArtworkFrame?>(initialValue = null, coverData, sceneClock.meshIndex) {
+    var artwork by remember { mutableStateOf<MacArtworkFrame?>(null) }
+
+    LaunchedEffect(coverData, sceneClock.meshIndex) {
         try {
             val result = withContext(Dispatchers.IO) {
                 val req = ImageRequest.Builder(context)
@@ -87,18 +90,22 @@ fun MacBackground(
             }
             currentCoroutineContext().ensureActive()
             val input = ((result as? SuccessResult)?.drawable as? BitmapDrawable)?.bitmap
-            value = if (input == null) null else withContext(Dispatchers.Default) {
-                val copy = Bitmap.createBitmap(256, 256, Bitmap.Config.ARGB_8888)
-                Canvas(copy).drawBitmap(input, null, Rect(0, 0, 256, 256), Paint(Paint.FILTER_BITMAP_FLAG))
-                val metrics = context.resources.displayMetrics
-                val fallback = macStaticFrame(context, copy, metrics.widthPixels, metrics.heightPixels, sceneClock.meshIndex)
-                currentCoroutineContext().ensureActive()
-                MacArtworkFrame(copy, fallback)
+            if (input != null) {
+                val newFrame = withContext(Dispatchers.Default) {
+                    val copy = Bitmap.createBitmap(256, 256, Bitmap.Config.ARGB_8888)
+                    Canvas(copy).drawBitmap(input, null, Rect(0, 0, 256, 256), Paint(Paint.FILTER_BITMAP_FLAG))
+                    val metrics = context.resources.displayMetrics
+                    val fallback = macStaticFrame(context, copy, metrics.widthPixels, metrics.heightPixels, sceneClock.meshIndex)
+                    currentCoroutineContext().ensureActive()
+                    MacArtworkFrame(copy, fallback)
+                }
+                artwork = newFrame
+            } else {
+                artwork = null
             }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            value = null
             Logger.ui.w("MacBackground", "封面位图解析异常", e)
         }
     }

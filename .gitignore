@@ -22,3 +22,6 @@ captures/
 
 # Temp
 /tmp/
+
+# Agent Context
+.context/

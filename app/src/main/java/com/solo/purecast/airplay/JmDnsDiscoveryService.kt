@@ -3,7 +3,13 @@ package com.solo.purecast.airplay
 import android.content.Context
 import android.net.wifi.WifiManager
 import com.solo.purecast.util.Logger
+import com.solo.purecast.util.NetworkUtils
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.net.InetAddress
 import java.net.NetworkInterface
@@ -30,6 +36,11 @@ class JmDnsDiscoveryService(private val context: Context) {
         const val DACP_SERVICE_TYPE = "_dacp._tcp.local."
         const val DEFAULT_AIRPLAY_PORT = 7000
         const val DEFAULT_RAOP_PORT = 5000
+
+        /**
+         * 获取有效的本地局域网 IPv4 地址 (代理至公共 NetworkUtils)
+         */
+        fun getLocalIpv4Address(): InetAddress? = NetworkUtils.getLocalIpv4Address()
     }
 
     private var jmdns: JmDNS? = null
@@ -38,6 +49,8 @@ class JmDnsDiscoveryService(private val context: Context) {
     private var raopServiceInfo: ServiceInfo? = null
 
     // 💡 DACP 动态端口发现监听器与目标凭证匹配
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var dacpResolveJob: Job? = null
     private var dacpListener: javax.jmdns.ServiceListener? = null
     private var targetDacpId: String? = null
     private var targetClientIp: String? = null
@@ -198,41 +211,9 @@ class JmDnsDiscoveryService(private val context: Context) {
     }
 
     /**
-     * 获取有效的本地局域网 IPv4 地址
-     * 💡 优先绑定物理网卡 wlan (WiFi) 或 eth (以太网)，主动跳过 usb0/rndis 等虚拟/共享接口
+     * 获取有效的本地局域网 IPv4 地址 (代理到 Companion 静态实现)
      */
-    fun getLocalIpv4Address(): InetAddress? {
-        try {
-            val interfaces = Collections.list(NetworkInterface.getNetworkInterfaces())
-            val sortedInterfaces = interfaces.sortedWith(compareByDescending { intf ->
-                when {
-                    intf.name.startsWith("wlan") -> 3
-                    intf.name.startsWith("eth") -> 2
-                    else -> 0
-                }
-            })
-            for (intf in sortedInterfaces) {
-                if (intf.isLoopback || !intf.isUp) continue
-                val name = intf.name.lowercase()
-                // 💡 严格排除投影仪内部主板 usb0、虚拟网卡 dummy、p2p 等
-                if (name.startsWith("usb") || name.startsWith("dummy") || name.startsWith("p2p") || name.startsWith("tun")) {
-                    continue
-                }
-                val addrs = Collections.list(intf.inetAddresses)
-                for (addr in addrs) {
-                    if (!addr.isLoopbackAddress && addr is java.net.Inet4Address) {
-                        val host = addr.hostAddress ?: ""
-                        if (!host.startsWith("127.") && !host.startsWith("169.254.") && !host.startsWith("192.168.48.")) {
-                            return addr
-                        }
-                    }
-                }
-            }
-        } catch (e: Exception) {
-            Logger.service.e(TAG, "获取本地 IPv4 地址失败", e)
-        }
-        return null
-    }
+    fun getLocalIpv4Address(): InetAddress? = Companion.getLocalIpv4Address()
 
     /**
      * 获取格式化的 MAC 地址（12 位大写无分隔符，如 1485540BCBC4）
@@ -317,7 +298,7 @@ class JmDnsDiscoveryService(private val context: Context) {
 
             override fun serviceResolved(event: javax.jmdns.ServiceEvent) {
                 val info = event.info ?: return
-                Logger.service.i(TAG, "已解析 _dacp._tcp 服务: Name=${info.name}, Port=${info.port}")
+                Logger.service.d(TAG, "已解析 _dacp._tcp 服务: Name=${info.name}, Port=${info.port}")
                 inspectDacpServiceInfo(info)
             }
         }
@@ -329,23 +310,28 @@ class JmDnsDiscoveryService(private val context: Context) {
      * 💡 注册 DACP 目标客户端信息，并启动端口匹配
      */
     fun resolveDacpPort(dacpId: String, clientIp: String, onPortResolved: (Int) -> Unit) {
-        targetDacpId = dacpId
-        targetClientIp = clientIp
+        targetDacpId = dacpId.ifEmpty { null }
+        targetClientIp = clientIp.ifEmpty { null }
         onDacpPortResolvedCallback = onPortResolved
 
         Logger.service.i(TAG, "注册 DACP 监听目标: dacpId=$dacpId, clientIp=$clientIp，启动动态匹配")
 
-        // 优先检查 JmDNS 当前已缓存的服务
+        // 异步检查并解析 JmDNS 当前已缓存的服务 (由 CoroutineScope 统一调度与取消)
         jmdns?.let { dns ->
-            try {
-                val existingServices = dns.list(DACP_SERVICE_TYPE)
-                for (info in existingServices) {
-                    if (inspectDacpServiceInfo(info)) {
-                        return
+            dacpResolveJob?.cancel()
+            dacpResolveJob = serviceScope.launch {
+                try {
+                    val existingServices = dns.list(DACP_SERVICE_TYPE)
+                    for (stub in existingServices) {
+                        if (!isActive) break
+                        val resolved = if (stub.port > 0) stub else dns.getServiceInfo(stub.type, stub.name, 1000)
+                        if (resolved != null && inspectDacpServiceInfo(resolved)) {
+                            return@launch
+                        }
                     }
+                } catch (e: Exception) {
+                    Logger.service.w(TAG, "遍历解析已缓存 DACP 服务异常: ${e.message}")
                 }
-            } catch (e: Exception) {
-                Logger.service.w(TAG, "遍历已缓存 DACP 服务异常: ${e.message}")
             }
         }
     }
@@ -360,12 +346,16 @@ class JmDnsDiscoveryService(private val context: Context) {
         val targetIp = targetClientIp
         val targetId = targetDacpId
 
-        val matchesIp = targetIp != null && info.inet4Addresses.any { it.hostAddress == targetIp }
-        val matchesName = targetId != null && info.name.contains(targetId, ignoreCase = true)
-        val matchesDbId = targetId != null && info.getPropertyString("DbId")?.equals(targetId, ignoreCase = true) == true
+        val hostMatches = targetIp != null && (
+            info.hostAddresses.any { it == targetIp } ||
+            info.inetAddresses.any { it.hostAddress == targetIp } ||
+            info.inet4Addresses.any { it.hostAddress == targetIp }
+        )
+        val nameMatches = !targetId.isNullOrEmpty() && info.name.contains(targetId, ignoreCase = true)
+        val dbIdMatches = !targetId.isNullOrEmpty() && info.getPropertyString("DbId")?.equals(targetId, ignoreCase = true) == true
 
-        if (matchesIp || matchesName || matchesDbId) {
-            val ips = info.inet4Addresses.joinToString { it.hostAddress ?: "" }
+        if (hostMatches || nameMatches || dbIdMatches) {
+            val ips = (info.hostAddresses.toList() + info.inet4Addresses.mapNotNull { it.hostAddress }).distinct().joinToString()
             Logger.service.i(TAG, "🎉 成功锁定 DACP 真实端口: $port (Name=${info.name}, IPs=[$ips])")
             onDacpPortResolvedCallback?.invoke(port)
             return true
@@ -377,6 +367,8 @@ class JmDnsDiscoveryService(private val context: Context) {
      * 清理 DACP 匹配目标
      */
     fun clearDacpTarget() {
+        dacpResolveJob?.cancel()
+        dacpResolveJob = null
         targetDacpId = null
         targetClientIp = null
         onDacpPortResolvedCallback = null

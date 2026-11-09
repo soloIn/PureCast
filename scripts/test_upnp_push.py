@@ -156,7 +156,7 @@ def main():
     sample_rate = int(sys.argv[5]) if len(sys.argv) > 5 else 44100
     bit_depth = int(sys.argv[6]) if len(sys.argv) > 6 else 16
 
-    local_ip = get_local_ip()
+    local_ip = "127.0.0.1" if target_host == "127.0.0.1" else get_local_ip()
     temp_dir = "/tmp/purecast_test"
     os.makedirs(temp_dir, exist_ok=True)
     file_prefix = f"purecast_test_{sample_rate}_{bit_depth}"

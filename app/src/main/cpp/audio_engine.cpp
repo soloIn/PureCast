@@ -473,8 +473,15 @@ int AudioEngine::open_device(int fd, int sample_rate, int bit_depth, int channel
         LOGI("未发现 UAC Feature Unit 实体，跳过硬件音量锁定");
     }
 
-    // 💡 步骤 5: 构建无锁环形缓冲区 (默认 1MB，支持 ~5 秒无损缓冲)
-    ring_buffer_ = std::make_unique<SpscRingBuffer>(1024 * 1024);
+    // 💡 步骤 5: 构建无锁环形缓冲区：根据采样率与位深动态分配容量
+    // 容量 = max(65536, byte_rate * 0.5s)（对齐至 2^N，例如 44.1k/16b 分配 128KB，192k/24b 分配 1MB），兼顾 AirPlay 低延迟与 UPnP 高码率抗抖动
+    const size_t bytes_per_sample = (bit_depth > 0) ? static_cast<size_t>(bit_depth / 8) : 2;
+    const size_t byte_rate = static_cast<size_t>(sample_rate) * static_cast<size_t>(channels) * bytes_per_sample;
+    const size_t min_capacity = std::max(static_cast<size_t>(65536), static_cast<size_t>(byte_rate * 0.5));
+    ring_buffer_ = std::make_unique<SpscRingBuffer>(min_capacity);
+    LOGI("动态构建无锁环形缓冲区: min_capacity=%zu, actual_capacity=%zu (byte_rate=%zu bytes/s, 约 %.2f 秒缓冲)",
+         min_capacity, ring_buffer_->capacity(), byte_rate,
+         byte_rate > 0 ? (static_cast<double>(ring_buffer_->capacity()) / byte_rate) : 0.0);
 
     // 💡 步骤 5.2: 配置 50ms DAC Warmup 静音预充 (保护继电器免受切频瞬间物理爆音冲击)
     // High-Speed (125us 微帧): 每秒 8000 microframes，50ms 对应 400 个微帧

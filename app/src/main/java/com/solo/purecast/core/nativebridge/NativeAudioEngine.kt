@@ -99,8 +99,19 @@ object NativeAudioEngine {
      * FLAC 解码器采样格式解析就绪回调
      */
     fun interface FlacFormatCallback {
-        fun onFormatReady(sampleRate: Int, bitDepth: Int, channels: Int)
+        fun onFormatReady(sampleRate: Int, bitDepth: Int, channels: Int, totalPcmFrames: Long)
     }
+
+    /**
+     * 获取 Native FLAC 流解码已成功写入环形缓冲区的 PCM 采样帧数
+     */
+    external fun getFlacDecodedFrames(): Long
+
+    /**
+     * 重置 Native FLAC 流解码写入的采样帧计数器
+     */
+    external fun resetFlacDecodedFrames()
+
 
     /**
      * 💡 通过 Native dr_flac 流式无损解码 FLAC 并实时直通写入环形缓冲区

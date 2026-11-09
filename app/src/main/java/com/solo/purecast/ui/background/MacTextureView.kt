@@ -143,17 +143,37 @@ internal class MacTextureView(
 
         private var choreographer: Choreographer? = null
         private val vsyncFrame = Choreographer.FrameCallback { onVsync() }
+        private var vsyncFrameCount = 0L
 
         private fun onVsync() {
             if (!stopping.get() && !closed && active) {
-                choreographer?.postFrameCallback(vsyncFrame)
+                val state = renderState
+
+                // 💡 帧率节流：当 quality.fps 在 1..30 之间（如 POWER_SAVE 档位的 30fps）时，跳过奇数 VSYNC 信号（60Hz -> 30Hz）
+                vsyncFrameCount++
+                if (state.quality.fps in 1..30 && (vsyncFrameCount % 2L != 0L)) {
+                    if (state.playing && state.quality.animated) {
+                        choreographer?.postFrameCallback(vsyncFrame)
+                    }
+                    return
+                }
+
                 render()
+
+                // 💡 当 state.playing == false（暂停或停止）时，在完成当前过渡帧渲染后停止 choreographer 回调，GPU 占用直接降至 0%
+                // 待恢复播放或状态变更时，通过外部 wake() 重新唤醒帧循环
+                if (state.playing && state.quality.animated) {
+                    choreographer?.postFrameCallback(vsyncFrame)
+                }
             }
         }
 
         private val frame = Runnable {
-            choreographer?.postFrameCallback(vsyncFrame)
             render()
+            val state = renderState
+            if (state.playing && state.quality.animated && !stopping.get() && !closed && active) {
+                choreographer?.postFrameCallback(vsyncFrame)
+            }
         }
 
         fun start() {

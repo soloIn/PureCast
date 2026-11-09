@@ -6,13 +6,13 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 11)
 
-# 💡 针对 armeabi-v7a 32 位架构开启 NEON 向量化加速与 O3 优化
+# 💡 针对 armeabi-v7a 与 arm64-v8a 开启 NEON 向量化加速、ARMv8-A Crypto 硬件指令与 O3 优化
 if(${ANDROID_ABI} STREQUAL "armeabi-v7a")
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=armv7-a -mfpu=neon -mfloat-abi=softfp -O3 -fvisibility=hidden")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=armv7-a -mfpu=neon -mfloat-abi=softfp -O3 -fvisibility=hidden")
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=armv8-a+crypto -mfpu=crypto-neon-fp-armv8 -mfloat-abi=softfp -O3 -fvisibility=hidden")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=armv8-a+crypto -mfpu=crypto-neon-fp-armv8 -mfloat-abi=softfp -O3 -fvisibility=hidden")
 else()
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3 -fvisibility=hidden")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -fvisibility=hidden")
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=armv8-a+crypto -O3 -fvisibility=hidden")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=armv8-a+crypto -O3 -fvisibility=hidden")
 endif()
 
 # -------------------------------------------------------------
