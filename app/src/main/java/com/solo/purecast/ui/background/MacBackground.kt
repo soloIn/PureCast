@@ -74,7 +74,8 @@ fun MacBackground(
 
     LaunchedEffect(coverData, sceneClock.meshIndex) {
         if (coverData == null) {
-            artwork = null
+            // 💡 切歌过渡或新曲目封面异步拉取期间，保留当前已有 artwork 背景，绝不将其置空！
+            // 置空会导致全屏背景瞬间闪回黑底，产生强烈的视觉闪烁 (闪两下)
             return@LaunchedEffect
         }
         try {

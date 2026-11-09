@@ -24,6 +24,7 @@ struct RaopStreamParams {
     std::string dacp_id;
     std::string active_remote_token;
     int dacp_port{0};
+    int payload_type{96};
     std::vector<int32_t> fmtp;
 };
 

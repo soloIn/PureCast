@@ -203,47 +203,26 @@ fun MainTvScreen(
                     val hasValidCover = metadata.coverBytes != null ||
                             (!uri.isNullOrEmpty() &&
                                     (uri.startsWith("http://", ignoreCase = true) || uri.startsWith("https://", ignoreCase = true)))
-                    var lastValidCover by remember { mutableStateOf<Any?>(null) }
+                    var persistentCover by remember { mutableStateOf<Any?>(null) }
 
                     LaunchedEffect(hasValidCover, coverData, isPlaying) {
-                        if (coverData == null && !isPlaying) {
-                            lastValidCover = null
+                        if (hasValidCover && coverData != null) {
+                            persistentCover = coverData
+                        } else if (!isPlaying && coverData == null) {
+                            persistentCover = null
                         }
                     }
 
-                    val effectiveCover = if (hasValidCover && coverData != null) coverData else lastValidCover
-
-                    if (effectiveCover != null) {
-                        Box(modifier = Modifier.fillMaxSize()) {
-                            // 💡 垫底保持上一首封面，防止新封面加载解码瞬间出现空白/闪烁
-                            if (lastValidCover != null && lastValidCover != coverData && coverData != null) {
-                                AsyncImage(
-                                    model = lastValidCover,
-                                    contentDescription = null,
-                                    contentScale = ContentScale.Crop,
-                                    modifier = Modifier.fillMaxSize()
-                                )
-                            }
-                            AsyncImage(
-                                model = ImageRequest.Builder(LocalContext.current)
-                                    .data(effectiveCover)
-                                    .crossfade(300)
-                                    .listener(
-                                        onSuccess = { _, _ ->
-                                            lastValidCover = effectiveCover
-                                        },
-                                        onError = { _, _ ->
-                                            if (!isPlaying) {
-                                                lastValidCover = null
-                                            }
-                                        }
-                                    )
-                                    .build(),
-                                contentDescription = "Album Cover",
-                                contentScale = ContentScale.Crop,
-                                modifier = Modifier.fillMaxSize()
-                            )
-                        }
+                    if (persistentCover != null) {
+                        AsyncImage(
+                            model = ImageRequest.Builder(LocalContext.current)
+                                .data(persistentCover)
+                                .crossfade(400)
+                                .build(),
+                            contentDescription = "Album Cover",
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier.fillMaxSize()
+                        )
                     } else {
                         DefaultCoverCard(
                             isPlaying = isPlaying,

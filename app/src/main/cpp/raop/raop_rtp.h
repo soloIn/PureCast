@@ -78,6 +78,17 @@ public:
     }
 
     /**
+     * 💡 配置协商的 RTP 音频 Payload Type (默认 96，亦可为 10、94 等)
+     */
+    void set_audio_payload_type(uint8_t pt) {
+        audio_payload_type_.store(pt, std::memory_order_release);
+    }
+
+    uint8_t get_audio_payload_type() const {
+        return audio_payload_type_.load(std::memory_order_acquire);
+    }
+
+    /**
      * 是否正在运行
      */
     bool is_running() const { return is_running_.load(std::memory_order_relaxed); }
@@ -142,6 +153,7 @@ private:
     std::atomic<bool> has_crypto_{false};
 
     std::atomic<AudioCodec> audio_codec_{AudioCodec::ALAC};
+    std::atomic<uint8_t> audio_payload_type_{96};
     alac::AlacDecoder alac_decoder_;
     RaopJitterBuffer jitter_buffer_;
 

@@ -285,12 +285,27 @@ void RaopRtp::data_loop() {
         if (n < 12) continue;
 
         uint8_t payload_type = buffer[1] & 0x7F;
+        uint8_t expected_pt = audio_payload_type_.load(std::memory_order_relaxed);
+
         // 💡 AirTunes/RAOP 音频包类型:
-        // 0x60 (96): 标准实时音频数据包
-        // 0x56 (86): 重传音频数据包 (带有额外 4 字节前导头)
-        // 0x54 (84): Sync 控制包 (非音频数据，直接忽略)
-        if (payload_type != 96 && payload_type != 86) {
+        // expected_pt / 96: 标准实时音频数据包 (ALAC 或动态 L16/PCM)
+        // 86: 重传音频数据包 (带有额外 4 字节前导头)
+        // 10: RFC 3551 标准静态 L16 双声道 PCM (常用于非 Apple Music / 视频第三方投屏)
+        if (payload_type != expected_pt && payload_type != 96 && payload_type != 86 && payload_type != 10) {
+            static uint32_t unknown_drop_count = 0;
+            if (unknown_drop_count++ % 100 == 0) {
+                LOGW("data_loop: 收到未知 payload_type=%u (期望=%u, 96, 86, 10), len=%zd, 忽略",
+                     payload_type, expected_pt, n);
+            }
             continue;
+        }
+
+        // 💡 采样打印接收到的音频包，确保链路可观测
+        static uint32_t audio_pkt_count = 0;
+        uint32_t cur_cnt = audio_pkt_count++;
+        if (cur_cnt < 10 || cur_cnt % 500 == 0) {
+            LOGI("data_loop: 收到音频包 [%u] pt=%u, len=%zd, has_crypto=%d",
+                 cur_cnt, payload_type, n, has_crypto_.load(std::memory_order_relaxed));
         }
 
         // 💡 更新最近音频数据包时间戳，若此前处于暂停状态则即时唤醒恢复播放
@@ -392,6 +407,11 @@ void RaopRtp::data_loop() {
         } else {
             // 💡 ALAC 实时无损解码为 16-bit 44.1kHz PCM (S16_LE)
             if (!alac_decoder_.decode_frame(decrypted_payload.data(), payload_len, pcm_frame.data(), out_bytes)) {
+                static uint32_t alac_fail_cnt = 0;
+                if (alac_fail_cnt++ % 100 == 0) {
+                    LOGE("ALAC 解码单帧失败! payload_len=%zu, seq=%u, has_crypto=%d",
+                         payload_len, seq, has_crypto_.load(std::memory_order_relaxed));
+                }
                 out_bytes = 0;
             }
         }
@@ -403,7 +423,10 @@ void RaopRtp::data_loop() {
             // 3. 将连续就绪的 PCM 帧出队并推入 SPSC 环形缓冲区
             std::vector<uint8_t> ready_frame;
             while (jitter_buffer_.pop(ready_frame)) {
-                AudioEngine::instance().write_pcm(ready_frame.data(), ready_frame.size());
+                int written = AudioEngine::instance().write_pcm(ready_frame.data(), ready_frame.size());
+                if (cur_cnt < 5) {
+                    LOGI("AudioEngine 写入首批 PCM 帧: bytes=%zu, ret=%d", ready_frame.size(), written);
+                }
             }
         }
     }

@@ -464,7 +464,7 @@ class PlaybackService : LifecycleService() {
             com.solo.purecast.model.StreamProtocol.UPNP_DLNA
         }
         val resolvedCodec = when (source) {
-            StreamSource.AIRPLAY -> "ALAC"
+            StreamSource.AIRPLAY -> if (codec.isNotBlank()) codec else "ALAC"
             StreamSource.UPNP -> if (codec.isNotBlank()) codec else "PCM"
             else -> codec
         }
@@ -635,7 +635,13 @@ class PlaybackService : LifecycleService() {
             else -> "AirPlay 设备"
         }
         val mergedAlbum = if (album.isNotEmpty()) album else current.album
-        val mergedCover = if (coverArt != null && coverArt.isNotEmpty()) coverArt else current.coverBytes
+        // 💡 换歌时若尚未收到新封面 (coverArt 为空)，切勿用上一首老歌封面污染新曲元数据！
+        // 只有在同一首歌曲的增量信息推送或新封面到达时，才执行合并
+        val mergedCover = when {
+            coverArt != null && coverArt.isNotEmpty() -> coverArt
+            isNewTrack -> null // 新曲目尚未送达封面，置空等待原生图片包推送，UI 保持平滑过渡
+            else -> current.coverBytes
+        }
         val mergedDuration = if (durationMs > 0) durationMs else current.durationMs
 
         if (isNewTrack) {

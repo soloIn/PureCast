@@ -81,6 +81,9 @@ class AirPlayServerManager(
                     } catch (e: Exception) {
                         Logger.airplay.e(TAG, "处理 AirPlay 密钥注入异常", e)
                     }
+                } else {
+                    Logger.airplay.i(TAG, "推流未携带 AES 会话密钥 (明文/非加密流)，重置底层解密上下文")
+                    NativeAudioEngine.setAirPlayCryptoKey(ByteArray(0), ByteArray(0))
                 }
 
                 // 2. 更新 DACP 反向控制凭证与启动 mDNS 动态端口解析

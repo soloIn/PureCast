@@ -468,6 +468,8 @@ class RaopProtocolIntegrationTest {
     @Test
     fun testSdpRtpmapParsingL16AndAlac() {
         fun parseSdpFormat(sdp: String): Triple<String, Int, Int> {
+            val mAudioLine = sdp.lines().firstOrNull { it.startsWith("m=audio") } ?: ""
+            val pt = mAudioLine.substringAfter("RTP/AVP").trim().split(" ").firstOrNull()?.toIntOrNull() ?: 96
             val rtpmapLine = sdp.lines().firstOrNull { it.startsWith("a=rtpmap:") } ?: ""
             val rtpmap = rtpmapLine.removePrefix("a=rtpmap:").trim()
             val lower = rtpmap.lowercase()
@@ -476,8 +478,9 @@ class RaopProtocolIntegrationTest {
             var sampleRate = 44100
             var channels = 2
 
-            if (lower.contains("l16") || lower.contains("pcm")) {
+            if (lower.contains("l16") || lower.contains("pcm") || pt == 10 || pt == 11) {
                 codec = "PCM"
+                channels = if (pt == 11) 1 else 2
                 val slash1 = rtpmap.indexOf('/')
                 if (slash1 != -1) {
                     val slash2 = rtpmap.indexOf('/', slash1 + 1)
@@ -528,6 +531,16 @@ class RaopProtocolIntegrationTest {
         assertEquals("ALAC", codecC)
         assertEquals(44100, rateC)
         assertEquals(2, chC)
+
+        // 场景 D: 客户端使用 RFC 3551 静态 Payload Type 10 (无需 a=rtpmap 声明)
+        val sdpStaticPt10 = """
+            v=0
+            m=audio 0 RTP/AVP 10
+        """.trimIndent()
+        val (codecD, rateD, chD) = parseSdpFormat(sdpStaticPt10)
+        assertEquals("PCM", codecD)
+        assertEquals(44100, rateD)
+        assertEquals(2, chD)
     }
 
     /**
