@@ -38,6 +38,10 @@ class AirPlayServerManager(
     private var currentPort = DEFAULT_RTSP_PORT
     private var currentDeviceName = "PureCast"
 
+    @Volatile
+    var isRtpActive: Boolean = false
+        private set
+
     fun start(deviceName: String, port: Int = DEFAULT_RTSP_PORT): Boolean {
         if (isRunning) {
             Logger.airplay.w(TAG, "AirPlay 服务已处于运行状态，无需重复启动")
@@ -88,13 +92,19 @@ class AirPlayServerManager(
                 }
 
                 // 3. 回调上层申请音频焦点与 USB 声卡独占
-                return onStreamRequestedListener(sampleRate, bitDepth, channels, clientIp, dacpPort, activeRemoteToken)
+                val accepted = onStreamRequestedListener(sampleRate, bitDepth, channels, clientIp, dacpPort, activeRemoteToken)
+                if (accepted) {
+                    isRtpActive = true
+                }
+                return accepted
             }
 
             override fun onStreamStopped() {
-                Logger.airplay.i(TAG, "AirPlay 推流连接断开或停止")
-                jmdnsDiscoveryService.clearDacpTarget()
-                dacpClient.clearSession()
+                isRtpActive = false
+                Logger.airplay.i(TAG, "AirPlay RTSP 传输通道断开/挂起")
+                // 💡 注意：切勿在此处立即清理 DACP 会话与凭据！
+                // 在 iOS AirPlay 1 中，暂停推流时发送端会主动下发 TEARDOWN 拆除音频通道。
+                // 必须保留 DACP 会话，由 PlaybackService 状态机统一托管挂起待机与超时释放。
                 onStreamStoppedListener()
             }
 
@@ -156,6 +166,7 @@ class AirPlayServerManager(
     fun stop() {
         if (!isRunning) return
         Logger.airplay.i(TAG, "正在停止 AirPlay 1 服务...")
+        isRtpActive = false
         scope.launch(Dispatchers.IO) {
             jmdnsDiscoveryService.stopBroadcast()
         }
@@ -198,6 +209,15 @@ class AirPlayServerManager(
         } else if (!isRunning) {
             start(deviceName)
         }
+    }
+
+    /**
+     * 💡 彻底清理 DACP 会话与凭据 (由 PlaybackService 在会话彻底超时或主动停止时调用)
+     */
+    fun clearDacpSession() {
+        Logger.airplay.i(TAG, "彻底清理 DACP 会话凭据与目标监听")
+        jmdnsDiscoveryService.clearDacpTarget()
+        dacpClient.clearSession()
     }
 
     fun isRunning(): Boolean = isRunning

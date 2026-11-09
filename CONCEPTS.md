@@ -53,3 +53,11 @@ A strictly monotonically increasing atomic token (`AtomicLong`) that gates async
 ### Stream Source Preemption
 An arbitration policy across heterogeneous streaming protocols (e.g., UPnP/DLNA and AirPlay) where a newer incoming stream actively shuts down the incumbent stream, resets the underlying SPSC RingBuffer, and claims exclusive USB DAC playback to prevent dual-stream mixing.
 *Aliases: 跨协议后发抢占, 推流仲裁*
+
+### AirPlay Soft Suspend
+A session management state in AirPlay 1 where transport-layer audio transmission channels (RTP over UDP) are detached via RTSP `TEARDOWN` upon pause, but application-level session context (track metadata, protocol association, and DACP control credentials) remains active and preserved under a watchdog timeout, enabling TV remote reverse resumption and preventing premature USB DAC release.
+*Aliases: 软挂起状态, 传输层解耦挂起, Transport Detached State*
+
+### DACP Reverse Wakeup
+A reverse-control workflow over Apple Digital Audio Control Protocol where a TV receiver sends HTTP media control commands (such as `play`) to an AirPlay sender whose audio transmission channel has been suspended, instructing the sender to re-establish RTSP SETUP and RECORD streaming to resume playback without user interaction on the mobile device.
+*Aliases: DACP 反控唤醒, 遥控反向建流*

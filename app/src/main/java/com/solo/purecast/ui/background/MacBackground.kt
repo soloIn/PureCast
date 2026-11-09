@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
@@ -74,7 +75,9 @@ fun MacBackground(
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
-    val artwork by produceState<MacArtworkFrame?>(initialValue = null, coverData, sceneClock.meshIndex) {
+    var artwork by remember { mutableStateOf<MacArtworkFrame?>(null) }
+
+    LaunchedEffect(coverData, sceneClock.meshIndex) {
         try {
             val result = withContext(Dispatchers.IO) {
                 val req = ImageRequest.Builder(context)
@@ -96,7 +99,9 @@ fun MacBackground(
                     currentCoroutineContext().ensureActive()
                     MacArtworkFrame(copy, fallback)
                 }
-                value = newFrame
+                artwork = newFrame
+            } else {
+                artwork = null
             }
         } catch (e: CancellationException) {
             throw e

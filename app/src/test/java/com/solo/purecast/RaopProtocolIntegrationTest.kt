@@ -1,5 +1,6 @@
 package com.solo.purecast
 
+import com.solo.purecast.airplay.AirPlayStateManager
 import com.solo.purecast.model.AudioPathState
 import com.solo.purecast.model.PlaybackStatus
 import com.solo.purecast.model.StreamProtocol
@@ -390,77 +391,74 @@ class RaopProtocolIntegrationTest {
      */
     @Test
     fun testZeroProgressRejectionOnPause() {
-        var currentPos = 45000L
-        var currentDuration = 180000L
-
-        fun handleProgressUpdate(posMs: Long, durMs: Long) {
-            // 严格过滤 0/0 全零空值
-            if (posMs <= 0L && durMs <= 0L) {
-                return
-            }
-            if (durMs > 0L) {
-                currentDuration = durMs
-            }
-            currentPos = posMs
-        }
+        val stateManager = AirPlayStateManager()
+        val song = TrackMetadata(title = "Hotel California", artist = "Eagles", durationMs = 180000L)
+        stateManager.onStreamStarted(song)
+        stateManager.handleProgressUpdate(45000L, 180000L)
 
         // 正常时间戳推进至 50 秒
-        handleProgressUpdate(50000L, 180000L)
-        assertEquals(50000L, currentPos)
-        assertEquals(180000L, currentDuration)
+        val update1 = stateManager.handleProgressUpdate(50000L, 180000L)
+        assertTrue(update1)
+        assertEquals(50000L, stateManager.positionMs)
+        assertEquals(180000L, stateManager.metadata.durationMs)
 
-        // 收到暂停阶段的 progress: 0/0/0
-        handleProgressUpdate(0L, 0L)
-        assertEquals("0/0/0 报文不得重置当前播放进度", 50000L, currentPos)
-        assertEquals("0/0/0 报文不得重置总时长", 180000L, currentDuration)
+        // 收到暂停阶段的 progress: 0/0/0，生产逻辑判定无效并拒绝更新
+        val updateRejected = stateManager.handleProgressUpdate(0L, 0L)
+        assertFalse("0/0/0 报文应被生产逻辑判定为无效过滤", updateRejected)
+        assertEquals("0/0/0 报文不得重置当前播放进度", 50000L, stateManager.positionMs)
+        assertEquals("0/0/0 报文不得重置总时长", 180000L, stateManager.metadata.durationMs)
 
         // 恢复推流后更新至 52 秒
-        handleProgressUpdate(52000L, 180000L)
-        assertEquals(52000L, currentPos)
+        val update2 = stateManager.handleProgressUpdate(52000L, 180000L)
+        assertTrue(update2)
+        assertEquals(52000L, stateManager.positionMs)
     }
 
     /**
      * 💡 验证 AirPlay 暂停与断开的状态机分流隔离：
-     * 暂停必须保持协议来源、音频参数与元数据，仅切换 PlaybackStatus；断开才清理独占与会话
+     * 1. iOS 暂停发送 TEARDOWN 时必须保持协议来源、DACP 会话与元数据，仅切换 PlaybackStatus 为 PAUSED；
+     * 2. TV 端尝试恢复时若 RTP 处于断开状态，严禁盲目置为 PLAYING (杜绝僵尸播放态)；
+     * 3. 待客户端重连 RTP 后才切换为 PLAYING；
+     * 4. 只有在 10 分钟挂起超时或用户主动停止时才彻底清理独占、DACP 会话并复位协议为 NONE。
      */
     @Test
     fun testPauseVsStopStateSeparation() {
-        var protocol = StreamProtocol.AIRPLAY_1
-        var status = PlaybackStatus.PLAYING
-        var frozenPosition = 65000L
-        val metadata = TrackMetadata(title = "Hotel California", artist = "Eagles", durationMs = 391000L)
+        val controller = AirPlayStateManager()
+        val song = TrackMetadata(title = "Hotel California", artist = "Eagles", durationMs = 391000L)
 
-        // 1. 触发暂停
-        fun onPause() {
-            // 状态机仅切换至 PAUSED，协议保持 AIRPLAY_1，元数据与冻结进度不被破坏
-            status = PlaybackStatus.PAUSED
-        }
+        // 1. 初始化并开始推流
+        controller.onStreamStarted(song)
+        assertEquals(PlaybackStatus.PLAYING, controller.status)
+        assertEquals(StreamProtocol.AIRPLAY_1, controller.protocol)
+        assertTrue(controller.isRtpActive)
+        assertTrue(controller.isDacpActive)
 
-        onPause()
-        assertEquals(PlaybackStatus.PAUSED, status)
-        assertEquals(StreamProtocol.AIRPLAY_1, protocol)
-        assertEquals(65000L, frozenPosition)
-        assertEquals("Hotel California", metadata.title)
+        // 2. 触发 iOS 暂停 (RTSP TEARDOWN 拆除音频传输通道)
+        controller.onStreamTeardown(currentPos = 65000L)
+        assertEquals(PlaybackStatus.PAUSED, controller.status)
+        assertEquals(StreamProtocol.AIRPLAY_1, controller.protocol)
+        assertEquals(65000L, controller.positionMs)
+        assertEquals("Hotel California", controller.metadata.title)
+        assertFalse(controller.isRtpActive) // RTP 已拆除
+        assertTrue(controller.isDacpActive) // DACP 仍存活用于反控
 
-        // 2. 触发恢复
-        fun onResume() {
-            status = PlaybackStatus.PLAYING
-        }
+        // 3. TV 端点击播放恢复：因 RTP 处于挂起断开状态，不得盲目置为 PLAYING
+        val directResumeSucceeded = controller.onTvResumeRequest()
+        assertFalse("RTP 断开时 TV 端不得直接进入 PLAYING 僵尸状态", directResumeSucceeded)
+        assertEquals(PlaybackStatus.PAUSED, controller.status)
 
-        onResume()
-        assertEquals(PlaybackStatus.PLAYING, status)
-        assertEquals(StreamProtocol.AIRPLAY_1, protocol)
+        // 4. iOS 收到 DACP play 重新建流 SETUP/RECORD，RTP 通道恢复
+        controller.onIncomingRtpReconnect()
+        assertEquals(PlaybackStatus.PLAYING, controller.status)
+        assertTrue(controller.isRtpActive)
+        assertEquals(65000L, controller.positionMs)
 
-        // 3. 触发会话彻底断开 (TEARDOWN)
-        fun onStop() {
-            protocol = StreamProtocol.NONE
-            status = PlaybackStatus.STOPPED
-            frozenPosition = 0L
-        }
-
-        onStop()
-        assertEquals(PlaybackStatus.STOPPED, status)
-        assertEquals(StreamProtocol.NONE, protocol)
-        assertEquals(0L, frozenPosition)
+        // 5. 触发彻底停止 (10分钟软挂起超时或用户主动停止)
+        controller.onFullSessionStop()
+        assertEquals(PlaybackStatus.STOPPED, controller.status)
+        assertEquals(StreamProtocol.NONE, controller.protocol)
+        assertEquals(0L, controller.positionMs)
+        assertFalse(controller.isRtpActive)
+        assertFalse(controller.isDacpActive)
     }
 }

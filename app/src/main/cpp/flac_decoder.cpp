@@ -157,10 +157,12 @@ bool FlacDecoder::decode_stream(
                 int n = AudioEngine::instance().write_pcm(pcm24_bytes.data() + written_total, bytes_to_write - written_total);
                 if (n > 0) {
                     written_total += static_cast<size_t>(n);
-                    s_flac_decoded_frames.fetch_add(static_cast<size_t>(n) / (channels * 3), std::memory_order_relaxed);
                 } else {
                     std::this_thread::sleep_for(std::chrono::milliseconds(2));
                 }
+            }
+            if (written_total == bytes_to_write) {
+                s_flac_decoded_frames.fetch_add(frames_read, std::memory_order_relaxed);
             }
         }
     } else {
@@ -192,10 +194,12 @@ bool FlacDecoder::decode_stream(
                 int n = AudioEngine::instance().write_pcm(raw_bytes + written_total, bytes_to_write - written_total);
                 if (n > 0) {
                     written_total += static_cast<size_t>(n);
-                    s_flac_decoded_frames.fetch_add(static_cast<size_t>(n) / bytes_per_frame, std::memory_order_relaxed);
                 } else {
                     std::this_thread::sleep_for(std::chrono::milliseconds(2));
                 }
+            }
+            if (written_total == bytes_to_write) {
+                s_flac_decoded_frames.fetch_add(frames_read, std::memory_order_relaxed);
             }
         }
     }

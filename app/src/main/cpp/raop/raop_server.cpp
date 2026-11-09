@@ -176,7 +176,12 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
     if (!dacp_id.empty()) current_params_.dacp_id = dacp_id;
     std::string dacp_port = parse_header(request, "DACP-Port");
     if (!dacp_port.empty()) {
-        try { current_params_.dacp_port = std::stoi(dacp_port); } catch (...) {}
+        try {
+            current_params_.dacp_port = std::stoi(dacp_port);
+        } catch (const std::exception& e) {
+            LOGW("解析 DACP-Port 异常: %s (%s)", dacp_port.c_str(), e.what());
+            current_params_.dacp_port = 0;
+        }
     }
 
     std::string challenge = parse_header(request, "Apple-Challenge");
@@ -291,12 +296,19 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
                  << apple_response_header
                  << "Server: AirTunes/105.1\r\n\r\n";
     } else if (method == "SETUP") {
-        // 解析 Active-Remote 与 DACP-ID
-        current_params_.active_remote_token = parse_header(request, "Active-Remote");
-        current_params_.dacp_id = parse_header(request, "DACP-ID");
+        // 解析 Active-Remote 与 DACP-ID (仅非空时覆盖，避免清空已保留的凭据)
+        std::string setup_token = parse_header(request, "Active-Remote");
+        if (!setup_token.empty()) current_params_.active_remote_token = setup_token;
+        std::string setup_dacp_id = parse_header(request, "DACP-ID");
+        if (!setup_dacp_id.empty()) current_params_.dacp_id = setup_dacp_id;
         std::string dacp_port_str = parse_header(request, "DACP-Port");
         if (!dacp_port_str.empty()) {
-            current_params_.dacp_port = std::stoi(dacp_port_str);
+            try {
+                current_params_.dacp_port = std::stoi(dacp_port_str);
+            } catch (const std::exception& e) {
+                LOGW("SETUP 解析 DACP-Port 异常: %s (%s)", dacp_port_str.c_str(), e.what());
+                current_params_.dacp_port = 0;
+            }
         }
 
         // 解析控制端口
@@ -402,6 +414,14 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
                             if (progress_cb_) {
                                 progress_cb_(pos_ms, dur_ms);
                             }
+                        } else if (end_ts == 0 && curr_ts >= start_ts && start_ts > 0) {
+                            // 💡 直播/电台流 (end_ts == 0)，上报当前已播放时长，总时长为 0
+                            uint32_t rate = current_params_.sample_rate > 0 ? current_params_.sample_rate : 44100;
+                            long pos_ms = static_cast<long>((curr_ts - start_ts) * 1000ULL / rate);
+                            LOGD("AirPlay 直播流进度校准: pos=%ld ms (RTP: %s)", pos_ms, prog_val.c_str());
+                            if (progress_cb_) {
+                                progress_cb_(pos_ms, 0);
+                            }
                         }
                     }
                 }
@@ -429,7 +449,11 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
 }
 
 std::string RaopServer::parse_header(const std::string& request, const std::string& header_name) {
-    std::string req_lower = request;
+    size_t header_end = request.find("\r\n\r\n");
+    size_t scan_len = (header_end != std::string::npos) ? (header_end + 2) : request.size();
+
+    // 💡 仅拷贝并转换头部区域，严禁对多兆字节的二进制 Body (如封面图片) 进行全量复制与 tolower
+    std::string req_lower = request.substr(0, scan_len);
     std::string hdr_lower = header_name;
     std::transform(req_lower.begin(), req_lower.end(), req_lower.begin(), ::tolower);
     std::transform(hdr_lower.begin(), hdr_lower.end(), hdr_lower.begin(), ::tolower);
@@ -450,11 +474,11 @@ std::string RaopServer::parse_header(const std::string& request, const std::stri
     }
 
     size_t start = pos + target_len;
-    while (start < request.size() && (request[start] == ' ' || request[start] == '\t')) start++;
+    while (start < scan_len && (request[start] == ' ' || request[start] == '\t')) start++;
     size_t end = request.find("\r", start);
-    if (end == std::string::npos) {
+    if (end == std::string::npos || end > scan_len) {
         end = request.find("\n", start);
-        if (end == std::string::npos) end = request.size();
+        if (end == std::string::npos || end > scan_len) end = scan_len;
     }
     return request.substr(start, end - start);
 }

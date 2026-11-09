@@ -6,6 +6,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -43,6 +44,10 @@ class StreamDemuxer(
     private var isDemuxing = false
     @Volatile
     private var currentStreamUrl: String = ""
+    @Volatile
+    private var activeConnection: HttpURLConnection? = null
+    @Volatile
+    private var activeInputStream: InputStream? = null
 
     // 💡 播放进度时间统计状态
     @Volatile
@@ -63,6 +68,8 @@ class StreamDemuxer(
     private var currentBitDepth: Int = 0
     @Volatile
     private var currentChannels: Int = 0
+    @Volatile
+    private var isFlacStream: Boolean = false
 
     fun isRunning(): Boolean = isDemuxing
     fun getCurrentUri(): String = currentStreamUrl
@@ -73,7 +80,7 @@ class StreamDemuxer(
     fun getCurrentPlayPositionSeconds(): Long {
         val bps = bytesPerSecond
         if (bps > 0L) {
-            if (flacTotalFrames > 0L && currentSampleRate > 0) {
+            if (isFlacStream && currentSampleRate > 0) {
                 // 💡 FLAC 模式：根据 Native 解码实际写入帧数与环形缓冲在途有效数据帧数精准计算已播放秒数
                 val decodedFrames = NativeAudioEngine.getFlacDecodedFrames()
                 val bytesPerFrame = currentChannels * (currentBitDepth / 8)
@@ -102,11 +109,25 @@ class StreamDemuxer(
      * @param streamUrl HTTP 媒体流地址 (如 http://192.168.2.5:49152/stream.wav)
      */
     fun start(streamUrl: String) {
+        val previousJob = streamingJob
+        val oldConn = activeConnection
+        val oldStream = activeInputStream
+        activeConnection = null
+        activeInputStream = null
+
+        // 💡 快速断开旧连接与输入流，促使阻塞在 JNI 的 dr_flac 或 read 立即抛异常退出
+        scope.launch(Dispatchers.IO) {
+            try {
+                oldStream?.close()
+                oldConn?.disconnect()
+            } catch (e: Exception) {
+                // ignore
+            }
+        }
+
         val thisSession = sessionToken.incrementAndGet()
         progressJob?.cancel()
         progressJob = null
-        streamingJob?.cancel()
-        streamingJob = null
 
         isDemuxing = true
         currentStreamUrl = streamUrl
@@ -118,6 +139,7 @@ class StreamDemuxer(
         currentSampleRate = 0
         currentBitDepth = 0
         currentChannels = 0
+        isFlacStream = false
 
         // 💡 启动播放进度定期更新任务 (每 500ms 刷新一次)
         progressJob = scope.launch(Dispatchers.Default) {
@@ -129,6 +151,16 @@ class StreamDemuxer(
         }
 
         streamingJob = scope.launch(Dispatchers.IO) {
+            // 💡 确保前序 native 解码任务彻底退出，消除快速切歌时计数器与 JNI 资源的并发竞争
+            try {
+                previousJob?.cancelAndJoin()
+            } catch (e: Exception) {
+                // ignore
+            }
+            if (thisSession != sessionToken.get()) return@launch
+
+            NativeAudioEngine.resetFlacDecodedFrames()
+
             Logger.upnp.i(TAG, "开始连接音频流 (session=$thisSession): $streamUrl")
             var connection: HttpURLConnection? = null
             var inputStream: InputStream? = null
@@ -143,6 +175,7 @@ class StreamDemuxer(
                     setRequestProperty("User-Agent", "PureCast-UPnP-Renderer/1.0")
                     setRequestProperty("Connection", "keep-alive")
                 }
+                activeConnection = connection
 
                 connection.connect()
                 val responseCode = connection.responseCode
@@ -155,6 +188,7 @@ class StreamDemuxer(
                 Logger.upnp.i(TAG, "HTTP 连接成功 (session=$thisSession), Content-Type: $contentType, Content-Length: ${connection.contentLengthLong}")
 
                 inputStream = BufferedInputStream(connection.inputStream, 64 * 1024)
+                activeInputStream = inputStream
 
                 // 💡 步骤 1: 探测前 12 字节魔数区分 FLAC 或 WAV
                 inputStream.mark(64)
@@ -169,6 +203,7 @@ class StreamDemuxer(
                 val magicStr = String(magic, 0, 4)
 
                 if (magicStr == "fLaC") {
+                    isFlacStream = true
                     Logger.upnp.i(TAG, "检测到 FLAC 无损流容器 (fLaC)，交由 Native dr_flac 流式无损解码...")
                     flacStartTimeMs = System.currentTimeMillis()
                     val ok = NativeAudioEngine.decodeFlacStream(inputStream) { rate, bits, ch, totalPcmFrames ->
@@ -194,6 +229,7 @@ class StreamDemuxer(
                         Logger.upnp.w(TAG, "Native dr_flac 解码失败或提前退出 (session=$thisSession)")
                     }
                 } else if (magicStr == "RIFF") {
+                    isFlacStream = false
                     // 💡 解析容器头 (WAV / L16)
                     val format = parseHeader(inputStream)
                     if (thisSession != sessionToken.get()) return@launch
@@ -238,8 +274,15 @@ class StreamDemuxer(
                                     offset += written
                                     remaining -= written
                                 } else {
-                                    // 💡 环形缓冲满载时非阻塞挂起 5ms 等待等时 URB 消费，彻底杜绝阻塞 Dispatchers.IO 工作线程
-                                    delay(5)
+                                    // 💡 环形缓冲满载时自适应非阻塞挂起，等待等时 URB 消费，彻底杜绝高频 JNI 空转
+                                    val avail = NativeAudioEngine.getBufferAvailable()
+                                    val needed = (remaining - avail).coerceAtLeast(0)
+                                    val waitMs = if (bytesPerSecond > 0L && needed > 0) {
+                                        ((needed.toLong() * 1000L) / bytesPerSecond).coerceIn(5L, 20L)
+                                    } else {
+                                        5L
+                                    }
+                                    delay(waitMs)
                                 }
                             }
                         }
@@ -269,6 +312,8 @@ class StreamDemuxer(
                     onError("音频流传输异常: ${e.message}")
                 }
             } finally {
+                if (activeConnection === connection) activeConnection = null
+                if (activeInputStream === inputStream) activeInputStream = null
                 try {
                     inputStream?.close()
                     connection?.disconnect()
@@ -291,12 +336,26 @@ class StreamDemuxer(
 
     fun stop() {
         sessionToken.incrementAndGet()
+        val oldConn = activeConnection
+        val oldStream = activeInputStream
+        activeConnection = null
+        activeInputStream = null
+        scope.launch(Dispatchers.IO) {
+            try {
+                oldStream?.close()
+                oldConn?.disconnect()
+            } catch (e: Exception) {
+                // ignore
+            }
+        }
         isDemuxing = false
         currentStreamUrl = ""
+        isFlacStream = false
         progressJob?.cancel()
         progressJob = null
         streamingJob?.cancel()
         streamingJob = null
+        NativeAudioEngine.resetFlacDecodedFrames()
     }
 
     data class AudioStreamFormat(

@@ -1,6 +1,6 @@
 package com.solo.purecast.upnp
 
-import com.solo.purecast.airplay.JmDnsDiscoveryService
+import com.solo.purecast.util.NetworkUtils
 import com.solo.purecast.model.TrackMetadata
 import com.solo.purecast.service.PlaybackService
 import com.solo.purecast.util.Logger
@@ -784,7 +784,7 @@ class UpnpRendererServer(
     }
 
     private fun getActiveLocalIpAddress(): String {
-        return JmDnsDiscoveryService.getLocalIpv4Address()?.hostAddress ?: "127.0.0.1"
+        return NetworkUtils.getLocalIpv4Address()?.hostAddress ?: "127.0.0.1"
     }
 
     private fun escapeXml(text: String): String {

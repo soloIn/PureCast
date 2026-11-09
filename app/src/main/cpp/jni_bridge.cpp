@@ -429,6 +429,14 @@ Java_com_solo_purecast_core_nativebridge_NativeAudioEngine_getFlacDecodedFrames(
     return static_cast<jlong>(purecast::FlacDecoder::get_decoded_frames());
 }
 
+JNIEXPORT void JNICALL
+Java_com_solo_purecast_core_nativebridge_NativeAudioEngine_resetFlacDecodedFrames(
+    JNIEnv* /* env */,
+    jobject /* thiz */
+) {
+    purecast::FlacDecoder::reset_decoded_frames();
+}
+
 JNIEXPORT jboolean JNICALL
 Java_com_solo_purecast_core_nativebridge_NativeAudioEngine_decodeFlacStream(
     JNIEnv* env,

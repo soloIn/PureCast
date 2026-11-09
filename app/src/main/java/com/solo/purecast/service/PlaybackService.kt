@@ -76,7 +76,10 @@ class PlaybackService : LifecycleService() {
     private var mediaSession: MediaSession? = null
 
     // 💡 AirPlay 进度平滑推进器 (基于单调时钟推算，补偿 iOS 连续播放时不发 RTSP progress 的特性)
+    private val airPlayStateManager = com.solo.purecast.airplay.AirPlayStateManager()
     private var airPlayProgressJob: kotlinx.coroutines.Job? = null
+    private var airPlaySuspendJob: kotlinx.coroutines.Job? = null
+    private var airPlayResumeWatchdogJob: kotlinx.coroutines.Job? = null
     private var airPlayAnchorRealtimeMs: Long = 0L
     private var airPlayBasePositionMs: Long = 0L
 
@@ -476,7 +479,15 @@ class PlaybackService : LifecycleService() {
 
         // 💡 若为 AirPlay 会话，启动单调时钟平滑进度推进器
         if (currentStreamSource == StreamSource.AIRPLAY) {
-            airPlayBasePositionMs = 0L
+            airPlayResumeWatchdogJob?.cancel()
+            airPlayResumeWatchdogJob = null
+            airPlaySuspendJob?.cancel()
+            airPlaySuspendJob = null
+            if (_playbackPositionMs.value > 0L) {
+                airPlayBasePositionMs = _playbackPositionMs.value
+            } else {
+                airPlayBasePositionMs = 0L
+            }
             airPlayAnchorRealtimeMs = android.os.SystemClock.elapsedRealtime()
             launchAirPlayProgressTicker()
         }
@@ -498,6 +509,8 @@ class PlaybackService : LifecycleService() {
         token: String
     ): Boolean {
         Logger.service.i(TAG, "处理 AirPlay 推流请求 (后发抢占): client=$clientIp")
+        airPlaySuspendJob?.cancel()
+        airPlaySuspendJob = null
 
         // 💡 后发抢占：若当前正在运行 UPnP 流，立即优雅中止旧流
         if (currentStreamSource == StreamSource.UPNP) {
@@ -515,15 +528,40 @@ class PlaybackService : LifecycleService() {
     }
 
     /**
+     * 💡 启动 10 分钟软挂起超时守护：若长时间未恢复，彻底释放 DACP 会话与声卡独占
+     */
+    private fun scheduleAirPlaySuspendTimeout() {
+        airPlaySuspendJob?.cancel()
+        airPlaySuspendJob = lifecycleScope.launch(Dispatchers.Default) {
+            delay(10 * 60 * 1000L)
+            if (currentStreamSource == StreamSource.AIRPLAY && _playbackStatus.value == PlaybackStatus.PAUSED) {
+                Logger.service.i(TAG, "AirPlay 挂起待机超时 (10分钟)，彻底释放会话与声卡")
+                stopPlayback(StreamSource.AIRPLAY)
+                airPlayServer?.clearDacpSession()
+                _audioPathState.value = _audioPathState.value.copy(
+                    protocol = com.solo.purecast.model.StreamProtocol.NONE
+                )
+            }
+        }
+    }
+
+    /**
      * 💡 原生 AirPlay 1 推流停止事件 (TEARDOWN 触发)
      */
     private fun onAirPlayStreamStopped() {
         if (currentStreamSource == StreamSource.AIRPLAY) {
-            Logger.service.i(TAG, "AirPlay 会话结束，停止播放")
-            stopPlayback(StreamSource.AIRPLAY)
-            _audioPathState.value = _audioPathState.value.copy(
-                protocol = com.solo.purecast.model.StreamProtocol.NONE
-            )
+            Logger.service.i(TAG, "AirPlay 音频传输通道断开 (TEARDOWN)，进入挂起暂停状态并保持 DACP 会话与元数据")
+            airPlayProgressJob?.cancel()
+            airPlayProgressJob = null
+            airPlayBasePositionMs = _playbackPositionMs.value
+
+            NativeAudioEngine.pauseStream()
+            _playbackStatus.value = PlaybackStatus.PAUSED
+            releaseWifiLowLatencyLock()
+            updateMediaSessionState()
+            updateNotification()
+
+            scheduleAirPlaySuspendTimeout()
         }
     }
 
@@ -540,9 +578,10 @@ class PlaybackService : LifecycleService() {
             NativeAudioEngine.pauseStream()
             _playbackStatus.value = PlaybackStatus.PAUSED
             releaseWifiLowLatencyLock()
-            // 💡 暂停期间保持 USB DAC 独占与时钟锁相，不触发 10 秒声卡让渡，确保指示胶囊常绿且支持秒级即时恢复
             updateMediaSessionState()
             updateNotification()
+
+            scheduleAirPlaySuspendTimeout()
         }
     }
 
@@ -552,6 +591,8 @@ class PlaybackService : LifecycleService() {
     private fun onAirPlayStreamResumed() {
         if (currentStreamSource == StreamSource.AIRPLAY && _playbackStatus.value == PlaybackStatus.PAUSED) {
             Logger.service.i(TAG, "AirPlay 数据流恢复 (iPhone 恢复推流)，同步 TV 端播放状态机为 PLAYING")
+            airPlaySuspendJob?.cancel()
+            airPlaySuspendJob = null
             acquireWifiLowLatencyLock()
             usbDeviceManager.cancelIdleRelease()
             if (!usbDeviceManager.isExclusive()) {
@@ -608,8 +649,8 @@ class PlaybackService : LifecycleService() {
      * 💡 原生 AirPlay 1 播放进度与总时长更新 (SET_PARAMETER progress: start/curr/end 触发)
      */
     private fun onAirPlayProgressUpdated(positionMs: Long, durationMs: Long) {
-        // 💡 过滤全零无效时间戳 (如 progress: 0/0/0)，杜绝暂停或缓冲时将当前进度冲刷归零
-        if (positionMs <= 0L && durationMs <= 0L) {
+        // 💡 委托 AirPlayStateManager 过滤全零无效时间戳 (如 progress: 0/0/0)，杜绝暂停或缓冲时将当前进度冲刷归零
+        if (!airPlayStateManager.handleProgressUpdate(positionMs, durationMs)) {
             return
         }
         val current = _currentMetadata.value
@@ -649,12 +690,18 @@ class PlaybackService : LifecycleService() {
 
     fun pausePlayback() {
         Logger.service.i(TAG, "暂停音频播放 (流源: $currentStreamSource)...")
+        airPlayResumeWatchdogJob?.cancel()
+        airPlayResumeWatchdogJob = null
         airPlayProgressJob?.cancel()
         airPlayProgressJob = null
         airPlayBasePositionMs = _playbackPositionMs.value
 
         if (currentStreamSource == StreamSource.AIRPLAY) {
             airPlayServer?.dacpClient?.pause()
+            scheduleAirPlaySuspendTimeout()
+        } else if (currentStreamSource == StreamSource.UPNP) {
+            // 💡 UPnP 暂停：挂起 10 分钟闲置让渡任务，防止无限占用 USB 声卡
+            usbDeviceManager.scheduleIdleRelease(10 * 60 * 1000L)
         }
 
         NativeAudioEngine.pauseStream()
@@ -668,6 +715,10 @@ class PlaybackService : LifecycleService() {
 
     fun resumePlayback() {
         Logger.service.i(TAG, "恢复音频播放 (流源: $currentStreamSource)...")
+        airPlayResumeWatchdogJob?.cancel()
+        airPlayResumeWatchdogJob = null
+        airPlaySuspendJob?.cancel()
+        airPlaySuspendJob = null
         acquireWifiLowLatencyLock()
         usbDeviceManager.cancelIdleRelease()
         if (!usbDeviceManager.isExclusive()) {
@@ -676,7 +727,21 @@ class PlaybackService : LifecycleService() {
         }
 
         if (currentStreamSource == StreamSource.AIRPLAY) {
+            val rtpActive = airPlayServer?.isRtpActive == true
             airPlayServer?.dacpClient?.play()
+            if (!rtpActive) {
+                Logger.service.i(TAG, "AirPlay RTP 通道已挂起断开 (处于 TEARDOWN 状态)，已通过 DACP 发送 play，等待客户端重连建流...")
+                // 启动 5 秒重连看门狗，若超时未收到 SETUP/RECORD 建流则维持 PAUSED 并告警
+                airPlayResumeWatchdogJob = lifecycleScope.launch(Dispatchers.Default) {
+                    delay(5000L)
+                    if (currentStreamSource == StreamSource.AIRPLAY && _playbackStatus.value == PlaybackStatus.PAUSED) {
+                        Logger.service.w(TAG, "AirPlay 恢复播放超时 (5秒内未收到客户端重连 RTP)，维持 PAUSED 状态")
+                        releaseWifiLowLatencyLock()
+                        scheduleAirPlaySuspendTimeout()
+                    }
+                }
+                return
+            }
             airPlayAnchorRealtimeMs = android.os.SystemClock.elapsedRealtime()
             launchAirPlayProgressTicker()
         }
@@ -695,6 +760,10 @@ class PlaybackService : LifecycleService() {
             return
         }
         Logger.service.i(TAG, "停止音频播放 (流源: $currentStreamSource)...")
+        airPlayResumeWatchdogJob?.cancel()
+        airPlayResumeWatchdogJob = null
+        airPlaySuspendJob?.cancel()
+        airPlaySuspendJob = null
         airPlayProgressJob?.cancel()
         airPlayProgressJob = null
         airPlayBasePositionMs = 0L
@@ -702,9 +771,13 @@ class PlaybackService : LifecycleService() {
 
         if (currentStreamSource == StreamSource.AIRPLAY) {
             airPlayServer?.dacpClient?.stop()
+            airPlayServer?.clearDacpSession()
         }
 
         currentStreamSource = StreamSource.IDLE
+        _audioPathState.value = _audioPathState.value.copy(
+            protocol = com.solo.purecast.model.StreamProtocol.NONE
+        )
 
         NativeAudioEngine.stopStream()
         _playbackStatus.value = PlaybackStatus.STOPPED
@@ -987,6 +1060,8 @@ class PlaybackService : LifecycleService() {
         Logger.service.i(TAG, "PlaybackService onDestroy: 彻底清理服务...")
         instance = null
         unregisterNetworkCallback()
+        airPlaySuspendJob?.cancel()
+        airPlaySuspendJob = null
         airPlayProgressJob?.cancel()
         airPlayProgressJob = null
         mediaSession?.apply {

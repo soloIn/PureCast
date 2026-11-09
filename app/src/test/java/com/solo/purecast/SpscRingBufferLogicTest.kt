@@ -11,6 +11,22 @@ import java.nio.ByteOrder
  */
 class SpscRingBufferLogicTest {
 
+    /**
+     * 💡 SPSC 环形缓冲容量动态计算参考实现 (与 C++ AudioEngine::open_device 容量公式保持 100% 一致)
+     */
+    private object AudioBufferCalculator {
+        fun calculateDynamicCapacity(sampleRate: Int, bitDepth: Int, channels: Int): Int {
+            val bytesPerSample = if (bitDepth > 0) bitDepth / 8 else 2
+            val byteRate = sampleRate.toLong() * channels.toLong() * bytesPerSample.toLong()
+            val minCap = Math.max(65536L, (byteRate * 0.5).toLong()).toInt()
+            var cap = 1
+            while (cap < minCap) {
+                cap = cap shl 1
+            }
+            return cap
+        }
+    }
+
     @Test
     fun testPowerOfTwoCapacityCalculation() {
         // 验证容量自动向上对齐至 2^N
@@ -25,25 +41,14 @@ class SpscRingBufferLogicTest {
 
     @Test
     fun testDynamicRingBufferCapacityCalculation() {
-        fun calcCapacity(sampleRate: Int, bitDepth: Int, channels: Int): Int {
-            val bytesPerSample = if (bitDepth > 0) bitDepth / 8 else 2
-            val byteRate = sampleRate.toLong() * channels.toLong() * bytesPerSample.toLong()
-            val minCap = Math.max(65536L, (byteRate * 0.5).toLong()).toInt()
-            var cap = 1
-            while (cap < minCap) {
-                cap = cap shl 1
-            }
-            return cap
-        }
-
         // 44.1kHz / 16bit / 2ch (AirPlay 默认) -> 128KB (低延迟)
-        assertEquals(131072, calcCapacity(44100, 16, 2))
+        assertEquals(131072, AudioBufferCalculator.calculateDynamicCapacity(44100, 16, 2))
 
         // 96kHz / 24bit / 2ch -> 512KB (抗网络抖动)
-        assertEquals(524288, calcCapacity(96000, 24, 2))
+        assertEquals(524288, AudioBufferCalculator.calculateDynamicCapacity(96000, 24, 2))
 
         // 192kHz / 24bit / 2ch (UPnP 高码率) -> 1MB
-        assertEquals(1048576, calcCapacity(192000, 24, 2))
+        assertEquals(1048576, AudioBufferCalculator.calculateDynamicCapacity(192000, 24, 2))
     }
 
     @Test
