@@ -185,13 +185,11 @@ class MainActivity : ComponentActivity() {
     private fun handlePreviousTrack() {
         Logger.ui.i(TAG, "遥控器触发: 上一曲")
         PlaybackService.instance?.handlePreviousTrack()
-        Toast.makeText(this, "已请求上一曲", Toast.LENGTH_SHORT).show()
     }
 
     private fun handleNextTrack() {
         Logger.ui.i(TAG, "遥控器触发: 下一曲")
         PlaybackService.instance?.handleNextTrack()
-        Toast.makeText(this, "已请求下一曲", Toast.LENGTH_SHORT).show()
     }
 
     /**

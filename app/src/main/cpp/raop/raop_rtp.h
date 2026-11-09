@@ -15,6 +15,14 @@
 namespace purecast::raop {
 
 /**
+ * 💡 RAOP 音频编码格式类型
+ */
+enum class AudioCodec {
+    ALAC,   // Apple Lossless (由 alac_decoder_ 实时解压为 S16_LE PCM)
+    PCM     // L16 未压缩 16-bit 线性 PCM (网络大端字节序，需转换为本地 S16_LE)
+};
+
+/**
  * 💡 RaopRtp: 原生 AirPlay 1 (RAOP) UDP 接收与流处理引擎
  * 负责音频数据包解密、ALAC 解码、JitterBuffer 重排、控制包与 NTP 授时对齐。
  */
@@ -56,6 +64,17 @@ public:
      */
     void init_alac(const int32_t* fmtp) {
         alac_decoder_.init(fmtp);
+    }
+
+    /**
+     * 💡 配置推流音频格式类型 (ALAC 或 PCM)
+     */
+    void set_audio_codec(AudioCodec codec) {
+        audio_codec_.store(codec, std::memory_order_release);
+    }
+
+    AudioCodec get_audio_codec() const {
+        return audio_codec_.load(std::memory_order_acquire);
     }
 
     /**
@@ -122,6 +141,7 @@ private:
     std::vector<uint8_t> aes_iv_;
     std::atomic<bool> has_crypto_{false};
 
+    std::atomic<AudioCodec> audio_codec_{AudioCodec::ALAC};
     alac::AlacDecoder alac_decoder_;
     RaopJitterBuffer jitter_buffer_;
 

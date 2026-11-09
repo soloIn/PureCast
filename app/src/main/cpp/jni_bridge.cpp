@@ -35,9 +35,10 @@ static bool notify_java_stream_requested(const purecast::raop::RaopStreamParams&
     jmethodID mid = env->GetMethodID(
         cls,
         "onStreamRequested",
-        "(IIILjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;I)Z"
+        "(IIILjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;I)Z"
     );
 
+    jstring j_codec = env->NewStringUTF(params.codec.c_str());
     jstring j_client_ip = env->NewStringUTF(params.client_ip.c_str());
     jstring j_key = env->NewStringUTF(params.aes_key_base64.c_str());
     jstring j_iv = env->NewStringUTF(params.aes_iv_base64.c_str());
@@ -52,6 +53,7 @@ static bool notify_java_stream_requested(const purecast::raop::RaopStreamParams&
             params.sample_rate,
             params.bit_depth,
             params.channels,
+            j_codec,
             j_client_ip,
             j_key,
             j_iv,
@@ -61,6 +63,7 @@ static bool notify_java_stream_requested(const purecast::raop::RaopStreamParams&
         );
     }
 
+    env->DeleteLocalRef(j_codec);
     env->DeleteLocalRef(j_client_ip);
     env->DeleteLocalRef(j_key);
     env->DeleteLocalRef(j_iv);

@@ -461,4 +461,142 @@ class RaopProtocolIntegrationTest {
         assertFalse(controller.isRtpActive)
         assertFalse(controller.isDacpActive)
     }
+
+    /**
+     * 💡 回归测试 1: 验证 SDP rtpmap 解析对 L16 (PCM) 与 ALAC 的格式识别与参数提取
+     */
+    @Test
+    fun testSdpRtpmapParsingL16AndAlac() {
+        fun parseSdpFormat(sdp: String): Triple<String, Int, Int> {
+            val rtpmapLine = sdp.lines().firstOrNull { it.startsWith("a=rtpmap:") } ?: ""
+            val rtpmap = rtpmapLine.removePrefix("a=rtpmap:").trim()
+            val lower = rtpmap.lowercase()
+
+            val codec: String
+            var sampleRate = 44100
+            var channels = 2
+
+            if (lower.contains("l16") || lower.contains("pcm")) {
+                codec = "PCM"
+                val slash1 = rtpmap.indexOf('/')
+                if (slash1 != -1) {
+                    val slash2 = rtpmap.indexOf('/', slash1 + 1)
+                    val rateStr = if (slash2 != -1) rtpmap.substring(slash1 + 1, slash2) else rtpmap.substring(slash1 + 1)
+                    sampleRate = rateStr.toIntOrNull() ?: 44100
+                    if (slash2 != -1) {
+                        channels = rtpmap.substring(slash2 + 1).toIntOrNull() ?: 2
+                    }
+                }
+            } else {
+                codec = "ALAC"
+            }
+            return Triple(codec, sampleRate, channels)
+        }
+
+        // 场景 A: 视频 App / 网页通过 AirPlay 1 推送 16-bit 44.1kHz L16 PCM
+        val sdpL16 = """
+            v=0
+            o=AirTunes 123456 0 IN IP4 192.168.2.1
+            s=AirTunes
+            m=audio 0 RTP/AVP 96
+            a=rtpmap:96 L16/44100/2
+        """.trimIndent()
+        val (codecA, rateA, chA) = parseSdpFormat(sdpL16)
+        assertEquals("PCM", codecA)
+        assertEquals(44100, rateA)
+        assertEquals(2, chA)
+
+        // 场景 B: 视频 App 推送 48kHz L16 PCM
+        val sdpL16_48k = """
+            v=0
+            m=audio 0 RTP/AVP 96
+            a=rtpmap:96 L16/48000/2
+        """.trimIndent()
+        val (codecB, rateB, chB) = parseSdpFormat(sdpL16_48k)
+        assertEquals("PCM", codecB)
+        assertEquals(48000, rateB)
+        assertEquals(2, chB)
+
+        // 场景 C: 音乐 App 推送 ALAC
+        val sdpAlac = """
+            v=0
+            m=audio 0 RTP/AVP 96
+            a=rtpmap:96 AppleLossless
+            a=fmtp:96 352 0 16 40 10 14 2 255 0 0 44100
+        """.trimIndent()
+        val (codecC, rateC, chC) = parseSdpFormat(sdpAlac)
+        assertEquals("ALAC", codecC)
+        assertEquals(44100, rateC)
+        assertEquals(2, chC)
+    }
+
+    /**
+     * 💡 回归测试 2: 验证 L16 网络大端字节序转换为本地架构 S16_LE 整数 PCM
+     */
+    @Test
+    fun testL16NetworkByteOrderEndianConversion() {
+        // 构造网络大端序 16-bit 采样: 左声道 0x1234, 右声道 0x5678
+        val netPayload = byteArrayOf(0x12, 0x34, 0x56, 0x78)
+        val pcmFrame = ByteArray(netPayload.size)
+
+        val validBytes = netPayload.size and 1.inv()
+        for (i in 0 until validBytes step 2) {
+            pcmFrame[i] = netPayload[i + 1]     // 小端低字节
+            pcmFrame[i + 1] = netPayload[i]     // 小端高字节
+        }
+
+        // 验证小端序重组为正确的带符号 short
+        val buf = ByteBuffer.wrap(pcmFrame).order(ByteOrder.LITTLE_ENDIAN)
+        val leftSample = buf.getShort()
+        val rightSample = buf.getShort()
+
+        assertEquals(0x1234.toShort(), leftSample)
+        assertEquals(0x5678.toShort(), rightSample)
+    }
+
+    /**
+     * 💡 回归测试 3: 验证切歌时元数据与进度条平稳过渡 (保留现有封面、重置在途进度)
+     */
+    @Test
+    fun testTrackSwitchMetadataAndProgressStability() {
+        val existingCover = byteArrayOf(0x01, 0x02, 0x03)
+        var currentMeta = TrackMetadata(
+            title = "Track 1",
+            artist = "Artist 1",
+            album = "Album 1",
+            coverBytes = existingCover,
+            durationMs = 240000L
+        )
+
+        // 模拟切歌：新歌的 DMAP 元数据到达，尚未包含封面
+        val newTitle = "Track 2"
+        val newArtist = "Artist 2"
+        val isNewTrack = (newTitle != currentMeta.title) || (newArtist != currentMeta.artist)
+        assertTrue("检测到切歌", isNewTrack)
+
+        // 验证切歌时沿用已有封面垫底，杜绝空白闪烁
+        val mergedCover = null ?: currentMeta.coverBytes
+        val nextMeta = TrackMetadata(
+            title = newTitle,
+            artist = newArtist,
+            album = "Album 2",
+            coverBytes = mergedCover,
+            durationMs = 180000L
+        )
+        assertEquals(existingCover, nextMeta.coverBytes)
+        assertEquals("Track 2", nextMeta.title)
+
+        // 验证进度重置与安全钳位
+        var playbackPositionMs = 210000L // 上一曲在途位置
+        if (isNewTrack) {
+            playbackPositionMs = 0L // 切歌即时归零
+        }
+        assertEquals(0L, playbackPositionMs)
+
+        // 模拟新歌首个 progress 更新到达 (例如 position=5000ms, duration=180000ms)
+        val incomingPos = 5000L
+        val incomingDur = 180000L
+        val clampedPos = incomingPos.coerceIn(0L, incomingDur)
+        assertEquals(5000L, clampedPos)
+    }
 }

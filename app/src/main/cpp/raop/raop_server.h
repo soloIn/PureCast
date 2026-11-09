@@ -15,6 +15,7 @@ struct RaopStreamParams {
     int sample_rate{44100};
     int bit_depth{16};
     int channels{2};
+    std::string codec{"ALAC"};
     std::string aes_key_base64;
     std::string aes_iv_base64;
     std::string client_ip;

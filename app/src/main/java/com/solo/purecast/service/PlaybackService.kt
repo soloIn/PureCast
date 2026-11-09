@@ -138,8 +138,8 @@ class PlaybackService : LifecycleService() {
         airPlayServer = com.solo.purecast.airplay.AirPlayServerManager(
             context = this,
             scope = lifecycleScope,
-            onStreamRequestedListener = { sampleRate, bitDepth, channels, clientIp, dacpPort, token ->
-                onAirPlayStreamRequested(sampleRate, bitDepth, channels, clientIp, dacpPort, token)
+            onStreamRequestedListener = { sampleRate, bitDepth, channels, codec, clientIp, dacpPort, token ->
+                onAirPlayStreamRequested(sampleRate, bitDepth, channels, codec, clientIp, dacpPort, token)
             },
             onStreamStoppedListener = {
                 onAirPlayStreamStopped()
@@ -504,11 +504,12 @@ class PlaybackService : LifecycleService() {
         sampleRate: Int,
         bitDepth: Int,
         channels: Int,
+        codec: String,
         clientIp: String,
         dacpPort: Int,
         token: String
     ): Boolean {
-        Logger.service.i(TAG, "处理 AirPlay 推流请求 (后发抢占): client=$clientIp")
+        Logger.service.i(TAG, "处理 AirPlay 推流请求 (后发抢占): client=$clientIp, codec=$codec")
         airPlaySuspendJob?.cancel()
         airPlaySuspendJob = null
 
@@ -520,7 +521,7 @@ class PlaybackService : LifecycleService() {
         }
 
         currentStreamSource = StreamSource.AIRPLAY
-        val started = startStreaming(sampleRate, bitDepth, channels, StreamSource.AIRPLAY, codec = "ALAC")
+        val started = startStreaming(sampleRate, bitDepth, channels, StreamSource.AIRPLAY, codec = codec)
         if (!started) {
             currentStreamSource = StreamSource.IDLE
         }
@@ -620,6 +621,9 @@ class PlaybackService : LifecycleService() {
         coverArt: ByteArray?
     ) {
         val current = _currentMetadata.value
+        val isNewTrack = (title.isNotEmpty() && title != current.title) ||
+                (artist.isNotEmpty() && artist != current.artist)
+
         val mergedTitle = when {
             title.isNotEmpty() -> title
             current.title.isNotEmpty() && current.title != "AirPlay 音频直通" -> current.title
@@ -633,6 +637,14 @@ class PlaybackService : LifecycleService() {
         val mergedAlbum = if (album.isNotEmpty()) album else current.album
         val mergedCover = if (coverArt != null && coverArt.isNotEmpty()) coverArt else current.coverBytes
         val mergedDuration = if (durationMs > 0) durationMs else current.durationMs
+
+        if (isNewTrack) {
+            // 💡 换歌时重置在途进度并取消旧 Ticker，避免上一曲尾部时间戳引发进度条跳动
+            airPlayProgressJob?.cancel()
+            airPlayProgressJob = null
+            airPlayBasePositionMs = 0L
+            _playbackPositionMs.value = 0L
+        }
 
         val meta = TrackMetadata(
             title = mergedTitle,
@@ -654,11 +666,13 @@ class PlaybackService : LifecycleService() {
             return
         }
         val current = _currentMetadata.value
-        if (durationMs > 0 && current.durationMs != durationMs) {
-            val updated = current.copy(durationMs = durationMs, isLiveStream = false)
+        val resolvedDuration = if (durationMs > 0) durationMs else current.durationMs
+        if (resolvedDuration > 0 && current.durationMs != resolvedDuration) {
+            val updated = current.copy(durationMs = resolvedDuration, isLiveStream = false)
             updateMetadata(updated)
         }
-        startOrUpdateAirPlayProgress(positionMs, durationMs)
+        val clampedPos = if (resolvedDuration > 0) positionMs.coerceIn(0L, resolvedDuration) else positionMs
+        startOrUpdateAirPlayProgress(clampedPos, resolvedDuration)
         updateMediaSessionState()
     }
 
@@ -1035,8 +1049,8 @@ class PlaybackService : LifecycleService() {
                 airPlayServer = com.solo.purecast.airplay.AirPlayServerManager(
                     context = this,
                     scope = lifecycleScope,
-                    onStreamRequestedListener = { sampleRate, bitDepth, channels, clientIp, dacpPort, token ->
-                        onAirPlayStreamRequested(sampleRate, bitDepth, channels, clientIp, dacpPort, token)
+                    onStreamRequestedListener = { sampleRate, bitDepth, channels, codec, clientIp, dacpPort, token ->
+                        onAirPlayStreamRequested(sampleRate, bitDepth, channels, codec, clientIp, dacpPort, token)
                     },
                     onStreamStoppedListener = { onAirPlayStreamStopped() },
                     onMetadataReceivedListener = { title, artist, album, durationMs, coverArt ->

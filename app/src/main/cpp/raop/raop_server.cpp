@@ -265,6 +265,11 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
         current_params_.aes_key_base64 = parse_sdp_attribute(request, "rsaaeskey");
         current_params_.aes_iv_base64 = parse_sdp_attribute(request, "aesiv");
 
+        // 💡 提取 SDP a=rtpmap 格式映射行 (例如 a=rtpmap:96 AppleLossless 或 a=rtpmap:96 L16/44100/2)
+        std::string rtpmap_str = parse_sdp_attribute(request, "rtpmap");
+        std::string rtpmap_lower = rtpmap_str;
+        std::transform(rtpmap_lower.begin(), rtpmap_lower.end(), rtpmap_lower.begin(), ::tolower);
+
         // 💡 提取 SDP a=fmtp 参数行 (例如 a=fmtp:96 352 0 16 40 10 14 2 255 0 0 44100)
         std::string fmtp_str = parse_sdp_attribute(request, "fmtp");
         current_params_.fmtp.clear();
@@ -276,16 +281,66 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
             }
         }
 
-        if (current_params_.fmtp.size() >= 12) {
-            LOGI("ANNOUNCE 提取 fmtp 参数 (12项): frame_size=%d, sample_size=%d, sample_rate=%d",
-                 current_params_.fmtp[1], current_params_.fmtp[3], current_params_.fmtp[11]);
-            current_params_.sample_rate = current_params_.fmtp[11];
-            current_params_.bit_depth = current_params_.fmtp[3];
-            current_params_.channels = current_params_.fmtp[7] > 0 ? current_params_.fmtp[7] : 2;
-            rtp_.init_alac(current_params_.fmtp.data());
+        LOGI("ANNOUNCE 收到 SDP: rtpmap='%s', fmtp_len=%zu, key_len=%zu",
+             rtpmap_str.c_str(), current_params_.fmtp.size(), current_params_.aes_key_base64.size());
+
+        // 判断音频编码格式与参数 (L16 未压缩线性 PCM vs AppleLossless ALAC)
+        if (rtpmap_lower.find("l16") != std::string::npos || rtpmap_lower.find("pcm") != std::string::npos) {
+            current_params_.codec = "PCM";
+            current_params_.bit_depth = 16;
+            current_params_.sample_rate = 44100;
+            current_params_.channels = 2;
+
+            // 尝试从 rtpmap (形如 96 L16/48000/2 或 96 L16/44100) 提取采样率和通道
+            size_t slash1 = rtpmap_str.find('/');
+            if (slash1 != std::string::npos) {
+                size_t slash2 = rtpmap_str.find('/', slash1 + 1);
+                std::string rate_str = (slash2 != std::string::npos)
+                    ? rtpmap_str.substr(slash1 + 1, slash2 - slash1 - 1)
+                    : rtpmap_str.substr(slash1 + 1);
+                try {
+                    int rate = std::stoi(rate_str);
+                    if (rate > 0) current_params_.sample_rate = rate;
+                } catch (...) {}
+
+                if (slash2 != std::string::npos) {
+                    try {
+                        int ch = std::stoi(rtpmap_str.substr(slash2 + 1));
+                        if (ch > 0) current_params_.channels = ch;
+                    } catch (...) {}
+                }
+            }
+
+            rtp_.set_audio_codec(AudioCodec::PCM);
+            LOGI("ANNOUNCE 匹配音频格式: PCM (L16), rate=%d, depth=%d, channels=%d",
+                 current_params_.sample_rate, current_params_.bit_depth, current_params_.channels);
+        } else if (rtpmap_lower.find("l24") != std::string::npos) {
+            current_params_.codec = "PCM";
+            current_params_.bit_depth = 24;
+            current_params_.sample_rate = 44100;
+            current_params_.channels = 2;
+            rtp_.set_audio_codec(AudioCodec::PCM);
+            LOGI("ANNOUNCE 匹配音频格式: PCM (L24), rate=%d, depth=%d, channels=%d",
+                 current_params_.sample_rate, current_params_.bit_depth, current_params_.channels);
         } else {
-            LOGI("ANNOUNCE 未检测到标准 12 项 fmtp，采用标准 44.1kHz/16-bit 默认配置初始化 ALAC");
-            rtp_.init_alac(nullptr);
+            // 默认为 AppleLossless (ALAC)
+            current_params_.codec = "ALAC";
+            rtp_.set_audio_codec(AudioCodec::ALAC);
+
+            if (current_params_.fmtp.size() >= 12) {
+                LOGI("ANNOUNCE 提取 fmtp 参数 (12项): frame_size=%d, sample_size=%d, sample_rate=%d",
+                     current_params_.fmtp[1], current_params_.fmtp[3], current_params_.fmtp[11]);
+                current_params_.sample_rate = current_params_.fmtp[11];
+                current_params_.bit_depth = current_params_.fmtp[3];
+                current_params_.channels = current_params_.fmtp[7] > 0 ? current_params_.fmtp[7] : 2;
+                rtp_.init_alac(current_params_.fmtp.data());
+            } else {
+                LOGI("ANNOUNCE 未检测到标准 12 项 fmtp，采用标准 44.1kHz/16-bit 默认配置初始化 ALAC");
+                current_params_.sample_rate = 44100;
+                current_params_.bit_depth = 16;
+                current_params_.channels = 2;
+                rtp_.init_alac(nullptr);
+            }
         }
 
         LOGI("ANNOUNCE 提取密钥: key_len=%zu, iv_len=%zu",

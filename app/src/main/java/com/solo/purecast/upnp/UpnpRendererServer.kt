@@ -393,8 +393,11 @@ class UpnpRendererServer(
         val metadataXml = extractTagValue(body, "CurrentURIMetaData")
         Logger.upnp.i(TAG, "SetAVTransportURI: uri=$uri, hasMetadata=${metadataXml.isNotEmpty()}")
 
-        if (uri.isNotEmpty() && uri != currentUri && demuxer?.isRunning() == true) {
-            demuxer?.stop()
+        if (uri.isNotEmpty() && uri != currentUri) {
+            playbackService.updatePlaybackPosition(0L)
+            if (demuxer?.isRunning() == true) {
+                demuxer?.stop()
+            }
         }
         currentUri = uri
 
@@ -552,12 +555,12 @@ class UpnpRendererServer(
 
         val title = extractTagValue(unescaped, "dc:title")
             .ifEmpty { extractTagValue(unescaped, "title") }
-            .ifEmpty { "AirPlay 无损音频" }
+            .ifEmpty { "UPnP 音频流" }
 
         val artist = extractTagValue(unescaped, "upnp:artist")
             .ifEmpty { extractTagValue(unescaped, "dc:creator") }
             .ifEmpty { extractTagValue(unescaped, "artist") }
-            .ifEmpty { "Apple Music" }
+            .ifEmpty { "PureCast" }
 
         val album = extractTagValue(unescaped, "upnp:album")
             .ifEmpty { extractTagValue(unescaped, "album") }
@@ -566,7 +569,7 @@ class UpnpRendererServer(
             .ifEmpty { extractTagValue(unescaped, "albumArtURI") }
             .ifEmpty { extractTagValue(unescaped, "upnp:icon") }
             .ifEmpty { extractTagValue(unescaped, "icon") }
-            .ifEmpty { null }
+            .ifEmpty { currentTrackMetadata.coverUri }
 
         val isLive = if (durationMs > 0L) {
             false

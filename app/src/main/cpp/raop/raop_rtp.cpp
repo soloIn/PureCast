@@ -370,18 +370,40 @@ void RaopRtp::data_loop() {
             }
         }
 
-        // 2. ALAC 实时无损解码为 16-bit 44.1kHz PCM (S16_LE)
+        // 2. 音频解码 / 转换处理
         size_t out_bytes = 0;
-        if (alac_decoder_.decode_frame(decrypted_payload.data(), payload_len, pcm_frame.data(), out_bytes)) {
-            if (out_bytes > 0) {
-                std::vector<uint8_t> pcm_copy(pcm_frame.data(), pcm_frame.data() + out_bytes);
-                jitter_buffer_.push(seq, ts, std::move(pcm_copy));
+        AudioCodec current_codec = audio_codec_.load(std::memory_order_acquire);
 
-                // 3. 将连续就绪的 PCM 帧出队并推入 SPSC 环形缓冲区
-                std::vector<uint8_t> ready_frame;
-                while (jitter_buffer_.pop(ready_frame)) {
-                    AudioEngine::instance().write_pcm(ready_frame.data(), ready_frame.size());
-                }
+        if (current_codec == AudioCodec::PCM) {
+            // 💡 L16 未压缩线性 PCM 处理:
+            // 遵循 RFC 3551 规范，L16 采样为 16-bit 有符号大端网络字节序 (Big-Endian)
+            // 需逐采样转换为本地架构 Little-Endian (S16_LE) 以便 AudioEngine 直通播放
+            size_t valid_bytes = payload_len & ~1;
+            if (valid_bytes > pcm_frame.size()) {
+                pcm_frame.resize(valid_bytes);
+            }
+            const uint8_t* src = decrypted_payload.data();
+            uint8_t* dst = pcm_frame.data();
+            for (size_t i = 0; i < valid_bytes; i += 2) {
+                dst[i] = src[i + 1];     // 低位
+                dst[i + 1] = src[i];     // 高位
+            }
+            out_bytes = valid_bytes;
+        } else {
+            // 💡 ALAC 实时无损解码为 16-bit 44.1kHz PCM (S16_LE)
+            if (!alac_decoder_.decode_frame(decrypted_payload.data(), payload_len, pcm_frame.data(), out_bytes)) {
+                out_bytes = 0;
+            }
+        }
+
+        if (out_bytes > 0) {
+            std::vector<uint8_t> pcm_copy(pcm_frame.data(), pcm_frame.data() + out_bytes);
+            jitter_buffer_.push(seq, ts, std::move(pcm_copy));
+
+            // 3. 将连续就绪的 PCM 帧出队并推入 SPSC 环形缓冲区
+            std::vector<uint8_t> ready_frame;
+            while (jitter_buffer_.pop(ready_frame)) {
+                AudioEngine::instance().write_pcm(ready_frame.data(), ready_frame.size());
             }
         }
     }
