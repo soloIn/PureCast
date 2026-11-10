@@ -121,6 +121,16 @@ public:
      */
     void mark_paused_manually(bool paused);
 
+    /**
+     * 💡 设置实时音量分贝 (单位 dB, -144.0 为静音, 0.0 为最大)
+     */
+    void set_volume(float vol_db) {
+        current_volume_db_.store(vol_db, std::memory_order_relaxed);
+    }
+    float get_volume() const {
+        return current_volume_db_.load(std::memory_order_relaxed);
+    }
+
 private:
     void data_loop();
     void ctrl_loop();
@@ -168,6 +178,7 @@ private:
     StreamStateCallback state_cb_{nullptr};
     std::atomic<uint64_t> last_audio_packet_time_ms_{0};
     std::atomic<bool> is_stream_paused_{false};
+    std::atomic<float> current_volume_db_{0.0f};
 };
 
 } // namespace purecast::raop

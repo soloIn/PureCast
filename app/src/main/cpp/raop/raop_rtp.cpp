@@ -306,6 +306,9 @@ void RaopRtp::data_loop() {
         if (cur_cnt < 10 || cur_cnt % 500 == 0) {
             LOGI("data_loop: 收到音频包 [%u] pt=%u, len=%zd, has_crypto=%d",
                  cur_cnt, payload_type, n, has_crypto_.load(std::memory_order_relaxed));
+        } else if (n <= 64 && (cur_cnt % 500 == 250)) {
+            // 💡 短包采样观测 (如 44 字节静音或控制包)
+            LOGD("data_loop: 收到短音频包 [%u] pt=%u, len=%zd", cur_cnt, payload_type, n);
         }
 
         // 💡 更新最近音频数据包时间戳，若此前处于暂停状态则即时唤醒恢复播放
@@ -360,10 +363,11 @@ void RaopRtp::data_loop() {
         // 💡 AirPlay 1 规范要求:
         // 每个音频包独立初始化 CBC 向量 (使用 ANNOUNCE 协商的 aes_iv_)
         // 解密长度为 16 字节整倍数 (payload_len & ~0xf)，尾部余数保持明文拷贝
+        // 💡 针对 RFC 3551 L16 PCM (pt=10) 静态标准包，无需 AES 解密 (保持明文网络序传输)
         decrypted_payload.resize(payload_len);
         memcpy(decrypted_payload.data(), payload, payload_len);
 
-        if (has_crypto_.load(std::memory_order_acquire)) {
+        if (has_crypto_.load(std::memory_order_acquire) && payload_type != 10) {
             size_t aeslen = payload_len & ~0xf;
             if (aeslen > 0) {
                 uint8_t key[16];
@@ -389,7 +393,7 @@ void RaopRtp::data_loop() {
         size_t out_bytes = 0;
         AudioCodec current_codec = audio_codec_.load(std::memory_order_acquire);
 
-        if (current_codec == AudioCodec::PCM) {
+        if (current_codec == AudioCodec::PCM || payload_type == 10) {
             // 💡 L16 未压缩线性 PCM 处理:
             // 遵循 RFC 3551 规范，L16 采样为 16-bit 有符号大端网络字节序 (Big-Endian)
             // 需逐采样转换为本地架构 Little-Endian (S16_LE) 以便 AudioEngine 直通播放
@@ -417,6 +421,37 @@ void RaopRtp::data_loop() {
         }
 
         if (out_bytes > 0) {
+            // 💡 静音帧感知与诊断: 检查前 64 字节是否全部为 0
+            bool is_silence = true;
+            size_t check_len = std::min(out_bytes, static_cast<size_t>(64));
+            for (size_t i = 0; i < check_len; ++i) {
+                if (pcm_frame[i] != 0) {
+                    is_silence = false;
+                    break;
+                }
+            }
+
+            static uint32_t continuous_silence_count = 0;
+            if (is_silence) {
+                continuous_silence_count++;
+                if (continuous_silence_count == 100 || continuous_silence_count % 1000 == 0) {
+                    float vol = current_volume_db_.load(std::memory_order_relaxed);
+                    LOGW("⚠️ ALAC/PCM 连续解码产出全静音帧 (已持续 %u 帧, 当前包长=%zd, 客户端音量=%.2f dB)",
+                         continuous_silence_count, n, vol);
+                }
+            } else {
+                if (continuous_silence_count > 0) {
+                    LOGI("🔊 检测到有效音频信号恢复 (结束了连续 %u 帧静音)", continuous_silence_count);
+                    continuous_silence_count = 0;
+                }
+            }
+
+            // 💡 保证等时传输线程处于就绪状态，防止此前因为暂停而导致环形缓冲区积压饱和丢弃
+            if (AudioEngine::instance().is_paused()) {
+                LOGI("▶️ 收到有效解码音频帧且 AudioEngine 处于暂停态，底层主动调用 resume_stream");
+                AudioEngine::instance().resume_stream();
+            }
+
             std::vector<uint8_t> pcm_copy(pcm_frame.data(), pcm_frame.data() + out_bytes);
             jitter_buffer_.push(seq, ts, std::move(pcm_copy));
 

@@ -251,9 +251,30 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
                  << "RTP-Info: rtptime=0\r\n"
                  << "Server: AirTunes/105.1\r\n\r\n";
     } else if (method == "GET_PARAMETER") {
-        response << "RTSP/1.0 200 OK\r\n"
-                 << "CSeq: " << cseq << "\r\n"
-                 << "Server: AirTunes/105.1\r\n\r\n";
+        size_t header_end = request.find("\r\n\r\n");
+        std::string body;
+        if (header_end != std::string::npos && header_end + 4 < request.size()) {
+            body = request.substr(header_end + 4);
+        }
+        LOGI("收到 RTSP GET_PARAMETER 请求: CSeq=%s, Body='%s'", cseq.c_str(), body.c_str());
+
+        if (body.find("volume") != std::string::npos) {
+            float vol = current_volume_db_.load(std::memory_order_relaxed);
+            char vol_buf[64] = {0};
+            snprintf(vol_buf, sizeof(vol_buf), "volume: %.6f\r\n", vol);
+            std::string vol_str(vol_buf);
+
+            response << "RTSP/1.0 200 OK\r\n"
+                     << "CSeq: " << cseq << "\r\n"
+                     << "Content-Type: text/parameters\r\n"
+                     << "Content-Length: " << vol_str.size() << "\r\n"
+                     << "Server: AirTunes/105.1\r\n\r\n"
+                     << vol_str;
+        } else {
+            response << "RTSP/1.0 200 OK\r\n"
+                     << "CSeq: " << cseq << "\r\n"
+                     << "Server: AirTunes/105.1\r\n\r\n";
+        }
     } else if (method == "OPTIONS") {
         response << "RTSP/1.0 200 OK\r\n"
                  << "CSeq: " << cseq << "\r\n"
@@ -475,8 +496,28 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
                     LOGI("SET_PARAMETER 收到切歌过渡/空封面提示 (image/none)，保留当前封面杜绝界面黑屏跳动");
                 }
             } else if (content_type.find("text/parameters") != std::string::npos) {
-                // 💡 3. 文本参数推送 (progress: start/curr/end 播放时间进度或音量)
+                // 💡 3. 文本参数推送 (progress: start/curr/end 播放时间进度或 volume: 音量调节)
                 std::string body(reinterpret_cast<const char*>(payload), payload_len);
+                LOGI("SET_PARAMETER 收到文本参数推送:\n%s", body.c_str());
+
+                // 3.1 音量调节: volume: -15.000000 (单位 dB, -144.0 为静音 MUTE, 0.0 为最大)
+                size_t vol_pos = body.find("volume:");
+                if (vol_pos != std::string::npos) {
+                    size_t vstart = vol_pos + 7;
+                    while (vstart < body.size() && (body[vstart] == ' ' || body[vstart] == '\t')) vstart++;
+                    size_t vend = body.find("\r\n", vstart);
+                    if (vend == std::string::npos) vend = body.size();
+                    try {
+                        float vol_db = std::stof(body.substr(vstart, vend - vstart));
+                        current_volume_db_.store(vol_db, std::memory_order_relaxed);
+                        rtp_.set_volume(vol_db);
+                        LOGI("AirPlay 客户端设置音量: %.2f dB %s", vol_db, (vol_db <= -143.0f ? "(MUTE 静音)" : ""));
+                    } catch (const std::exception& e) {
+                        LOGW("解析 volume 参数异常: %s", e.what());
+                    }
+                }
+
+                // 3.2 播放时间进度: progress: start/curr/end
                 size_t prog_pos = body.find("progress:");
                 if (prog_pos != std::string::npos) {
                     size_t start_pos = prog_pos + 9;

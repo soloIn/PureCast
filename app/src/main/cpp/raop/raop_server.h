@@ -79,6 +79,7 @@ private:
 
     RaopRtp rtp_;
     RaopStreamParams current_params_{};
+    std::atomic<float> current_volume_db_{0.0f};
 
     StreamRequestCallback stream_request_cb_{nullptr};
     StreamStopCallback stream_stop_cb_{nullptr};

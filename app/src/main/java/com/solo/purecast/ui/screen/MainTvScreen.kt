@@ -217,7 +217,7 @@ fun MainTvScreen(
                         AsyncImage(
                             model = ImageRequest.Builder(LocalContext.current)
                                 .data(persistentCover)
-                                .crossfade(400)
+                                .crossfade(false)
                                 .build(),
                             contentDescription = "Album Cover",
                             contentScale = ContentScale.Crop,
