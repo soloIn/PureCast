@@ -178,6 +178,7 @@ private:
     StreamStateCallback state_cb_{nullptr};
     std::atomic<uint64_t> last_audio_packet_time_ms_{0};
     std::atomic<bool> is_stream_paused_{false};
+    std::atomic<bool> is_manually_paused_{false};
     std::atomic<float> current_volume_db_{0.0f};
 };
 

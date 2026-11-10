@@ -247,8 +247,12 @@ void RaopRtp::watchdog_loop() {
 }
 
 void RaopRtp::mark_paused_manually(bool paused) {
+    is_manually_paused_.store(paused, std::memory_order_release);
     is_stream_paused_.store(paused, std::memory_order_release);
-    if (!paused) {
+    if (paused) {
+        LOGI("收到手动标记暂停指令 (RTSP PAUSE)");
+    } else {
+        LOGI("收到手动标记恢复指令 (RTSP RECORD)");
         last_audio_packet_time_ms_.store(get_monotonic_time_ms(), std::memory_order_relaxed);
     }
 }
@@ -306,19 +310,11 @@ void RaopRtp::data_loop() {
         if (cur_cnt < 10 || cur_cnt % 500 == 0) {
             LOGI("data_loop: 收到音频包 [%u] pt=%u, len=%zd, has_crypto=%d",
                  cur_cnt, payload_type, n, has_crypto_.load(std::memory_order_relaxed));
-        } else if (n <= 64 && (cur_cnt % 500 == 250)) {
-            // 💡 短包采样观测 (如 44 字节静音或控制包)
-            LOGD("data_loop: 收到短音频包 [%u] pt=%u, len=%zd", cur_cnt, payload_type, n);
         }
 
-        // 💡 更新最近音频数据包时间戳，若此前处于暂停状态则即时唤醒恢复播放
+        // 💡 更新最近音频数据包时间戳供看门狗超时检测 (绝不可在此盲目唤醒播放，须待解码确定非静音后方可唤醒)
         uint64_t now_ms = get_monotonic_time_ms();
         last_audio_packet_time_ms_.store(now_ms, std::memory_order_relaxed);
-        if (is_stream_paused_.load(std::memory_order_relaxed)) {
-            is_stream_paused_.store(false, std::memory_order_release);
-            LOGI("▶️ 检测到 RTP 新音频包到达，通知上层流已恢复播放");
-            if (state_cb_) state_cb_(false);
-        }
 
         const uint8_t* pktp = buffer.data();
         ssize_t plen = n;
@@ -421,6 +417,15 @@ void RaopRtp::data_loop() {
         }
 
         if (out_bytes > 0) {
+            // 💡 打印短包 (如 44 字节静音或特定音频帧) 原始十六进制以供深度链路核验
+            if (n <= 64 && (cur_cnt % 500 == 0 || cur_cnt < 5)) {
+                char hex_buf[70] = {0};
+                for (size_t i = 0; i < std::min(payload_len, static_cast<size_t>(32)); ++i) {
+                    snprintf(hex_buf + i * 2, sizeof(hex_buf) - i * 2, "%02x", payload[i]);
+                }
+                LOGI("data_loop: 短音频包原始负载 [pkt=%u, len=%zu]: %s", cur_cnt, payload_len, hex_buf);
+            }
+
             // 💡 静音帧感知与诊断: 检查前 64 字节是否全部为 0
             bool is_silence = true;
             size_t check_len = std::min(out_bytes, static_cast<size_t>(64));
@@ -434,6 +439,12 @@ void RaopRtp::data_loop() {
             static uint32_t continuous_silence_count = 0;
             if (is_silence) {
                 continuous_silence_count++;
+                // 💡 关键双向同步: 连续 25 帧全静音 (~200ms) 说明 iPhone 处于暂停推流保活状态
+                if (continuous_silence_count >= 25 && !is_stream_paused_.load(std::memory_order_relaxed)) {
+                    is_stream_paused_.store(true, std::memory_order_release);
+                    LOGI("⏸️ 检测到连续静音保活帧 (iPhone 暂停推流)，同步 TV 端播放状态机为 PAUSED");
+                    if (state_cb_) state_cb_(true);
+                }
                 if (continuous_silence_count == 100 || continuous_silence_count % 1000 == 0) {
                     float vol = current_volume_db_.load(std::memory_order_relaxed);
                     LOGW("⚠️ ALAC/PCM 连续解码产出全静音帧 (已持续 %u 帧, 当前包长=%zd, 客户端音量=%.2f dB)",
@@ -444,12 +455,19 @@ void RaopRtp::data_loop() {
                     LOGI("🔊 检测到有效音频信号恢复 (结束了连续 %u 帧静音)", continuous_silence_count);
                     continuous_silence_count = 0;
                 }
-            }
 
-            // 💡 保证等时传输线程处于就绪状态，防止此前因为暂停而导致环形缓冲区积压饱和丢弃
-            if (AudioEngine::instance().is_paused()) {
-                LOGI("▶️ 收到有效解码音频帧且 AudioEngine 处于暂停态，底层主动调用 resume_stream");
-                AudioEngine::instance().resume_stream();
+                // 💡 关键双向同步: 收到真正有声的非静音音频帧，立即同步 TV 端播放状态机为 PLAYING
+                if (is_stream_paused_.load(std::memory_order_relaxed) && !is_manually_paused_.load(std::memory_order_relaxed)) {
+                    is_stream_paused_.store(false, std::memory_order_release);
+                    LOGI("▶️ 检测到有效音频信号 (iPhone 恢复推流)，同步 TV 端播放状态机为 PLAYING");
+                    if (state_cb_) state_cb_(false);
+                }
+
+                // 💡 保证等时传输线程处于就绪状态，防止此前因为暂停而导致环形缓冲区积压饱和丢弃
+                if (AudioEngine::instance().is_paused()) {
+                    LOGI("▶️ 收到有效解码音频帧且 AudioEngine 处于暂停态，底层主动调用 resume_stream");
+                    AudioEngine::instance().resume_stream();
+                }
             }
 
             std::vector<uint8_t> pcm_copy(pcm_frame.data(), pcm_frame.data() + out_bytes);

@@ -443,7 +443,7 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
                          << ";timing_port=" << timing_p
                          << ";server_port=" << data_p << "\r\n"
                          << "Session: 1\r\n"
-                         << "Audio-Jack-Status: connected; type=digital\r\n"
+                         << "Audio-Jack-Status: connected; type=analog\r\n"
                          << "Server: AirTunes/105.1\r\n\r\n";
             } else {
                 response << "RTSP/1.0 500 Internal Server Error\r\n"
