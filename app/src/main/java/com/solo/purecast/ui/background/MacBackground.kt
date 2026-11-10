@@ -55,11 +55,6 @@ fun MacBackground(
     lowPower: Boolean = false,
     modifier: Modifier = Modifier
 ) {
-    if (quality == FluidQuality.OFF || coverData == null) {
-        Box(modifier.fillMaxSize().background(AppPalette.background))
-        return
-    }
-
     val sceneClock = remember { MacClock() }
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -78,6 +73,11 @@ fun MacBackground(
     var artwork by remember { mutableStateOf<MacArtworkFrame?>(null) }
 
     LaunchedEffect(coverData, sceneClock.meshIndex) {
+        if (coverData == null) {
+            // 💡 切歌过渡或新曲目封面异步拉取期间，保留当前已有 artwork 背景，绝不将其置空！
+            // 置空会导致全屏背景瞬间闪回黑底，产生强烈的视觉闪烁 (闪两下)
+            return@LaunchedEffect
+        }
         try {
             val result = withContext(Dispatchers.IO) {
                 val req = ImageRequest.Builder(context)
@@ -100,14 +100,17 @@ fun MacBackground(
                     MacArtworkFrame(copy, fallback)
                 }
                 artwork = newFrame
-            } else {
-                artwork = null
             }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
             Logger.ui.w("MacBackground", "封面位图解析异常", e)
         }
+    }
+
+    if (quality == FluidQuality.OFF || (coverData == null && artwork == null)) {
+        Box(modifier.fillMaxSize().background(AppPalette.background))
+        return
     }
 
     val effectiveQuality = when {

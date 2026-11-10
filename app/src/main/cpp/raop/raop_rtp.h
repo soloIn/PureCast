@@ -15,6 +15,14 @@
 namespace purecast::raop {
 
 /**
+ * 💡 RAOP 音频编码格式类型
+ */
+enum class AudioCodec {
+    ALAC,   // Apple Lossless (由 alac_decoder_ 实时解压为 S16_LE PCM)
+    PCM     // L16 未压缩 16-bit 线性 PCM (网络大端字节序，需转换为本地 S16_LE)
+};
+
+/**
  * 💡 RaopRtp: 原生 AirPlay 1 (RAOP) UDP 接收与流处理引擎
  * 负责音频数据包解密、ALAC 解码、JitterBuffer 重排、控制包与 NTP 授时对齐。
  */
@@ -59,6 +67,28 @@ public:
     }
 
     /**
+     * 💡 配置推流音频格式类型 (ALAC 或 PCM)
+     */
+    void set_audio_codec(AudioCodec codec) {
+        audio_codec_.store(codec, std::memory_order_release);
+    }
+
+    AudioCodec get_audio_codec() const {
+        return audio_codec_.load(std::memory_order_acquire);
+    }
+
+    /**
+     * 💡 配置协商的 RTP 音频 Payload Type (默认 96，亦可为 10、94 等)
+     */
+    void set_audio_payload_type(uint8_t pt) {
+        audio_payload_type_.store(pt, std::memory_order_release);
+    }
+
+    uint8_t get_audio_payload_type() const {
+        return audio_payload_type_.load(std::memory_order_acquire);
+    }
+
+    /**
      * 是否正在运行
      */
     bool is_running() const { return is_running_.load(std::memory_order_relaxed); }
@@ -91,6 +121,16 @@ public:
      */
     void mark_paused_manually(bool paused);
 
+    /**
+     * 💡 设置实时音量分贝 (单位 dB, -144.0 为静音, 0.0 为最大)
+     */
+    void set_volume(float vol_db) {
+        current_volume_db_.store(vol_db, std::memory_order_relaxed);
+    }
+    float get_volume() const {
+        return current_volume_db_.load(std::memory_order_relaxed);
+    }
+
 private:
     void data_loop();
     void ctrl_loop();
@@ -122,6 +162,8 @@ private:
     std::vector<uint8_t> aes_iv_;
     std::atomic<bool> has_crypto_{false};
 
+    std::atomic<AudioCodec> audio_codec_{AudioCodec::ALAC};
+    std::atomic<uint8_t> audio_payload_type_{96};
     alac::AlacDecoder alac_decoder_;
     RaopJitterBuffer jitter_buffer_;
 
@@ -136,6 +178,9 @@ private:
     StreamStateCallback state_cb_{nullptr};
     std::atomic<uint64_t> last_audio_packet_time_ms_{0};
     std::atomic<bool> is_stream_paused_{false};
+    std::atomic<bool> is_manually_paused_{false};
+    std::atomic<float> current_volume_db_{0.0f};
+    std::atomic<uint32_t> continuous_silence_count_{0};
 };
 
 } // namespace purecast::raop

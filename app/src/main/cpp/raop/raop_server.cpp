@@ -33,6 +33,12 @@ static size_t safe_parse_content_length(const std::string& str) {
     }
 }
 
+static inline std::string to_lower_copy(std::string_view s) {
+    std::string res(s);
+    std::transform(res.begin(), res.end(), res.begin(), ::tolower);
+    return res;
+}
+
 RaopServer::RaopServer() {
     rtp_.set_stream_state_callback([this](bool is_paused) {
         if (is_paused) {
@@ -251,9 +257,30 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
                  << "RTP-Info: rtptime=0\r\n"
                  << "Server: AirTunes/105.1\r\n\r\n";
     } else if (method == "GET_PARAMETER") {
-        response << "RTSP/1.0 200 OK\r\n"
-                 << "CSeq: " << cseq << "\r\n"
-                 << "Server: AirTunes/105.1\r\n\r\n";
+        size_t header_end = request.find("\r\n\r\n");
+        std::string body;
+        if (header_end != std::string::npos && header_end + 4 < request.size()) {
+            body = request.substr(header_end + 4);
+        }
+        LOGI("收到 RTSP GET_PARAMETER 请求: CSeq=%s, Body='%s'", cseq.c_str(), body.c_str());
+
+        if (body.find("volume") != std::string::npos) {
+            float vol = current_volume_db_.load(std::memory_order_relaxed);
+            char vol_buf[64] = {0};
+            snprintf(vol_buf, sizeof(vol_buf), "volume: %.6f\r\n", vol);
+            std::string vol_str(vol_buf);
+
+            response << "RTSP/1.0 200 OK\r\n"
+                     << "CSeq: " << cseq << "\r\n"
+                     << "Content-Type: text/parameters\r\n"
+                     << "Content-Length: " << vol_str.size() << "\r\n"
+                     << "Server: AirTunes/105.1\r\n\r\n"
+                     << vol_str;
+        } else {
+            response << "RTSP/1.0 200 OK\r\n"
+                     << "CSeq: " << cseq << "\r\n"
+                     << "Server: AirTunes/105.1\r\n\r\n";
+        }
     } else if (method == "OPTIONS") {
         response << "RTSP/1.0 200 OK\r\n"
                  << "CSeq: " << cseq << "\r\n"
@@ -261,11 +288,43 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
                  << "Public: ANNOUNCE, SETUP, RECORD, PAUSE, FLUSH, TEARDOWN, OPTIONS, GET_PARAMETER, SET_PARAMETER\r\n"
                  << "Server: AirTunes/105.1\r\n\r\n";
     } else if (method == "ANNOUNCE") {
+        LOGI("=== 收到客户端 RTSP ANNOUNCE 请求 ===\n%s\n========================================", request.c_str());
+
         // 解析 SDP 中的 rsaaeskey 与 aesiv
         current_params_.aes_key_base64 = parse_sdp_attribute(request, "rsaaeskey");
         current_params_.aes_iv_base64 = parse_sdp_attribute(request, "aesiv");
 
-        // 💡 提取 SDP a=fmtp 参数行 (例如 a=fmtp:96 352 0 16 40 10 14 2 255 0 0 44100)
+        // 💡 1. 提取 m=audio 行中的音频 Payload Type (如 m=audio 0 RTP/AVP 96 或 m=audio 0 RTP/AVP 10)
+        int audio_pt = 96;
+        size_t m_pos = request.find("m=audio ");
+        if (m_pos != std::string::npos) {
+            size_t line_end = request.find("\n", m_pos);
+            std::string m_line = request.substr(m_pos, (line_end != std::string::npos) ? (line_end - m_pos) : std::string::npos);
+            size_t avp_pos = m_line.find("RTP/AVP");
+            if (avp_pos != std::string::npos) {
+                std::istringstream miss(m_line.substr(avp_pos + 7));
+                int pt_val;
+                if (miss >> pt_val) {
+                    audio_pt = pt_val;
+                }
+            }
+        }
+
+        // 💡 2. 提取 SDP a=rtpmap 格式映射行 (例如 a=rtpmap:96 AppleLossless 或 a=rtpmap:96 L16/44100/2)
+        std::string rtpmap_str = parse_sdp_attribute(request, "rtpmap");
+        std::string rtpmap_lower = to_lower_copy(rtpmap_str);
+
+        if (!rtpmap_str.empty()) {
+            std::istringstream riss(rtpmap_str);
+            int rtp_pt_val;
+            if (riss >> rtp_pt_val) {
+                audio_pt = rtp_pt_val;
+            }
+        }
+        current_params_.payload_type = audio_pt;
+        rtp_.set_audio_payload_type(static_cast<uint8_t>(audio_pt));
+
+        // 💡 3. 提取 SDP a=fmtp 参数行 (例如 a=fmtp:96 352 0 16 40 10 14 2 255 0 0 44100)
         std::string fmtp_str = parse_sdp_attribute(request, "fmtp");
         current_params_.fmtp.clear();
         if (!fmtp_str.empty()) {
@@ -276,20 +335,73 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
             }
         }
 
-        if (current_params_.fmtp.size() >= 12) {
-            LOGI("ANNOUNCE 提取 fmtp 参数 (12项): frame_size=%d, sample_size=%d, sample_rate=%d",
-                 current_params_.fmtp[1], current_params_.fmtp[3], current_params_.fmtp[11]);
-            current_params_.sample_rate = current_params_.fmtp[11];
-            current_params_.bit_depth = current_params_.fmtp[3];
-            current_params_.channels = current_params_.fmtp[7] > 0 ? current_params_.fmtp[7] : 2;
-            rtp_.init_alac(current_params_.fmtp.data());
+        LOGI("ANNOUNCE SDP 解析: pt=%d, rtpmap='%s', fmtp_count=%zu, key_len=%zu, iv_len=%zu",
+             audio_pt, rtpmap_str.c_str(), current_params_.fmtp.size(),
+             current_params_.aes_key_base64.size(), current_params_.aes_iv_base64.size());
+
+        // 判断音频编码格式与参数 (L16 未压缩线性 PCM vs AppleLossless ALAC)
+        if (rtpmap_lower.find("l16") != std::string::npos ||
+            rtpmap_lower.find("pcm") != std::string::npos ||
+            audio_pt == 10 || audio_pt == 11) {
+            current_params_.codec = "PCM";
+            current_params_.bit_depth = 16;
+            current_params_.sample_rate = 44100;
+            current_params_.channels = (audio_pt == 11) ? 1 : 2;
+
+            // 尝试从 rtpmap (形如 96 L16/48000/2 或 96 L16/44100) 提取采样率和通道
+            size_t slash1 = rtpmap_str.find('/');
+            if (slash1 != std::string::npos) {
+                size_t slash2 = rtpmap_str.find('/', slash1 + 1);
+                std::string rate_str = (slash2 != std::string::npos)
+                    ? rtpmap_str.substr(slash1 + 1, slash2 - slash1 - 1)
+                    : rtpmap_str.substr(slash1 + 1);
+                try {
+                    int rate = std::stoi(rate_str);
+                    if (rate > 0) current_params_.sample_rate = rate;
+                } catch (...) {}
+
+                if (slash2 != std::string::npos) {
+                    try {
+                        int ch = std::stoi(rtpmap_str.substr(slash2 + 1));
+                        if (ch > 0) current_params_.channels = ch;
+                    } catch (...) {}
+                }
+            }
+
+            rtp_.set_audio_codec(AudioCodec::PCM);
+            LOGI("🎉 ANNOUNCE 成功匹配未压缩格式: PCM (L16), pt=%d, rate=%d, depth=%d, channels=%d",
+                 audio_pt, current_params_.sample_rate, current_params_.bit_depth, current_params_.channels);
+        } else if (rtpmap_lower.find("l24") != std::string::npos) {
+            current_params_.codec = "PCM";
+            current_params_.bit_depth = 24;
+            current_params_.sample_rate = 44100;
+            current_params_.channels = 2;
+            rtp_.set_audio_codec(AudioCodec::PCM);
+            LOGI("🎉 ANNOUNCE 成功匹配未压缩格式: PCM (L24), pt=%d, rate=%d, depth=%d, channels=%d",
+                 audio_pt, current_params_.sample_rate, current_params_.bit_depth, current_params_.channels);
         } else {
-            LOGI("ANNOUNCE 未检测到标准 12 项 fmtp，采用标准 44.1kHz/16-bit 默认配置初始化 ALAC");
-            rtp_.init_alac(nullptr);
+            // 默认为 AppleLossless (ALAC)
+            current_params_.codec = "ALAC";
+            rtp_.set_audio_codec(AudioCodec::ALAC);
+
+            if (current_params_.fmtp.size() >= 12) {
+                LOGI("ANNOUNCE 提取 fmtp 参数 (12项): frame_size=%d, sample_size=%d, sample_rate=%d",
+                     current_params_.fmtp[1], current_params_.fmtp[3], current_params_.fmtp[11]);
+                current_params_.sample_rate = current_params_.fmtp[11];
+                current_params_.bit_depth = current_params_.fmtp[3];
+                current_params_.channels = current_params_.fmtp[7] > 0 ? current_params_.fmtp[7] : 2;
+                rtp_.init_alac(current_params_.fmtp.data());
+            } else {
+                LOGI("ANNOUNCE 未检测到标准 12 项 fmtp，采用标准 44.1kHz/16-bit 默认配置初始化 ALAC");
+                current_params_.sample_rate = 44100;
+                current_params_.bit_depth = 16;
+                current_params_.channels = 2;
+                rtp_.init_alac(nullptr);
+            }
         }
 
-        LOGI("ANNOUNCE 提取密钥: key_len=%zu, iv_len=%zu",
-             current_params_.aes_key_base64.size(), current_params_.aes_iv_base64.size());
+        LOGI("ANNOUNCE 协商完成: codec=%s, pt=%d, rate=%d, key_len=%zu",
+             current_params_.codec.c_str(), audio_pt, current_params_.sample_rate, current_params_.aes_key_base64.size());
 
         response << "RTSP/1.0 200 OK\r\n"
                  << "CSeq: " << cseq << "\r\n"
@@ -313,6 +425,7 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
 
         // 解析控制端口
         std::string transport = parse_header(request, "Transport");
+        LOGI("=== 收到 RTSP SETUP Transport ===: %s", transport.c_str());
         size_t cport_pos = transport.find("control_port=");
         if (cport_pos != std::string::npos) {
             current_params_.client_control_port = std::stoi(transport.substr(cport_pos + 13));
@@ -335,7 +448,7 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
                          << ";timing_port=" << timing_p
                          << ";server_port=" << data_p << "\r\n"
                          << "Session: 1\r\n"
-                         << "Audio-Jack-Status: connected; type=digital\r\n"
+                         << "Audio-Jack-Status: connected; type=analog\r\n"
                          << "Server: AirTunes/105.1\r\n\r\n";
             } else {
                 response << "RTSP/1.0 500 Internal Server Error\r\n"
@@ -388,8 +501,28 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
                     LOGI("SET_PARAMETER 收到切歌过渡/空封面提示 (image/none)，保留当前封面杜绝界面黑屏跳动");
                 }
             } else if (content_type.find("text/parameters") != std::string::npos) {
-                // 💡 3. 文本参数推送 (progress: start/curr/end 播放时间进度或音量)
+                // 💡 3. 文本参数推送 (progress: start/curr/end 播放时间进度或 volume: 音量调节)
                 std::string body(reinterpret_cast<const char*>(payload), payload_len);
+                LOGI("SET_PARAMETER 收到文本参数推送:\n%s", body.c_str());
+
+                // 3.1 音量调节: volume: -15.000000 (单位 dB, -144.0 为静音 MUTE, 0.0 为最大)
+                size_t vol_pos = body.find("volume:");
+                if (vol_pos != std::string::npos) {
+                    size_t vstart = vol_pos + 7;
+                    while (vstart < body.size() && (body[vstart] == ' ' || body[vstart] == '\t')) vstart++;
+                    size_t vend = body.find("\r\n", vstart);
+                    if (vend == std::string::npos) vend = body.size();
+                    try {
+                        float vol_db = std::stof(body.substr(vstart, vend - vstart));
+                        current_volume_db_.store(vol_db, std::memory_order_relaxed);
+                        rtp_.set_volume(vol_db);
+                        LOGI("AirPlay 客户端设置音量: %.2f dB %s", vol_db, (vol_db <= -143.0f ? "(MUTE 静音)" : ""));
+                    } catch (const std::exception& e) {
+                        LOGW("解析 volume 参数异常: %s", e.what());
+                    }
+                }
+
+                // 3.2 播放时间进度: progress: start/curr/end
                 size_t prog_pos = body.find("progress:");
                 if (prog_pos != std::string::npos) {
                     size_t start_pos = prog_pos + 9;
@@ -486,10 +619,21 @@ std::string RaopServer::parse_header(const std::string& request, const std::stri
 std::string RaopServer::parse_sdp_attribute(const std::string& sdp, const std::string& attr_name) {
     std::string target = "a=" + attr_name + ":";
     size_t pos = sdp.find(target);
-    if (pos == std::string::npos) return "";
+    if (pos == std::string::npos) {
+        // 尝试大小写不敏感匹配
+        std::string sdp_lower = to_lower_copy(sdp);
+        std::string target_lower = to_lower_copy(target);
+        pos = sdp_lower.find(target_lower);
+        if (pos == std::string::npos) return "";
+    }
     size_t start = pos + target.size();
-    size_t end = sdp.find("\r\n", start);
-    if (end == std::string::npos) end = sdp.size();
+    while (start < sdp.size() && (sdp[start] == ' ' || sdp[start] == '\t')) start++;
+    size_t end = sdp.find("\n", start);
+    if (end == std::string::npos) {
+        end = sdp.size();
+    } else if (end > start && sdp[end - 1] == '\r') {
+        end--;
+    }
     return sdp.substr(start, end - start);
 }
 

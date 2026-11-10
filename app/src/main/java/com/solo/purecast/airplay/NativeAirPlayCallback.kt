@@ -9,6 +9,7 @@ interface NativeAirPlayCallback {
      * @param sampleRate 采样率 (标称 44100)
      * @param bitDepth 位深 (标称 16)
      * @param channels 声道数 (标称 2)
+     * @param codec 经 SDP 协商确认的音频编码 (如 "ALAC" 或 "PCM")
      * @param clientIp iPhone 对端 IP
      * @param aesKeyBase64 RSA 加密的 AES Key (Base64)
      * @param aesIvBase64 AES IV (Base64)
@@ -21,6 +22,7 @@ interface NativeAirPlayCallback {
         sampleRate: Int,
         bitDepth: Int,
         channels: Int,
+        codec: String,
         clientIp: String,
         aesKeyBase64: String,
         aesIvBase64: String,

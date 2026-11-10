@@ -19,7 +19,7 @@ import java.util.Base64
 class AirPlayServerManager(
     private val context: Context,
     private val scope: CoroutineScope,
-    private val onStreamRequestedListener: (sampleRate: Int, bitDepth: Int, channels: Int, clientIp: String, dacpPort: Int, token: String) -> Boolean,
+    private val onStreamRequestedListener: (sampleRate: Int, bitDepth: Int, channels: Int, codec: String, clientIp: String, dacpPort: Int, token: String) -> Boolean,
     private val onStreamStoppedListener: () -> Unit,
     private val onMetadataReceivedListener: (title: String, artist: String, album: String, durationMs: Long, coverArt: ByteArray?) -> Unit,
     private val onProgressUpdatedListener: (positionMs: Long, durationMs: Long) -> Unit = { _, _ -> },
@@ -57,6 +57,7 @@ class AirPlayServerManager(
                 sampleRate: Int,
                 bitDepth: Int,
                 channels: Int,
+                codec: String,
                 clientIp: String,
                 aesKeyBase64: String,
                 aesIvBase64: String,
@@ -64,7 +65,7 @@ class AirPlayServerManager(
                 activeRemoteToken: String,
                 dacpPort: Int
             ): Boolean {
-                Logger.airplay.i(TAG, "收到 AirPlay 推流请求: $clientIp, rate=$sampleRate, depth=$bitDepth, ch=$channels")
+                Logger.airplay.i(TAG, "收到 AirPlay 推流请求: $clientIp, codec=$codec, rate=$sampleRate, depth=$bitDepth, ch=$channels")
 
                 // 1. RSA 私钥解密 AES 会话主密钥
                 if (aesKeyBase64.isNotEmpty() && aesIvBase64.isNotEmpty()) {
@@ -80,6 +81,9 @@ class AirPlayServerManager(
                     } catch (e: Exception) {
                         Logger.airplay.e(TAG, "处理 AirPlay 密钥注入异常", e)
                     }
+                } else {
+                    Logger.airplay.i(TAG, "推流未携带 AES 会话密钥 (明文/非加密流)，重置底层解密上下文")
+                    NativeAudioEngine.setAirPlayCryptoKey(ByteArray(0), ByteArray(0))
                 }
 
                 // 2. 更新 DACP 反向控制凭证与启动 mDNS 动态端口解析
@@ -92,7 +96,7 @@ class AirPlayServerManager(
                 }
 
                 // 3. 回调上层申请音频焦点与 USB 声卡独占
-                val accepted = onStreamRequestedListener(sampleRate, bitDepth, channels, clientIp, dacpPort, activeRemoteToken)
+                val accepted = onStreamRequestedListener(sampleRate, bitDepth, channels, codec, clientIp, dacpPort, activeRemoteToken)
                 if (accepted) {
                     isRtpActive = true
                 }

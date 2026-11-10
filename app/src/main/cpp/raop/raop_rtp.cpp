@@ -103,6 +103,7 @@ bool RaopRtp::start(int& out_data_port, int& out_ctrl_port, int& out_timing_port
 
     is_running_.store(true, std::memory_order_release);
     jitter_buffer_.reset();
+    continuous_silence_count_.store(0, std::memory_order_relaxed);
 
     data_thread_ = std::thread(&RaopRtp::data_loop, this);
     ctrl_thread_ = std::thread(&RaopRtp::ctrl_loop, this);
@@ -146,6 +147,7 @@ void RaopRtp::stop() {
     }
 
     jitter_buffer_.reset();
+    continuous_silence_count_.store(0, std::memory_order_relaxed);
     first_data_seq_ = true;
     last_data_seq_ = 0;
     has_client_ctrl_.store(false, std::memory_order_release);
@@ -247,8 +249,12 @@ void RaopRtp::watchdog_loop() {
 }
 
 void RaopRtp::mark_paused_manually(bool paused) {
+    is_manually_paused_.store(paused, std::memory_order_release);
     is_stream_paused_.store(paused, std::memory_order_release);
-    if (!paused) {
+    if (paused) {
+        LOGI("收到手动标记暂停指令 (RTSP PAUSE)");
+    } else {
+        LOGI("收到手动标记恢复指令 (RTSP RECORD)");
         last_audio_packet_time_ms_.store(get_monotonic_time_ms(), std::memory_order_relaxed);
     }
 }
@@ -285,22 +291,32 @@ void RaopRtp::data_loop() {
         if (n < 12) continue;
 
         uint8_t payload_type = buffer[1] & 0x7F;
+        uint8_t expected_pt = audio_payload_type_.load(std::memory_order_relaxed);
+
         // 💡 AirTunes/RAOP 音频包类型:
-        // 0x60 (96): 标准实时音频数据包
-        // 0x56 (86): 重传音频数据包 (带有额外 4 字节前导头)
-        // 0x54 (84): Sync 控制包 (非音频数据，直接忽略)
-        if (payload_type != 96 && payload_type != 86) {
+        // expected_pt / 96: 标准实时音频数据包 (ALAC 或动态 L16/PCM)
+        // 86: 重传音频数据包 (带有额外 4 字节前导头)
+        // 10: RFC 3551 标准静态 L16 双声道 PCM (常用于非 Apple Music / 视频第三方投屏)
+        if (payload_type != expected_pt && payload_type != 96 && payload_type != 86 && payload_type != 10) {
+            static uint32_t unknown_drop_count = 0;
+            if (unknown_drop_count++ % 100 == 0) {
+                LOGW("data_loop: 收到未知 payload_type=%u (期望=%u, 96, 86, 10), len=%zd, 忽略",
+                     payload_type, expected_pt, n);
+            }
             continue;
         }
 
-        // 💡 更新最近音频数据包时间戳，若此前处于暂停状态则即时唤醒恢复播放
+        // 💡 采样打印接收到的音频包，确保链路可观测
+        static uint32_t audio_pkt_count = 0;
+        uint32_t cur_cnt = audio_pkt_count++;
+        if (cur_cnt < 10 || cur_cnt % 500 == 0) {
+            LOGI("data_loop: 收到音频包 [%u] pt=%u, len=%zd, has_crypto=%d",
+                 cur_cnt, payload_type, n, has_crypto_.load(std::memory_order_relaxed));
+        }
+
+        // 💡 更新最近音频数据包时间戳供看门狗超时检测 (绝不可在此盲目唤醒播放，须待解码确定非静音后方可唤醒)
         uint64_t now_ms = get_monotonic_time_ms();
         last_audio_packet_time_ms_.store(now_ms, std::memory_order_relaxed);
-        if (is_stream_paused_.load(std::memory_order_relaxed)) {
-            is_stream_paused_.store(false, std::memory_order_release);
-            LOGI("▶️ 检测到 RTP 新音频包到达，通知上层流已恢复播放");
-            if (state_cb_) state_cb_(false);
-        }
 
         const uint8_t* pktp = buffer.data();
         ssize_t plen = n;
@@ -345,10 +361,11 @@ void RaopRtp::data_loop() {
         // 💡 AirPlay 1 规范要求:
         // 每个音频包独立初始化 CBC 向量 (使用 ANNOUNCE 协商的 aes_iv_)
         // 解密长度为 16 字节整倍数 (payload_len & ~0xf)，尾部余数保持明文拷贝
+        // 💡 针对 RFC 3551 L16 PCM (pt=10) 静态标准包，无需 AES 解密 (保持明文网络序传输)
         decrypted_payload.resize(payload_len);
         memcpy(decrypted_payload.data(), payload, payload_len);
 
-        if (has_crypto_.load(std::memory_order_acquire)) {
+        if (has_crypto_.load(std::memory_order_acquire) && payload_type != 10) {
             size_t aeslen = payload_len & ~0xf;
             if (aeslen > 0) {
                 uint8_t key[16];
@@ -370,17 +387,123 @@ void RaopRtp::data_loop() {
             }
         }
 
-        // 2. ALAC 实时无损解码为 16-bit 44.1kHz PCM (S16_LE)
+        // 2. 音频解码 / 转换处理
         size_t out_bytes = 0;
-        if (alac_decoder_.decode_frame(decrypted_payload.data(), payload_len, pcm_frame.data(), out_bytes)) {
-            if (out_bytes > 0) {
-                std::vector<uint8_t> pcm_copy(pcm_frame.data(), pcm_frame.data() + out_bytes);
-                jitter_buffer_.push(seq, ts, std::move(pcm_copy));
+        AudioCodec current_codec = audio_codec_.load(std::memory_order_acquire);
 
-                // 3. 将连续就绪的 PCM 帧出队并推入 SPSC 环形缓冲区
-                std::vector<uint8_t> ready_frame;
-                while (jitter_buffer_.pop(ready_frame)) {
-                    AudioEngine::instance().write_pcm(ready_frame.data(), ready_frame.size());
+        if (current_codec == AudioCodec::PCM || payload_type == 10) {
+            // 💡 L16 未压缩线性 PCM 处理:
+            // 遵循 RFC 3551 规范，L16 采样为 16-bit 有符号大端网络字节序 (Big-Endian)
+            // 需逐采样转换为本地架构 Little-Endian (S16_LE) 以便 AudioEngine 直通播放
+            size_t valid_bytes = payload_len & ~1;
+            if (valid_bytes > pcm_frame.size()) {
+                pcm_frame.resize(valid_bytes);
+            }
+            const uint8_t* src = decrypted_payload.data();
+            uint8_t* dst = pcm_frame.data();
+            for (size_t i = 0; i < valid_bytes; i += 2) {
+                dst[i] = src[i + 1];     // 低位
+                dst[i + 1] = src[i];     // 高位
+            }
+            out_bytes = valid_bytes;
+        } else {
+            // 💡 ALAC 实时无损解码为 16-bit 44.1kHz PCM (S16_LE)
+            if (!alac_decoder_.decode_frame(decrypted_payload.data(), payload_len, pcm_frame.data(), out_bytes)) {
+                static uint32_t alac_fail_cnt = 0;
+                if (alac_fail_cnt++ % 100 == 0) {
+                    LOGE("ALAC 解码单帧失败! payload_len=%zu, seq=%u, has_crypto=%d",
+                         payload_len, seq, has_crypto_.load(std::memory_order_relaxed));
+                }
+                out_bytes = 0;
+            }
+        }
+
+        if (out_bytes > 0) {
+            // 💡 打印短包 (如 44 字节静音或特定音频帧) 原始十六进制以供深度链路核验
+            if (n <= 64 && (cur_cnt % 500 == 0 || cur_cnt < 5)) {
+                char hex_buf[70] = {0};
+                for (size_t i = 0; i < std::min(payload_len, static_cast<size_t>(32)); ++i) {
+                    snprintf(hex_buf + i * 2, sizeof(hex_buf) - i * 2, "%02x", payload[i]);
+                }
+                LOGI("data_loop: 短音频包原始负载 [pkt=%u, len=%zu]: %s", cur_cnt, payload_len, hex_buf);
+            }
+
+            // 💡 全帧深度静音感知与诊断: 采用 64 位宽并行比对高速扫描整个 PCM 帧，确保 100% 全为零始判定为静音
+            bool is_silence = true;
+            const uint64_t* p64 = reinterpret_cast<const uint64_t*>(pcm_frame.data());
+            const size_t words64 = out_bytes / sizeof(uint64_t);
+            for (size_t i = 0; i < words64; ++i) {
+                if (p64[i] != 0ULL) {
+                    is_silence = false;
+                    break;
+                }
+            }
+            if (is_silence) {
+                for (size_t i = words64 * sizeof(uint64_t); i < out_bytes; ++i) {
+                    if (pcm_frame[i] != 0) {
+                        is_silence = false;
+                        break;
+                    }
+                }
+            }
+
+            if (is_silence) {
+                uint32_t sil_cnt = continuous_silence_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+                // 💡 关键双向同步: 连续 25 帧全静音 (~200ms) 说明 iPhone 处于暂停推流保活状态
+                if (sil_cnt >= 25 && !is_stream_paused_.load(std::memory_order_relaxed)) {
+                    is_stream_paused_.store(true, std::memory_order_release);
+                    LOGI("⏸️ 检测到连续静音保活帧 (iPhone 暂停推流)，同步 TV 端播放状态机为 PAUSED");
+                    if (state_cb_) state_cb_(true);
+                }
+                if (sil_cnt == 100 || sil_cnt % 1000 == 0) {
+                    float vol = current_volume_db_.load(std::memory_order_relaxed);
+                    LOGW("⚠️ ALAC/PCM 连续解码产出全静音帧 (已持续 %u 帧, 当前包长=%zd, 客户端音量=%.2f dB)",
+                         sil_cnt, n, vol);
+                }
+                // 💡 关键保护：静音保活帧绝不推入 JitterBuffer 和 AudioEngine 环形缓冲区！
+                // 避免在暂停期间以 125fps 持续将静音包塞满 RingBuffer 导致高水位丢包与恢复时的吞音延迟
+                continue;
+            } else {
+                uint32_t prev_sil_cnt = continuous_silence_count_.exchange(0, std::memory_order_relaxed);
+                if (prev_sil_cnt > 0) {
+                    LOGI("🔊 检测到有效音频信号恢复 (结束了连续 %u 帧静音)", prev_sil_cnt);
+                }
+
+                // 💡 关键双向同步与长暂停时钟基准重置:
+                // 1. 若此前处于暂停状态，显式调用 jitter_buffer_.reset()！
+                //    彻底解决当暂停时间较长 (例如 > 4.3 分钟 / 32768 包) 时，RTP 序列号差值溢出 int16_t 为负数，
+                //    导致恢复后的首个有效音频包被 JitterBuffer 误判为乱序过期包全部丢弃的严重吞音 Bug！
+                // 2. 刷新 AudioEngine 环形缓冲区，消除暂停前可能残留的旧声波断裂；
+                // 3. 恢复等时传输并同步 TV 端播放状态机为 PLAYING。
+                if (is_stream_paused_.load(std::memory_order_relaxed) && !is_manually_paused_.load(std::memory_order_relaxed)) {
+                    is_stream_paused_.store(false, std::memory_order_release);
+                    LOGI("▶️ 检测到有效音频信号 (iPhone 恢复推流)，重置 JitterBuffer 并同步 TV 端状态机为 PLAYING");
+                    jitter_buffer_.reset();
+                    AudioEngine::instance().flush_buffer();
+                    if (state_cb_) state_cb_(false);
+                }
+
+                // 💡 保证等时传输线程处于就绪状态，防止此前因为暂停而导致环形缓冲区积压饱和丢弃
+                if (AudioEngine::instance().is_paused()) {
+                    LOGI("▶️ 收到有效解码音频帧且 AudioEngine 处于暂停态，底层主动调用 resume_stream");
+                    AudioEngine::instance().resume_stream();
+                }
+            }
+
+            // 💡 若处于暂停态（例如手动暂停），丢弃音频帧防止在暂停期间灌满 RingBuffer
+            if (is_stream_paused_.load(std::memory_order_relaxed)) {
+                continue;
+            }
+
+            std::vector<uint8_t> pcm_copy(pcm_frame.data(), pcm_frame.data() + out_bytes);
+            jitter_buffer_.push(seq, ts, std::move(pcm_copy));
+
+            // 3. 将连续就绪的 PCM 帧出队并推入 SPSC 环形缓冲区
+            std::vector<uint8_t> ready_frame;
+            while (jitter_buffer_.pop(ready_frame)) {
+                int written = AudioEngine::instance().write_pcm(ready_frame.data(), ready_frame.size());
+                if (cur_cnt < 5) {
+                    LOGI("AudioEngine 写入首批 PCM 帧: bytes=%zu, ret=%d", ready_frame.size(), written);
                 }
             }
         }

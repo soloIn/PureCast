@@ -15,6 +15,7 @@ struct RaopStreamParams {
     int sample_rate{44100};
     int bit_depth{16};
     int channels{2};
+    std::string codec{"ALAC"};
     std::string aes_key_base64;
     std::string aes_iv_base64;
     std::string client_ip;
@@ -23,6 +24,7 @@ struct RaopStreamParams {
     std::string dacp_id;
     std::string active_remote_token;
     int dacp_port{0};
+    int payload_type{96};
     std::vector<int32_t> fmtp;
 };
 
@@ -77,6 +79,7 @@ private:
 
     RaopRtp rtp_;
     RaopStreamParams current_params_{};
+    std::atomic<float> current_volume_db_{0.0f};
 
     StreamRequestCallback stream_request_cb_{nullptr};
     StreamStopCallback stream_stop_cb_{nullptr};

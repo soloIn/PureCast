@@ -203,43 +203,26 @@ fun MainTvScreen(
                     val hasValidCover = metadata.coverBytes != null ||
                             (!uri.isNullOrEmpty() &&
                                     (uri.startsWith("http://", ignoreCase = true) || uri.startsWith("https://", ignoreCase = true)))
-                    var lastValidCover by remember { mutableStateOf<Any?>(null) }
+                    var persistentCover by remember { mutableStateOf<Any?>(null) }
 
-                    LaunchedEffect(hasValidCover, coverData) {
-                        if (!hasValidCover || coverData == null) {
-                            lastValidCover = null
+                    LaunchedEffect(hasValidCover, coverData, isPlaying) {
+                        if (hasValidCover && coverData != null) {
+                            persistentCover = coverData
+                        } else if (!isPlaying && coverData == null) {
+                            persistentCover = null
                         }
                     }
 
-                    if (hasValidCover && coverData != null) {
-                        Box(modifier = Modifier.fillMaxSize()) {
-                            // 💡 垫底保持上一首封面，防止新封面加载解码瞬间出现空白/闪烁
-                            if (lastValidCover != null && lastValidCover != coverData) {
-                                AsyncImage(
-                                    model = lastValidCover,
-                                    contentDescription = null,
-                                    contentScale = ContentScale.Crop,
-                                    modifier = Modifier.fillMaxSize()
-                                )
-                            }
-                            AsyncImage(
-                                model = ImageRequest.Builder(LocalContext.current)
-                                    .data(coverData)
-                                    .crossfade(300)
-                                    .listener(
-                                        onSuccess = { _, _ ->
-                                            lastValidCover = coverData
-                                        },
-                                        onError = { _, _ ->
-                                            lastValidCover = null
-                                        }
-                                    )
-                                    .build(),
-                                contentDescription = "Album Cover",
-                                contentScale = ContentScale.Crop,
-                                modifier = Modifier.fillMaxSize()
-                            )
-                        }
+                    if (persistentCover != null) {
+                        AsyncImage(
+                            model = ImageRequest.Builder(LocalContext.current)
+                                .data(persistentCover)
+                                .crossfade(false)
+                                .build(),
+                            contentDescription = "Album Cover",
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier.fillMaxSize()
+                        )
                     } else {
                         DefaultCoverCard(
                             isPlaying = isPlaying,
@@ -400,10 +383,11 @@ private fun IsolatedProgressBar(
     val coroutineScope = rememberCoroutineScope()
     var debounceJob by remember { mutableStateOf<Job?>(null) }
 
-    // 💡 只有在非用户拖拽寻道防抖期间，才接受 servicePositionMs 的覆盖
-    LaunchedEffect(servicePositionMs) {
+    // 💡 只有在非用户拖拽寻道防抖期间，才接受 servicePositionMs 的覆盖，并结合总时长安全钳位
+    LaunchedEffect(servicePositionMs, totalDurationMs) {
         if (!isScrubbing) {
-            seekPositionMs = servicePositionMs
+            val clamped = if (totalDurationMs > 0) servicePositionMs.coerceIn(0L, totalDurationMs) else servicePositionMs
+            seekPositionMs = clamped
         }
     }
 

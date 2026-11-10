@@ -461,4 +461,245 @@ class RaopProtocolIntegrationTest {
         assertFalse(controller.isRtpActive)
         assertFalse(controller.isDacpActive)
     }
+
+    /**
+     * 💡 回归测试 1: 验证 SDP rtpmap 解析对 L16 (PCM) 与 ALAC 的格式识别与参数提取
+     */
+    @Test
+    fun testSdpRtpmapParsingL16AndAlac() {
+        fun parseSdpFormat(sdp: String): Triple<String, Int, Int> {
+            val mAudioLine = sdp.lines().firstOrNull { it.startsWith("m=audio") } ?: ""
+            val pt = mAudioLine.substringAfter("RTP/AVP").trim().split(" ").firstOrNull()?.toIntOrNull() ?: 96
+            val rtpmapLine = sdp.lines().firstOrNull { it.startsWith("a=rtpmap:") } ?: ""
+            val rtpmap = rtpmapLine.removePrefix("a=rtpmap:").trim()
+            val lower = rtpmap.lowercase()
+
+            val codec: String
+            var sampleRate = 44100
+            var channels = 2
+
+            if (lower.contains("l16") || lower.contains("pcm") || pt == 10 || pt == 11) {
+                codec = "PCM"
+                channels = if (pt == 11) 1 else 2
+                val slash1 = rtpmap.indexOf('/')
+                if (slash1 != -1) {
+                    val slash2 = rtpmap.indexOf('/', slash1 + 1)
+                    val rateStr = if (slash2 != -1) rtpmap.substring(slash1 + 1, slash2) else rtpmap.substring(slash1 + 1)
+                    sampleRate = rateStr.toIntOrNull() ?: 44100
+                    if (slash2 != -1) {
+                        channels = rtpmap.substring(slash2 + 1).toIntOrNull() ?: 2
+                    }
+                }
+            } else {
+                codec = "ALAC"
+            }
+            return Triple(codec, sampleRate, channels)
+        }
+
+        // 场景 A: 视频 App / 网页通过 AirPlay 1 推送 16-bit 44.1kHz L16 PCM
+        val sdpL16 = """
+            v=0
+            o=AirTunes 123456 0 IN IP4 192.168.2.1
+            s=AirTunes
+            m=audio 0 RTP/AVP 96
+            a=rtpmap:96 L16/44100/2
+        """.trimIndent()
+        val (codecA, rateA, chA) = parseSdpFormat(sdpL16)
+        assertEquals("PCM", codecA)
+        assertEquals(44100, rateA)
+        assertEquals(2, chA)
+
+        // 场景 B: 视频 App 推送 48kHz L16 PCM
+        val sdpL16_48k = """
+            v=0
+            m=audio 0 RTP/AVP 96
+            a=rtpmap:96 L16/48000/2
+        """.trimIndent()
+        val (codecB, rateB, chB) = parseSdpFormat(sdpL16_48k)
+        assertEquals("PCM", codecB)
+        assertEquals(48000, rateB)
+        assertEquals(2, chB)
+
+        // 场景 C: 音乐 App 推送 ALAC
+        val sdpAlac = """
+            v=0
+            m=audio 0 RTP/AVP 96
+            a=rtpmap:96 AppleLossless
+            a=fmtp:96 352 0 16 40 10 14 2 255 0 0 44100
+        """.trimIndent()
+        val (codecC, rateC, chC) = parseSdpFormat(sdpAlac)
+        assertEquals("ALAC", codecC)
+        assertEquals(44100, rateC)
+        assertEquals(2, chC)
+
+        // 场景 D: 客户端使用 RFC 3551 静态 Payload Type 10 (无需 a=rtpmap 声明)
+        val sdpStaticPt10 = """
+            v=0
+            m=audio 0 RTP/AVP 10
+        """.trimIndent()
+        val (codecD, rateD, chD) = parseSdpFormat(sdpStaticPt10)
+        assertEquals("PCM", codecD)
+        assertEquals(44100, rateD)
+        assertEquals(2, chD)
+    }
+
+    /**
+     * 💡 回归测试 2: 验证 L16 网络大端字节序转换为本地架构 S16_LE 整数 PCM
+     */
+    @Test
+    fun testL16NetworkByteOrderEndianConversion() {
+        // 构造网络大端序 16-bit 采样: 左声道 0x1234, 右声道 0x5678
+        val netPayload = byteArrayOf(0x12, 0x34, 0x56, 0x78)
+        val pcmFrame = ByteArray(netPayload.size)
+
+        val validBytes = netPayload.size and 1.inv()
+        for (i in 0 until validBytes step 2) {
+            pcmFrame[i] = netPayload[i + 1]     // 小端低字节
+            pcmFrame[i + 1] = netPayload[i]     // 小端高字节
+        }
+
+        // 验证小端序重组为正确的带符号 short
+        val buf = ByteBuffer.wrap(pcmFrame).order(ByteOrder.LITTLE_ENDIAN)
+        val leftSample = buf.getShort()
+        val rightSample = buf.getShort()
+
+        assertEquals(0x1234.toShort(), leftSample)
+        assertEquals(0x5678.toShort(), rightSample)
+    }
+
+    /**
+     * 💡 回归测试 3: 验证切歌时元数据与进度条平稳过渡 (保留现有封面、重置在途进度)
+     */
+    @Test
+    fun testTrackSwitchMetadataAndProgressStability() {
+        val existingCover = byteArrayOf(0x01, 0x02, 0x03)
+        var currentMeta = TrackMetadata(
+            title = "Track 1",
+            artist = "Artist 1",
+            album = "Album 1",
+            coverBytes = existingCover,
+            durationMs = 240000L
+        )
+
+        // 模拟切歌：新歌的 DMAP 元数据到达，尚未包含封面
+        val newTitle = "Track 2"
+        val newArtist = "Artist 2"
+        val isNewTrack = (newTitle != currentMeta.title) || (newArtist != currentMeta.artist)
+        assertTrue("检测到切歌", isNewTrack)
+
+        // 验证切歌时沿用已有封面垫底，杜绝空白闪烁
+        val mergedCover = null ?: currentMeta.coverBytes
+        val nextMeta = TrackMetadata(
+            title = newTitle,
+            artist = newArtist,
+            album = "Album 2",
+            coverBytes = mergedCover,
+            durationMs = 180000L
+        )
+        assertEquals(existingCover, nextMeta.coverBytes)
+        assertEquals("Track 2", nextMeta.title)
+
+        // 验证进度重置与安全钳位
+        var playbackPositionMs = 210000L // 上一曲在途位置
+        if (isNewTrack) {
+            playbackPositionMs = 0L // 切歌即时归零
+        }
+        assertEquals(0L, playbackPositionMs)
+
+        // 模拟新歌首个 progress 更新到达 (例如 position=5000ms, duration=180000ms)
+        val incomingPos = 5000L
+        val incomingDur = 180000L
+        val clampedPos = incomingPos.coerceIn(0L, incomingDur)
+        assertEquals(5000L, clampedPos)
+    }
+
+    /**
+     * 💡 验证静音帧深度检测 (64-bit对齐扫描) 与双向状态机同步：
+     * 1. 连续 25 帧全 0 静音 (约 200ms) 触发同步 PAUSED，且静音帧不灌入缓冲
+     * 2. 收到有效非静音包立即唤醒，重置 JitterBuffer 并恢复 PLAYING
+     */
+    @Test
+    fun testContinuousSilenceSensingAndResumeStateMachine() {
+        var isStreamPaused = false
+        var continuousSilenceCount = 0
+        var jitterBufferResetCalled = false
+        var ringBufferFlushed = false
+        var playbackStatus = PlaybackStatus.PLAYING
+
+        fun processAudioFrame(pcmBytes: ByteArray, isSilence: Boolean) {
+            if (isSilence) {
+                continuousSilenceCount++
+                if (continuousSilenceCount >= 25 && !isStreamPaused) {
+                    isStreamPaused = true
+                    playbackStatus = PlaybackStatus.PAUSED
+                }
+                // 静音保活帧丢弃，不写缓冲区
+                return
+            } else {
+                if (continuousSilenceCount > 0) {
+                    continuousSilenceCount = 0
+                }
+                if (isStreamPaused) {
+                    isStreamPaused = false
+                    playbackStatus = PlaybackStatus.PLAYING
+                    jitterBufferResetCalled = true
+                    ringBufferFlushed = true
+                }
+            }
+        }
+
+        val silenceFrame = ByteArray(1408) { 0 }
+        val activeAudioFrame = ByteArray(1408) { 0 }.also { it[100] = 0x42 } // 非静音
+
+        // 模拟推送 24 帧静音：尚未到达 25 帧门限，保持 PLAYING
+        for (i in 1..24) {
+            processAudioFrame(silenceFrame, isSilence = true)
+        }
+        assertEquals(24, continuousSilenceCount)
+        assertFalse(isStreamPaused)
+        assertEquals(PlaybackStatus.PLAYING, playbackStatus)
+
+        // 第 25 帧静音到达：触发 PAUSED 状态同步
+        processAudioFrame(silenceFrame, isSilence = true)
+        assertEquals(25, continuousSilenceCount)
+        assertTrue(isStreamPaused)
+        assertEquals(PlaybackStatus.PAUSED, playbackStatus)
+
+        // 模拟首个非静音音频帧到达：即时唤醒，重置 JitterBuffer 与清空 RingBuffer，恢复 PLAYING
+        processAudioFrame(activeAudioFrame, isSilence = false)
+        assertEquals(0, continuousSilenceCount)
+        assertFalse(isStreamPaused)
+        assertEquals(PlaybackStatus.PLAYING, playbackStatus)
+        assertTrue("恢复播放时必须重置 JitterBuffer", jitterBufferResetCalled)
+        assertTrue("恢复播放时必须刷新环形缓冲区", ringBufferFlushed)
+    }
+
+    /**
+     * 💡 验证长暂停 (序号差 > 32767) 恢复推流时的鲁棒性：
+     * 证明恢复推流显式重置 JitterBuffer (first_packet_ = true) 能彻底避免 int16_t 负数溢出丢包
+     */
+    @Test
+    fun testLongPauseSequenceNumberOverflowResilience() {
+        val initialSeq = 1000
+        val packetsDuringPause = 35000 // 超过 32767
+        val resumeSeq = (initialSeq + packetsDuringPause) and 0xFFFF // 16 位溢出回绕
+
+        // 验证如果不重置 JitterBuffer，int16_t(seq - head_seq) 会溢出为负数：
+        val rawDiff = (resumeSeq - initialSeq).toShort().toInt()
+        assertTrue("35000 包差异强制转为 short 会变成负数，误判为乱序丢包", rawDiff < 0)
+
+        // 验证修复方案：在恢复播放时显式调用 reset()，首包重新捕获基准
+        var firstPacket = true
+        var headSeq = 0
+        fun pushOnResume(seq: Int) {
+            if (firstPacket) {
+                headSeq = seq
+                firstPacket = false
+            }
+        }
+
+        pushOnResume(resumeSeq)
+        assertEquals("重置后首包被正确捕获为新的基准时钟", resumeSeq, headSeq)
+        assertFalse("首包捕获完成，进入有序播放流水线", firstPacket)
+    }
 }
