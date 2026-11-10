@@ -33,6 +33,12 @@ static size_t safe_parse_content_length(const std::string& str) {
     }
 }
 
+static inline std::string to_lower_copy(std::string_view s) {
+    std::string res(s);
+    std::transform(res.begin(), res.end(), res.begin(), ::tolower);
+    return res;
+}
+
 RaopServer::RaopServer() {
     rtp_.set_stream_state_callback([this](bool is_paused) {
         if (is_paused) {
@@ -306,8 +312,7 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
 
         // 💡 2. 提取 SDP a=rtpmap 格式映射行 (例如 a=rtpmap:96 AppleLossless 或 a=rtpmap:96 L16/44100/2)
         std::string rtpmap_str = parse_sdp_attribute(request, "rtpmap");
-        std::string rtpmap_lower = rtpmap_str;
-        std::transform(rtpmap_lower.begin(), rtpmap_lower.end(), rtpmap_lower.begin(), ::tolower);
+        std::string rtpmap_lower = to_lower_copy(rtpmap_str);
 
         if (!rtpmap_str.empty()) {
             std::istringstream riss(rtpmap_str);
@@ -616,10 +621,8 @@ std::string RaopServer::parse_sdp_attribute(const std::string& sdp, const std::s
     size_t pos = sdp.find(target);
     if (pos == std::string::npos) {
         // 尝试大小写不敏感匹配
-        std::string sdp_lower = sdp;
-        std::string target_lower = target;
-        std::transform(sdp_lower.begin(), sdp_lower.end(), sdp_lower.begin(), ::tolower);
-        std::transform(target_lower.begin(), target_lower.end(), target_lower.begin(), ::tolower);
+        std::string sdp_lower = to_lower_copy(sdp);
+        std::string target_lower = to_lower_copy(target);
         pos = sdp_lower.find(target_lower);
         if (pos == std::string::npos) return "";
     }

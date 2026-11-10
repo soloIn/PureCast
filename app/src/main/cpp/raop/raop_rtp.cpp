@@ -103,6 +103,7 @@ bool RaopRtp::start(int& out_data_port, int& out_ctrl_port, int& out_timing_port
 
     is_running_.store(true, std::memory_order_release);
     jitter_buffer_.reset();
+    continuous_silence_count_.store(0, std::memory_order_relaxed);
 
     data_thread_ = std::thread(&RaopRtp::data_loop, this);
     ctrl_thread_ = std::thread(&RaopRtp::ctrl_loop, this);
@@ -146,6 +147,7 @@ void RaopRtp::stop() {
     }
 
     jitter_buffer_.reset();
+    continuous_silence_count_.store(0, std::memory_order_relaxed);
     first_data_seq_ = true;
     last_data_seq_ = 0;
     has_client_ctrl_.store(false, std::memory_order_release);
@@ -426,40 +428,58 @@ void RaopRtp::data_loop() {
                 LOGI("data_loop: 短音频包原始负载 [pkt=%u, len=%zu]: %s", cur_cnt, payload_len, hex_buf);
             }
 
-            // 💡 静音帧感知与诊断: 检查前 64 字节是否全部为 0
+            // 💡 全帧深度静音感知与诊断: 采用 64 位宽并行比对高速扫描整个 PCM 帧，确保 100% 全为零始判定为静音
             bool is_silence = true;
-            size_t check_len = std::min(out_bytes, static_cast<size_t>(64));
-            for (size_t i = 0; i < check_len; ++i) {
-                if (pcm_frame[i] != 0) {
+            const uint64_t* p64 = reinterpret_cast<const uint64_t*>(pcm_frame.data());
+            const size_t words64 = out_bytes / sizeof(uint64_t);
+            for (size_t i = 0; i < words64; ++i) {
+                if (p64[i] != 0ULL) {
                     is_silence = false;
                     break;
                 }
             }
-
-            static uint32_t continuous_silence_count = 0;
             if (is_silence) {
-                continuous_silence_count++;
+                for (size_t i = words64 * sizeof(uint64_t); i < out_bytes; ++i) {
+                    if (pcm_frame[i] != 0) {
+                        is_silence = false;
+                        break;
+                    }
+                }
+            }
+
+            if (is_silence) {
+                uint32_t sil_cnt = continuous_silence_count_.fetch_add(1, std::memory_order_relaxed) + 1;
                 // 💡 关键双向同步: 连续 25 帧全静音 (~200ms) 说明 iPhone 处于暂停推流保活状态
-                if (continuous_silence_count >= 25 && !is_stream_paused_.load(std::memory_order_relaxed)) {
+                if (sil_cnt >= 25 && !is_stream_paused_.load(std::memory_order_relaxed)) {
                     is_stream_paused_.store(true, std::memory_order_release);
                     LOGI("⏸️ 检测到连续静音保活帧 (iPhone 暂停推流)，同步 TV 端播放状态机为 PAUSED");
                     if (state_cb_) state_cb_(true);
                 }
-                if (continuous_silence_count == 100 || continuous_silence_count % 1000 == 0) {
+                if (sil_cnt == 100 || sil_cnt % 1000 == 0) {
                     float vol = current_volume_db_.load(std::memory_order_relaxed);
                     LOGW("⚠️ ALAC/PCM 连续解码产出全静音帧 (已持续 %u 帧, 当前包长=%zd, 客户端音量=%.2f dB)",
-                         continuous_silence_count, n, vol);
+                         sil_cnt, n, vol);
                 }
+                // 💡 关键保护：静音保活帧绝不推入 JitterBuffer 和 AudioEngine 环形缓冲区！
+                // 避免在暂停期间以 125fps 持续将静音包塞满 RingBuffer 导致高水位丢包与恢复时的吞音延迟
+                continue;
             } else {
-                if (continuous_silence_count > 0) {
-                    LOGI("🔊 检测到有效音频信号恢复 (结束了连续 %u 帧静音)", continuous_silence_count);
-                    continuous_silence_count = 0;
+                uint32_t prev_sil_cnt = continuous_silence_count_.exchange(0, std::memory_order_relaxed);
+                if (prev_sil_cnt > 0) {
+                    LOGI("🔊 检测到有效音频信号恢复 (结束了连续 %u 帧静音)", prev_sil_cnt);
                 }
 
-                // 💡 关键双向同步: 收到真正有声的非静音音频帧，立即同步 TV 端播放状态机为 PLAYING
+                // 💡 关键双向同步与长暂停时钟基准重置:
+                // 1. 若此前处于暂停状态，显式调用 jitter_buffer_.reset()！
+                //    彻底解决当暂停时间较长 (例如 > 4.3 分钟 / 32768 包) 时，RTP 序列号差值溢出 int16_t 为负数，
+                //    导致恢复后的首个有效音频包被 JitterBuffer 误判为乱序过期包全部丢弃的严重吞音 Bug！
+                // 2. 刷新 AudioEngine 环形缓冲区，消除暂停前可能残留的旧声波断裂；
+                // 3. 恢复等时传输并同步 TV 端播放状态机为 PLAYING。
                 if (is_stream_paused_.load(std::memory_order_relaxed) && !is_manually_paused_.load(std::memory_order_relaxed)) {
                     is_stream_paused_.store(false, std::memory_order_release);
-                    LOGI("▶️ 检测到有效音频信号 (iPhone 恢复推流)，同步 TV 端播放状态机为 PLAYING");
+                    LOGI("▶️ 检测到有效音频信号 (iPhone 恢复推流)，重置 JitterBuffer 并同步 TV 端状态机为 PLAYING");
+                    jitter_buffer_.reset();
+                    AudioEngine::instance().flush_buffer();
                     if (state_cb_) state_cb_(false);
                 }
 
@@ -468,6 +488,11 @@ void RaopRtp::data_loop() {
                     LOGI("▶️ 收到有效解码音频帧且 AudioEngine 处于暂停态，底层主动调用 resume_stream");
                     AudioEngine::instance().resume_stream();
                 }
+            }
+
+            // 💡 若处于暂停态（例如手动暂停），丢弃音频帧防止在暂停期间灌满 RingBuffer
+            if (is_stream_paused_.load(std::memory_order_relaxed)) {
+                continue;
             }
 
             std::vector<uint8_t> pcm_copy(pcm_frame.data(), pcm_frame.data() + out_bytes);

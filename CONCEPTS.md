@@ -61,3 +61,11 @@ A session management state in AirPlay 1 where transport-layer audio transmission
 ### DACP Reverse Wakeup
 A reverse-control workflow over Apple Digital Audio Control Protocol where a TV receiver sends HTTP media control commands (such as `play`) to an AirPlay sender whose audio transmission channel has been suspended, instructing the sender to re-establish RTSP SETUP and RECORD streaming to resume playback without user interaction on the mobile device.
 *Aliases: DACP 反控唤醒, 遥控反向建流*
+
+### Silence Keep-Alive Frame
+A continuous stream of fixed 44-byte ALAC packets (32-byte payload, decoding to 1408 bytes of zeros) transmitted at 125 fps by iOS CoreAudio during AirPlay 1 pause states or un-focused audio sessions to preserve UDP port NAT bindings and RTP clock synchronization without breaking the session. Receivers must discard these frames rather than queuing them into playback ring buffers to prevent buffer overrun and resume latency.
+*Aliases: 静音保活帧, 协议心跳帧*
+
+### Sequence Number Re-anchoring
+A resynchronization procedure in real-time UDP audio receivers where, following an extended pause exceeding the 16-bit sequence difference boundary ($2^{15} = 32768$ packets), the jitter buffer is explicitly reset upon the arrival of the first non-silent audio packet to establish a new monotonic sequence baseline (`first_packet_ = true`), preventing signed integer overflow (`int16_t` wrapping negative) from discarding valid incoming stream packets as out-of-order drops.
+*Aliases: 序号重锚定, 时钟基准重置*

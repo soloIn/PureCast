@@ -180,6 +180,7 @@ private:
     std::atomic<bool> is_stream_paused_{false};
     std::atomic<bool> is_manually_paused_{false};
     std::atomic<float> current_volume_db_{0.0f};
+    std::atomic<uint32_t> continuous_silence_count_{0};
 };
 
 } // namespace purecast::raop

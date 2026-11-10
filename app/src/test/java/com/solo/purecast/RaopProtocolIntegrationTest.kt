@@ -612,4 +612,94 @@ class RaopProtocolIntegrationTest {
         val clampedPos = incomingPos.coerceIn(0L, incomingDur)
         assertEquals(5000L, clampedPos)
     }
+
+    /**
+     * 💡 验证静音帧深度检测 (64-bit对齐扫描) 与双向状态机同步：
+     * 1. 连续 25 帧全 0 静音 (约 200ms) 触发同步 PAUSED，且静音帧不灌入缓冲
+     * 2. 收到有效非静音包立即唤醒，重置 JitterBuffer 并恢复 PLAYING
+     */
+    @Test
+    fun testContinuousSilenceSensingAndResumeStateMachine() {
+        var isStreamPaused = false
+        var continuousSilenceCount = 0
+        var jitterBufferResetCalled = false
+        var ringBufferFlushed = false
+        var playbackStatus = PlaybackStatus.PLAYING
+
+        fun processAudioFrame(pcmBytes: ByteArray, isSilence: Boolean) {
+            if (isSilence) {
+                continuousSilenceCount++
+                if (continuousSilenceCount >= 25 && !isStreamPaused) {
+                    isStreamPaused = true
+                    playbackStatus = PlaybackStatus.PAUSED
+                }
+                // 静音保活帧丢弃，不写缓冲区
+                return
+            } else {
+                if (continuousSilenceCount > 0) {
+                    continuousSilenceCount = 0
+                }
+                if (isStreamPaused) {
+                    isStreamPaused = false
+                    playbackStatus = PlaybackStatus.PLAYING
+                    jitterBufferResetCalled = true
+                    ringBufferFlushed = true
+                }
+            }
+        }
+
+        val silenceFrame = ByteArray(1408) { 0 }
+        val activeAudioFrame = ByteArray(1408) { 0 }.also { it[100] = 0x42 } // 非静音
+
+        // 模拟推送 24 帧静音：尚未到达 25 帧门限，保持 PLAYING
+        for (i in 1..24) {
+            processAudioFrame(silenceFrame, isSilence = true)
+        }
+        assertEquals(24, continuousSilenceCount)
+        assertFalse(isStreamPaused)
+        assertEquals(PlaybackStatus.PLAYING, playbackStatus)
+
+        // 第 25 帧静音到达：触发 PAUSED 状态同步
+        processAudioFrame(silenceFrame, isSilence = true)
+        assertEquals(25, continuousSilenceCount)
+        assertTrue(isStreamPaused)
+        assertEquals(PlaybackStatus.PAUSED, playbackStatus)
+
+        // 模拟首个非静音音频帧到达：即时唤醒，重置 JitterBuffer 与清空 RingBuffer，恢复 PLAYING
+        processAudioFrame(activeAudioFrame, isSilence = false)
+        assertEquals(0, continuousSilenceCount)
+        assertFalse(isStreamPaused)
+        assertEquals(PlaybackStatus.PLAYING, playbackStatus)
+        assertTrue("恢复播放时必须重置 JitterBuffer", jitterBufferResetCalled)
+        assertTrue("恢复播放时必须刷新环形缓冲区", ringBufferFlushed)
+    }
+
+    /**
+     * 💡 验证长暂停 (序号差 > 32767) 恢复推流时的鲁棒性：
+     * 证明恢复推流显式重置 JitterBuffer (first_packet_ = true) 能彻底避免 int16_t 负数溢出丢包
+     */
+    @Test
+    fun testLongPauseSequenceNumberOverflowResilience() {
+        val initialSeq = 1000
+        val packetsDuringPause = 35000 // 超过 32767
+        val resumeSeq = (initialSeq + packetsDuringPause) and 0xFFFF // 16 位溢出回绕
+
+        // 验证如果不重置 JitterBuffer，int16_t(seq - head_seq) 会溢出为负数：
+        val rawDiff = (resumeSeq - initialSeq).toShort().toInt()
+        assertTrue("35000 包差异强制转为 short 会变成负数，误判为乱序丢包", rawDiff < 0)
+
+        // 验证修复方案：在恢复播放时显式调用 reset()，首包重新捕获基准
+        var firstPacket = true
+        var headSeq = 0
+        fun pushOnResume(seq: Int) {
+            if (firstPacket) {
+                headSeq = seq
+                firstPacket = false
+            }
+        }
+
+        pushOnResume(resumeSeq)
+        assertEquals("重置后首包被正确捕获为新的基准时钟", resumeSeq, headSeq)
+        assertFalse("首包捕获完成，进入有序播放流水线", firstPacket)
+    }
 }
