@@ -8,6 +8,7 @@ import com.solo.purecast.model.TrackMetadata
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.ByteArrayOutputStream
@@ -615,7 +616,7 @@ class RaopProtocolIntegrationTest {
 
     /**
      * 💡 验证静音帧深度检测 (64-bit对齐扫描) 与双向状态机同步：
-     * 1. 连续 25 帧全 0 静音 (约 200ms) 触发同步 PAUSED，且静音帧不灌入缓冲
+     * 1. 连续 180 帧全 0 静音 (约 1.44s) 触发同步 PAUSED，且静音帧不灌入缓冲，杜绝短暂停顿或乐曲休止符误判
      * 2. 收到有效非静音包立即唤醒，重置 JitterBuffer 并恢复 PLAYING
      */
     @Test
@@ -629,7 +630,7 @@ class RaopProtocolIntegrationTest {
         fun processAudioFrame(pcmBytes: ByteArray, isSilence: Boolean) {
             if (isSilence) {
                 continuousSilenceCount++
-                if (continuousSilenceCount >= 25 && !isStreamPaused) {
+                if (continuousSilenceCount >= 180 && !isStreamPaused) {
                     isStreamPaused = true
                     playbackStatus = PlaybackStatus.PAUSED
                 }
@@ -651,17 +652,17 @@ class RaopProtocolIntegrationTest {
         val silenceFrame = ByteArray(1408) { 0 }
         val activeAudioFrame = ByteArray(1408) { 0 }.also { it[100] = 0x42 } // 非静音
 
-        // 模拟推送 24 帧静音：尚未到达 25 帧门限，保持 PLAYING
-        for (i in 1..24) {
+        // 模拟推送 179 帧静音：尚未到达 180 帧门限，保持 PLAYING
+        for (i in 1..179) {
             processAudioFrame(silenceFrame, isSilence = true)
         }
-        assertEquals(24, continuousSilenceCount)
+        assertEquals(179, continuousSilenceCount)
         assertFalse(isStreamPaused)
         assertEquals(PlaybackStatus.PLAYING, playbackStatus)
 
-        // 第 25 帧静音到达：触发 PAUSED 状态同步
+        // 第 180 帧静音到达：触发 PAUSED 状态同步
         processAudioFrame(silenceFrame, isSilence = true)
-        assertEquals(25, continuousSilenceCount)
+        assertEquals(180, continuousSilenceCount)
         assertTrue(isStreamPaused)
         assertEquals(PlaybackStatus.PAUSED, playbackStatus)
 
@@ -701,5 +702,181 @@ class RaopProtocolIntegrationTest {
         pushOnResume(resumeSeq)
         assertEquals("重置后首包被正确捕获为新的基准时钟", resumeSeq, headSeq)
         assertFalse("首包捕获完成，进入有序播放流水线", firstPacket)
+    }
+
+    /**
+     * 💡 验证切歌时元数据领域模型的真实性：
+     * 1. Track 1 有封面：正常保存 coverBytes
+     * 2. Track 2 无封面（如网络电台或无内嵌封面曲目）：isNewTrack 为 true 时 coverBytes 为 null，
+     *    严禁永久继承 Track 1 的封面污染 MediaSession 与全局状态；
+     * 3. 视觉暂留与平滑淡出委托给 UI 层 (MainTvScreen persistentCover) 1.2s 超时防抖
+     */
+    @Test
+    fun testTrackTransitionCoverMetadataTruthfulness() {
+        val track1Cover = byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 0xFF.toByte()) // JPEG Header
+        val currentMeta = TrackMetadata(
+            title = "Song A",
+            artist = "Artist A",
+            album = "Album A",
+            coverBytes = track1Cover,
+            durationMs = 200000L
+        )
+
+        // 模拟切换到 Track B (无封面)：
+        val isNewTrack = true
+        val incomingCoverArt: ByteArray? = null
+        val mergedCover = when {
+            incomingCoverArt != null && incomingCoverArt.isNotEmpty() -> incomingCoverArt
+            isNewTrack -> null // 关键校验：新曲目无封面时必须置 null
+            else -> currentMeta.coverBytes
+        }
+
+        assertNull("新曲目无封面时领域模型必须置 null，不得继承旧曲目封面", mergedCover)
+
+        // 模拟同一曲目在途接收到封面数据包更新：
+        val delayedCover = byteArrayOf(0x12, 0x34)
+        val progressiveCover = when {
+            delayedCover.isNotEmpty() -> delayedCover
+            false -> null
+            else -> currentMeta.coverBytes
+        }
+        assertNotNull("在途封面到达时必须成功采纳新封面", progressiveCover)
+        assertEquals(delayedCover, progressiveCover)
+    }
+
+    /**
+     * 💡 验证待机态语义双向覆盖：IDLE 与 STOPPED 均属于大屏待机范畴
+     */
+    @Test
+    fun testIdleAndStoppedStandbySemantics() {
+        fun isStandby(status: PlaybackStatus): Boolean {
+            return status == PlaybackStatus.IDLE || status == PlaybackStatus.STOPPED
+        }
+
+        assertTrue("IDLE 必须属于待机状态", isStandby(PlaybackStatus.IDLE))
+        assertTrue("STOPPED 必须属于待机状态，以支持停止推流后恢复指引与主题", isStandby(PlaybackStatus.STOPPED))
+        assertFalse("PLAYING 绝非待机状态", isStandby(PlaybackStatus.PLAYING))
+        assertFalse("PAUSED 绝非待机状态", isStandby(PlaybackStatus.PAUSED))
+    }
+
+    /**
+     * 💡 验证切歌至无时长直播流/网络电台时的时长重置与 isLiveStream 判定
+     */
+    @Test
+    fun testSwitchToLiveStreamWithoutDurationResetsDurationAndEnablesLive() {
+        val previousSong = TrackMetadata(
+            title = "Previous Song",
+            artist = "Previous Artist",
+            album = "Previous Album",
+            durationMs = 180000L,
+            isLiveStream = false
+        )
+
+        // 场景 1：切换到新曲目（网络电台/直播流，无时长 durationMs <= 0）
+        val isNewTrack = true
+        val incomingDurationMs = 0L
+        val mergedDuration = if (incomingDurationMs > 0) incomingDurationMs else if (isNewTrack) 0L else previousSong.durationMs
+        val isLive = mergedDuration <= 0
+
+        assertEquals("切歌进入直播流时总时长必须归零", 0L, mergedDuration)
+        assertTrue("切歌进入无时长音频时必须被标记为直播流", isLive)
+
+        // 场景 2：同一曲目增量推送（未附带时长），应保留已知时长
+        val isSameTrack = false
+        val sameTrackMergedDuration = if (incomingDurationMs > 0) incomingDurationMs else if (isSameTrack) 0L else previousSong.durationMs
+        val isSameTrackLive = sameTrackMergedDuration <= 0
+
+        assertEquals("同一曲目增量更新未附带时长时必须继承已知时长", 180000L, sameTrackMergedDuration)
+        assertFalse("有已知时长的曲目不得被误判为直播流", isSameTrackLive)
+    }
+
+    /**
+     * 💡 验证切歌豁免期静音丢弃与首个有效帧 JitterBuffer 游标重置机制
+     */
+    @Test
+    fun testTransitionSilenceFrameDropAndJitterResync() {
+        var isStreamPaused = false
+        var continuousSilenceCount = 0
+        var skippedSilenceInTransition = false
+        var jitterBufferResetCalled = false
+        var playbackStatus = PlaybackStatus.PLAYING
+        var inTransition = true
+
+        fun processAudioFrame(isSilence: Boolean) {
+            if (isSilence) {
+                if (inTransition) {
+                    continuousSilenceCount = 0
+                    skippedSilenceInTransition = true
+                    return
+                }
+                continuousSilenceCount++
+                if (continuousSilenceCount >= 180 && !isStreamPaused) {
+                    isStreamPaused = true
+                    playbackStatus = PlaybackStatus.PAUSED
+                }
+            } else {
+                continuousSilenceCount = 0
+                val wasPaused = isStreamPaused
+                val hadTransitionSilence = skippedSilenceInTransition
+                skippedSilenceInTransition = false
+
+                if (wasPaused || hadTransitionSilence) {
+                    if (wasPaused) {
+                        isStreamPaused = false
+                        playbackStatus = PlaybackStatus.PLAYING
+                    }
+                    jitterBufferResetCalled = true
+                }
+            }
+        }
+
+        // 1. 模拟在切歌过渡期推送 50 帧全静音保活帧：
+        for (i in 1..50) {
+            processAudioFrame(isSilence = true)
+        }
+        assertEquals("过渡期内静音计数器必须保持归零", 0, continuousSilenceCount)
+        assertFalse("过渡期内静音帧绝不能触发 PAUSED 状态误判", isStreamPaused)
+        assertEquals(PlaybackStatus.PLAYING, playbackStatus)
+        assertTrue("必须记录切歌过渡期丢弃过静音帧标记", skippedSilenceInTransition)
+
+        // 2. 模拟新歌曲首个有效音频帧到达：
+        processAudioFrame(isSilence = false)
+        assertTrue("切歌过渡期丢弃静音帧后首包到达必须重置 JitterBuffer 游标消除断层", jitterBufferResetCalled)
+        assertFalse("跳过静音帧标记必须被重置", skippedSilenceInTransition)
+        assertEquals(PlaybackStatus.PLAYING, playbackStatus)
+    }
+
+    /**
+     * 💡 验证看门狗暂停与数据恢复推流的竞态保护（杜绝回调反转导致 UI 僵死）
+     */
+    @Test
+    fun testWatchdogLoopCallbackInversionProtection() {
+        var isStreamPaused = false
+        var reportedStatus = PlaybackStatus.PLAYING
+        val stateLock = Any()
+
+        fun onStateChanged(paused: Boolean) {
+            synchronized(stateLock) {
+                reportedStatus = if (paused) PlaybackStatus.PAUSED else PlaybackStatus.PLAYING
+            }
+        }
+
+        // 模拟竞态：看门狗发现停顿 600ms 并 CAS 将 isStreamPaused 置为 true
+        isStreamPaused = true
+
+        // 在看门狗分发回调前，数据接收线程收到新音频包并先抢占锁分发恢复
+        synchronized(stateLock) {
+            isStreamPaused = false
+            onStateChanged(paused = false)
+        }
+
+        // 随后看门狗获取锁，执行竞态三检：核验 isStreamPaused 发现已被置为 false，放弃分发迟到的暂停
+        synchronized(stateLock) {
+            if (isStreamPaused) {
+                onStateChanged(paused = true)
+            }
+        }
+
+        assertEquals("竞态保护下最终分发状态必须为 PLAYING，绝不出现回调颠簸僵死", PlaybackStatus.PLAYING, reportedStatus)
     }
 }

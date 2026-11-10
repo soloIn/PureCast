@@ -18,6 +18,7 @@ internal class MacRenderer(private val context: Context, private val clock: MacC
     private class Program(vertex: String, fragment: String) {
         val id: Int
         private val locations = HashMap<String, Int>()
+        private val attrLocations = HashMap<String, Int>()
 
         init {
             val v = shader(GL.GL_VERTEX_SHADER, vertex)
@@ -43,7 +44,7 @@ internal class MacRenderer(private val context: Context, private val clock: MacC
         }
 
         fun location(n: String) = locations.getOrPut(n) { GL.glGetUniformLocation(id, n) }
-        fun attr(n: String) = GL.glGetAttribLocation(id, n)
+        fun attr(n: String) = attrLocations.getOrPut(n) { GL.glGetAttribLocation(id, n) }
         fun float(n: String, v: Float) = GL.glUniform1f(location(n), v)
         fun pair(n: String, x: Float, y: Float) = GL.glUniform2f(location(n), x, y)
         fun texture(n: String, t: Int, unit: Int = 0) {
@@ -212,13 +213,23 @@ internal class MacRenderer(private val context: Context, private val clock: MacC
         meshProgram.float("u_dark", 1f)
         meshProgram.float("u_luma", 0.5f)
         disableAttributes()
-        for ((name, offset) in listOf("a_texCoord" to 0, "a_from" to 2, "a_to" to 4)) {
-            val loc = meshProgram.attr(name)
-            if (loc >= 0) {
-                mesh.vertexBuffer.position(offset)
-                GL.glEnableVertexAttribArray(loc)
-                GL.glVertexAttribPointer(loc, 2, GL.GL_FLOAT, false, 24, mesh.vertexBuffer)
-            }
+        val texLoc = meshProgram.attr("a_texCoord")
+        if (texLoc >= 0) {
+            mesh.vertexBuffer.position(0)
+            GL.glEnableVertexAttribArray(texLoc)
+            GL.glVertexAttribPointer(texLoc, 2, GL.GL_FLOAT, false, 24, mesh.vertexBuffer)
+        }
+        val fromLoc = meshProgram.attr("a_from")
+        if (fromLoc >= 0) {
+            mesh.vertexBuffer.position(2)
+            GL.glEnableVertexAttribArray(fromLoc)
+            GL.glVertexAttribPointer(fromLoc, 2, GL.GL_FLOAT, false, 24, mesh.vertexBuffer)
+        }
+        val toLoc = meshProgram.attr("a_to")
+        if (toLoc >= 0) {
+            mesh.vertexBuffer.position(4)
+            GL.glEnableVertexAttribArray(toLoc)
+            GL.glVertexAttribPointer(toLoc, 2, GL.GL_FLOAT, false, 24, mesh.vertexBuffer)
         }
         mesh.indexBuffer.position(0)
         GL.glDrawElements(GL.GL_TRIANGLES, mesh.indices.size, GL.GL_UNSIGNED_SHORT, mesh.indexBuffer)
@@ -228,13 +239,17 @@ internal class MacRenderer(private val context: Context, private val clock: MacC
 
     private fun drawQuad(p: Program) {
         disableAttributes()
-        for ((name, offset) in listOf("a_position" to 0, "a_texCoord" to 2)) {
-            val loc = p.attr(name)
-            if (loc >= 0) {
-                quad.position(offset)
-                GL.glEnableVertexAttribArray(loc)
-                GL.glVertexAttribPointer(loc, 2, GL.GL_FLOAT, false, 16, quad)
-            }
+        val posLoc = p.attr("a_position")
+        if (posLoc >= 0) {
+            quad.position(0)
+            GL.glEnableVertexAttribArray(posLoc)
+            GL.glVertexAttribPointer(posLoc, 2, GL.GL_FLOAT, false, 16, quad)
+        }
+        val texLoc = p.attr("a_texCoord")
+        if (texLoc >= 0) {
+            quad.position(2)
+            GL.glEnableVertexAttribArray(texLoc)
+            GL.glVertexAttribPointer(texLoc, 2, GL.GL_FLOAT, false, 16, quad)
         }
         GL.glDrawArrays(GL.GL_TRIANGLES, 0, 6)
     }

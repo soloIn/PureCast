@@ -63,7 +63,7 @@ fun ProgressBarComponent(
     playbackStatus: PlaybackStatus = PlaybackStatus.IDLE,
     canSeek: Boolean = false
 ) {
-    val isIdle = playbackStatus == PlaybackStatus.IDLE
+    val isIdle = playbackStatus == PlaybackStatus.IDLE || playbackStatus == PlaybackStatus.STOPPED
     val canFocus = canSeek && !isLiveStream && totalDurationMs > 0L && !isIdle
     val isLivePlaying = playbackStatus == PlaybackStatus.PLAYING && (isLiveStream || totalDurationMs <= 0L)
     val interactionSource = remember { MutableInteractionSource() }

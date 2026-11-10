@@ -635,14 +635,17 @@ class PlaybackService : LifecycleService() {
             else -> "AirPlay 设备"
         }
         val mergedAlbum = if (album.isNotEmpty()) album else current.album
-        // 💡 换歌时若尚未收到新封面 (coverArt 为空)，切勿用上一首老歌封面污染新曲元数据！
-        // 只有在同一首歌曲的增量信息推送或新封面到达时，才执行合并
+        // 💡 模型真实性保证：换歌时若新曲目暂无封面（如无封面的网络电台/播客），模型层置 null，
+        // 视觉平滑过渡与旧封面暂留由 UI 层的 persistentCover 负责兜底并设置 1.2s 超时优雅清除。
         val mergedCover = when {
             coverArt != null && coverArt.isNotEmpty() -> coverArt
-            isNewTrack -> null // 新曲目尚未送达封面，置空等待原生图片包推送，UI 保持平滑过渡
+            isNewTrack -> null
             else -> current.coverBytes
         }
-        val mergedDuration = if (durationMs > 0) durationMs else current.durationMs
+        // 💡 换歌进入直播流/无时长电台保护：若为新曲目且 durationMs 未指定或 <= 0，
+        // 必须置 0 并判定为直播流 (isLiveStream = true)，绝不沿用上一曲固定时长导致状态误判
+        val mergedDuration = if (durationMs > 0) durationMs else if (isNewTrack) 0L else current.durationMs
+        val isLive = mergedDuration <= 0
 
         if (isNewTrack) {
             // 💡 换歌时重置在途进度并取消旧 Ticker，避免上一曲尾部时间戳引发进度条跳动
@@ -658,7 +661,7 @@ class PlaybackService : LifecycleService() {
             album = mergedAlbum,
             coverBytes = mergedCover,
             durationMs = mergedDuration,
-            isLiveStream = (mergedDuration <= 0)
+            isLiveStream = isLive
         )
         updateMetadata(meta)
     }

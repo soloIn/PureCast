@@ -122,6 +122,13 @@ public:
     void mark_paused_manually(bool paused);
 
     /**
+     * 💡 标记切歌或元数据过渡期（在若干毫秒内豁免静音暂停判定，防止切歌过渡期状态机颠簸）
+     */
+    void notify_track_transition(uint32_t grace_period_ms = 2500) {
+        track_transition_deadline_ms_.store(get_monotonic_time_ms() + grace_period_ms, std::memory_order_release);
+    }
+
+    /**
      * 💡 设置实时音量分贝 (单位 dB, -144.0 为静音, 0.0 为最大)
      */
     void set_volume(float vol_db) {
@@ -175,12 +182,15 @@ private:
     bool first_data_seq_{true};
 
     // 💡 音频推流无数据看门狗监测 (检测 iPhone 点击暂停停止推流)
+    std::mutex state_mutex_;
     StreamStateCallback state_cb_{nullptr};
     std::atomic<uint64_t> last_audio_packet_time_ms_{0};
     std::atomic<bool> is_stream_paused_{false};
     std::atomic<bool> is_manually_paused_{false};
     std::atomic<float> current_volume_db_{0.0f};
     std::atomic<uint32_t> continuous_silence_count_{0};
+    std::atomic<uint64_t> track_transition_deadline_ms_{0};
+    std::atomic<bool> skipped_silence_in_transition_{false};
 };
 
 } // namespace purecast::raop

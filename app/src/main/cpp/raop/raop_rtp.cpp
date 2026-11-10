@@ -229,14 +229,23 @@ void RaopRtp::watchdog_loop() {
         uint64_t last_time = last_audio_packet_time_ms_.load(std::memory_order_relaxed);
         if (last_time > 0 && !is_stream_paused_.load(std::memory_order_relaxed)) {
             uint64_t now = get_monotonic_time_ms();
-            if (now > last_time && (now - last_time) >= 600) {
+            bool in_transition = now < track_transition_deadline_ms_.load(std::memory_order_acquire);
+            if (!in_transition && now > last_time && (now - last_time) >= 600) {
                 // 💡 二次双检与原子 CAS 切换：确保在与新包到达的微秒级竞态中不产生状态颠簸
                 bool expected = false;
                 if (is_stream_paused_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
                     uint64_t recheck_time = last_audio_packet_time_ms_.load(std::memory_order_relaxed);
                     if (recheck_time == last_time) {
-                        LOGI("⚠️ 检测到 RTP 音频流停顿超 600ms (iPhone 暂停推流)，通知上层暂停");
-                        if (state_cb_) state_cb_(true);
+                        std::lock_guard<std::mutex> lock(state_mutex_);
+                        // 💡 竞态防抖三检：在获取锁后再次校验 is_stream_paused_
+                        // 杜绝在 CAS 与分发回调的微秒级窗口内，data_loop 收到新包将其置为 false 并派发了恢复回调，
+                        // 导致回调顺序颠倒（先分发恢复后分发暂停）将 UI 永久置于 PAUSED 僵死态
+                        if (is_stream_paused_.load(std::memory_order_acquire)) {
+                            LOGI("⚠️ 检测到 RTP 音频流停顿超 600ms (iPhone 暂停推流)，通知上层暂停");
+                            if (state_cb_) state_cb_(true);
+                        } else {
+                            LOGI("🔄 监测到 data_loop 已在临界区恢复推流，放弃分发迟到的暂停回调");
+                        }
                     } else {
                         // 在 CAS 切换瞬间新数据包到达并更新了时间戳，撤销暂停标记
                         is_stream_paused_.store(false, std::memory_order_release);
@@ -257,6 +266,8 @@ void RaopRtp::mark_paused_manually(bool paused) {
         LOGI("收到手动标记恢复指令 (RTSP RECORD)");
         last_audio_packet_time_ms_.store(get_monotonic_time_ms(), std::memory_order_relaxed);
     }
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    if (state_cb_) state_cb_(paused);
 }
 
 uint64_t RaopRtp::get_ntp_timestamp() {
@@ -448,14 +459,23 @@ void RaopRtp::data_loop() {
             }
 
             if (is_silence) {
+                // 💡 关键双向同步防抖: 在切歌豁免期内忽略静音判定并重置计数，防止切歌期间累计的静音帧在豁免期结束后立即突发误判为 PAUSED
+                bool in_transition = get_monotonic_time_ms() < track_transition_deadline_ms_.load(std::memory_order_acquire);
+                if (in_transition) {
+                    continuous_silence_count_.store(0, std::memory_order_relaxed);
+                    skipped_silence_in_transition_.store(true, std::memory_order_relaxed);
+                    continue;
+                }
                 uint32_t sil_cnt = continuous_silence_count_.fetch_add(1, std::memory_order_relaxed) + 1;
-                // 💡 关键双向同步: 连续 25 帧全静音 (~200ms) 说明 iPhone 处于暂停推流保活状态
-                if (sil_cnt >= 25 && !is_stream_paused_.load(std::memory_order_relaxed)) {
+                // 门限由 25 帧提高至 180 帧 (~1.44 秒)
+                // 彻底杜绝音乐中的自然休止符、前奏淡入、网络瞬间微抖动误触发 PAUSED 导致的大屏闪烁与焦点抢占
+                if (sil_cnt >= 180 && !is_stream_paused_.load(std::memory_order_relaxed)) {
                     is_stream_paused_.store(true, std::memory_order_release);
-                    LOGI("⏸️ 检测到连续静音保活帧 (iPhone 暂停推流)，同步 TV 端播放状态机为 PAUSED");
+                    LOGI("⏸️ 检测到连续静音保活帧 (持续 %u 帧 ~1.44s，iPhone 暂停推流)，同步 TV 端播放状态机为 PAUSED", sil_cnt);
+                    std::lock_guard<std::mutex> lock(state_mutex_);
                     if (state_cb_) state_cb_(true);
                 }
-                if (sil_cnt == 100 || sil_cnt % 1000 == 0) {
+                if (sil_cnt == 200 || sil_cnt % 1000 == 0) {
                     float vol = current_volume_db_.load(std::memory_order_relaxed);
                     LOGW("⚠️ ALAC/PCM 连续解码产出全静音帧 (已持续 %u 帧, 当前包长=%zd, 客户端音量=%.2f dB)",
                          sil_cnt, n, vol);
@@ -469,18 +489,29 @@ void RaopRtp::data_loop() {
                     LOGI("🔊 检测到有效音频信号恢复 (结束了连续 %u 帧静音)", prev_sil_cnt);
                 }
 
-                // 💡 关键双向同步与长暂停时钟基准重置:
-                // 1. 若此前处于暂停状态，显式调用 jitter_buffer_.reset()！
-                //    彻底解决当暂停时间较长 (例如 > 4.3 分钟 / 32768 包) 时，RTP 序列号差值溢出 int16_t 为负数，
-                //    导致恢复后的首个有效音频包被 JitterBuffer 误判为乱序过期包全部丢弃的严重吞音 Bug！
-                // 2. 刷新 AudioEngine 环形缓冲区，消除暂停前可能残留的旧声波断裂；
-                // 3. 恢复等时传输并同步 TV 端播放状态机为 PLAYING。
-                if (is_stream_paused_.load(std::memory_order_relaxed) && !is_manually_paused_.load(std::memory_order_relaxed)) {
-                    is_stream_paused_.store(false, std::memory_order_release);
-                    LOGI("▶️ 检测到有效音频信号 (iPhone 恢复推流)，重置 JitterBuffer 并同步 TV 端状态机为 PLAYING");
+                // 💡 关键时钟基准重置与状态同步：
+                // 1. 若此前处于暂停状态，或者切歌过渡期丢弃了静音帧导致序列号断层 (skipped_silence_in_transition_)，
+                //    显式调用 jitter_buffer_.reset()！
+                //    彻底消除过渡期丢包补偿 (密集生成全 0 静音帧) 造成的切歌卡顿与延迟，并消除长暂停 RTP 序列号回环吞音 Bug！
+                // 2. 刷新 AudioEngine 环形缓冲区，消除残留声波断裂；
+                // 3. 恢复等时传输并通过 state_mutex_ 串行化同步 TV 端播放状态机为 PLAYING。
+                bool was_paused = is_stream_paused_.load(std::memory_order_relaxed) && !is_manually_paused_.load(std::memory_order_relaxed);
+                bool had_transition_silence = skipped_silence_in_transition_.exchange(false, std::memory_order_acq_rel);
+
+                if (was_paused || had_transition_silence) {
+                    if (was_paused) {
+                        is_stream_paused_.store(false, std::memory_order_release);
+                        LOGI("▶️ 检测到有效音频信号 (iPhone 恢复推流)，重置 JitterBuffer 并同步 TV 端状态机为 PLAYING");
+                    }
+                    if (had_transition_silence) {
+                        LOGI("🔄 切歌过渡期丢弃静音帧后首个有效音频帧到达，重置 JitterBuffer 游标消除序列号断层");
+                    }
                     jitter_buffer_.reset();
                     AudioEngine::instance().flush_buffer();
-                    if (state_cb_) state_cb_(false);
+                    if (was_paused) {
+                        std::lock_guard<std::mutex> lock(state_mutex_);
+                        if (state_cb_) state_cb_(false);
+                    }
                 }
 
                 // 💡 保证等时传输线程处于就绪状态，防止此前因为暂停而导致环形缓冲区积压饱和丢弃

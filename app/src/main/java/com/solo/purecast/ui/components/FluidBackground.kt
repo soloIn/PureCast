@@ -14,6 +14,7 @@ import com.solo.purecast.ui.background.MacBackground
 fun FluidBackground(
     coverData: Any? = null,
     isPlaying: Boolean = true,
+    isIdle: Boolean = false,
     quality: FluidQuality = FluidQuality.STANDARD,
     primaryColor: Color = Color(0xFF1E2A38),
     secondaryColor: Color = Color(0xFF141A29),
@@ -23,6 +24,7 @@ fun FluidBackground(
         coverData = coverData,
         quality = quality,
         playing = isPlaying,
+        isIdle = isIdle,
         modifier = modifier
     )
 }

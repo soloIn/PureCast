@@ -482,7 +482,8 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
             size_t payload_len = request.size() - (header_end + 4);
 
             if (content_type.find("application/x-dmap-tagged") != std::string::npos) {
-                // 💡 1. 结构化 DMAP 元数据解析 (歌名、艺术家、专辑)
+                // 💡 1. 结构化 DMAP 元数据解析 (歌名、艺术家、专辑)，激活切歌过渡静音豁免
+                rtp_.notify_track_transition(2500);
                 DmapMetadata dmap;
                 if (DmapParser::parse(payload, payload_len, dmap)) {
                     if (metadata_cb_) {
@@ -490,7 +491,8 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
                     }
                 }
             } else if (content_type.find("image/") != std::string::npos) {
-                // 💡 2. 封面图片推送 (JPEG/PNG 原始二进制，杜绝送入 DMAP 解析器被误丢弃)
+                // 💡 2. 封面图片推送 (JPEG/PNG 原始二进制，杜绝送入 DMAP 解析器被误丢弃)，激活过渡静音豁免
+                rtp_.notify_track_transition(2500);
                 if (content_type.find("image/none") == std::string::npos && payload_len > 0) {
                     std::vector<uint8_t> cover_art(payload, payload + payload_len);
                     LOGI("SET_PARAMETER 收到原生封面图片推送: %s, 字节数=%zu", content_type.c_str(), payload_len);

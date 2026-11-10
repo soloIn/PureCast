@@ -56,7 +56,7 @@ fun PlaybackControls(
     settingsFocusRequester: FocusRequester? = null
 ) {
     val isPlaying = playbackStatus == PlaybackStatus.PLAYING
-    val isIdle = playbackStatus == PlaybackStatus.IDLE
+    val isIdle = playbackStatus == PlaybackStatus.IDLE || playbackStatus == PlaybackStatus.STOPPED
     val transportButtonsEnabled = !isIdle
 
     Row(

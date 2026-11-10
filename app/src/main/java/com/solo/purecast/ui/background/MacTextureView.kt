@@ -35,7 +35,6 @@ internal class MacTextureView(
     @Volatile private var surfaceGeneration = 0
     @Volatile private var surfaceWidth = 1
     @Volatile private var surfaceHeight = 1
-    private var recheckAfterLayerUpdate = true
     private var worker: Worker? = null
 
     init {
@@ -58,9 +57,8 @@ internal class MacTextureView(
     }
 
     private fun requestOutputRecovery() {
-        recheckAfterLayerUpdate = true
+        // 💡 仅递增 generation 以在待机恢复/HDMI切源时促使 EGLSurface 重建，绝不将 alpha 置 0 导致黑闪
         surfaceGeneration++
-        alpha = 0f
         worker?.wake()
     }
 
@@ -86,8 +84,6 @@ internal class MacTextureView(
         }
         surfaceWidth = width
         surfaceHeight = height
-        recheckAfterLayerUpdate = true
-        alpha = 0f
         worker = Worker(texture).also { it.start() }
     }
 
@@ -106,14 +102,10 @@ internal class MacTextureView(
     }
 
     override fun onSurfaceTextureUpdated(texture: SurfaceTexture) {
-        if (!closed && active && recheckAfterLayerUpdate) {
-            recheckAfterLayerUpdate = false
-            surfaceGeneration++
-            alpha = 0f
-            worker?.wake()
-            return
+        // 💡 首帧就绪保护：首帧渲染成功后点亮 alpha 至 1.0f，此后恒定保持可见，杜绝 alpha 震荡闪屏
+        if (!closed && alpha != 1f && worker?.visibleFrame == true) {
+            alpha = 1f
         }
-        if (!closed) alpha = if (worker?.visibleFrame == true) 1f else 0f
     }
 
     private inner class Worker(private val texture: SurfaceTexture) {
@@ -231,14 +223,17 @@ internal class MacTextureView(
                 if (reportedQuality != state.quality) {
                     reportedQuality = state.quality
                 }
-                if (!EGL14.eglSwapBuffers(display, eglSurface)) {
-                    val eglError = EGL14.eglGetError()
-                    if (eglError == 0x300E && contextRestarts++ == 0) {
-                        Logger.ui.w("MacTextureView", "EGL 上下文丢失，重建中...")
-                        destroyEgl()
-                        createEgl()
-                    } else {
-                        error("EGL 交换缓冲失败: 0x${eglError.toString(16)}")
+                // 💡 仅在成功完成有效帧渲染时才交换缓冲区，避免未就绪时向大屏输出黑底或残留帧
+                if (visibleFrame) {
+                    if (!EGL14.eglSwapBuffers(display, eglSurface)) {
+                        val eglError = EGL14.eglGetError()
+                        if (eglError == 0x300E && contextRestarts++ == 0) {
+                            Logger.ui.w("MacTextureView", "EGL 上下文丢失，重建中...")
+                            destroyEgl()
+                            createEgl()
+                        } else {
+                            error("EGL 交换缓冲失败: 0x${eglError.toString(16)}")
+                        }
                     }
                 }
             } catch (e: Exception) {

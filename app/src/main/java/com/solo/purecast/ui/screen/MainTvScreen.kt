@@ -1,7 +1,9 @@
 package com.solo.purecast.ui.screen
 
+import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -61,6 +63,7 @@ import com.solo.purecast.util.PermissionHelper
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlin.math.roundToInt
 import kotlin.math.sin
 
 /**
@@ -97,7 +100,7 @@ fun MainTvScreen(
     val settingsFocusRequester = remember { FocusRequester() }
 
     // ==========================================
-    // 1. OLED 防烧屏引擎: 微像素正弦平移 (每 10 秒平滑微移 2~3 像素)
+    // 1. OLED 防烧屏引擎: 微像素平滑微移 (每 10 秒平滑移动 2~3 像素，3秒线性插值杜绝生硬抽动)
     // ==========================================
     var pixelShiftX by remember { mutableFloatStateOf(0f) }
     var pixelShiftY by remember { mutableFloatStateOf(0f) }
@@ -112,13 +115,30 @@ fun MainTvScreen(
         }
     }
 
-    // 💡 焦点路由：待机空闲态聚焦在“设置”按钮；播放态聚焦在“播放/暂停”主按钮
+    val animatedShiftX by animateFloatAsState(
+        targetValue = pixelShiftX,
+        animationSpec = tween(durationMillis = 3000, easing = LinearEasing),
+        label = "pixelShiftXAnim"
+    )
+    val animatedShiftY by animateFloatAsState(
+        targetValue = pixelShiftY,
+        animationSpec = tween(durationMillis = 3000, easing = LinearEasing),
+        label = "pixelShiftYAnim"
+    )
+
+    // 💡 焦点路由：从待机空闲 (IDLE) 首次进入活跃播放时，自动聚焦到“播放/暂停”；
+    // 在切歌、暂停、恢复期间，严格保留用户遥控器当前选中的按钮（如“下一曲”），绝不强行夺焦！
+    var hasAutoFocusedOnPlay by remember { mutableStateOf(false) }
+
     LaunchedEffect(playbackStatus) {
-        delay(200)
         try {
-            if (playbackStatus == PlaybackStatus.IDLE) {
+            if (playbackStatus == PlaybackStatus.IDLE || playbackStatus == PlaybackStatus.STOPPED) {
+                hasAutoFocusedOnPlay = false
+                delay(200)
                 settingsFocusRequester.requestFocus()
-            } else {
+            } else if (!hasAutoFocusedOnPlay) {
+                hasAutoFocusedOnPlay = true
+                delay(200)
                 playPauseFocusRequester.requestFocus()
             }
         } catch (_: Exception) {}
@@ -129,9 +149,12 @@ fun MainTvScreen(
     // ==========================================
     val coverData: Any? = metadata.coverBytes ?: metadata.coverUri
     val isPlaying = playbackStatus == PlaybackStatus.PLAYING
+    val isIdle = playbackStatus == PlaybackStatus.IDLE || playbackStatus == PlaybackStatus.STOPPED
     val hasActiveCover = coverData != null
-    // 💡 视觉上下文：推流时始终为动态彩色暗场，待机时完整自适应深/浅色模式
-    val hasDarkBackground = hasActiveCover || AppPalette.isDark
+
+    // 💡 视觉色彩稳定性：推流活跃期间始终呈现全屏暗场流光，控件与进度条恒定保持纯净高亮白；
+    // 仅在完全待机 (IDLE) 时才跟随系统深浅色切换，彻底杜绝切歌瞬间黑白颜色闪烁颠簸
+    val hasDarkBackground = !isIdle || hasActiveCover || AppPalette.isDark
 
     // 封面放大弹簧动画
     val coverScale by animateFloatAsState(
@@ -152,6 +175,7 @@ fun MainTvScreen(
         FluidBackground(
             coverData = coverData,
             isPlaying = isPlaying,
+            isIdle = isIdle,
             quality = fluidQuality
         )
 
@@ -168,7 +192,7 @@ fun MainTvScreen(
         Row(
             modifier = Modifier
                 .fillMaxSize()
-                .offset { IntOffset(pixelShiftX.toInt(), pixelShiftY.toInt()) }
+                .offset { IntOffset(animatedShiftX.roundToInt(), animatedShiftY.roundToInt()) }
                 .padding(horizontal = 72.dp, vertical = 48.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
@@ -205,11 +229,18 @@ fun MainTvScreen(
                                     (uri.startsWith("http://", ignoreCase = true) || uri.startsWith("https://", ignoreCase = true)))
                     var persistentCover by remember { mutableStateOf<Any?>(null) }
 
-                    LaunchedEffect(hasValidCover, coverData, isPlaying) {
-                        if (hasValidCover && coverData != null) {
-                            persistentCover = coverData
-                        } else if (!isPlaying && coverData == null) {
+                    // 💡 封面占位保护：只有在完全空闲 (IDLE/STOPPED) 且无封面时才清空；
+                    // 切歌期间若新曲目暂无封面（如无封面电台/播客），保留上一曲封面 1.2s 防抖，若持续无封面则优雅清除过渡到默认占位
+                    LaunchedEffect(metadata.title, metadata.artist, hasValidCover, coverData, isIdle) {
+                        if (isIdle) {
                             persistentCover = null
+                        } else if (hasValidCover && coverData != null) {
+                            persistentCover = coverData
+                        } else {
+                            delay(1200)
+                            if (!hasValidCover && coverData == null) {
+                                persistentCover = null
+                            }
                         }
                     }
 
@@ -217,7 +248,7 @@ fun MainTvScreen(
                         AsyncImage(
                             model = ImageRequest.Builder(LocalContext.current)
                                 .data(persistentCover)
-                                .crossfade(false)
+                                .crossfade(300)
                                 .build(),
                             contentDescription = "Album Cover",
                             contentScale = ContentScale.Crop,
@@ -265,7 +296,7 @@ fun MainTvScreen(
 
                 Spacer(modifier = Modifier.height(20.dp))
 
-                val isIdle = playbackStatus == PlaybackStatus.IDLE
+                val isIdle = playbackStatus == PlaybackStatus.IDLE || playbackStatus == PlaybackStatus.STOPPED
                 val displayTitle = if (isIdle) "等待音频投屏接入" else metadata.title
 
                 // 歌曲标题：推流时纯白高亮，待机浅色时纯黑；平滑跑马灯永不截断
