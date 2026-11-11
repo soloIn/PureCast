@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstddef>
+#include <cstdlib>
 #include <vector>
 #include <cstring>
 #include <algorithm>
@@ -110,10 +111,10 @@ public:
     }
 
     /**
-     * 清空缓冲区（用于暂停、切歌或 Seek 重置）
+     * 清空缓冲区（仅允许在消费线程或无在途 URB 的安全边界调用）
      */
     void clear() {
-        const size_t head = head_.load(std::memory_order_relaxed);
+        const size_t head = head_.load(std::memory_order_acquire);
         tail_.store(head, std::memory_order_release);
     }
 
@@ -122,7 +123,7 @@ public:
      */
     [[nodiscard]] size_t available_read() const {
         const size_t head = head_.load(std::memory_order_acquire);
-        const size_t tail = tail_.load(std::memory_order_relaxed);
+        const size_t tail = tail_.load(std::memory_order_acquire);
         return head - tail;
     }
 

@@ -46,11 +46,37 @@ object NativeAudioEngine {
     ): Int
 
     /**
-     * 向无锁 SPSC 环形缓冲区写入原始 PCM 数据包
-     * @param data PCM 字节数组
-     * @param offset 偏移量
-     * @param length 写入长度
-     * @return 实际写入的字节数，负数表示缓冲区异常
+     * 💡 UAC 原位三元组切频与安全回滚
+     * 严禁在上层暴露 altSetting，由 Native 内部通过 parse_audio_descriptors 匹配
+     * @return 成功返回新激活的 buffer_epoch (>= 1L)，失败返回负错误码
+     */
+    external fun reconfigureAudioFormat(
+        sampleRate: Int,
+        bitDepth: Int,
+        channels: Int
+    ): Long
+
+    /**
+     * 💡 无锁硬件快路径：按 FlushReason 立即静音保活并可选递增 epoch 排空旧流
+     * @param reason 0=EXPLICIT_PAUSE, 1=FLUSH_SWITCH, 2=STOP_OR_TEARDOWN, 3=PREEMPT
+     * @return 最新有效的 buffer_epoch (>= 1L)
+     */
+    external fun emergencyMuteAndFlush(reason: Int): Long
+
+    /**
+     * 获取当前活跃的无锁环形缓冲区世代 (Epoch)
+     */
+    external fun getCurrentBufferEpoch(): Long
+
+    /**
+     * 💡 带世代防串扰与消费追平门闩的 PCM 直通写入
+     * @param expectedEpoch 切频/开流时获取的世代令牌
+     * @return >0 实际写入字节，0 整包满载丢弃，负数表示停止/过期/超时错误
+     */
+    external fun writePcm(data: ByteArray, offset: Int, length: Int, expectedEpoch: Long): Int
+
+    /**
+     * 向无锁 SPSC 环形缓冲区写入原始 PCM 数据包 (过渡期兼容重载，将在 U3 迁移完成后移除)
      */
     external fun writePcm(data: ByteArray, offset: Int, length: Int): Int
 

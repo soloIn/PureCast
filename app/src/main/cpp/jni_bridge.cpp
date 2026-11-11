@@ -327,14 +327,80 @@ Java_com_solo_purecast_core_nativebridge_NativeAudioEngine_openDevice(
     return purecast::AudioEngine::instance().open_device(fd, sample_rate, bit_depth, channels);
 }
 
+JNIEXPORT jlong JNICALL
+Java_com_solo_purecast_core_nativebridge_NativeAudioEngine_reconfigureAudioFormat(
+    JNIEnv * /* env */,
+    jobject /* thiz */,
+    jint sample_rate,
+    jint bit_depth,
+    jint channels) {
+    return static_cast<jlong>(
+        purecast::AudioEngine::instance().reconfigure_audio_format(sample_rate, bit_depth, channels)
+    );
+}
+
+JNIEXPORT jlong JNICALL
+Java_com_solo_purecast_core_nativebridge_NativeAudioEngine_emergencyMuteAndFlush(
+    JNIEnv * /* env */,
+    jobject /* thiz */,
+    jint reason) {
+    auto flush_reason = purecast::FlushReason::FLUSH_SWITCH;
+    switch (reason) {
+        case 0: flush_reason = purecast::FlushReason::EXPLICIT_PAUSE; break;
+        case 1: flush_reason = purecast::FlushReason::FLUSH_SWITCH; break;
+        case 2: flush_reason = purecast::FlushReason::STOP_OR_TEARDOWN; break;
+        case 3: flush_reason = purecast::FlushReason::PREEMPT; break;
+        default: flush_reason = purecast::FlushReason::FLUSH_SWITCH; break;
+    }
+    return static_cast<jlong>(
+        purecast::AudioEngine::instance().emergency_mute_and_flush(flush_reason)
+    );
+}
+
+JNIEXPORT jlong JNICALL
+Java_com_solo_purecast_core_nativebridge_NativeAudioEngine_getCurrentBufferEpoch(
+    JNIEnv * /* env */,
+    jobject /* thiz */) {
+    return static_cast<jlong>(
+        purecast::AudioEngine::instance().get_current_buffer_epoch()
+    );
+}
+
 JNIEXPORT jint JNICALL
-Java_com_solo_purecast_core_nativebridge_NativeAudioEngine_writePcm(
+Java_com_solo_purecast_core_nativebridge_NativeAudioEngine_writePcm___3BIIJ(
+    JNIEnv *env,
+    jobject /* thiz */,
+    jbyteArray data,
+    jint offset,
+    jint length,
+    jlong expected_epoch) {
+    if (!data || length <= 0 || offset < 0) return 0;
+    const jsize arr_len = env->GetArrayLength(data);
+    if (offset > arr_len || length > arr_len - offset) return -22;
+
+    jbyte* bytes = env->GetByteArrayElements(data, nullptr);
+    if (!bytes) return -1;
+
+    int written = purecast::AudioEngine::instance().write_pcm(
+        reinterpret_cast<const uint8_t*>(bytes + offset),
+        static_cast<size_t>(length),
+        expected_epoch > 0 ? static_cast<uint64_t>(expected_epoch) : 0ULL
+    );
+
+    env->ReleaseByteArrayElements(data, bytes, JNI_ABORT);
+    return written;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_solo_purecast_core_nativebridge_NativeAudioEngine_writePcm___3BII(
     JNIEnv *env,
     jobject /* thiz */,
     jbyteArray data,
     jint offset,
     jint length) {
-    if (!data || length <= 0) return 0;
+    if (!data || length <= 0 || offset < 0) return 0;
+    const jsize arr_len = env->GetArrayLength(data);
+    if (offset > arr_len || length > arr_len - offset) return -22;
 
     jbyte* bytes = env->GetByteArrayElements(data, nullptr);
     if (!bytes) return -1;
