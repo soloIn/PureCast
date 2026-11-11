@@ -5,6 +5,7 @@ import com.solo.purecast.model.AudioPathState
 import com.solo.purecast.model.PlaybackStatus
 import com.solo.purecast.model.StreamProtocol
 import com.solo.purecast.model.TrackMetadata
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -597,7 +598,7 @@ class RaopProtocolIntegrationTest {
             coverBytes = mergedCover,
             durationMs = 180000L
         )
-        assertEquals(existingCover, nextMeta.coverBytes)
+        assertArrayEquals(existingCover, nextMeta.coverBytes)
         assertEquals("Track 2", nextMeta.title)
 
         // 验证进度重置与安全钳位
