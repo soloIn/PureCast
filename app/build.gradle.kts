@@ -2,6 +2,7 @@ plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
+    jacoco
 }
 
 android {
@@ -75,7 +76,17 @@ android {
 
     testOptions {
         unitTests.isReturnDefaultValues = true
+        unitTests.all {
+            it.extensions.configure(JacocoTaskExtension::class.java) {
+                isIncludeNoLocationClasses = true
+                excludes = listOf("jdk.internal.*")
+            }
+        }
     }
+}
+
+jacoco {
+    toolVersion = "0.8.12"
 }
 
 dependencies {
@@ -104,4 +115,66 @@ dependencies {
     // Testing
     testImplementation(libs.junit)
     testImplementation(libs.kotlinx.coroutines.test)
+}
+
+// =========================================================================
+// 💡 U2/U7 覆盖率强校验门禁：PlaybackSessionCoordinator & TrackTransactionManager
+// 契约：指令/行覆盖率 >= 90%，状态转换核心逻辑分支覆盖率 = 100%
+// =========================================================================
+val sessionClassesTree = fileTree(layout.buildDirectory.dir("tmp/kotlin-classes/debug")) {
+    include(
+        "com/solo/purecast/core/session/PlaybackSessionCoordinator*.class",
+        "com/solo/purecast/core/session/TrackTransactionManager*.class",
+        "com/solo/purecast/core/session/TriStateTransitionMatrix*.class"
+    )
+}
+
+val jacocoTestReport by tasks.registering(JacocoReport::class) {
+    dependsOn("testDebugUnitTest")
+    reports {
+        xml.required.set(true)
+        html.required.set(true)
+    }
+    sourceDirectories.setFrom(files("${project.projectDir}/src/main/java"))
+    classDirectories.setFrom(files(sessionClassesTree))
+    executionData.setFrom(files(layout.buildDirectory.file("jacoco/testDebugUnitTest.exec")))
+}
+
+val jacocoTestCoverageVerification by tasks.registering(JacocoCoverageVerification::class) {
+    dependsOn(jacocoTestReport)
+    sourceDirectories.setFrom(files("${project.projectDir}/src/main/java"))
+    classDirectories.setFrom(files(sessionClassesTree))
+    executionData.setFrom(files(layout.buildDirectory.file("jacoco/testDebugUnitTest.exec")))
+
+    violationRules {
+        rule {
+            element = "BUNDLE"
+            limit {
+                counter = "INSTRUCTION"
+                value = "COVEREDRATIO"
+                minimum = "0.90".toBigDecimal()
+            }
+            limit {
+                counter = "LINE"
+                value = "COVEREDRATIO"
+                minimum = "0.90".toBigDecimal()
+            }
+        }
+        rule {
+            element = "CLASS"
+            includes = listOf(
+                "com.solo.purecast.core.session.TrackTransactionManager",
+                "com.solo.purecast.core.session.TriStateTransitionMatrix"
+            )
+            limit {
+                counter = "BRANCH"
+                value = "COVEREDRATIO"
+                minimum = "1.00".toBigDecimal()
+            }
+        }
+    }
+}
+
+tasks.named("check") {
+    dependsOn(jacocoTestCoverageVerification)
 }
