@@ -86,7 +86,7 @@ enum class StreamProtocol {
 }
 
 /**
- * 💡 曲目时长确定性状态（废除脆弱的 isLiveStream 布尔推断）
+ * 💡 曲目时长确定性状态（显式区分未知时长、固定点播时长与明确实时直播）
  */
 enum class DurationState {
     UNKNOWN,
@@ -143,8 +143,6 @@ class TrackMetadata private constructor(
     val durationState: DurationState,
     val seekCapability: SeekCapability,
     val trackUri: String?,
-    @Deprecated("Migrated to durationState/seekCapability, scheduled for removal in U6")
-    val isLiveStream: Boolean,
     @Suppress("UNUSED_PARAMETER") alreadyCopied: Boolean
 ) {
     constructor(
@@ -156,8 +154,7 @@ class TrackMetadata private constructor(
         durationMs: Long = 0L,
         durationState: DurationState = DurationState.UNKNOWN,
         seekCapability: SeekCapability = SeekCapability.UNKNOWN,
-        trackUri: String? = null,
-        isLiveStream: Boolean = false
+        trackUri: String? = null
     ) : this(
         title = title,
         artist = artist,
@@ -168,7 +165,6 @@ class TrackMetadata private constructor(
         durationState = durationState,
         seekCapability = seekCapability,
         trackUri = trackUri,
-        isLiveStream = isLiveStream,
         alreadyCopied = true
     )
 
@@ -191,8 +187,7 @@ class TrackMetadata private constructor(
         durationMs: Long = this.durationMs,
         durationState: DurationState = this.durationState,
         seekCapability: SeekCapability = this.seekCapability,
-        trackUri: String? = this.trackUri,
-        isLiveStream: Boolean = this.isLiveStream
+        trackUri: String? = this.trackUri
     ): TrackMetadata = TrackMetadata(
         title = title,
         artist = artist,
@@ -207,7 +202,6 @@ class TrackMetadata private constructor(
         durationState = durationState,
         seekCapability = seekCapability,
         trackUri = trackUri,
-        isLiveStream = isLiveStream,
         alreadyCopied = true
     )
 
@@ -229,7 +223,6 @@ class TrackMetadata private constructor(
         if (durationState != other.durationState) return false
         if (seekCapability != other.seekCapability) return false
         if (trackUri != other.trackUri) return false
-        if (isLiveStream != other.isLiveStream) return false
 
         return true
     }
@@ -244,7 +237,6 @@ class TrackMetadata private constructor(
         result = 31 * result + durationState.hashCode()
         result = 31 * result + seekCapability.hashCode()
         result = 31 * result + (trackUri?.hashCode() ?: 0)
-        result = 31 * result + isLiveStream.hashCode()
         return result
     }
 

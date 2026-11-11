@@ -101,14 +101,16 @@ class RaopProtocolIntegrationTest {
             album = "Hotel California",
             coverBytes = dummyCover,
             durationMs = 391000L,
-            isLiveStream = true
+            durationState = com.solo.purecast.model.DurationState.FIXED,
+            seekCapability = com.solo.purecast.model.SeekCapability.SEEKABLE
         )
 
         assertEquals("Hotel California", meta.title)
         assertEquals("Eagles", meta.artist)
         assertNotNull(meta.coverBytes)
         assertEquals(4, meta.coverBytes?.size)
-        assertTrue(meta.isLiveStream)
+        assertEquals(com.solo.purecast.model.DurationState.FIXED, meta.durationState)
+        assertEquals(com.solo.purecast.model.SeekCapability.SEEKABLE, meta.seekCapability)
     }
 
     /**
@@ -761,7 +763,7 @@ class RaopProtocolIntegrationTest {
     }
 
     /**
-     * 💡 验证切歌至无时长直播流/网络电台时的时长重置与 isLiveStream 判定
+     * 💡 验证切歌至无时长直播流/网络电台时的时长重置与 DurationState 判定
      */
     @Test
     fun testSwitchToLiveStreamWithoutDurationResetsDurationAndEnablesLive() {
@@ -770,25 +772,34 @@ class RaopProtocolIntegrationTest {
             artist = "Previous Artist",
             album = "Previous Album",
             durationMs = 180000L,
-            isLiveStream = false
+            durationState = com.solo.purecast.model.DurationState.FIXED,
+            seekCapability = com.solo.purecast.model.SeekCapability.SEEKABLE
         )
 
         // 场景 1：切换到新曲目（网络电台/直播流，无时长 durationMs <= 0）
         val isNewTrack = true
         val incomingDurationMs = 0L
         val mergedDuration = if (incomingDurationMs > 0) incomingDurationMs else if (isNewTrack) 0L else previousSong.durationMs
-        val isLive = mergedDuration <= 0
+        val durationState = if (mergedDuration > 0) {
+            com.solo.purecast.model.DurationState.FIXED
+        } else {
+            com.solo.purecast.model.DurationState.UNKNOWN
+        }
 
-        assertEquals("切歌进入直播流时总时长必须归零", 0L, mergedDuration)
-        assertTrue("切歌进入无时长音频时必须被标记为直播流", isLive)
+        assertEquals("切歌进入无时长流时总时长必须归零", 0L, mergedDuration)
+        assertEquals(com.solo.purecast.model.DurationState.UNKNOWN, durationState)
 
         // 场景 2：同一曲目增量推送（未附带时长），应保留已知时长
         val isSameTrack = false
         val sameTrackMergedDuration = if (incomingDurationMs > 0) incomingDurationMs else if (isSameTrack) 0L else previousSong.durationMs
-        val isSameTrackLive = sameTrackMergedDuration <= 0
+        val sameTrackState = if (sameTrackMergedDuration > 0) {
+            com.solo.purecast.model.DurationState.FIXED
+        } else {
+            com.solo.purecast.model.DurationState.UNKNOWN
+        }
 
         assertEquals("同一曲目增量更新未附带时长时必须继承已知时长", 180000L, sameTrackMergedDuration)
-        assertFalse("有已知时长的曲目不得被误判为直播流", isSameTrackLive)
+        assertEquals("有已知时长的曲目必须保持 FIXED 状态", com.solo.purecast.model.DurationState.FIXED, sameTrackState)
     }
 
     /**

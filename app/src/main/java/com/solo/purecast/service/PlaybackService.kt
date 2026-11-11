@@ -31,7 +31,6 @@ import com.solo.purecast.core.session.HardwareFastPathController
 import com.solo.purecast.core.session.PlaybackSessionCoordinator
 import com.solo.purecast.core.usb.UsbDeviceManager
 import com.solo.purecast.data.SettingsRepository
-import com.solo.purecast.model.AudioPathState
 import com.solo.purecast.model.PlaybackStatus
 import com.solo.purecast.model.PlayerSessionSnapshot
 import com.solo.purecast.model.SeekCapability
@@ -188,10 +187,10 @@ class PlaybackService : LifecycleService() {
             clockMs = { SystemClock.elapsedRealtime() }
         )
 
-        // 💡 同步发布不可变全局快照及兼容细粒度流，必须在 scanAndAttachDevice() 前启动观察
+        // 💡 单向发布不可变全局快照，必须在 scanAndAttachDevice() 前启动观察
         lifecycleScope.launch {
             coordinator.snapshot.collect { snap ->
-                publishSnapshotFlows(snap)
+                _sessionSnapshot.value = snap
             }
         }
         sessionHost.startObserving()
@@ -212,15 +211,6 @@ class PlaybackService : LifecycleService() {
         }
 
         startBootNetworkWatchdog()
-    }
-
-    private fun publishSnapshotFlows(snap: PlayerSessionSnapshot) {
-        _sessionSnapshot.value = snap
-        _playbackStatus.value = snap.playbackStatus
-        _currentMetadata.value = snap.metadata
-        _audioPathState.value = snap.audioPath
-        _playbackPositionMs.value = snap.progressPositionMs
-        _serverError.value = snap.highestPriorityError?.message
     }
 
     private fun preemptProtocolSession(protocol: StreamProtocol, sessionId: Long) {
@@ -733,21 +723,6 @@ class PlaybackService : LifecycleService() {
 
         private val _sessionSnapshot = MutableStateFlow(PlayerSessionSnapshot())
         val sessionSnapshot: StateFlow<PlayerSessionSnapshot> = _sessionSnapshot.asStateFlow()
-
-        private val _playbackStatus = MutableStateFlow(PlaybackStatus.IDLE)
-        val playbackStatus: StateFlow<PlaybackStatus> = _playbackStatus.asStateFlow()
-
-        private val _currentMetadata = MutableStateFlow(TrackMetadata())
-        val currentMetadata: StateFlow<TrackMetadata> = _currentMetadata.asStateFlow()
-
-        private val _audioPathState = MutableStateFlow(AudioPathState())
-        val audioPathState: StateFlow<AudioPathState> = _audioPathState.asStateFlow()
-
-        private val _playbackPositionMs = MutableStateFlow(0L)
-        val playbackPositionMs: StateFlow<Long> = _playbackPositionMs.asStateFlow()
-
-        private val _serverError = MutableStateFlow<String?>(null)
-        val serverError: StateFlow<String?> = _serverError.asStateFlow()
 
         fun start(context: Context) {
             val intent = Intent(context, PlaybackService::class.java)

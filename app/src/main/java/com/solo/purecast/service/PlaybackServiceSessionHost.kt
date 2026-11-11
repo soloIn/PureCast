@@ -28,7 +28,7 @@ import kotlinx.coroutines.launch
 
 /**
  * 💡 根据 [SeekCapability] 计算系统 MediaSession 可用控制动作掩码
- * 严格取代脆弱的 `isLiveStream` 布尔判断：仅当明确可寻道 [SeekCapability.SEEKABLE] 时开放 `ACTION_SEEK_TO`。
+ * 严格基于能力契约判断：仅当明确可寻道 [SeekCapability.SEEKABLE] 时开放 `ACTION_SEEK_TO`。
  */
 internal fun computeMediaSessionActions(seekCapability: SeekCapability): Long {
     val baseActions = PlaybackState.ACTION_PLAY or

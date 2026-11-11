@@ -45,7 +45,6 @@ import com.solo.purecast.model.PlaybackStatus
 @Composable
 fun PlaybackControls(
     playbackStatus: PlaybackStatus,
-    isLiveStream: Boolean,
     onPlayPauseClick: () -> Unit,
     onPreviousClick: () -> Unit,
     onNextClick: () -> Unit,

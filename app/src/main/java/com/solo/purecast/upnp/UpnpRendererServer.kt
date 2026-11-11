@@ -907,7 +907,6 @@ class UpnpRendererServer(
             DurationState.LIVE -> SeekCapability.UNSEEKABLE
             DurationState.UNKNOWN -> SeekCapability.UNKNOWN
         }
-        val isLive = durationState == DurationState.LIVE
 
         Logger.upnp.i(TAG, "解析 DIDL-Lite: title=$title, artist=$artist, album=$album, coverUri=$coverUri, durationMs=$durationMs, durationState=$durationState")
 
@@ -919,8 +918,7 @@ class UpnpRendererServer(
             durationMs = durationMs,
             durationState = durationState,
             seekCapability = seekCapability,
-            trackUri = trackUri.ifEmpty { null },
-            isLiveStream = isLive
+            trackUri = trackUri.ifEmpty { null }
         )
     }
 
