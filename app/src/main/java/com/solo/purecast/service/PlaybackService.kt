@@ -23,11 +23,33 @@ import androidx.lifecycle.LifecycleService
 import androidx.lifecycle.lifecycleScope
 import com.solo.purecast.R
 import com.solo.purecast.core.audio.AudioFocusManager
-import com.solo.purecast.core.nativebridge.NativeAudioEngine
+import com.solo.purecast.core.session.ErrorClearedEvent
+import com.solo.purecast.core.session.ErrorReportedEvent
+import com.solo.purecast.core.session.EventOrigin
+import com.solo.purecast.core.session.ExplicitPauseEvent
+import com.solo.purecast.core.session.FirstDataPacketEvent
+import com.solo.purecast.core.session.HardwareFastPathController
+import com.solo.purecast.core.session.HardwareReconfiguredEvent
+import com.solo.purecast.core.session.ImplicitPauseEvent
+import com.solo.purecast.core.session.MetadataPatchEvent
+import com.solo.purecast.core.session.ProgressUpdateEvent
+import com.solo.purecast.core.session.SessionEventEnvelope
+import com.solo.purecast.core.session.SessionEventPayload
+import com.solo.purecast.core.session.StreamResumeEvent
+import com.solo.purecast.core.session.StreamSetupEvent
+import com.solo.purecast.core.session.StreamStopEvent
+import com.solo.purecast.core.session.StreamTeardownEvent
+import com.solo.purecast.core.session.TrackCompleteEvent
+import com.solo.purecast.core.session.TrackSwitchEvent
 import com.solo.purecast.core.usb.UsbDeviceManager
 import com.solo.purecast.data.SettingsRepository
 import com.solo.purecast.model.AudioPathState
+import com.solo.purecast.model.BusinessSessionState
+import com.solo.purecast.model.DurationState
+import com.solo.purecast.model.FlushReason
 import com.solo.purecast.model.PlaybackStatus
+import com.solo.purecast.model.PlayerSessionSnapshot
+import com.solo.purecast.model.StreamProtocol
 import com.solo.purecast.model.TrackMetadata
 import com.solo.purecast.ui.MainActivity
 import com.solo.purecast.util.Logger
@@ -83,6 +105,15 @@ class PlaybackService : LifecycleService() {
     private var airPlayAnchorRealtimeMs: Long = 0L
     private var airPlayBasePositionMs: Long = 0L
 
+    // 💡 U3 临时兼容桥：待 U5 切换为 PlaybackSessionCoordinator 后移除
+    private val fastPath = HardwareFastPathController.default
+    private val tempSessionCounter = java.util.concurrent.atomic.AtomicLong(0L)
+    private val tempSequenceCounter = java.util.concurrent.atomic.AtomicLong(0L)
+    @Volatile
+    private var tempActiveSessionId: Long = 0L
+    @Volatile
+    private var tempActiveEpoch: Long = 1L
+
     // 💡 动态网络状态监听器 (解决开机自启时 Wi-Fi 尚未就绪导致服务瘫痪的问题)
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
 
@@ -125,38 +156,13 @@ class PlaybackService : LifecycleService() {
         // 💡 启动 UPnP / DLNA MediaRenderer 服务端 (友好名称末尾追加 [UPnP] 协议后缀)
         val friendlyName = settingsRepository.getFriendlyName()
         if (settingsRepository.isUpnpEnabled()) {
-            upnpServer = com.solo.purecast.upnp.UpnpRendererServer(
-                scope = lifecycleScope,
-                playbackService = this,
-                friendlyName = formatUpnpName(friendlyName)
-            ).apply {
+            upnpServer = createUpnpServer(formatUpnpName(friendlyName)).apply {
                 start()
             }
         }
 
         // 💡 启动原生 AirPlay 1 (RAOP) 接收服务端 (友好名称末尾追加 [AirPlay] 协议后缀)
-        airPlayServer = com.solo.purecast.airplay.AirPlayServerManager(
-            context = this,
-            scope = lifecycleScope,
-            onStreamRequestedListener = { sampleRate, bitDepth, channels, codec, clientIp, dacpPort, token ->
-                onAirPlayStreamRequested(sampleRate, bitDepth, channels, codec, clientIp, dacpPort, token)
-            },
-            onStreamStoppedListener = {
-                onAirPlayStreamStopped()
-            },
-            onMetadataReceivedListener = { title, artist, album, durationMs, coverArt ->
-                onAirPlayMetadataReceived(title, artist, album, durationMs, coverArt)
-            },
-            onProgressUpdatedListener = { positionMs, durationMs ->
-                onAirPlayProgressUpdated(positionMs, durationMs)
-            },
-            onStreamPausedListener = {
-                onAirPlayStreamPaused()
-            },
-            onStreamResumedListener = {
-                onAirPlayStreamResumed()
-            }
-        )
+        airPlayServer = createAirPlayServer()
 
         if (settingsRepository.isAirPlayEnabled()) {
             airPlayServer?.start(formatAirPlayName(friendlyName))
@@ -455,7 +461,7 @@ class PlaybackService : LifecycleService() {
         }
 
         // 💡 确保新流开始时唤醒 Native 传输管道并重置 is_paused 状态
-        NativeAudioEngine.resumeStream()
+        fastPath.resumeStream()
 
         _playbackStatus.value = PlaybackStatus.PLAYING
         val currentProto = if (currentStreamSource == StreamSource.AIRPLAY) {
@@ -556,7 +562,7 @@ class PlaybackService : LifecycleService() {
             airPlayProgressJob = null
             airPlayBasePositionMs = _playbackPositionMs.value
 
-            NativeAudioEngine.pauseStream()
+            fastPath.emergencyMuteAndFlush(FlushReason.EXPLICIT_PAUSE)
             _playbackStatus.value = PlaybackStatus.PAUSED
             releaseWifiLowLatencyLock()
             updateMediaSessionState()
@@ -576,7 +582,7 @@ class PlaybackService : LifecycleService() {
             airPlayProgressJob = null
             airPlayBasePositionMs = _playbackPositionMs.value
 
-            NativeAudioEngine.pauseStream()
+            fastPath.emergencyMuteAndFlush(FlushReason.EXPLICIT_PAUSE)
             _playbackStatus.value = PlaybackStatus.PAUSED
             releaseWifiLowLatencyLock()
             updateMediaSessionState()
@@ -600,7 +606,7 @@ class PlaybackService : LifecycleService() {
                 val state = _audioPathState.value
                 usbDeviceManager.claimUsbExclusive(state.sampleRate, state.bitDepth, state.channels)
             }
-            NativeAudioEngine.resumeStream()
+            fastPath.resumeStream()
             _playbackStatus.value = PlaybackStatus.PLAYING
             airPlayAnchorRealtimeMs = android.os.SystemClock.elapsedRealtime()
             launchAirPlayProgressTicker()
@@ -727,7 +733,7 @@ class PlaybackService : LifecycleService() {
             usbDeviceManager.scheduleIdleRelease(10 * 60 * 1000L)
         }
 
-        NativeAudioEngine.pauseStream()
+        fastPath.emergencyMuteAndFlush(FlushReason.EXPLICIT_PAUSE)
         _playbackStatus.value = PlaybackStatus.PAUSED
         releaseWifiLowLatencyLock()
         // 💡 暂停期间不触发 10 秒激进让渡，保持 USB DAC 独占与时钟锁相
@@ -769,7 +775,7 @@ class PlaybackService : LifecycleService() {
             launchAirPlayProgressTicker()
         }
 
-        NativeAudioEngine.resumeStream()
+        fastPath.resumeStream()
         _playbackStatus.value = PlaybackStatus.PLAYING
 
         upnpServer?.notifyTransportState("PLAYING")
@@ -802,7 +808,7 @@ class PlaybackService : LifecycleService() {
             protocol = com.solo.purecast.model.StreamProtocol.NONE
         )
 
-        NativeAudioEngine.stopStream()
+        fastPath.emergencyMuteAndFlush(FlushReason.STOP_OR_TEARDOWN)
         _playbackStatus.value = PlaybackStatus.STOPPED
         _playbackPositionMs.value = 0L
         releaseWifiLowLatencyLock()
@@ -818,7 +824,7 @@ class PlaybackService : LifecycleService() {
         if (currentStreamSource == StreamSource.AIRPLAY) {
             airPlayServer?.dacpClient?.next()
         } else {
-            upnpServer?.notifyNextTrack()
+            Logger.service.w(TAG, "UPnP 推流由发送端控制曲目列表，不支持 TV 遥控器切歌")
         }
     }
 
@@ -827,7 +833,7 @@ class PlaybackService : LifecycleService() {
         if (currentStreamSource == StreamSource.AIRPLAY) {
             airPlayServer?.dacpClient?.previous()
         } else {
-            upnpServer?.notifyPreviousTrack()
+            Logger.service.w(TAG, "UPnP 推流由发送端控制曲目列表，不支持 TV 遥控器切上一曲")
         }
     }
 
@@ -875,11 +881,7 @@ class PlaybackService : LifecycleService() {
         if (enabled) {
             val name = settingsRepository.getFriendlyName()
             if (upnpServer == null) {
-                upnpServer = com.solo.purecast.upnp.UpnpRendererServer(
-                    scope = lifecycleScope,
-                    playbackService = this,
-                    friendlyName = formatUpnpName(name)
-                )
+                upnpServer = createUpnpServer(formatUpnpName(name))
             } else {
                 upnpServer?.updateFriendlyName(formatUpnpName(name))
             }
@@ -1042,11 +1044,7 @@ class PlaybackService : LifecycleService() {
         val friendlyName = settingsRepository.getFriendlyName()
         if (settingsRepository.isUpnpEnabled()) {
             if (upnpServer == null) {
-                upnpServer = com.solo.purecast.upnp.UpnpRendererServer(
-                    scope = lifecycleScope,
-                    playbackService = this,
-                    friendlyName = formatUpnpName(friendlyName)
-                ).apply {
+                upnpServer = createUpnpServer(formatUpnpName(friendlyName)).apply {
                     start()
                 }
             } else {
@@ -1055,27 +1053,214 @@ class PlaybackService : LifecycleService() {
         }
         if (settingsRepository.isAirPlayEnabled()) {
             if (airPlayServer == null) {
-                airPlayServer = com.solo.purecast.airplay.AirPlayServerManager(
-                    context = this,
-                    scope = lifecycleScope,
-                    onStreamRequestedListener = { sampleRate, bitDepth, channels, codec, clientIp, dacpPort, token ->
-                        onAirPlayStreamRequested(sampleRate, bitDepth, channels, codec, clientIp, dacpPort, token)
-                    },
-                    onStreamStoppedListener = { onAirPlayStreamStopped() },
-                    onMetadataReceivedListener = { title, artist, album, durationMs, coverArt ->
-                        onAirPlayMetadataReceived(title, artist, album, durationMs, coverArt)
-                    },
-                    onProgressUpdatedListener = { positionMs, durationMs ->
-                        onAirPlayProgressUpdated(positionMs, durationMs)
-                    },
-                    onStreamPausedListener = { onAirPlayStreamPaused() },
-                    onStreamResumedListener = { onAirPlayStreamResumed() }
-                ).apply {
+                airPlayServer = createAirPlayServer().apply {
                     start(formatAirPlayName(friendlyName))
                 }
             } else {
                 airPlayServer?.restartIfIpChanged(formatAirPlayName(friendlyName))
             }
+        }
+    }
+
+    private fun createUpnpServer(friendlyName: String): com.solo.purecast.upnp.UpnpRendererServer {
+        return com.solo.purecast.upnp.UpnpRendererServer(
+            scope = lifecycleScope,
+            dispatchEvent = { envelope -> handleLegacySessionEnvelope(envelope) },
+            allocateSessionId = { tempSessionCounter.incrementAndGet() },
+            allocateSequence = { tempSequenceCounter.incrementAndGet() },
+            onAcquireHardwareForStream = { sampleRate, bitDepth, channels, codec ->
+                val started = startStreaming(sampleRate, bitDepth, channels, StreamSource.UPNP, codec = codec)
+                if (!started) {
+                    -1L
+                } else {
+                    val epoch = fastPath.getCurrentBufferEpoch().coerceAtLeast(1L)
+                    tempActiveEpoch = epoch
+                    epoch
+                }
+            },
+            snapshotProvider = { buildLegacySessionSnapshot() },
+            fastPath = fastPath,
+            onWakeUpUi = { wakeUpUiIfInBackground() },
+            friendlyName = friendlyName
+        )
+    }
+
+    private fun createAirPlayServer(): com.solo.purecast.airplay.AirPlayServerManager {
+        return com.solo.purecast.airplay.AirPlayServerManager(
+            context = this,
+            scope = lifecycleScope,
+            dispatchEvent = { envelope -> handleLegacySessionEnvelope(envelope) },
+            allocateSessionId = { tempSessionCounter.incrementAndGet() },
+            allocateSequence = { tempSequenceCounter.incrementAndGet() },
+            onAcquireHardwareForStream = { sampleRate, bitDepth, channels, codec ->
+                Logger.service.i(TAG, "处理 AirPlay 推流请求 (U3 桥接抢占): codec=$codec")
+                airPlaySuspendJob?.cancel()
+                airPlaySuspendJob = null
+                if (currentStreamSource == StreamSource.UPNP) {
+                    upnpServer?.stopPlayback(isPreempted = true)
+                }
+                currentStreamSource = StreamSource.AIRPLAY
+                val started = startStreaming(sampleRate, bitDepth, channels, StreamSource.AIRPLAY, codec = codec)
+                if (!started) {
+                    currentStreamSource = StreamSource.IDLE
+                    -1L
+                } else {
+                    val epoch = fastPath.getCurrentBufferEpoch().coerceAtLeast(1L)
+                    tempActiveEpoch = epoch
+                    epoch
+                }
+            }
+        )
+    }
+
+    private fun buildLegacySessionSnapshot(): PlayerSessionSnapshot {
+        val business = when (_playbackStatus.value) {
+            PlaybackStatus.IDLE -> BusinessSessionState.IDLE
+            PlaybackStatus.PLAYING -> BusinessSessionState.PLAYING
+            PlaybackStatus.PAUSED -> BusinessSessionState.PAUSED
+            PlaybackStatus.STOPPED -> BusinessSessionState.STOPPED
+        }
+        val protocol = when (currentStreamSource) {
+            StreamSource.AIRPLAY -> StreamProtocol.AIRPLAY_1
+            StreamSource.UPNP -> StreamProtocol.UPNP_DLNA
+            StreamSource.IDLE -> StreamProtocol.NONE
+        }
+        return PlayerSessionSnapshot(
+            sessionId = tempActiveSessionId,
+            businessState = business,
+            activeProtocol = protocol,
+            currentEpoch = tempActiveEpoch,
+            metadata = _currentMetadata.value,
+            audioPath = _audioPathState.value,
+            progressPositionMs = _playbackPositionMs.value,
+            progressDurationMs = _currentMetadata.value.durationMs
+        )
+    }
+
+    private fun handleLegacySessionEnvelope(envelope: SessionEventEnvelope<SessionEventPayload>) {
+        when (val payload = envelope.payload) {
+            is StreamSetupEvent -> {
+                tempActiveSessionId = envelope.sessionId
+                tempActiveEpoch = payload.initialEpoch
+                payload.initialMetadata?.let { updateMetadata(it) }
+            }
+
+            is FirstDataPacketEvent -> {
+                tempActiveEpoch = payload.epoch
+                if (envelope.origin == EventOrigin.AIRPLAY) {
+                    onAirPlayStreamResumed()
+                } else {
+                    _playbackStatus.value = PlaybackStatus.PLAYING
+                    updateMediaSessionState()
+                    updateNotification()
+                }
+            }
+
+            is TrackSwitchEvent -> {
+                tempActiveEpoch = payload.newEpoch
+                updatePlaybackPosition(0L)
+            }
+
+            is ExplicitPauseEvent, is ImplicitPauseEvent -> {
+                if (envelope.origin == EventOrigin.AIRPLAY) {
+                    onAirPlayStreamPaused()
+                } else {
+                    pausePlayback()
+                }
+            }
+
+            is StreamResumeEvent -> {
+                tempActiveEpoch = payload.resumedEpoch
+                if (envelope.origin == EventOrigin.AIRPLAY) {
+                    onAirPlayStreamResumed()
+                } else {
+                    resumePlayback()
+                }
+            }
+
+            is TrackCompleteEvent -> {
+                if (envelope.origin == EventOrigin.UPNP) {
+                    stopPlayback(StreamSource.UPNP)
+                }
+                if (envelope.sessionId == tempActiveSessionId) {
+                    tempActiveSessionId = 0L
+                }
+            }
+
+            is StreamStopEvent -> {
+                if (!payload.isPreempted) {
+                    stopPlayback(if (envelope.origin == EventOrigin.AIRPLAY) StreamSource.AIRPLAY else StreamSource.UPNP)
+                }
+                if (envelope.sessionId == tempActiveSessionId) {
+                    tempActiveSessionId = 0L
+                }
+            }
+
+            is StreamTeardownEvent -> {
+                if (payload.hardStop) {
+                    stopPlayback(StreamSource.AIRPLAY)
+                    if (envelope.sessionId == tempActiveSessionId) {
+                        tempActiveSessionId = 0L
+                    }
+                } else {
+                    onAirPlayStreamStopped()
+                }
+            }
+
+            is MetadataPatchEvent -> {
+                if (envelope.origin == EventOrigin.AIRPLAY) {
+                    onAirPlayMetadataReceived(
+                        title = payload.title.orEmpty(),
+                        artist = payload.artist.orEmpty(),
+                        album = payload.album.orEmpty(),
+                        durationMs = payload.durationMs ?: 0L,
+                        coverArt = payload.coverBytes
+                    )
+                } else {
+                    val cur = _currentMetadata.value
+                    val nextDurationMs = payload.durationMs ?: cur.durationMs
+                    val nextDurState = payload.durationState ?: cur.durationState
+                    updateMetadata(
+                        cur.copy(
+                            title = payload.title ?: cur.title,
+                            artist = payload.artist ?: cur.artist,
+                            album = payload.album ?: cur.album,
+                            coverUri = payload.coverUri ?: cur.coverUri,
+                            durationMs = nextDurationMs,
+                            durationState = nextDurState,
+                            seekCapability = payload.seekCapability ?: cur.seekCapability,
+                            isLiveStream = nextDurState == DurationState.LIVE
+                        )
+                    )
+                }
+            }
+
+            is ProgressUpdateEvent -> {
+                if (envelope.origin == EventOrigin.AIRPLAY) {
+                    onAirPlayProgressUpdated(payload.positionMs, payload.durationMs)
+                } else {
+                    updatePlaybackPosition(payload.positionMs)
+                }
+            }
+
+            is HardwareReconfiguredEvent -> {
+                tempActiveEpoch = payload.epoch
+                _audioPathState.value = _audioPathState.value.copy(
+                    sampleRate = payload.sampleRate,
+                    bitDepth = payload.bitDepth,
+                    channels = payload.channels
+                )
+            }
+
+            is ErrorReportedEvent -> {
+                updateServerError(payload.error.message)
+            }
+
+            is ErrorClearedEvent -> {
+                updateServerError(null)
+            }
+
+            else -> Unit
         }
     }
 

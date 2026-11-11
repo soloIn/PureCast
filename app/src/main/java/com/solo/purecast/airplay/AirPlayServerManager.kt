@@ -2,6 +2,8 @@ package com.solo.purecast.airplay
 
 import android.content.Context
 import com.solo.purecast.core.nativebridge.NativeAudioEngine
+import com.solo.purecast.core.session.SessionEventEnvelope
+import com.solo.purecast.core.session.SessionEventPayload
 import com.solo.purecast.util.Logger
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -9,22 +11,17 @@ import kotlinx.coroutines.launch
 import java.util.Base64
 
 /**
- * 💡 AirPlayServerManager: 原生 AirPlay 1 (RAOP) 接收引擎管理器
- * 统筹调度：
- * 1. JmDnsDiscoveryService: _airplay._tcp 与 _raop._tcp 零配置局域网服务广播
- * 2. NativeAudioEngine: C++20 RTSP 状态机、RTP JitterBuffer、AES-128 解密与 ALAC 解码
- * 3. AirPlayKeyDecryptor: RSA-2048 私钥解密 AES 会话主密钥
- * 4. DacpClient: DACP 遥控通道双向反控
+ * 💡 AirPlayServerManager: 无状态原生 AirPlay 1 (RAOP) 接收引擎管理器
+ * 职责严格收敛为：mDNS Bonjour 广播、RSA/AES 解密密钥注入、DACP 客户端托管与向协调器上报带序号事件
  */
 class AirPlayServerManager(
     private val context: Context,
     private val scope: CoroutineScope,
-    private val onStreamRequestedListener: (sampleRate: Int, bitDepth: Int, channels: Int, codec: String, clientIp: String, dacpPort: Int, token: String) -> Boolean,
-    private val onStreamStoppedListener: () -> Unit,
-    private val onMetadataReceivedListener: (title: String, artist: String, album: String, durationMs: Long, coverArt: ByteArray?) -> Unit,
-    private val onProgressUpdatedListener: (positionMs: Long, durationMs: Long) -> Unit = { _, _ -> },
-    private val onStreamPausedListener: () -> Unit = {},
-    private val onStreamResumedListener: () -> Unit = {}
+    private val dispatchEvent: (SessionEventEnvelope<SessionEventPayload>) -> Unit,
+    private val allocateSessionId: () -> Long,
+    private val allocateSequence: () -> Long,
+    private val onAcquireHardwareForStream: (sampleRate: Int, bitDepth: Int, channels: Int, codec: String) -> Long,
+    private val clockMs: () -> Long = { android.os.SystemClock.elapsedRealtime() }
 ) {
     companion object {
         private const val TAG = "AirPlayServerManager"
@@ -42,6 +39,31 @@ class AirPlayServerManager(
     var isRtpActive: Boolean = false
         private set
 
+    private val nativeDispatcher = AirPlayNativeEventDispatcher(
+        dispatchEvent = dispatchEvent,
+        allocateSessionId = allocateSessionId,
+        allocateSequence = allocateSequence,
+        onAcquireHardwareForStream = onAcquireHardwareForStream,
+        onDecryptAndInjectCryptoKey = { aesKeyBase64, aesIvBase64 ->
+            injectCryptoKey(aesKeyBase64, aesIvBase64)
+        },
+        onUpdateDacpTarget = { clientIp, dacpId, activeRemoteToken, dacpPort ->
+            if (clientIp.isNotEmpty()) {
+                dacpClient.updateSession(clientIp, dacpPort, activeRemoteToken)
+                jmdnsDiscoveryService.resolveDacpPort(dacpId, clientIp) { resolvedPort ->
+                    dacpClient.updatePort(resolvedPort)
+                }
+            }
+        },
+        onSolveChallenge = { challengeBase64 ->
+            solveAppleChallenge(challengeBase64)
+        },
+        onRtpActiveChanged = { active ->
+            isRtpActive = active
+        },
+        clockMs = clockMs
+    )
+
     fun start(deviceName: String, port: Int = DEFAULT_RTSP_PORT): Boolean {
         if (isRunning) {
             Logger.airplay.w(TAG, "AirPlay 服务已处于运行状态，无需重复启动")
@@ -52,106 +74,7 @@ class AirPlayServerManager(
         currentPort = port
         Logger.airplay.i(TAG, "正在启动原生 AirPlay 1 服务 (名称: $deviceName, RTSP 端口: $port)...")
 
-        val nativeStarted = NativeAudioEngine.startAirPlayServer(port, object : NativeAirPlayCallback {
-            override fun onStreamRequested(
-                sampleRate: Int,
-                bitDepth: Int,
-                channels: Int,
-                codec: String,
-                clientIp: String,
-                aesKeyBase64: String,
-                aesIvBase64: String,
-                dacpId: String,
-                activeRemoteToken: String,
-                dacpPort: Int
-            ): Boolean {
-                Logger.airplay.i(TAG, "收到 AirPlay 推流请求: $clientIp, codec=$codec, rate=$sampleRate, depth=$bitDepth, ch=$channels")
-
-                // 1. RSA 私钥解密 AES 会话主密钥
-                if (aesKeyBase64.isNotEmpty() && aesIvBase64.isNotEmpty()) {
-                    try {
-                        val decryptedKey = AirPlayKeyDecryptor.decryptRsaAesKey(aesKeyBase64)
-                        val ivBytes = Base64.getDecoder().decode(aesIvBase64)
-                        if (decryptedKey != null && ivBytes != null) {
-                            Logger.airplay.i(TAG, "成功解密 AES-128 会话密钥与 IV，注入底层协议栈")
-                            NativeAudioEngine.setAirPlayCryptoKey(decryptedKey, ivBytes)
-                        } else {
-                            Logger.airplay.e(TAG, "解密 AES 密钥失败，可能导致音频静音或解码异常")
-                        }
-                    } catch (e: Exception) {
-                        Logger.airplay.e(TAG, "处理 AirPlay 密钥注入异常", e)
-                    }
-                } else {
-                    Logger.airplay.i(TAG, "推流未携带 AES 会话密钥 (明文/非加密流)，重置底层解密上下文")
-                    NativeAudioEngine.setAirPlayCryptoKey(ByteArray(0), ByteArray(0))
-                }
-
-                // 2. 更新 DACP 反向控制凭证与启动 mDNS 动态端口解析
-                if (clientIp.isNotEmpty()) {
-                    dacpClient.updateSession(clientIp, dacpPort, activeRemoteToken)
-                    // 💡 无论客户端是否携带 DACP-ID，只要已掌握客户端 IP，立即启动 DACP 端口监听与匹配
-                    jmdnsDiscoveryService.resolveDacpPort(dacpId, clientIp) { port ->
-                        dacpClient.updatePort(port)
-                    }
-                }
-
-                // 3. 回调上层申请音频焦点与 USB 声卡独占
-                val accepted = onStreamRequestedListener(sampleRate, bitDepth, channels, codec, clientIp, dacpPort, activeRemoteToken)
-                if (accepted) {
-                    isRtpActive = true
-                }
-                return accepted
-            }
-
-            override fun onStreamStopped() {
-                isRtpActive = false
-                Logger.airplay.i(TAG, "AirPlay RTSP 传输通道断开/挂起")
-                // 💡 注意：切勿在此处立即清理 DACP 会话与凭据！
-                // 在 iOS AirPlay 1 中，暂停推流时发送端会主动下发 TEARDOWN 拆除音频通道。
-                // 必须保留 DACP 会话，由 PlaybackService 状态机统一托管挂起待机与超时释放。
-                onStreamStoppedListener()
-            }
-
-            override fun onStreamPaused() {
-                Logger.airplay.i(TAG, "AirPlay 推流暂停")
-                onStreamPausedListener()
-            }
-
-            override fun onStreamResumed() {
-                Logger.airplay.i(TAG, "AirPlay 推流恢复")
-                onStreamResumedListener()
-            }
-
-            override fun onChallengeRequested(challengeBase64: String): String? {
-                val localIp = jmdnsDiscoveryService.getLocalIpv4Address()
-                val macStr = jmdnsDiscoveryService.getMacAddressFormatted()
-                if (localIp == null) {
-                    Logger.airplay.e(TAG, "本地 IP 不可用，无法计算 Apple-Response")
-                    return null
-                }
-                val macBytes = ByteArray(6) { idx ->
-                    macStr.substring(idx * 2, idx * 2 + 2).toInt(16).toByte()
-                }
-                val response = AirPlayKeyDecryptor.solveAppleChallenge(challengeBase64, localIp, macBytes)
-                Logger.airplay.i(TAG, "计算 Apple-Challenge 响应: challenge=$challengeBase64, response=$response")
-                return response
-            }
-
-            override fun onMetadataReceived(
-                title: String,
-                artist: String,
-                album: String,
-                durationMs: Long,
-                coverArt: ByteArray?
-            ) {
-                Logger.airplay.i(TAG, "AirPlay 收到 DMAP 元数据: title=$title, artist=$artist, album=$album, coverSize=${coverArt?.size ?: 0}")
-                onMetadataReceivedListener(title, artist, album, durationMs, coverArt)
-            }
-
-            override fun onProgressUpdated(positionMs: Long, durationMs: Long) {
-                onProgressUpdatedListener(positionMs, durationMs)
-            }
-        })
+        val nativeStarted = NativeAudioEngine.startAirPlayServer(port, nativeDispatcher)
 
         if (!nativeStarted) {
             Logger.airplay.e(TAG, "启动 Native RAOP 服务失败")
@@ -170,7 +93,7 @@ class AirPlayServerManager(
     fun stop() {
         if (!isRunning) return
         Logger.airplay.i(TAG, "正在停止 AirPlay 1 服务...")
-        isRtpActive = false
+        nativeDispatcher.resetSessions()
         scope.launch(Dispatchers.IO) {
             jmdnsDiscoveryService.stopBroadcast()
         }
@@ -178,6 +101,41 @@ class AirPlayServerManager(
         dacpClient.clearSession()
         isRunning = false
         Logger.airplay.i(TAG, "AirPlay 1 服务已完全停止")
+    }
+
+    private fun injectCryptoKey(aesKeyBase64: String, aesIvBase64: String) {
+        if (aesKeyBase64.isNotEmpty() && aesIvBase64.isNotEmpty()) {
+            try {
+                val decryptedKey = AirPlayKeyDecryptor.decryptRsaAesKey(aesKeyBase64)
+                val ivBytes = Base64.getDecoder().decode(aesIvBase64)
+                if (decryptedKey != null && ivBytes != null) {
+                    Logger.airplay.i(TAG, "成功解密 AES-128 会话密钥与 IV，注入底层协议栈")
+                    NativeAudioEngine.setAirPlayCryptoKey(decryptedKey, ivBytes)
+                } else {
+                    Logger.airplay.e(TAG, "解密 AES 密钥失败，可能导致音频静音或解码异常")
+                }
+            } catch (e: Exception) {
+                Logger.airplay.e(TAG, "处理 AirPlay 密钥注入异常", e)
+            }
+        } else {
+            Logger.airplay.i(TAG, "推流未携带 AES 会话密钥 (明文/非加密流)，重置底层解密上下文")
+            NativeAudioEngine.setAirPlayCryptoKey(ByteArray(0), ByteArray(0))
+        }
+    }
+
+    private fun solveAppleChallenge(challengeBase64: String): String? {
+        val localIp = jmdnsDiscoveryService.getLocalIpv4Address()
+        val macStr = jmdnsDiscoveryService.getMacAddressFormatted()
+        if (localIp == null) {
+            Logger.airplay.e(TAG, "本地 IP 不可用，无法计算 Apple-Response")
+            return null
+        }
+        val macBytes = ByteArray(6) { idx ->
+            macStr.substring(idx * 2, idx * 2 + 2).toInt(16).toByte()
+        }
+        val response = AirPlayKeyDecryptor.solveAppleChallenge(challengeBase64, localIp, macBytes)
+        Logger.airplay.i(TAG, "计算 Apple-Challenge 响应: challenge=$challengeBase64, response=$response")
+        return response
     }
 
     fun updateDeviceName(newName: String) {
@@ -216,7 +174,7 @@ class AirPlayServerManager(
     }
 
     /**
-     * 💡 彻底清理 DACP 会话与凭据 (由 PlaybackService 在会话彻底超时或主动停止时调用)
+     * 💡 彻底清理 DACP 会话与凭据 (由协调器在会话彻底超时或主动停止时调用)
      */
     fun clearDacpSession() {
         Logger.airplay.i(TAG, "彻底清理 DACP 会话凭据与目标监听")

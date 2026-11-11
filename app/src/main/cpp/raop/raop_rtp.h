@@ -109,17 +109,50 @@ public:
     void send_resend_request(uint16_t first_seq, uint16_t count);
 
     /**
-     * 💡 设置音频数据流活动状态变更回调 (true 为暂停/断流，false 为恢复推流)
+     * 💡 设置音频数据流活动状态变更回调 (is_paused: 暂停/恢复, is_implicit: 静默/断流隐式暂停触发, epoch: 当前世代号)
      */
-    using StreamStateCallback = std::function<void(bool is_paused)>;
+    using StreamStateCallback = std::function<void(bool is_paused, bool is_implicit, uint64_t epoch)>;
     void set_stream_state_callback(StreamStateCallback cb) {
+        std::lock_guard<std::mutex> lock(state_mutex_);
         state_cb_ = std::move(cb);
     }
 
     /**
-     * 💡 手动标记暂停或恢复状态 (由 RTSP PAUSE / RECORD 触发)
+     * 💡 新流/新世代首包有效解码 PCM 写入回调，用于驱动协议无关的 STREAMING / PLAYING 迁移
      */
-    void mark_paused_manually(bool paused);
+    using FirstDataPacketCallback = std::function<void(uint64_t epoch, int sample_rate, int bit_depth, int channels, const std::string& codec)>;
+    void set_first_data_packet_callback(FirstDataPacketCallback cb) {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        first_packet_cb_ = std::move(cb);
+    }
+
+    /**
+     * 💡 绑定当前推流写入所校验的 AudioEngine buffer_epoch
+     */
+    void set_active_epoch(uint64_t epoch) {
+        active_epoch_.store(epoch, std::memory_order_release);
+    }
+
+    uint64_t get_active_epoch() const {
+        return active_epoch_.load(std::memory_order_acquire);
+    }
+
+    /**
+     * 💡 配置当前流格式元信息供首包回调上报
+     */
+    void set_format_info(int sample_rate, int bit_depth, int channels, const std::string& codec) {
+        std::lock_guard<std::mutex> lock(format_mutex_);
+        format_sample_rate_ = sample_rate;
+        format_bit_depth_ = bit_depth;
+        format_channels_ = channels;
+        format_codec_ = codec;
+    }
+
+    /**
+     * 💡 手动标记暂停或恢复状态 (由 RTSP PAUSE / RECORD 触发)
+     * @param emit_callback true 时通知上层同步业务态 (PAUSE 显式暂停防抖 / PAUSE 后无 FLUSH 恢复)，false 用于 SETUP/FLUSH 后的初始 RECORD 启动阶段
+     */
+    void mark_paused_manually(bool paused, bool emit_callback = true);
 
     /**
      * 💡 标记切歌或元数据过渡期（在若干毫秒内豁免静音暂停判定，防止切歌过渡期状态机颠簸）
@@ -181,9 +214,17 @@ private:
     uint16_t last_data_seq_{0};
     bool first_data_seq_{true};
 
-    // 💡 音频推流无数据看门狗监测 (检测 iPhone 点击暂停停止推流)
+    // 💡 音频推流无数据看门狗与首包状态监测
     std::mutex state_mutex_;
     StreamStateCallback state_cb_{nullptr};
+    FirstDataPacketCallback first_packet_cb_{nullptr};
+    std::mutex format_mutex_;
+    int format_sample_rate_{44100};
+    int format_bit_depth_{16};
+    int format_channels_{2};
+    std::string format_codec_{"ALAC"};
+    std::atomic<uint64_t> active_epoch_{1ULL};
+    std::atomic<uint64_t> emitted_first_epoch_{0ULL};
     std::atomic<uint64_t> last_audio_packet_time_ms_{0};
     std::atomic<bool> is_stream_paused_{false};
     std::atomic<bool> is_manually_paused_{false};

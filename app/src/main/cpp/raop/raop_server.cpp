@@ -1,5 +1,6 @@
 #include "raop_server.h"
 #include "dmap_parser.h"
+#include "../audio_engine.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -11,6 +12,10 @@
 #include <algorithm>
 
 #define RAOP_TAG "PureCastRAOP"
+#undef LOGD
+#undef LOGI
+#undef LOGW
+#undef LOGE
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, RAOP_TAG, __VA_ARGS__)
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, RAOP_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, RAOP_TAG, __VA_ARGS__)
@@ -40,11 +45,20 @@ static inline std::string to_lower_copy(std::string_view s) {
 }
 
 RaopServer::RaopServer() {
-    rtp_.set_stream_state_callback([this](bool is_paused) {
+    rtp_.set_stream_state_callback([this](bool is_paused, bool is_implicit, uint64_t epoch) {
+        const int64_t sid = active_session_id_.load(std::memory_order_acquire);
+        const int64_t seq = next_seq();
         if (is_paused) {
-            if (stream_pause_cb_) stream_pause_cb_();
+            if (stream_pause_cb_) stream_pause_cb_(sid, seq, static_cast<int64_t>(epoch), is_implicit);
         } else {
-            if (stream_resume_cb_) stream_resume_cb_();
+            if (stream_resume_cb_) stream_resume_cb_(sid, seq, static_cast<int64_t>(epoch));
+        }
+    });
+    rtp_.set_first_data_packet_callback([this](uint64_t epoch, int sr, int bits, int ch, const std::string& codec) {
+        const int64_t sid = active_session_id_.load(std::memory_order_acquire);
+        const int64_t seq = next_seq();
+        if (first_data_packet_cb_) {
+            first_data_packet_cb_(sid, seq, static_cast<int64_t>(epoch), sr, bits, ch, codec);
         }
     });
 }
@@ -250,8 +264,15 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
                      << "Server: AirTunes/105.1\r\n\r\n";
         }
     } else if (method == "FLUSH") {
-        rtp_.reset_buffer(); // 💡 收到 FLUSH 立即重置 JitterBuffer 与 AudioEngine 环形缓冲，杜绝残音爆音与断层
-        if (flush_cb_) flush_cb_();
+        // 💡 收到 FLUSH 立即无锁静音递增 epoch 并重置 JitterBuffer，杜绝残音爆音并隔离旧包
+        has_paused_without_flush_.store(false, std::memory_order_release);
+        rtp_.reset_buffer();
+        rtp_.notify_track_transition(2500);
+        const uint64_t new_epoch = AudioEngine::instance().emergency_mute_and_flush(FlushReason::FLUSH_SWITCH);
+        rtp_.set_active_epoch(new_epoch);
+        if (flush_cb_) {
+            flush_cb_(active_session_id_.load(std::memory_order_acquire), next_seq(), static_cast<int64_t>(new_epoch));
+        }
         response << "RTSP/1.0 200 OK\r\n"
                  << "CSeq: " << cseq << "\r\n"
                  << "RTP-Info: rtptime=0\r\n"
@@ -434,12 +455,19 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
             }
         }
 
-        bool accepted = true;
+        const int64_t sid = next_session_id_.fetch_add(1, std::memory_order_acq_rel) + 1;
+        active_session_id_.store(sid, std::memory_order_release);
+        has_paused_without_flush_.store(false, std::memory_order_release);
+
+        int64_t acquired_epoch = 1;
         if (stream_request_cb_) {
-            accepted = stream_request_cb_(current_params_);
+            acquired_epoch = stream_request_cb_(sid, next_seq(), current_params_);
         }
 
-        if (accepted) {
+        if (acquired_epoch > 0) {
+            rtp_.set_format_info(current_params_.sample_rate, current_params_.bit_depth, current_params_.channels, current_params_.codec);
+            rtp_.reset_buffer();
+            rtp_.set_active_epoch(static_cast<uint64_t>(acquired_epoch));
             int data_p = 0, ctrl_p = 0, timing_p = 0;
             if (rtp_.start(data_p, ctrl_p, timing_p)) {
                 response << "RTSP/1.0 200 OK\r\n"
@@ -459,18 +487,28 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
                      << "CSeq: " << cseq << "\r\n\r\n";
         }
     } else if (method == "RECORD") {
-        rtp_.reset_buffer();
-        rtp_.mark_paused_manually(false);
-        if (stream_resume_cb_) stream_resume_cb_();
-        if (flush_cb_) flush_cb_();
+        const bool resuming_from_pause = has_paused_without_flush_.exchange(false, std::memory_order_acq_rel);
+        if (resuming_from_pause) {
+            // 💡 同流恢复 (PAUSE -> RECORD 无 FLUSH)：保留原有 epoch 与环形缓冲，仅取消显式静音标记并上报恢复
+            AudioEngine::instance().resume_stream();
+            rtp_.mark_paused_manually(false, true);
+        } else {
+            // 💡 初次建流 RECORD 或 FLUSH 后 RECORD：切换世代排空潜在旧残留，等待 FirstDataPacketEvent 解锁 PLAYING
+            rtp_.reset_buffer();
+            const uint64_t switched_ep = AudioEngine::instance().emergency_mute_and_flush(FlushReason::FLUSH_SWITCH);
+            rtp_.set_active_epoch(switched_ep);
+            AudioEngine::instance().resume_stream();
+            rtp_.mark_paused_manually(false, false);
+        }
         response << "RTSP/1.0 200 OK\r\n"
                  << "CSeq: " << cseq << "\r\n"
                  << "Audio-Latency: 11025\r\n"
                  << "Server: AirTunes/105.1\r\n\r\n";
     } else if (method == "PAUSE") {
-        LOGI("收到 RTSP PAUSE 请求，执行推流暂停");
-        rtp_.mark_paused_manually(true);
-        if (stream_pause_cb_) stream_pause_cb_();
+        LOGI("收到 RTSP PAUSE 请求，执行无锁快路径静音 (EXPLICIT_PAUSE) 并保留环形缓冲");
+        has_paused_without_flush_.store(true, std::memory_order_release);
+        AudioEngine::instance().emergency_mute_and_flush(FlushReason::EXPLICIT_PAUSE);
+        rtp_.mark_paused_manually(true, true);
         response << "RTSP/1.0 200 OK\r\n"
                  << "CSeq: " << cseq << "\r\n\r\n";
     } else if (method == "SET_PARAMETER") {
@@ -487,7 +525,15 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
                 DmapMetadata dmap;
                 if (DmapParser::parse(payload, payload_len, dmap)) {
                     if (metadata_cb_) {
-                        metadata_cb_(dmap.title, dmap.artist, dmap.album, dmap.duration_ms, dmap.cover_art);
+                        metadata_cb_(
+                            active_session_id_.load(std::memory_order_acquire),
+                            next_seq(),
+                            dmap.title,
+                            dmap.artist,
+                            dmap.album,
+                            dmap.duration_ms,
+                            dmap.cover_art
+                        );
                     }
                 }
             } else if (content_type.find("image/") != std::string::npos) {
@@ -497,7 +543,15 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
                     std::vector<uint8_t> cover_art(payload, payload + payload_len);
                     LOGI("SET_PARAMETER 收到原生封面图片推送: %s, 字节数=%zu", content_type.c_str(), payload_len);
                     if (metadata_cb_) {
-                        metadata_cb_("", "", "", 0, cover_art);
+                        metadata_cb_(
+                            active_session_id_.load(std::memory_order_acquire),
+                            next_seq(),
+                            "",
+                            "",
+                            "",
+                            0,
+                            cover_art
+                        );
                     }
                 } else {
                     LOGI("SET_PARAMETER 收到切歌过渡/空封面提示 (image/none)，保留当前封面杜绝界面黑屏跳动");
@@ -547,7 +601,7 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
                             LOGD("AirPlay 进度实时校准: pos=%ld ms, duration=%ld ms (RTP: %s)",
                                  pos_ms, dur_ms, prog_val.c_str());
                             if (progress_cb_) {
-                                progress_cb_(pos_ms, dur_ms);
+                                progress_cb_(active_session_id_.load(std::memory_order_acquire), next_seq(), pos_ms, dur_ms);
                             }
                         } else if (end_ts == 0 && curr_ts >= start_ts && start_ts > 0) {
                             // 💡 直播/电台流 (end_ts == 0)，上报当前已播放时长，总时长为 0
@@ -555,7 +609,7 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
                             long pos_ms = static_cast<long>((curr_ts - start_ts) * 1000ULL / rate);
                             LOGD("AirPlay 直播流进度校准: pos=%ld ms (RTP: %s)", pos_ms, prog_val.c_str());
                             if (progress_cb_) {
-                                progress_cb_(pos_ms, 0);
+                                progress_cb_(active_session_id_.load(std::memory_order_acquire), next_seq(), pos_ms, 0);
                             }
                         }
                     }
@@ -566,10 +620,12 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
         response << "RTSP/1.0 200 OK\r\n"
                  << "CSeq: " << cseq << "\r\n\r\n";
     } else if (method == "TEARDOWN") {
+        has_paused_without_flush_.store(false, std::memory_order_release);
         rtp_.stop();
-        if (flush_cb_) flush_cb_();
+        const uint64_t teardown_ep = AudioEngine::instance().emergency_mute_and_flush(FlushReason::STOP_OR_TEARDOWN);
+        rtp_.set_active_epoch(teardown_ep);
         if (stream_stop_cb_) {
-            stream_stop_cb_();
+            stream_stop_cb_(active_session_id_.load(std::memory_order_acquire), next_seq(), static_cast<int64_t>(teardown_ep));
         }
         response << "RTSP/1.0 200 OK\r\n"
                  << "CSeq: " << cseq << "\r\n"

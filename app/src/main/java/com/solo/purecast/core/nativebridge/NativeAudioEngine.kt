@@ -76,24 +76,9 @@ object NativeAudioEngine {
     external fun writePcm(data: ByteArray, offset: Int, length: Int, expectedEpoch: Long): Int
 
     /**
-     * 向无锁 SPSC 环形缓冲区写入原始 PCM 数据包 (过渡期兼容重载，将在 U3 迁移完成后移除)
-     */
-    external fun writePcm(data: ByteArray, offset: Int, length: Int): Int
-
-    /**
-     * 暂停等时传输流
-     */
-    external fun pauseStream(): Int
-
-    /**
      * 恢复等时传输流
      */
     external fun resumeStream(): Int
-
-    /**
-     * 停止 URB 传输并清空缓冲区
-     */
-    external fun stopStream(): Int
 
     /**
      * 彻底释放 USB 设备独占权，触发内核驱动重绑时序
@@ -122,10 +107,18 @@ object NativeAudioEngine {
     external fun isStreaming(): Boolean
 
     /**
-     * FLAC 解码器采样格式解析就绪回调
+     * FLAC 解码器采样格式解析与首帧写入事件回调
      */
-    fun interface FlacFormatCallback {
-        fun onFormatReady(sampleRate: Int, bitDepth: Int, channels: Int, totalPcmFrames: Long)
+    interface FlacFormatCallback {
+        /**
+         * 同步完成硬件三元组重配并锁定流世代，返回 >0 的 expectedEpoch；<= 0 则中止解码
+         */
+        fun onFormatReady(sampleRate: Int, bitDepth: Int, channels: Int, totalPcmFrames: Long): Long
+
+        /**
+         * 首包有效 decoded PCM 写入环形缓冲时触发，用于解锁 PLAYING 状态
+         */
+        fun onFirstPcmWritten() {}
     }
 
     /**

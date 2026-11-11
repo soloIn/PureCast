@@ -78,16 +78,7 @@ public:
      */
     int write_pcm(const uint8_t* data, size_t size, uint64_t expected_epoch);
 
-    // 过渡期兼容重载（将在 U3 协议层全部传入 expected_epoch 后移除）
-    int write_pcm(const uint8_t* data, size_t size);
-
-    int pause_stream();
-
     int resume_stream();
-
-    int stop_stream();
-
-    void flush_buffer();
 
     int release_device();
 

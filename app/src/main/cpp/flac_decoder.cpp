@@ -67,7 +67,8 @@ void FlacDecoder::reset_decoded_frames() {
 bool FlacDecoder::decode_stream(
     JNIEnv* env,
     jobject input_stream,
-    void (*on_format_ready)(int, int, int, int64_t, void*),
+    int64_t (*on_format_ready)(int, int, int, int64_t, void*),
+    void (*on_first_pcm_written)(void*),
     void* user_data
 ) {
     if (!env || !input_stream) return false;
@@ -106,13 +107,26 @@ bool FlacDecoder::decode_stream(
          static_cast<unsigned long long>(pFlac->totalPCMFrameCount));
 
     const unsigned int target_bits = (pFlac->bitsPerSample > 16) ? 24 : 16;
+    int64_t expected_epoch = 0;
     if (on_format_ready) {
-        on_format_ready(static_cast<int>(pFlac->sampleRate),
-                        static_cast<int>(target_bits),
-                        static_cast<int>(pFlac->channels),
-                        static_cast<int64_t>(pFlac->totalPCMFrameCount),
-                        user_data);
+        expected_epoch = on_format_ready(
+            static_cast<int>(pFlac->sampleRate),
+            static_cast<int>(target_bits),
+            static_cast<int>(pFlac->channels),
+            static_cast<int64_t>(pFlac->totalPCMFrameCount),
+            user_data
+        );
     }
+    if (expected_epoch <= 0) {
+        LOGW("FLAC on_format_ready 返回无效世代 (%lld)，中止解码以避免串扰或硬件未就绪写入",
+             static_cast<long long>(expected_epoch));
+        drflac_close(pFlac);
+        env->DeleteLocalRef(jbuffer);
+        return false;
+    }
+    const uint64_t stream_epoch = static_cast<uint64_t>(expected_epoch);
+    bool first_pcm_notified = false;
+    bool aborted_by_epoch = false;
 
     constexpr size_t FRAMES_PER_READ = 2048;
     const unsigned int bits = pFlac->bitsPerSample;
@@ -123,7 +137,7 @@ bool FlacDecoder::decode_stream(
         std::vector<drflac_int32> pcm32_frames(FRAMES_PER_READ * channels);
         std::vector<uint8_t> pcm24_bytes(FRAMES_PER_READ * channels * 3);
 
-        while (AudioEngine::instance().is_running()) {
+        while (AudioEngine::instance().is_running() && !aborted_by_epoch) {
             if (AudioEngine::instance().is_paused()) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 continue;
@@ -154,9 +168,22 @@ bool FlacDecoder::decode_stream(
                     std::this_thread::sleep_for(std::chrono::milliseconds(10));
                     continue;
                 }
-                int n = AudioEngine::instance().write_pcm(pcm24_bytes.data() + written_total, bytes_to_write - written_total);
+                int n = AudioEngine::instance().write_pcm(
+                    pcm24_bytes.data() + written_total,
+                    bytes_to_write - written_total,
+                    stream_epoch
+                );
                 if (n > 0) {
                     written_total += static_cast<size_t>(n);
+                    if (!first_pcm_notified) {
+                        first_pcm_notified = true;
+                        if (on_first_pcm_written) on_first_pcm_written(user_data);
+                    }
+                } else if (n == -2 || n == -1) {
+                    LOGW("FLAC 24-bit 写入因世代失效或引擎退出而终止: ret=%d, epoch=%llu",
+                         n, static_cast<unsigned long long>(stream_epoch));
+                    aborted_by_epoch = true;
+                    break;
                 } else {
                     std::this_thread::sleep_for(std::chrono::milliseconds(2));
                 }
@@ -170,7 +197,7 @@ bool FlacDecoder::decode_stream(
         std::vector<drflac_int16> pcm_frames(FRAMES_PER_READ * channels);
         const size_t bytes_per_frame = channels * sizeof(drflac_int16);
 
-        while (AudioEngine::instance().is_running()) {
+        while (AudioEngine::instance().is_running() && !aborted_by_epoch) {
             if (AudioEngine::instance().is_paused()) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 continue;
@@ -191,9 +218,22 @@ bool FlacDecoder::decode_stream(
                     std::this_thread::sleep_for(std::chrono::milliseconds(10));
                     continue;
                 }
-                int n = AudioEngine::instance().write_pcm(raw_bytes + written_total, bytes_to_write - written_total);
+                int n = AudioEngine::instance().write_pcm(
+                    raw_bytes + written_total,
+                    bytes_to_write - written_total,
+                    stream_epoch
+                );
                 if (n > 0) {
                     written_total += static_cast<size_t>(n);
+                    if (!first_pcm_notified) {
+                        first_pcm_notified = true;
+                        if (on_first_pcm_written) on_first_pcm_written(user_data);
+                    }
+                } else if (n == -2 || n == -1) {
+                    LOGW("FLAC 16-bit 写入因世代失效或引擎退出而终止: ret=%d, epoch=%llu",
+                         n, static_cast<unsigned long long>(stream_epoch));
+                    aborted_by_epoch = true;
+                    break;
                 } else {
                     std::this_thread::sleep_for(std::chrono::milliseconds(2));
                 }
@@ -206,7 +246,7 @@ bool FlacDecoder::decode_stream(
 
     drflac_close(pFlac);
     env->DeleteLocalRef(jbuffer);
-    return true;
+    return !aborted_by_epoch;
 }
 
 } // namespace purecast

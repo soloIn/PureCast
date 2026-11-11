@@ -1,24 +1,17 @@
 package com.solo.purecast.airplay
 
 /**
- * 💡 NativeAirPlayCallback: Native RAOP 协议栈与 Android 系统服务的交互契约
+ * 💡 NativeAirPlayCallback: Native RAOP 协议栈与 Kotlin 无状态驱动层的异步事件桥接契约
+ * 全部异步会话回调均由 C++ 层携带单调 [nativeSessionId] 与递增 [sequence] 注入
  */
 interface NativeAirPlayCallback {
     /**
      * 收到 AirPlay 投播请求 (SETUP 阶段)
-     * @param sampleRate 采样率 (标称 44100)
-     * @param bitDepth 位深 (标称 16)
-     * @param channels 声道数 (标称 2)
-     * @param codec 经 SDP 协商确认的音频编码 (如 "ALAC" 或 "PCM")
-     * @param clientIp iPhone 对端 IP
-     * @param aesKeyBase64 RSA 加密的 AES Key (Base64)
-     * @param aesIvBase64 AES IV (Base64)
-     * @param dacpId DACP-ID 会话标识
-     * @param activeRemoteToken Active-Remote 遥控令牌
-     * @param dacpPort DACP HTTP 控制端口
-     * @return true 允许推流接入 (已就绪音频焦点与声卡独占), false 拒绝投播
+     * @return >0 表示允许推流且硬件已锁定新世代 epoch；<= 0 表示拒绝投播 (RTSP 返回 503)
      */
     fun onStreamRequested(
+        nativeSessionId: Long,
+        sequence: Long,
         sampleRate: Int,
         bitDepth: Int,
         channels: Int,
@@ -29,39 +22,52 @@ interface NativeAirPlayCallback {
         dacpId: String,
         activeRemoteToken: String,
         dacpPort: Int
-    ): Boolean
+    ): Long
 
     /**
      * AirPlay 会话停止或网络连接断开 (TEARDOWN 阶段)
      */
-    fun onStreamStopped()
+    fun onStreamStopped(nativeSessionId: Long, sequence: Long, epoch: Long)
 
     /**
-     * 💡 接收到推流端暂停请求或检测到音频流中断 (PAUSE / Stream Inactivity 触发)
+     * 💡 接收到推流端暂停请求或检测到音频流静音/断流 (isImplicit=true 表示 600ms/180帧静音触发，须 0ms 瞬切 UI)
      */
-    fun onStreamPaused()
+    fun onStreamPaused(nativeSessionId: Long, sequence: Long, epoch: Long, isImplicit: Boolean)
 
     /**
-     * 💡 接收到推流端恢复请求或检测到新音频包到达 (RECORD / Stream Resumed 触发)
+     * 💡 接收到推流端同流恢复请求或静音恢复 (PAUSE -> RECORD 无 FLUSH 触发)
      */
-    fun onStreamResumed()
+    fun onStreamResumed(nativeSessionId: Long, sequence: Long, epoch: Long)
+
+    /**
+     * 💡 收到 RTSP FLUSH 切歌/Seek 冲刷，C++ 已无锁切换至新世代 [newEpoch]
+     */
+    fun onTrackSwitchFlushed(nativeSessionId: Long, sequence: Long, newEpoch: Long)
+
+    /**
+     * 💡 新流或 FLUSH 新世代的首包有效解码 PCM 写入环形缓冲，触发业务层进入 STREAMING/PLAYING
+     */
+    fun onFirstDataPacket(
+        nativeSessionId: Long,
+        sequence: Long,
+        epoch: Long,
+        sampleRate: Int,
+        bitDepth: Int,
+        channels: Int,
+        codec: String
+    )
 
     /**
      * 收到 Apple-Challenge 挑战握手请求 (OPTIONS / ANNOUNCE 阶段)
-     * @param challengeBase64 Apple 设备发来的 Base64 编码随机挑战
-     * @return 经 RSA 私钥签名的 Apple-Response Base64 字符串，失败返回 null
      */
     fun onChallengeRequested(challengeBase64: String): String?
 
     /**
      * 接收到推流端 DMAP 音乐元数据更新
-     * @param title 歌曲名
-     * @param artist 艺术家
-     * @param album 专辑
-     * @param durationMs 音轨时长 (毫秒)
-     * @param coverArt 封面图片字节数据 (JPEG/PNG)
      */
     fun onMetadataReceived(
+        nativeSessionId: Long,
+        sequence: Long,
         title: String,
         artist: String,
         album: String,
@@ -71,8 +77,6 @@ interface NativeAirPlayCallback {
 
     /**
      * 💡 接收到推流端播放进度更新 (SET_PARAMETER progress: start/curr/end)
-     * @param positionMs 当前播放位置 (毫秒)
-     * @param durationMs 歌曲总时长 (毫秒)
      */
-    fun onProgressUpdated(positionMs: Long, durationMs: Long)
+    fun onProgressUpdated(nativeSessionId: Long, sequence: Long, positionMs: Long, durationMs: Long)
 }

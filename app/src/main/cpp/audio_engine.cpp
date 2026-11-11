@@ -1195,28 +1195,10 @@ int AudioEngine::write_pcm(const uint8_t* data, size_t size, uint64_t expected_e
     return static_cast<int>(written);
 }
 
-int AudioEngine::write_pcm(const uint8_t* data, size_t size) {
-    return write_pcm(data, size, get_current_buffer_epoch());
-}
-
-int AudioEngine::pause_stream() {
-    emergency_mute_and_flush(FlushReason::EXPLICIT_PAUSE);
-    return 0;
-}
-
 int AudioEngine::resume_stream() {
     is_explicitly_paused_.store(false, std::memory_order_release);
     LOGI("音频流显式暂停标记已清除，恢复等时输出");
     return 0;
-}
-
-int AudioEngine::stop_stream() {
-    emergency_mute_and_flush(FlushReason::STOP_OR_TEARDOWN);
-    return 0;
-}
-
-void AudioEngine::flush_buffer() {
-    emergency_mute_and_flush(FlushReason::FLUSH_SWITCH);
 }
 
 int AudioEngine::release_device() {

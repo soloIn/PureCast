@@ -30,14 +30,15 @@ struct RaopStreamParams {
 
 class RaopServer {
 public:
-    using StreamRequestCallback = std::function<bool(const RaopStreamParams& params)>;
-    using StreamStopCallback = std::function<void()>;
-    using MetadataCallback = std::function<void(const std::string& title, const std::string& artist, const std::string& album, long duration_ms, const std::vector<uint8_t>& cover_art)>;
+    using StreamRequestCallback = std::function<int64_t(int64_t session_id, int64_t sequence, const RaopStreamParams& params)>;
+    using StreamStopCallback = std::function<void(int64_t session_id, int64_t sequence, int64_t epoch)>;
+    using MetadataCallback = std::function<void(int64_t session_id, int64_t sequence, const std::string& title, const std::string& artist, const std::string& album, long duration_ms, const std::vector<uint8_t>& cover_art)>;
     using ChallengeCallback = std::function<std::string(const std::string& challenge_b64)>;
-    using ProgressCallback = std::function<void(long position_ms, long duration_ms)>;
-    using FlushCallback = std::function<void()>;
-    using StreamPauseCallback = std::function<void()>;
-    using StreamResumeCallback = std::function<void()>;
+    using ProgressCallback = std::function<void(int64_t session_id, int64_t sequence, long position_ms, long duration_ms)>;
+    using FlushCallback = std::function<void(int64_t session_id, int64_t sequence, int64_t new_epoch)>;
+    using StreamPauseCallback = std::function<void(int64_t session_id, int64_t sequence, int64_t epoch, bool is_implicit)>;
+    using StreamResumeCallback = std::function<void(int64_t session_id, int64_t sequence, int64_t epoch)>;
+    using FirstDataPacketCallback = std::function<void(int64_t session_id, int64_t sequence, int64_t epoch, int sample_rate, int bit_depth, int channels, const std::string& codec)>;
 
     RaopServer();
     ~RaopServer();
@@ -51,6 +52,7 @@ public:
     void set_stream_stop_callback(StreamStopCallback cb) { stream_stop_cb_ = std::move(cb); }
     void set_stream_pause_callback(StreamPauseCallback cb) { stream_pause_cb_ = std::move(cb); }
     void set_stream_resume_callback(StreamResumeCallback cb) { stream_resume_cb_ = std::move(cb); }
+    void set_first_data_packet_callback(FirstDataPacketCallback cb) { first_data_packet_cb_ = std::move(cb); }
     void set_metadata_callback(MetadataCallback cb) { metadata_cb_ = std::move(cb); }
     void set_challenge_callback(ChallengeCallback cb) { challenge_cb_ = std::move(cb); }
     void set_progress_callback(ProgressCallback cb) { progress_cb_ = std::move(cb); }
@@ -70,6 +72,9 @@ private:
 
     std::string parse_header(const std::string& request, const std::string& header_name);
     std::string parse_sdp_attribute(const std::string& sdp, const std::string& attr_name);
+    int64_t next_seq() {
+        return event_sequence_.fetch_add(1, std::memory_order_acq_rel) + 1;
+    }
 
 private:
     int server_port_{5000};
@@ -80,11 +85,16 @@ private:
     RaopRtp rtp_;
     RaopStreamParams current_params_{};
     std::atomic<float> current_volume_db_{0.0f};
+    std::atomic<int64_t> active_session_id_{0};
+    std::atomic<int64_t> next_session_id_{0};
+    std::atomic<int64_t> event_sequence_{0};
+    std::atomic<bool> has_paused_without_flush_{false};
 
     StreamRequestCallback stream_request_cb_{nullptr};
     StreamStopCallback stream_stop_cb_{nullptr};
     StreamPauseCallback stream_pause_cb_{nullptr};
     StreamResumeCallback stream_resume_cb_{nullptr};
+    FirstDataPacketCallback first_data_packet_cb_{nullptr};
     MetadataCallback metadata_cb_{nullptr};
     ChallengeCallback challenge_cb_{nullptr};
     ProgressCallback progress_cb_{nullptr};

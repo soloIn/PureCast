@@ -9,47 +9,96 @@
 
 static JavaVM* g_jvm = nullptr;
 static jobject g_airplay_callback = nullptr;
-static std::recursive_mutex g_airplay_mutex;
+// 💡 分离回调引用锁与服务生命周期锁，绝不在持有锁时调用 Java 回调或 join 线程，彻底消除 stopAirPlayServer 互锁
+static std::mutex g_callback_mutex;
+static std::recursive_mutex g_server_mutex;
 static std::unique_ptr<purecast::raop::RaopServer> g_raop_server = nullptr;
+
+namespace {
+
+struct ScopedJniCallback {
+    JNIEnv* env{nullptr};
+    jobject callback{nullptr};
+    bool attached{false};
+
+    ScopedJniCallback() {
+        if (!g_jvm) return;
+        JNIEnv* cur_env = nullptr;
+        jint res = g_jvm->GetEnv(reinterpret_cast<void**>(&cur_env), JNI_VERSION_1_6);
+        if (res == JNI_EDETACHED) {
+            if (g_jvm->AttachCurrentThread(&cur_env, nullptr) != JNI_OK) {
+                return;
+            }
+            attached = true;
+        } else if (res != JNI_OK) {
+            return;
+        }
+        jobject local_cb = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(g_callback_mutex);
+            if (g_airplay_callback) {
+                local_cb = cur_env->NewLocalRef(g_airplay_callback);
+            }
+        }
+        if (!local_cb) {
+            if (attached) {
+                g_jvm->DetachCurrentThread();
+                attached = false;
+            }
+            return;
+        }
+        env = cur_env;
+        callback = local_cb;
+    }
+
+    ~ScopedJniCallback() {
+        if (env && callback) {
+            env->DeleteLocalRef(callback);
+        }
+        if (attached && g_jvm) {
+            g_jvm->DetachCurrentThread();
+        }
+    }
+
+    explicit operator bool() const { return env != nullptr && callback != nullptr; }
+};
+
+} // namespace
 
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* /* reserved */) {
     g_jvm = vm;
     return JNI_VERSION_1_6;
 }
 
-static bool notify_java_stream_requested(const purecast::raop::RaopStreamParams& params) {
-    std::lock_guard<std::recursive_mutex> lock(g_airplay_mutex);
-    if (!g_jvm || !g_airplay_callback) return true;
+static int64_t notify_java_stream_requested(
+    int64_t session_id,
+    int64_t sequence,
+    const purecast::raop::RaopStreamParams& params
+) {
+    ScopedJniCallback jni;
+    if (!jni) return -1;
 
-    JNIEnv* env = nullptr;
-    bool attached = false;
-    jint res = g_jvm->GetEnv((void**)&env, JNI_VERSION_1_6);
-    if (res == JNI_EDETACHED) {
-        if (g_jvm->AttachCurrentThread(&env, nullptr) != JNI_OK) {
-            return false;
-        }
-        attached = true;
-    }
-
-    jclass cls = env->GetObjectClass(g_airplay_callback);
-    jmethodID mid = env->GetMethodID(
+    jclass cls = jni.env->GetObjectClass(jni.callback);
+    jmethodID mid = jni.env->GetMethodID(
         cls,
         "onStreamRequested",
-        "(IIILjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;I)Z"
+        "(JJIIILjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;I)J"
     );
 
-    jstring j_codec = env->NewStringUTF(params.codec.c_str());
-    jstring j_client_ip = env->NewStringUTF(params.client_ip.c_str());
-    jstring j_key = env->NewStringUTF(params.aes_key_base64.c_str());
-    jstring j_iv = env->NewStringUTF(params.aes_iv_base64.c_str());
-    jstring j_dacp_id = env->NewStringUTF(params.dacp_id.c_str());
-    jstring j_token = env->NewStringUTF(params.active_remote_token.c_str());
+    jstring j_codec = jni.env->NewStringUTF(params.codec.c_str());
+    jstring j_client_ip = jni.env->NewStringUTF(params.client_ip.c_str());
+    jstring j_key = jni.env->NewStringUTF(params.aes_key_base64.c_str());
+    jstring j_iv = jni.env->NewStringUTF(params.aes_iv_base64.c_str());
+    jstring j_dacp_id = jni.env->NewStringUTF(params.dacp_id.c_str());
+    jstring j_token = jni.env->NewStringUTF(params.active_remote_token.c_str());
 
-    jboolean ret = JNI_TRUE;
+    jlong epoch_ret = -1;
     if (mid) {
-        ret = env->CallBooleanMethod(
-            g_airplay_callback,
+        epoch_ret = jni.env->CallLongMethod(
+            jni.callback,
             mid,
+            static_cast<jlong>(session_id),
+            static_cast<jlong>(sequence),
             params.sample_rate,
             params.bit_depth,
             params.channels,
@@ -63,134 +112,150 @@ static bool notify_java_stream_requested(const purecast::raop::RaopStreamParams&
         );
     }
 
-    env->DeleteLocalRef(j_codec);
-    env->DeleteLocalRef(j_client_ip);
-    env->DeleteLocalRef(j_key);
-    env->DeleteLocalRef(j_iv);
-    env->DeleteLocalRef(j_dacp_id);
-    env->DeleteLocalRef(j_token);
-    env->DeleteLocalRef(cls);
+    jni.env->DeleteLocalRef(j_codec);
+    jni.env->DeleteLocalRef(j_client_ip);
+    jni.env->DeleteLocalRef(j_key);
+    jni.env->DeleteLocalRef(j_iv);
+    jni.env->DeleteLocalRef(j_dacp_id);
+    jni.env->DeleteLocalRef(j_token);
+    jni.env->DeleteLocalRef(cls);
 
-    if (attached) {
-        g_jvm->DetachCurrentThread();
-    }
-    return ret == JNI_TRUE;
+    return static_cast<int64_t>(epoch_ret);
 }
 
-static void notify_java_stream_stopped() {
-    std::lock_guard<std::recursive_mutex> lock(g_airplay_mutex);
-    if (!g_jvm || !g_airplay_callback) return;
+static void notify_java_stream_stopped(int64_t session_id, int64_t sequence, int64_t epoch) {
+    ScopedJniCallback jni;
+    if (!jni) return;
 
-    JNIEnv* env = nullptr;
-    bool attached = false;
-    jint res = g_jvm->GetEnv((void**)&env, JNI_VERSION_1_6);
-    if (res == JNI_EDETACHED) {
-        if (g_jvm->AttachCurrentThread(&env, nullptr) != JNI_OK) {
-            return;
-        }
-        attached = true;
-    }
-
-    jclass cls = env->GetObjectClass(g_airplay_callback);
-    jmethodID mid = env->GetMethodID(cls, "onStreamStopped", "()V");
+    jclass cls = jni.env->GetObjectClass(jni.callback);
+    jmethodID mid = jni.env->GetMethodID(cls, "onStreamStopped", "(JJJ)V");
     if (mid) {
-        env->CallVoidMethod(g_airplay_callback, mid);
+        jni.env->CallVoidMethod(
+            jni.callback,
+            mid,
+            static_cast<jlong>(session_id),
+            static_cast<jlong>(sequence),
+            static_cast<jlong>(epoch)
+        );
     }
-    env->DeleteLocalRef(cls);
-
-    if (attached) {
-        g_jvm->DetachCurrentThread();
-    }
+    jni.env->DeleteLocalRef(cls);
 }
 
-static void notify_java_stream_paused() {
-    std::lock_guard<std::recursive_mutex> lock(g_airplay_mutex);
-    if (!g_jvm || !g_airplay_callback) return;
+static void notify_java_stream_paused(int64_t session_id, int64_t sequence, int64_t epoch, bool is_implicit) {
+    ScopedJniCallback jni;
+    if (!jni) return;
 
-    JNIEnv* env = nullptr;
-    bool attached = false;
-    jint res = g_jvm->GetEnv((void**)&env, JNI_VERSION_1_6);
-    if (res == JNI_EDETACHED) {
-        if (g_jvm->AttachCurrentThread(&env, nullptr) != JNI_OK) {
-            return;
-        }
-        attached = true;
-    }
-
-    jclass cls = env->GetObjectClass(g_airplay_callback);
-    jmethodID mid = env->GetMethodID(cls, "onStreamPaused", "()V");
+    jclass cls = jni.env->GetObjectClass(jni.callback);
+    jmethodID mid = jni.env->GetMethodID(cls, "onStreamPaused", "(JJJZ)V");
     if (mid) {
-        env->CallVoidMethod(g_airplay_callback, mid);
+        jni.env->CallVoidMethod(
+            jni.callback,
+            mid,
+            static_cast<jlong>(session_id),
+            static_cast<jlong>(sequence),
+            static_cast<jlong>(epoch),
+            is_implicit ? JNI_TRUE : JNI_FALSE
+        );
     }
-    env->DeleteLocalRef(cls);
-
-    if (attached) {
-        g_jvm->DetachCurrentThread();
-    }
+    jni.env->DeleteLocalRef(cls);
 }
 
-static void notify_java_stream_resumed() {
-    std::lock_guard<std::recursive_mutex> lock(g_airplay_mutex);
-    if (!g_jvm || !g_airplay_callback) return;
+static void notify_java_stream_resumed(int64_t session_id, int64_t sequence, int64_t epoch) {
+    ScopedJniCallback jni;
+    if (!jni) return;
 
-    JNIEnv* env = nullptr;
-    bool attached = false;
-    jint res = g_jvm->GetEnv((void**)&env, JNI_VERSION_1_6);
-    if (res == JNI_EDETACHED) {
-        if (g_jvm->AttachCurrentThread(&env, nullptr) != JNI_OK) {
-            return;
-        }
-        attached = true;
-    }
-
-    jclass cls = env->GetObjectClass(g_airplay_callback);
-    jmethodID mid = env->GetMethodID(cls, "onStreamResumed", "()V");
+    jclass cls = jni.env->GetObjectClass(jni.callback);
+    jmethodID mid = jni.env->GetMethodID(cls, "onStreamResumed", "(JJJ)V");
     if (mid) {
-        env->CallVoidMethod(g_airplay_callback, mid);
+        jni.env->CallVoidMethod(
+            jni.callback,
+            mid,
+            static_cast<jlong>(session_id),
+            static_cast<jlong>(sequence),
+            static_cast<jlong>(epoch)
+        );
     }
-    env->DeleteLocalRef(cls);
+    jni.env->DeleteLocalRef(cls);
+}
 
-    if (attached) {
-        g_jvm->DetachCurrentThread();
+static void notify_java_track_switch_flushed(int64_t session_id, int64_t sequence, int64_t new_epoch) {
+    ScopedJniCallback jni;
+    if (!jni) return;
+
+    jclass cls = jni.env->GetObjectClass(jni.callback);
+    jmethodID mid = jni.env->GetMethodID(cls, "onTrackSwitchFlushed", "(JJJ)V");
+    if (mid) {
+        jni.env->CallVoidMethod(
+            jni.callback,
+            mid,
+            static_cast<jlong>(session_id),
+            static_cast<jlong>(sequence),
+            static_cast<jlong>(new_epoch)
+        );
     }
+    jni.env->DeleteLocalRef(cls);
+}
+
+static void notify_java_first_data_packet(
+    int64_t session_id,
+    int64_t sequence,
+    int64_t epoch,
+    int sample_rate,
+    int bit_depth,
+    int channels,
+    const std::string& codec
+) {
+    ScopedJniCallback jni;
+    if (!jni) return;
+
+    jclass cls = jni.env->GetObjectClass(jni.callback);
+    jmethodID mid = jni.env->GetMethodID(cls, "onFirstDataPacket", "(JJJIIILjava/lang/String;)V");
+    jstring j_codec = jni.env->NewStringUTF(codec.c_str());
+    if (mid) {
+        jni.env->CallVoidMethod(
+            jni.callback,
+            mid,
+            static_cast<jlong>(session_id),
+            static_cast<jlong>(sequence),
+            static_cast<jlong>(epoch),
+            sample_rate,
+            bit_depth,
+            channels,
+            j_codec
+        );
+    }
+    jni.env->DeleteLocalRef(j_codec);
+    jni.env->DeleteLocalRef(cls);
 }
 
 static void notify_java_metadata(
+    int64_t session_id,
+    int64_t sequence,
     const std::string& title,
     const std::string& artist,
     const std::string& album,
     long duration_ms,
     const std::vector<uint8_t>& cover_art
 ) {
-    std::lock_guard<std::recursive_mutex> lock(g_airplay_mutex);
-    if (!g_jvm || !g_airplay_callback) return;
+    ScopedJniCallback jni;
+    if (!jni) return;
 
-    JNIEnv* env = nullptr;
-    bool attached = false;
-    jint res = g_jvm->GetEnv((void**)&env, JNI_VERSION_1_6);
-    if (res == JNI_EDETACHED) {
-        if (g_jvm->AttachCurrentThread(&env, nullptr) != JNI_OK) {
-            return;
-        }
-        attached = true;
-    }
-
-    jclass cls = env->GetObjectClass(g_airplay_callback);
-    jmethodID mid = env->GetMethodID(
+    jclass cls = jni.env->GetObjectClass(jni.callback);
+    jmethodID mid = jni.env->GetMethodID(
         cls,
         "onMetadataReceived",
-        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;J[B)V"
+        "(JJLjava/lang/String;Ljava/lang/String;Ljava/lang/String;J[B)V"
     );
 
     if (mid) {
-        jstring j_title = env->NewStringUTF(title.c_str());
-        jstring j_artist = env->NewStringUTF(artist.c_str());
-        jstring j_album = env->NewStringUTF(album.c_str());
+        jstring j_title = jni.env->NewStringUTF(title.c_str());
+        jstring j_artist = jni.env->NewStringUTF(artist.c_str());
+        jstring j_album = jni.env->NewStringUTF(album.c_str());
         jbyteArray j_cover = nullptr;
 
         if (!cover_art.empty()) {
-            j_cover = env->NewByteArray(static_cast<jsize>(cover_art.size()));
-            env->SetByteArrayRegion(
+            j_cover = jni.env->NewByteArray(static_cast<jsize>(cover_art.size()));
+            jni.env->SetByteArrayRegion(
                 j_cover,
                 0,
                 static_cast<jsize>(cover_art.size()),
@@ -198,9 +263,11 @@ static void notify_java_metadata(
             );
         }
 
-        env->CallVoidMethod(
-            g_airplay_callback,
+        jni.env->CallVoidMethod(
+            jni.callback,
             mid,
+            static_cast<jlong>(session_id),
+            static_cast<jlong>(sequence),
             j_title,
             j_artist,
             j_album,
@@ -208,94 +275,59 @@ static void notify_java_metadata(
             j_cover
         );
 
-        env->DeleteLocalRef(j_title);
-        env->DeleteLocalRef(j_artist);
-        env->DeleteLocalRef(j_album);
-        if (j_cover) env->DeleteLocalRef(j_cover);
+        jni.env->DeleteLocalRef(j_title);
+        jni.env->DeleteLocalRef(j_artist);
+        jni.env->DeleteLocalRef(j_album);
+        if (j_cover) jni.env->DeleteLocalRef(j_cover);
     }
-    env->DeleteLocalRef(cls);
-
-    if (attached) {
-        g_jvm->DetachCurrentThread();
-    }
+    jni.env->DeleteLocalRef(cls);
 }
 
-static void notify_java_progress_updated(long position_ms, long duration_ms) {
-    std::lock_guard<std::recursive_mutex> lock(g_airplay_mutex);
-    if (!g_jvm || !g_airplay_callback) return;
+static void notify_java_progress_updated(int64_t session_id, int64_t sequence, long position_ms, long duration_ms) {
+    ScopedJniCallback jni;
+    if (!jni) return;
 
-    JNIEnv* env = nullptr;
-    bool attached = false;
-    jint res = g_jvm->GetEnv((void**)&env, JNI_VERSION_1_6);
-    if (res == JNI_EDETACHED) {
-        if (g_jvm->AttachCurrentThread(&env, nullptr) != JNI_OK) {
-            return;
-        }
-        attached = true;
-    }
-
-    jclass cls = env->GetObjectClass(g_airplay_callback);
-    jmethodID mid = env->GetMethodID(
-        cls,
-        "onProgressUpdated",
-        "(JJ)V"
-    );
-
+    jclass cls = jni.env->GetObjectClass(jni.callback);
+    jmethodID mid = jni.env->GetMethodID(cls, "onProgressUpdated", "(JJJJ)V");
     if (mid) {
-        env->CallVoidMethod(
-            g_airplay_callback,
+        jni.env->CallVoidMethod(
+            jni.callback,
             mid,
+            static_cast<jlong>(session_id),
+            static_cast<jlong>(sequence),
             static_cast<jlong>(position_ms),
             static_cast<jlong>(duration_ms)
         );
     }
-    env->DeleteLocalRef(cls);
-
-    if (attached) {
-        g_jvm->DetachCurrentThread();
-    }
+    jni.env->DeleteLocalRef(cls);
 }
 
 static std::string notify_java_challenge_requested(const std::string& challenge_b64) {
-    std::lock_guard<std::recursive_mutex> lock(g_airplay_mutex);
-    if (!g_jvm || !g_airplay_callback) return "";
-
-    JNIEnv* env = nullptr;
-    bool attached = false;
-    jint res = g_jvm->GetEnv((void**)&env, JNI_VERSION_1_6);
-    if (res == JNI_EDETACHED) {
-        if (g_jvm->AttachCurrentThread(&env, nullptr) != JNI_OK) {
-            return "";
-        }
-        attached = true;
-    }
+    ScopedJniCallback jni;
+    if (!jni) return "";
 
     std::string result;
-    jclass cls = env->GetObjectClass(g_airplay_callback);
-    jmethodID mid = env->GetMethodID(
+    jclass cls = jni.env->GetObjectClass(jni.callback);
+    jmethodID mid = jni.env->GetMethodID(
         cls,
         "onChallengeRequested",
         "(Ljava/lang/String;)Ljava/lang/String;"
     );
 
     if (mid) {
-        jstring j_challenge = env->NewStringUTF(challenge_b64.c_str());
-        auto j_resp = (jstring)env->CallObjectMethod(g_airplay_callback, mid, j_challenge);
+        jstring j_challenge = jni.env->NewStringUTF(challenge_b64.c_str());
+        auto j_resp = static_cast<jstring>(jni.env->CallObjectMethod(jni.callback, mid, j_challenge));
         if (j_resp) {
-            const char* chars = env->GetStringUTFChars(j_resp, nullptr);
+            const char* chars = jni.env->GetStringUTFChars(j_resp, nullptr);
             if (chars) {
                 result = chars;
-                env->ReleaseStringUTFChars(j_resp, chars);
+                jni.env->ReleaseStringUTFChars(j_resp, chars);
             }
-            env->DeleteLocalRef(j_resp);
+            jni.env->DeleteLocalRef(j_resp);
         }
-        env->DeleteLocalRef(j_challenge);
+        jni.env->DeleteLocalRef(j_challenge);
     }
-    env->DeleteLocalRef(cls);
-
-    if (attached) {
-        g_jvm->DetachCurrentThread();
-    }
+    jni.env->DeleteLocalRef(cls);
     return result;
 }
 
@@ -392,47 +424,10 @@ Java_com_solo_purecast_core_nativebridge_NativeAudioEngine_writePcm___3BIIJ(
 }
 
 JNIEXPORT jint JNICALL
-Java_com_solo_purecast_core_nativebridge_NativeAudioEngine_writePcm___3BII(
-    JNIEnv *env,
-    jobject /* thiz */,
-    jbyteArray data,
-    jint offset,
-    jint length) {
-    if (!data || length <= 0 || offset < 0) return 0;
-    const jsize arr_len = env->GetArrayLength(data);
-    if (offset > arr_len || length > arr_len - offset) return -22;
-
-    jbyte* bytes = env->GetByteArrayElements(data, nullptr);
-    if (!bytes) return -1;
-
-    int written = purecast::AudioEngine::instance().write_pcm(
-        reinterpret_cast<const uint8_t*>(bytes + offset),
-        static_cast<size_t>(length)
-    );
-
-    env->ReleaseByteArrayElements(data, bytes, JNI_ABORT);
-    return written;
-}
-
-JNIEXPORT jint JNICALL
-Java_com_solo_purecast_core_nativebridge_NativeAudioEngine_pauseStream(
-    JNIEnv * /* env */,
-    jobject /* thiz */) {
-    return purecast::AudioEngine::instance().pause_stream();
-}
-
-JNIEXPORT jint JNICALL
 Java_com_solo_purecast_core_nativebridge_NativeAudioEngine_resumeStream(
     JNIEnv * /* env */,
     jobject /* thiz */) {
     return purecast::AudioEngine::instance().resume_stream();
-}
-
-JNIEXPORT jint JNICALL
-Java_com_solo_purecast_core_nativebridge_NativeAudioEngine_stopStream(
-    JNIEnv * /* env */,
-    jobject /* thiz */) {
-    return purecast::AudioEngine::instance().stop_stream();
 }
 
 JNIEXPORT jint JNICALL
@@ -473,19 +468,32 @@ Java_com_solo_purecast_core_nativebridge_NativeAudioEngine_isStreaming(
 struct JniFormatCallbackData {
     JNIEnv* env;
     jobject callback_obj;
-    jmethodID callback_method;
+    jmethodID on_format_ready_method;
+    jmethodID on_first_pcm_method;
 };
 
-static void jni_flac_format_cb(int sample_rate, int bit_depth, int channels, int64_t total_pcm_frames, void* user_data) {
+static int64_t jni_flac_format_cb(int sample_rate, int bit_depth, int channels, int64_t total_pcm_frames, void* user_data) {
     auto* cb_data = static_cast<JniFormatCallbackData*>(user_data);
-    if (cb_data && cb_data->env && cb_data->callback_obj && cb_data->callback_method) {
-        cb_data->env->CallVoidMethod(
+    if (cb_data && cb_data->env && cb_data->callback_obj && cb_data->on_format_ready_method) {
+        jlong epoch = cb_data->env->CallLongMethod(
             cb_data->callback_obj,
-            cb_data->callback_method,
+            cb_data->on_format_ready_method,
             sample_rate,
             bit_depth,
             channels,
             static_cast<jlong>(total_pcm_frames)
+        );
+        return static_cast<int64_t>(epoch);
+    }
+    return -1;
+}
+
+static void jni_flac_first_pcm_cb(void* user_data) {
+    auto* cb_data = static_cast<JniFormatCallbackData*>(user_data);
+    if (cb_data && cb_data->env && cb_data->callback_obj && cb_data->on_first_pcm_method) {
+        cb_data->env->CallVoidMethod(
+            cb_data->callback_obj,
+            cb_data->on_first_pcm_method
         );
     }
 }
@@ -516,19 +524,23 @@ Java_com_solo_purecast_core_nativebridge_NativeAudioEngine_decodeFlacStream(
     if (!input_stream || !on_format_callback) return JNI_FALSE;
 
     jclass cb_class = env->GetObjectClass(on_format_callback);
-    jmethodID cb_method = env->GetMethodID(cb_class, "onFormatReady", "(IIIJ)V");
+    jmethodID cb_method = env->GetMethodID(cb_class, "onFormatReady", "(IIIJ)J");
+    jmethodID first_pcm_method = env->GetMethodID(cb_class, "onFirstPcmWritten", "()V");
+    env->DeleteLocalRef(cb_class);
     if (!cb_method) return JNI_FALSE;
 
     JniFormatCallbackData cb_data{
         env,
         on_format_callback,
-        cb_method
+        cb_method,
+        first_pcm_method
     };
 
     bool ok = purecast::FlacDecoder::decode_stream(
         env,
         input_stream,
         jni_flac_format_cb,
+        jni_flac_first_pcm_cb,
         &cb_data
     );
     return ok ? JNI_TRUE : JNI_FALSE;
@@ -541,32 +553,43 @@ Java_com_solo_purecast_core_nativebridge_NativeAudioEngine_startAirPlayServer(
     jint port,
     jobject callback
 ) {
-    std::lock_guard<std::recursive_mutex> lock(g_airplay_mutex);
-    if (g_airplay_callback) {
-        env->DeleteGlobalRef(g_airplay_callback);
-        g_airplay_callback = nullptr;
+    std::unique_ptr<purecast::raop::RaopServer> old_server;
+    {
+        std::lock_guard<std::recursive_mutex> slock(g_server_mutex);
+        old_server = std::move(g_raop_server);
+    }
+    if (old_server) {
+        old_server->stop();
+        old_server.reset();
     }
 
-    if (callback) {
-        g_airplay_callback = env->NewGlobalRef(callback);
+    {
+        std::lock_guard<std::mutex> clock(g_callback_mutex);
+        if (g_airplay_callback) {
+            env->DeleteGlobalRef(g_airplay_callback);
+            g_airplay_callback = nullptr;
+        }
+        if (callback) {
+            g_airplay_callback = env->NewGlobalRef(callback);
+        }
     }
 
-    if (!g_raop_server) {
-        g_raop_server = std::make_unique<purecast::raop::RaopServer>();
+    auto server = std::make_unique<purecast::raop::RaopServer>();
+    server->set_stream_request_callback(notify_java_stream_requested);
+    server->set_stream_stop_callback(notify_java_stream_stopped);
+    server->set_stream_pause_callback(notify_java_stream_paused);
+    server->set_stream_resume_callback(notify_java_stream_resumed);
+    server->set_first_data_packet_callback(notify_java_first_data_packet);
+    server->set_metadata_callback(notify_java_metadata);
+    server->set_challenge_callback(notify_java_challenge_requested);
+    server->set_progress_callback(notify_java_progress_updated);
+    server->set_flush_callback(notify_java_track_switch_flushed);
+
+    bool ok = server->start(port);
+    if (ok) {
+        std::lock_guard<std::recursive_mutex> slock(g_server_mutex);
+        g_raop_server = std::move(server);
     }
-
-    g_raop_server->set_stream_request_callback(notify_java_stream_requested);
-    g_raop_server->set_stream_stop_callback(notify_java_stream_stopped);
-    g_raop_server->set_stream_pause_callback(notify_java_stream_paused);
-    g_raop_server->set_stream_resume_callback(notify_java_stream_resumed);
-    g_raop_server->set_metadata_callback(notify_java_metadata);
-    g_raop_server->set_challenge_callback(notify_java_challenge_requested);
-    g_raop_server->set_progress_callback(notify_java_progress_updated);
-    g_raop_server->set_flush_callback([]() {
-        purecast::AudioEngine::instance().flush_buffer();
-    });
-
-    bool ok = g_raop_server->start(port);
     return ok ? JNI_TRUE : JNI_FALSE;
 }
 
@@ -575,12 +598,18 @@ Java_com_solo_purecast_core_nativebridge_NativeAudioEngine_stopAirPlayServer(
     JNIEnv* env,
     jobject /* thiz */
 ) {
-    std::lock_guard<std::recursive_mutex> lock(g_airplay_mutex);
-    if (g_raop_server) {
-        g_raop_server->stop();
-        g_raop_server.reset();
+    std::unique_ptr<purecast::raop::RaopServer> server_to_stop;
+    {
+        std::lock_guard<std::recursive_mutex> slock(g_server_mutex);
+        server_to_stop = std::move(g_raop_server);
+    }
+    if (server_to_stop) {
+        // 💡 无锁调用 stop() 等待线程 join，避免与回调线程互锁
+        server_to_stop->stop();
+        server_to_stop.reset();
     }
 
+    std::lock_guard<std::mutex> clock(g_callback_mutex);
     if (g_airplay_callback) {
         env->DeleteGlobalRef(g_airplay_callback);
         g_airplay_callback = nullptr;
@@ -605,7 +634,7 @@ Java_com_solo_purecast_core_nativebridge_NativeAudioEngine_setAirPlayCryptoKey(
     env->GetByteArrayRegion(aes_key, 0, key_len, reinterpret_cast<jbyte*>(key.data()));
     env->GetByteArrayRegion(aes_iv, 0, iv_len, reinterpret_cast<jbyte*>(iv.data()));
 
-    std::lock_guard<std::recursive_mutex> lock(g_airplay_mutex);
+    std::lock_guard<std::recursive_mutex> slock(g_server_mutex);
     if (g_raop_server) {
         g_raop_server->set_decrypted_aes_key(key, iv);
     }

@@ -1,6 +1,8 @@
 package com.solo.purecast.upnp
 
 import com.solo.purecast.core.nativebridge.NativeAudioEngine
+import com.solo.purecast.model.DurationState
+import com.solo.purecast.model.SeekCapability
 import com.solo.purecast.util.Logger
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -18,20 +20,85 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
 /**
+ * 💡 HTTP 音频流解复用音频输出网关，解耦 Native JNI 调用以便 JVM 单测注入桩实现
+ */
+interface DemuxerAudioGateway {
+    fun writePcm(data: ByteArray, offset: Int, length: Int, expectedEpoch: Long): Int
+    fun getBufferAvailable(): Int
+    fun getAvailableRead(): Int
+    fun getFlacDecodedFrames(): Long
+    fun resetFlacDecodedFrames()
+    fun decodeFlacStream(
+        inputStream: InputStream,
+        callback: NativeAudioEngine.FlacFormatCallback
+    ): Boolean
+}
+
+/**
+ * 💡 生产环境默认直连 Native C++ AudioEngine 的音频网关
+ */
+object NativeDemuxerAudioGateway : DemuxerAudioGateway {
+    override fun writePcm(data: ByteArray, offset: Int, length: Int, expectedEpoch: Long): Int =
+        NativeAudioEngine.writePcm(data, offset, length, expectedEpoch)
+
+    override fun getBufferAvailable(): Int = NativeAudioEngine.getBufferAvailable()
+    override fun getAvailableRead(): Int = NativeAudioEngine.getAvailableRead()
+    override fun getFlacDecodedFrames(): Long = NativeAudioEngine.getFlacDecodedFrames()
+    override fun resetFlacDecodedFrames() = NativeAudioEngine.resetFlacDecodedFrames()
+    override fun decodeFlacStream(
+        inputStream: InputStream,
+        callback: NativeAudioEngine.FlacFormatCallback
+    ): Boolean = NativeAudioEngine.decodeFlacStream(inputStream, callback)
+}
+
+/**
+ * 💡 从容器头提取的流媒体音频规格与真实时长语义
+ */
+data class DemuxedStreamSpec(
+    val sampleRate: Int,
+    val bitDepth: Int,
+    val channels: Int,
+    val codec: String,
+    val durationMs: Long,
+    val durationState: DurationState,
+    val seekCapability: SeekCapability
+)
+
+internal fun resolveWavDurationSpec(dataSize: Long, bytesPerSecond: Long): Triple<Long, DurationState, SeekCapability> {
+    return when {
+        dataSize >= 0x7FFFFFFFL -> Triple(0L, DurationState.LIVE, SeekCapability.UNSEEKABLE)
+        dataSize > 0L && bytesPerSecond > 0L -> {
+            val durMs = (dataSize * 1000L) / bytesPerSecond
+            Triple(durMs, DurationState.FIXED, SeekCapability.SEEKABLE)
+        }
+        else -> Triple(0L, DurationState.UNKNOWN, SeekCapability.UNSEEKABLE)
+    }
+}
+
+internal fun resolveFlacDurationSpec(sampleRate: Int, totalPcmFrames: Long): Triple<Long, DurationState, SeekCapability> {
+    return if (sampleRate > 0 && totalPcmFrames > 0L) {
+        val durMs = (totalPcmFrames * 1000L) / sampleRate.toLong()
+        Triple(durMs, DurationState.FIXED, SeekCapability.SEEKABLE)
+    } else {
+        Triple(0L, DurationState.UNKNOWN, SeekCapability.UNSEEKABLE)
+    }
+}
+
+/**
  * 💡 PureCast HTTP 音频流无损解包器 (Stream Demuxer)
- * 支持以零拷贝、零延迟方式解析 HTTP WAV / Raw PCM 流容器头部，
- * 并以高效流水线将纯 PCM 字节直通至 C++ SPSC 无锁环形缓冲区。
  *
- * 核心特性：
- * 1. 精准提取 44~N 字节多 Chunk 容器头，深度流式解析 LIST INFO（INAM 歌名、IART 艺术家、IPRD 专辑）
- * 2. 完美适配 airupnp 无边界流 (Content-Length 为空或 0x7FFFFFFF)
- * 3. 统计已消费传输 PCM 采样字节数，精确上报播放时间戳 RelTime
- * 4. 实时上报底层硬件时钟采样率与位深
+ * 核心事务契约（R1/R4/U3）：
+ * 1. 解析容器头后同步阻塞完成硬件重配并获取 [expectedEpoch] (`<= 0` 则直接中止解码)；
+ * 2. 携带 `expectedEpoch` 写入 PCM；一旦返回 `< 0`（`-2` 世代过期或 `-1` 停止）立即终止写入，绝不越代覆盖；
+ * 3. 首次写入有效 PCM 时通知 [onFirstDataPacket]，推动协调器跃迁至 PLAYING；
+ * 4. 严格识别 `>= 0x7FFFFFFF` 无边界流为 `DurationState.LIVE` + `SeekCapability.UNSEEKABLE`。
  */
 class StreamDemuxer(
     private val scope: CoroutineScope,
-    private val onStreamStarted: (sampleRate: Int, bitDepth: Int, channels: Int, codec: String) -> Unit,
-    private val onStreamEnded: () -> Unit,
+    private val audioGateway: DemuxerAudioGateway = NativeDemuxerAudioGateway,
+    private val onAcquireStreamEpoch: (spec: DemuxedStreamSpec) -> Long,
+    private val onFirstDataPacket: (epoch: Long, spec: DemuxedStreamSpec) -> Unit,
+    private val onStreamEnded: (abortedByEpoch: Boolean, finalEpoch: Long) -> Unit,
     private val onError: (String) -> Unit,
     private val onMetadataParsed: ((title: String?, artist: String?, album: String?) -> Unit)? = null,
     private val onPositionUpdated: ((positionMs: Long) -> Unit)? = null
@@ -59,8 +126,6 @@ class StreamDemuxer(
     @Volatile
     private var flacStartTimeMs: Long = 0L
     @Volatile
-    private var lastPositionUpdateMs: Long = 0L
-    @Volatile
     private var flacTotalFrames: Long = 0L
     @Volatile
     private var currentSampleRate: Int = 0
@@ -81,15 +146,13 @@ class StreamDemuxer(
         val bps = bytesPerSecond
         if (bps > 0L) {
             if (isFlacStream && currentSampleRate > 0) {
-                // 💡 FLAC 模式：根据 Native 解码实际写入帧数与环形缓冲在途有效数据帧数精准计算已播放秒数
-                val decodedFrames = NativeAudioEngine.getFlacDecodedFrames()
+                val decodedFrames = audioGateway.getFlacDecodedFrames()
                 val bytesPerFrame = currentChannels * (currentBitDepth / 8)
-                val bufferedFrames = if (bytesPerFrame > 0) (NativeAudioEngine.getAvailableRead() / bytesPerFrame).toLong() else 0L
+                val bufferedFrames = if (bytesPerFrame > 0) (audioGateway.getAvailableRead() / bytesPerFrame).toLong() else 0L
                 val playedFrames = (decodedFrames - bufferedFrames).coerceAtLeast(0L)
                 return playedFrames / currentSampleRate.toLong()
             } else if (totalBytesStreamed > 0L) {
-                // 💡 WAV / PCM 模式：已播放字节修正为 (totalBytesStreamed - NativeAudioEngine.getAvailableRead()).coerceAtLeast(0)
-                val playedBytes = (totalBytesStreamed - NativeAudioEngine.getAvailableRead().toLong()).coerceAtLeast(0L)
+                val playedBytes = (totalBytesStreamed - audioGateway.getAvailableRead().toLong()).coerceAtLeast(0L)
                 return playedBytes / bps
             }
         }
@@ -159,11 +222,13 @@ class StreamDemuxer(
             }
             if (thisSession != sessionToken.get()) return@launch
 
-            NativeAudioEngine.resetFlacDecodedFrames()
+            audioGateway.resetFlacDecodedFrames()
 
             Logger.upnp.i(TAG, "开始连接音频流 (session=$thisSession): $streamUrl")
             var connection: HttpURLConnection? = null
             var inputStream: InputStream? = null
+            var abortedByEpoch = false
+            var acquiredEpoch = -1L
 
             try {
                 if (thisSession != sessionToken.get()) return@launch
@@ -206,58 +271,96 @@ class StreamDemuxer(
                     isFlacStream = true
                     Logger.upnp.i(TAG, "检测到 FLAC 无损流容器 (fLaC)，交由 Native dr_flac 流式无损解码...")
                     flacStartTimeMs = System.currentTimeMillis()
-                    val ok = NativeAudioEngine.decodeFlacStream(inputStream) { rate, bits, ch, totalPcmFrames ->
-                        if (thisSession == sessionToken.get()) {
-                            currentSampleRate = rate
-                            currentBitDepth = bits
-                            currentChannels = ch
-                            flacTotalFrames = totalPcmFrames
-                            bytesPerSecond = (rate.toLong() * ch * (bits / 8))
-                            if (rate > 0 && totalPcmFrames > 0L) {
-                                totalDurationSeconds = totalPcmFrames / rate.toLong()
-                                Logger.upnp.i(
-                                    TAG,
-                                    "Native dr_flac 解析音频规格成功: $rate Hz, $bits bit, $ch ch, 总采样帧: $totalPcmFrames, 总时长: ${totalDurationSeconds}秒"
+                    var currentSpec: DemuxedStreamSpec? = null
+                    val ok = audioGateway.decodeFlacStream(
+                        inputStream,
+                        object : NativeAudioEngine.FlacFormatCallback {
+                            override fun onFormatReady(
+                                sampleRate: Int,
+                                bitDepth: Int,
+                                channels: Int,
+                                totalPcmFrames: Long
+                            ): Long {
+                                if (thisSession != sessionToken.get()) {
+                                    abortedByEpoch = true
+                                    return -1L
+                                }
+                                currentSampleRate = sampleRate
+                                currentBitDepth = bitDepth
+                                currentChannels = channels
+                                flacTotalFrames = totalPcmFrames
+                                bytesPerSecond = (sampleRate.toLong() * channels * (bitDepth / 8))
+                                val (durMs, durState, seekCap) = resolveFlacDurationSpec(sampleRate, totalPcmFrames)
+                                totalDurationSeconds = durMs / 1000L
+                                val spec = DemuxedStreamSpec(
+                                    sampleRate = sampleRate,
+                                    bitDepth = bitDepth,
+                                    channels = channels,
+                                    codec = "FLAC",
+                                    durationMs = durMs,
+                                    durationState = durState,
+                                    seekCapability = seekCap
                                 )
-                            } else {
-                                Logger.upnp.i(TAG, "Native dr_flac 解析音频规格成功: $rate Hz, $bits bit, $ch ch")
+                                currentSpec = spec
+                                acquiredEpoch = onAcquireStreamEpoch(spec)
+                                if (acquiredEpoch <= 0L) {
+                                    abortedByEpoch = true
+                                }
+                                return acquiredEpoch
                             }
-                            onStreamStarted(rate, bits, ch, "FLAC")
+
+                            override fun onFirstPcmWritten() {
+                                val spec = currentSpec ?: return
+                                if (thisSession == sessionToken.get() && acquiredEpoch > 0L) {
+                                    onFirstDataPacket(acquiredEpoch, spec)
+                                }
+                            }
                         }
-                    }
+                    )
                     if (!ok) {
-                        Logger.upnp.w(TAG, "Native dr_flac 解码失败或提前退出 (session=$thisSession)")
+                        abortedByEpoch = true
+                        Logger.upnp.w(TAG, "Native dr_flac 解码失败、世代过期或提前退出 (session=$thisSession)")
                     }
                 } else if (magicStr == "RIFF") {
                     isFlacStream = false
-                    // 💡 解析容器头 (WAV / L16)
                     val format = parseHeader(inputStream)
-                    if (thisSession != sessionToken.get()) return@launch
+                    if (thisSession != sessionToken.get()) {
+                        abortedByEpoch = true
+                        return@launch
+                    }
                     currentSampleRate = format.sampleRate
                     currentBitDepth = format.bitDepth
                     currentChannels = format.channels
                     flacTotalFrames = 0L
+
+                    bytesPerSecond = (format.sampleRate.toLong() * format.channels * (format.bitDepth / 8))
+                    val (durMs, durState, seekCap) = resolveWavDurationSpec(format.dataSize, bytesPerSecond)
+                    totalDurationSeconds = durMs / 1000L
                     Logger.upnp.i(
                         TAG,
-                        "WAV 容器头部解析完毕: 采样率=${format.sampleRate}Hz, 位深=${format.bitDepth}bit, 声道=${format.channels}, dataSize=${format.dataSize}"
+                        "WAV 容器头部解析完毕: ${format.sampleRate}Hz/${format.bitDepth}bit/${format.channels}ch, dataSize=${format.dataSize}, durationState=$durState"
                     )
 
-                    // 计算每秒字节数
-                    bytesPerSecond = (format.sampleRate * format.channels * (format.bitDepth / 8)).toLong()
-                    if (format.dataSize > 0L && format.dataSize != 0x7FFFFFFFL && bytesPerSecond > 0L) {
-                        totalDurationSeconds = format.dataSize / bytesPerSecond
-                        Logger.upnp.i(TAG, "已计算出音频总时长: ${totalDurationSeconds}秒")
+                    val spec = DemuxedStreamSpec(
+                        sampleRate = format.sampleRate,
+                        bitDepth = format.bitDepth,
+                        channels = format.channels,
+                        codec = "WAV",
+                        durationMs = durMs,
+                        durationState = durState,
+                        seekCapability = seekCap
+                    )
+                    acquiredEpoch = onAcquireStreamEpoch(spec)
+                    if (acquiredEpoch <= 0L) {
+                        abortedByEpoch = true
+                        Logger.upnp.w(TAG, "WAV 获取硬件世代失败 ($acquiredEpoch)，中止推流 (session=$thisSession)")
+                        return@launch
                     }
 
-                    // 通知主服务开启硬件独占与时钟锁定
-                    if (thisSession == sessionToken.get()) {
-                        onStreamStarted(format.sampleRate, format.bitDepth, format.channels, "WAV")
-                    }
-
-                    // 💡 流式搬运纯 PCM 数据包直接灌入 Native SPSC RingBuffer (扩大至 32KB 减少 87.5% JNI 调用)
                     val pcmBuffer = ByteArray(32768)
+                    var firstPacketEmitted = false
 
-                    while (isActive && isDemuxing && thisSession == sessionToken.get()) {
+                    while (isActive && isDemuxing && thisSession == sessionToken.get() && !abortedByEpoch) {
                         val bytesRead = inputStream.read(pcmBuffer, 0, pcmBuffer.size)
                         if (bytesRead == -1) {
                             Logger.upnp.i(TAG, "音频流正常读取至 EOF 边界 (session=$thisSession)")
@@ -269,13 +372,21 @@ class StreamDemuxer(
                             var offset = 0
                             var remaining = bytesRead
                             while (remaining > 0 && isActive && isDemuxing && thisSession == sessionToken.get()) {
-                                val written = NativeAudioEngine.writePcm(pcmBuffer, offset, remaining)
+                                val written = audioGateway.writePcm(pcmBuffer, offset, remaining, acquiredEpoch)
                                 if (written > 0) {
+                                    if (!firstPacketEmitted) {
+                                        firstPacketEmitted = true
+                                        onFirstDataPacket(acquiredEpoch, spec)
+                                    }
                                     offset += written
                                     remaining -= written
+                                } else if (written == -2 || written == -1) {
+                                    // 💡 R1/U3 铁律：收到 -2 世代过期或 -1 引擎停止立即跳出，严禁阻塞或跨代覆写
+                                    Logger.upnp.w(TAG, "WAV writePcm 因世代过期或引擎停止中止写入: ret=$written, epoch=$acquiredEpoch")
+                                    abortedByEpoch = true
+                                    break
                                 } else {
-                                    // 💡 环形缓冲满载时自适应非阻塞挂起，等待等时 URB 消费，彻底杜绝高频 JNI 空转
-                                    val avail = NativeAudioEngine.getBufferAvailable()
+                                    val avail = audioGateway.getBufferAvailable()
                                     val needed = (remaining - avail).coerceAtLeast(0)
                                     val waitMs = if (bytesPerSecond > 0L && needed > 0) {
                                         ((needed.toLong() * 1000L) / bytesPerSecond).coerceIn(5L, 20L)
@@ -292,23 +403,24 @@ class StreamDemuxer(
                     throw IllegalArgumentException("不支持的非 WAV/FLAC 格式流: $magicStr")
                 }
 
-                Logger.upnp.i(TAG, "音频流数据拉取完毕，等待环形缓冲排空播放 (session=$thisSession)...")
-                // 💡 等待环形缓冲区中的数据被 USB DAC 完全消费播放完毕 (最多等待 6 秒防挂起)
-                var waitCount = 0
-                while (isActive && isDemuxing && thisSession == sessionToken.get() && NativeAudioEngine.getAvailableRead() > 0 && waitCount < 120) {
-                    delay(50)
-                    waitCount++
-                }
-                // 💡 环形缓冲排空后，额外增加 25ms 延时等待在途的 8ms 等时 URB 与 DAC 硬件 FIFO 完整播放完毕，彻底杜绝曲末截断
-                delay(25)
-                if (thisSession == sessionToken.get()) {
-                    Logger.upnp.i(TAG, "音频流播放完毕 (session=$thisSession)")
+                if (!abortedByEpoch && thisSession == sessionToken.get()) {
+                    Logger.upnp.i(TAG, "音频流数据拉取完毕，等待环形缓冲排空播放 (session=$thisSession)...")
+                    var waitCount = 0
+                    while (isActive && isDemuxing && thisSession == sessionToken.get() && audioGateway.getAvailableRead() > 0 && waitCount < 120) {
+                        delay(50)
+                        waitCount++
+                    }
+                    delay(25)
+                    if (thisSession == sessionToken.get()) {
+                        Logger.upnp.i(TAG, "音频流播放完毕 (session=$thisSession)")
+                    }
                 }
             } catch (e: CancellationException) {
+                abortedByEpoch = true
                 Logger.upnp.i(TAG, "音频拉取流被主动取消 (session=$thisSession)")
             } catch (e: Exception) {
                 Logger.upnp.e(TAG, "音频流拉取/解包异常 (session=$thisSession)", e)
-                if (thisSession == sessionToken.get()) {
+                if (thisSession == sessionToken.get() && !abortedByEpoch) {
                     onError("音频流传输异常: ${e.message}")
                 }
             } finally {
@@ -320,13 +432,12 @@ class StreamDemuxer(
                 } catch (e: Exception) {
                     // ignore
                 }
-                // 💡 仅当前活跃会话有权修改全局状态与触发流结束回调，杜绝快速切歌时旧协程误杀新流
                 if (thisSession == sessionToken.get()) {
                     progressJob?.cancel()
                     progressJob = null
                     isDemuxing = false
-                    onStreamEnded()
-                    Logger.upnp.i(TAG, "活跃会话 (session=$thisSession) 正常结束并回调 onStreamEnded")
+                    onStreamEnded(abortedByEpoch, acquiredEpoch)
+                    Logger.upnp.i(TAG, "活跃会话 (session=$thisSession) 结束 (abortedByEpoch=$abortedByEpoch)")
                 } else {
                     Logger.upnp.i(TAG, "旧协程 (session=$thisSession) 资源清理完成，当前活跃会话为 ${sessionToken.get()}，跳过全局状态重置")
                 }
@@ -355,7 +466,7 @@ class StreamDemuxer(
         progressJob = null
         streamingJob?.cancel()
         streamingJob = null
-        NativeAudioEngine.resetFlacDecodedFrames()
+        audioGateway.resetFlacDecodedFrames()
     }
 
     data class AudioStreamFormat(

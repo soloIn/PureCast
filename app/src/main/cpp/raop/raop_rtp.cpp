@@ -154,6 +154,8 @@ void RaopRtp::stop() {
     resend_req_seq_.store(0, std::memory_order_relaxed);
     last_audio_packet_time_ms_.store(0, std::memory_order_relaxed);
     is_stream_paused_.store(false, std::memory_order_relaxed);
+    is_manually_paused_.store(false, std::memory_order_relaxed);
+    emitted_first_epoch_.store(0ULL, std::memory_order_release);
     {
         std::lock_guard<std::mutex> lock(crypto_mutex_);
         aes_key_.clear();
@@ -227,7 +229,9 @@ void RaopRtp::watchdog_loop() {
         if (!is_running_.load(std::memory_order_relaxed)) break;
 
         uint64_t last_time = last_audio_packet_time_ms_.load(std::memory_order_relaxed);
-        if (last_time > 0 && !is_stream_paused_.load(std::memory_order_relaxed)) {
+        if (last_time > 0 &&
+            !is_stream_paused_.load(std::memory_order_relaxed) &&
+            !is_manually_paused_.load(std::memory_order_acquire)) {
             uint64_t now = get_monotonic_time_ms();
             bool in_transition = now < track_transition_deadline_ms_.load(std::memory_order_acquire);
             if (!in_transition && now > last_time && (now - last_time) >= 600) {
@@ -235,20 +239,27 @@ void RaopRtp::watchdog_loop() {
                 bool expected = false;
                 if (is_stream_paused_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
                     uint64_t recheck_time = last_audio_packet_time_ms_.load(std::memory_order_relaxed);
-                    if (recheck_time == last_time) {
+                    StreamStateCallback cb_copy;
+                    uint64_t pause_epoch = 0ULL;
+                    bool should_notify = false;
+                    {
                         std::lock_guard<std::mutex> lock(state_mutex_);
-                        // 💡 竞态防抖三检：在获取锁后再次校验 is_stream_paused_
-                        // 杜绝在 CAS 与分发回调的微秒级窗口内，data_loop 收到新包将其置为 false 并派发了恢复回调，
-                        // 导致回调顺序颠倒（先分发恢复后分发暂停）将 UI 永久置于 PAUSED 僵死态
-                        if (is_stream_paused_.load(std::memory_order_acquire)) {
-                            LOGI("⚠️ 检测到 RTP 音频流停顿超 600ms (iPhone 暂停推流)，通知上层暂停");
-                            if (state_cb_) state_cb_(true);
+                        // 💡 竞态防抖三检：在获取锁后再次校验 is_stream_paused_ 与时间戳
+                        if (recheck_time == last_time &&
+                            is_stream_paused_.load(std::memory_order_acquire) &&
+                            !is_manually_paused_.load(std::memory_order_acquire)) {
+                            LOGI("⚠️ 检测到 RTP 音频流停顿超 600ms (iPhone 暂停推流)，C++ 立即无锁静音并通知隐式暂停");
+                            pause_epoch = AudioEngine::instance().emergency_mute_and_flush(FlushReason::EXPLICIT_PAUSE);
+                            cb_copy = state_cb_;
+                            should_notify = true;
+                        } else if (recheck_time != last_time) {
+                            is_stream_paused_.store(false, std::memory_order_release);
                         } else {
                             LOGI("🔄 监测到 data_loop 已在临界区恢复推流，放弃分发迟到的暂停回调");
                         }
-                    } else {
-                        // 在 CAS 切换瞬间新数据包到达并更新了时间戳，撤销暂停标记
-                        is_stream_paused_.store(false, std::memory_order_release);
+                    }
+                    if (should_notify && cb_copy) {
+                        cb_copy(true, true, pause_epoch);
                     }
                 }
             }
@@ -257,17 +268,27 @@ void RaopRtp::watchdog_loop() {
     LOGI("RAOP RTP 数据流无数据看门狗已退出");
 }
 
-void RaopRtp::mark_paused_manually(bool paused) {
+void RaopRtp::mark_paused_manually(bool paused, bool emit_callback) {
     is_manually_paused_.store(paused, std::memory_order_release);
     is_stream_paused_.store(paused, std::memory_order_release);
     if (paused) {
         LOGI("收到手动标记暂停指令 (RTSP PAUSE)");
     } else {
-        LOGI("收到手动标记恢复指令 (RTSP RECORD)");
+        LOGI("收到手动标记恢复指令 (RTSP RECORD, emit=%d)", emit_callback ? 1 : 0);
         last_audio_packet_time_ms_.store(get_monotonic_time_ms(), std::memory_order_relaxed);
     }
-    std::lock_guard<std::mutex> lock(state_mutex_);
-    if (state_cb_) state_cb_(paused);
+    if (!emit_callback) {
+        return;
+    }
+    StreamStateCallback cb_copy;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        cb_copy = state_cb_;
+    }
+    const uint64_t cur_epoch = active_epoch_.load(std::memory_order_acquire);
+    if (cb_copy) {
+        cb_copy(paused, false, cur_epoch);
+    }
 }
 
 uint64_t RaopRtp::get_ntp_timestamp() {
@@ -470,10 +491,17 @@ void RaopRtp::data_loop() {
                 // 门限由 25 帧提高至 180 帧 (~1.44 秒)
                 // 彻底杜绝音乐中的自然休止符、前奏淡入、网络瞬间微抖动误触发 PAUSED 导致的大屏闪烁与焦点抢占
                 if (sil_cnt >= 180 && !is_stream_paused_.load(std::memory_order_relaxed)) {
-                    is_stream_paused_.store(true, std::memory_order_release);
-                    LOGI("⏸️ 检测到连续静音保活帧 (持续 %u 帧 ~1.44s，iPhone 暂停推流)，同步 TV 端播放状态机为 PAUSED", sil_cnt);
-                    std::lock_guard<std::mutex> lock(state_mutex_);
-                    if (state_cb_) state_cb_(true);
+                    bool expected = false;
+                    if (is_stream_paused_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+                        uint64_t pause_ep = AudioEngine::instance().emergency_mute_and_flush(FlushReason::EXPLICIT_PAUSE);
+                        LOGI("⏸️ 检测到连续静音保活帧 (持续 %u 帧 ~1.44s，iPhone 暂停推流)，C++ 立即静音并上报隐式暂停", sil_cnt);
+                        StreamStateCallback cb_copy;
+                        {
+                            std::lock_guard<std::mutex> lock(state_mutex_);
+                            cb_copy = state_cb_;
+                        }
+                        if (cb_copy) cb_copy(true, true, pause_ep);
+                    }
                 }
                 if (sil_cnt == 200 || sil_cnt % 1000 == 0) {
                     float vol = current_volume_db_.load(std::memory_order_relaxed);
@@ -490,11 +518,8 @@ void RaopRtp::data_loop() {
                 }
 
                 // 💡 关键时钟基准重置与状态同步：
-                // 1. 若此前处于暂停状态，或者切歌过渡期丢弃了静音帧导致序列号断层 (skipped_silence_in_transition_)，
-                //    显式调用 jitter_buffer_.reset()！
-                //    彻底消除过渡期丢包补偿 (密集生成全 0 静音帧) 造成的切歌卡顿与延迟，并消除长暂停 RTP 序列号回环吞音 Bug！
-                // 2. 刷新 AudioEngine 环形缓冲区，消除残留声波断裂；
-                // 3. 恢复等时传输并通过 state_mutex_ 串行化同步 TV 端播放状态机为 PLAYING。
+                // 1. 若此前处于隐式暂停状态，或切歌过渡期丢弃了静音帧导致序列号断层，重置 JitterBuffer 并更新 epoch；
+                // 2. 非手动暂停状态下确保等时输出唤醒，恢复状态机为 PLAYING。
                 bool was_paused = is_stream_paused_.load(std::memory_order_relaxed) && !is_manually_paused_.load(std::memory_order_relaxed);
                 bool had_transition_silence = skipped_silence_in_transition_.exchange(false, std::memory_order_acq_rel);
 
@@ -507,15 +532,23 @@ void RaopRtp::data_loop() {
                         LOGI("🔄 切歌过渡期丢弃静音帧后首个有效音频帧到达，重置 JitterBuffer 游标消除序列号断层");
                     }
                     jitter_buffer_.reset();
-                    AudioEngine::instance().flush_buffer();
+                    uint64_t next_ep = AudioEngine::instance().emergency_mute_and_flush(FlushReason::FLUSH_SWITCH);
+                    active_epoch_.store(next_ep, std::memory_order_release);
+                    AudioEngine::instance().resume_stream();
                     if (was_paused) {
-                        std::lock_guard<std::mutex> lock(state_mutex_);
-                        if (state_cb_) state_cb_(false);
+                        StreamStateCallback cb_copy;
+                        {
+                            std::lock_guard<std::mutex> lock(state_mutex_);
+                            cb_copy = state_cb_;
+                        }
+                        if (cb_copy) cb_copy(false, false, next_ep);
                     }
                 }
 
-                // 💡 保证等时传输线程处于就绪状态，防止此前因为暂停而导致环形缓冲区积压饱和丢弃
-                if (AudioEngine::instance().is_paused()) {
+                // 💡 仅在非手动/非流暂停状态下恢复等时输出，防止手动暂停期瞬间误解封
+                if (!is_stream_paused_.load(std::memory_order_acquire) &&
+                    !is_manually_paused_.load(std::memory_order_acquire) &&
+                    AudioEngine::instance().is_paused()) {
                     LOGI("▶️ 收到有效解码音频帧且 AudioEngine 处于暂停态，底层主动调用 resume_stream");
                     AudioEngine::instance().resume_stream();
                 }
@@ -529,12 +562,43 @@ void RaopRtp::data_loop() {
             std::vector<uint8_t> pcm_copy(pcm_frame.data(), pcm_frame.data() + out_bytes);
             jitter_buffer_.push(seq, ts, std::move(pcm_copy));
 
-            // 3. 将连续就绪的 PCM 帧出队并推入 SPSC 环形缓冲区
+            // 3. 将连续就绪的 PCM 帧出队并携带 active_epoch_ 推入 SPSC 环形缓冲区
             std::vector<uint8_t> ready_frame;
             while (jitter_buffer_.pop(ready_frame)) {
-                int written = AudioEngine::instance().write_pcm(ready_frame.data(), ready_frame.size());
+                const uint64_t cur_epoch = active_epoch_.load(std::memory_order_acquire);
+                int written = AudioEngine::instance().write_pcm(ready_frame.data(), ready_frame.size(), cur_epoch);
+                if (written > 0) {
+                    uint64_t prev_emitted = emitted_first_epoch_.load(std::memory_order_acquire);
+                    if (prev_emitted != cur_epoch &&
+                        emitted_first_epoch_.compare_exchange_strong(prev_emitted, cur_epoch, std::memory_order_acq_rel)) {
+                        FirstDataPacketCallback fcb_copy;
+                        int sr = 44100;
+                        int bits = 16;
+                        int ch = 2;
+                        std::string codec_str = "ALAC";
+                        {
+                            std::lock_guard<std::mutex> flock(format_mutex_);
+                            sr = format_sample_rate_;
+                            bits = format_bit_depth_;
+                            ch = format_channels_;
+                            codec_str = format_codec_;
+                        }
+                        {
+                            std::lock_guard<std::mutex> slock(state_mutex_);
+                            fcb_copy = first_packet_cb_;
+                        }
+                        if (fcb_copy) {
+                            fcb_copy(cur_epoch, sr, bits, ch, codec_str);
+                        }
+                    }
+                } else if (written < 0) {
+                    LOGW("RAOP write_pcm 返回错误或世代过期: ret=%d, epoch=%llu",
+                         written, static_cast<unsigned long long>(cur_epoch));
+                    break;
+                }
                 if (cur_cnt < 5) {
-                    LOGI("AudioEngine 写入首批 PCM 帧: bytes=%zu, ret=%d", ready_frame.size(), written);
+                    LOGI("AudioEngine 写入首批 PCM 帧: bytes=%zu, ret=%d, epoch=%llu",
+                         ready_frame.size(), written, static_cast<unsigned long long>(cur_epoch));
                 }
             }
         }

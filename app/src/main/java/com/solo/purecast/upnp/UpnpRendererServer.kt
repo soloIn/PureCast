@@ -1,9 +1,33 @@
 package com.solo.purecast.upnp
 
-import com.solo.purecast.util.NetworkUtils
+import com.solo.purecast.core.session.ErrorClearedEvent
+import com.solo.purecast.core.session.ErrorReportedEvent
+import com.solo.purecast.core.session.EventOrigin
+import com.solo.purecast.core.session.ExplicitPauseEvent
+import com.solo.purecast.core.session.FirstDataPacketEvent
+import com.solo.purecast.core.session.HardwareFastPathController
+import com.solo.purecast.core.session.HardwareReconfiguredEvent
+import com.solo.purecast.core.session.MetadataPatchEvent
+import com.solo.purecast.core.session.ProgressUpdateEvent
+import com.solo.purecast.core.session.SessionEventEnvelope
+import com.solo.purecast.core.session.SessionEventPayload
+import com.solo.purecast.core.session.StreamResumeEvent
+import com.solo.purecast.core.session.StreamSetupEvent
+import com.solo.purecast.core.session.StreamStopEvent
+import com.solo.purecast.core.session.TrackBoundaryEvent
+import com.solo.purecast.core.session.TrackCompleteEvent
+import com.solo.purecast.core.session.TrackSwitchEvent
+import com.solo.purecast.model.DurationState
+import com.solo.purecast.model.ErrorCode
+import com.solo.purecast.model.FlushReason
+import com.solo.purecast.model.PlaybackError
+import com.solo.purecast.model.PlaybackStatus
+import com.solo.purecast.model.PlayerSessionSnapshot
+import com.solo.purecast.model.SeekCapability
+import com.solo.purecast.model.StreamProtocol
 import com.solo.purecast.model.TrackMetadata
-import com.solo.purecast.service.PlaybackService
 import com.solo.purecast.util.Logger
+import com.solo.purecast.util.NetworkUtils
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -26,17 +50,24 @@ import java.util.UUID
 import java.util.regex.Pattern
 
 /**
- * 💡 PureCast UPnP / DLNA MediaRenderer 协议栈核心服务端
- * 零冗余、纯 Kotlin 实现：
- * 1. SSDP 组播发现与心跳宣告 (239.255.255.250:1900)
- * 2. HTTP 控制端点与 SCPD 描述符托管 (支持 SetAVTransportURI, Play, Pause, Stop, Seek, Next, Previous)
- * 3. DIDL-Lite XML 元数据流式提取、LIST INFO 回退与 GENA 双向状态同步
- * 4. 精确上报基于已消费 PCM 采样的播放时间戳 RelTime
- * 5. 支持局域网设备广播名称即时更新与 SSDP 重新宣告
+ * 💡 PureCast 无状态 UPnP / DLNA MediaRenderer 协议栈服务端
+ *
+ * 架构边界（R1/U3）：
+ * 1. 不直接持有或依赖 Android 前台播放保活服务；所有播放态变化统一封包 [SessionEventEnvelope] 上报协调器；
+ * 2. SOAP Pause / Stop / Preempt 同步直通 [HardwareFastPathController] 执行无锁快路径静音；
+ * 3. `GetTransportInfo` 等查询仅只读投影当前状态快照。
  */
 class UpnpRendererServer(
     private val scope: CoroutineScope,
-    private val playbackService: PlaybackService,
+    private val dispatchEvent: (SessionEventEnvelope<SessionEventPayload>) -> Unit,
+    private val allocateSessionId: () -> Long,
+    private val allocateSequence: () -> Long,
+    private val onAcquireHardwareForStream: (sampleRate: Int, bitDepth: Int, channels: Int, codec: String) -> Long,
+    private val snapshotProvider: () -> PlayerSessionSnapshot,
+    private val fastPath: HardwareFastPathController = HardwareFastPathController.default,
+    private val audioGateway: DemuxerAudioGateway = NativeDemuxerAudioGateway,
+    private val onWakeUpUi: (() -> Unit)? = null,
+    private val clockMs: () -> Long = { System.currentTimeMillis() },
     private var friendlyName: String = "PureCast TV",
     private val httpPort: Int = 7952
 ) {
@@ -52,7 +83,15 @@ class UpnpRendererServer(
     val genaNotifier = GenaEventNotifier(scope)
     private var demuxer: StreamDemuxer? = null
 
+    private val sessionStateLock = Any()
+    private var activeUpnpSessionId: Long = 0L
+    private var trackGenerationCounter: Long = 0L
+    private var sessionSetupDispatched: Boolean = false
+
+    @Volatile
     private var currentUri: String = ""
+
+    @Volatile
     private var currentTrackMetadata = TrackMetadata()
 
     /**
@@ -88,22 +127,23 @@ class UpnpRendererServer(
         genaNotifier.notifyTransportState(state)
     }
 
-    fun notifyNextTrack() {
-        Logger.upnp.i(TAG, "电视端触发切下一曲通知")
-        genaNotifier.notifyTransportState("TRANSITIONING")
-    }
-
-    fun notifyPreviousTrack() {
-        Logger.upnp.i(TAG, "电视端触发切上一曲通知")
-        genaNotifier.notifyTransportState("TRANSITIONING")
-    }
-
     /**
-     * 💡 主动中止当前 UPnP 解复用器与流传输
+     * 💡 主动中止当前 UPnP 解复用器与流传输（如被 AirPlay 抢占或停止广播时调用）
      */
-    fun stopPlayback() {
-        Logger.upnp.i(TAG, "主动中止 UPnP 流播放")
+    fun stopPlayback(isPreempted: Boolean = true) {
+        Logger.upnp.i(TAG, "主动中止 UPnP 流播放 (isPreempted=$isPreempted)")
         demuxer?.stop()
+        val reason = if (isPreempted) FlushReason.PREEMPT else FlushReason.STOP_OR_TEARDOWN
+        val stoppedEpoch = fastPath.emergencyMuteAndFlush(reason)
+        synchronized(sessionStateLock) {
+            val activeSnap = snapshotProvider()
+            val canEmitStop = activeUpnpSessionId != 0L && sessionSetupDispatched &&
+                (activeSnap.sessionId == activeUpnpSessionId || (!isPreempted && (activeSnap.sessionId == 0L || activeSnap.activeProtocol == StreamProtocol.UPNP_DLNA)))
+            if (canEmitStop) {
+                emitEventLocked(StreamStopEvent(newEpoch = stoppedEpoch, isPreempted = isPreempted))
+            }
+            sessionSetupDispatched = false
+        }
         notifyTransportState("STOPPED")
     }
 
@@ -125,61 +165,198 @@ class UpnpRendererServer(
         localIpAddress = getActiveLocalIpAddress()
         Logger.upnp.i(TAG, "启动 UPnP MediaRenderer: 名称=$friendlyName, 本地IP=$localIpAddress, 端口=$httpPort")
 
-        demuxer = StreamDemuxer(
+        demuxer = buildDemuxer().also {
+            // 仅在 Play 动作触发推流，不在 Server 初始化阶段启动网络请求
+        }
+
+        startHttpServer()
+        startSsdpEngine()
+    }
+
+    private fun ensureDemuxer(): StreamDemuxer {
+        val existing = demuxer
+        if (existing != null) return existing
+        return buildDemuxer().also { demuxer = it }
+    }
+
+    private fun buildDemuxer(): StreamDemuxer {
+        return StreamDemuxer(
             scope = scope,
-            onStreamStarted = { sampleRate, bitDepth, channels, codec ->
-                Logger.upnp.i(TAG, "StreamDemuxer 回调流启动: $sampleRate Hz, $bitDepth bit, $codec")
-                val totalDur = demuxer?.getTotalDurationSeconds() ?: 0L
-                if (totalDur > 0L && currentTrackMetadata.durationMs == 0L) {
-                    currentTrackMetadata = currentTrackMetadata.copy(
-                        durationMs = totalDur * 1000L,
-                        isLiveStream = false
-                    )
-                    playbackService.updateMetadata(currentTrackMetadata)
+            audioGateway = audioGateway,
+            onAcquireStreamEpoch = { spec ->
+                val acquiredEpoch = onAcquireHardwareForStream(spec.sampleRate, spec.bitDepth, spec.channels, spec.codec)
+                if (acquiredEpoch <= 0L) {
+                    return@StreamDemuxer -1L
                 }
-                playbackService.startStreaming(sampleRate, bitDepth, channels, PlaybackService.StreamSource.UPNP, codec = codec)
+                synchronized(sessionStateLock) {
+                    val resolvedDurMs = when {
+                        spec.durationState == DurationState.LIVE -> 0L
+                        spec.durationMs > 0L -> spec.durationMs
+                        else -> currentTrackMetadata.durationMs
+                    }
+                    val resolvedDurState = when {
+                        spec.durationState == DurationState.LIVE -> DurationState.LIVE
+                        resolvedDurMs > 0L -> DurationState.FIXED
+                        else -> spec.durationState
+                    }
+                    val resolvedSeekCap = if (resolvedDurState == DurationState.LIVE) {
+                        SeekCapability.UNSEEKABLE
+                    } else if (resolvedDurState == DurationState.FIXED) {
+                        SeekCapability.SEEKABLE
+                    } else {
+                        spec.seekCapability
+                    }
+                    currentTrackMetadata = currentTrackMetadata.copy(
+                        durationMs = resolvedDurMs,
+                        durationState = resolvedDurState,
+                        seekCapability = resolvedSeekCap,
+                        trackUri = currentUri.ifEmpty { currentTrackMetadata.trackUri }
+                    )
+
+                    val activeSnap = snapshotProvider()
+                    if (activeUpnpSessionId == 0L || activeSnap.sessionId != activeUpnpSessionId) {
+                        activeUpnpSessionId = allocateSessionId()
+                        trackGenerationCounter += 1L
+                        sessionSetupDispatched = false
+                    }
+
+                    if (!sessionSetupDispatched || activeSnap.sessionId != activeUpnpSessionId) {
+                        sessionSetupDispatched = true
+                        emitEventLocked(
+                            StreamSetupEvent(
+                                protocol = StreamProtocol.UPNP_DLNA,
+                                sampleRate = spec.sampleRate,
+                                bitDepth = spec.bitDepth,
+                                channels = spec.channels,
+                                codec = spec.codec,
+                                initialEpoch = acquiredEpoch,
+                                trackGeneration = trackGenerationCounter,
+                                initialMetadata = currentTrackMetadata
+                            )
+                        )
+                    } else {
+                        emitEventLocked(
+                            HardwareReconfiguredEvent(
+                                sampleRate = spec.sampleRate,
+                                bitDepth = spec.bitDepth,
+                                channels = spec.channels,
+                                epoch = acquiredEpoch
+                            )
+                        )
+                        emitEventLocked(
+                            MetadataPatchEvent(
+                                trackGeneration = trackGenerationCounter,
+                                durationMs = resolvedDurMs,
+                                durationState = resolvedDurState,
+                                seekCapability = resolvedSeekCap
+                            )
+                        )
+                    }
+                }
+                acquiredEpoch
+            },
+            onFirstDataPacket = { epoch, spec ->
+                synchronized(sessionStateLock) {
+                    if (activeUpnpSessionId != 0L) {
+                        emitEventLocked(
+                            FirstDataPacketEvent(
+                                epoch = epoch,
+                                sampleRate = spec.sampleRate,
+                                bitDepth = spec.bitDepth,
+                                channels = spec.channels,
+                                codec = spec.codec,
+                                protocol = StreamProtocol.UPNP_DLNA
+                            )
+                        )
+                    }
+                }
                 genaNotifier.notifyTransportState("PLAYING")
             },
-            onStreamEnded = {
-                Logger.upnp.i(TAG, "StreamDemuxer 回调流结束")
-                playbackService.stopPlayback(PlaybackService.StreamSource.UPNP)
-                genaNotifier.notifyTransportState("STOPPED")
+            onStreamEnded = { abortedByEpoch, _ ->
+                Logger.upnp.i(TAG, "StreamDemuxer 回调流结束 (abortedByEpoch=$abortedByEpoch)")
+                if (!abortedByEpoch) {
+                    val ep = fastPath.emergencyMuteAndFlush(FlushReason.STOP_OR_TEARDOWN)
+                    synchronized(sessionStateLock) {
+                        if (activeUpnpSessionId != 0L && snapshotProvider().sessionId == activeUpnpSessionId) {
+                            emitEventLocked(TrackCompleteEvent(newEpoch = ep))
+                        }
+                        sessionSetupDispatched = false
+                    }
+                    genaNotifier.notifyTransportState("STOPPED")
+                }
             },
             onError = { err ->
                 Logger.upnp.e(TAG, "StreamDemuxer 报错: $err")
-                playbackService.stopPlayback(PlaybackService.StreamSource.UPNP)
-                playbackService.updateServerError(err)
+                val ep = fastPath.emergencyMuteAndFlush(FlushReason.STOP_OR_TEARDOWN)
+                synchronized(sessionStateLock) {
+                    if (activeUpnpSessionId == 0L) {
+                        activeUpnpSessionId = allocateSessionId()
+                    }
+                    emitEventLocked(
+                        ErrorReportedEvent(
+                            PlaybackError(
+                                code = ErrorCode.NETWORK_STREAM_ERROR,
+                                message = err,
+                                recoverable = true,
+                                timestampMs = clockMs()
+                            )
+                        )
+                    )
+                    if (snapshotProvider().sessionId == activeUpnpSessionId) {
+                        emitEventLocked(StreamStopEvent(newEpoch = ep, isPreempted = false))
+                    }
+                    sessionSetupDispatched = false
+                }
                 genaNotifier.notifyTransportState("STOPPED")
             },
             onMetadataParsed = { title, artist, album ->
                 Logger.upnp.i(TAG, "从音频流容器提取到内嵌元数据: title=$title, artist=$artist, album=$album")
-                val isDefaultTitle = currentTrackMetadata.title.isEmpty() ||
+                synchronized(sessionStateLock) {
+                    val isDefaultTitle = currentTrackMetadata.title.isEmpty() ||
                         currentTrackMetadata.title == "等待音频推送" ||
-                        currentTrackMetadata.title == "AirPlay 无损音频"
-                val isDefaultArtist = currentTrackMetadata.artist.isEmpty() ||
+                        currentTrackMetadata.title == "AirPlay 无损音频" ||
+                        currentTrackMetadata.title == "UPnP 音频流"
+                    val isDefaultArtist = currentTrackMetadata.artist.isEmpty() ||
                         currentTrackMetadata.artist == "PureCast UPnP / DLNA 接收端" ||
+                        currentTrackMetadata.artist == "PureCast" ||
                         currentTrackMetadata.artist == "Apple Music"
-                val isDefaultAlbum = currentTrackMetadata.album.isEmpty() ||
+                    val isDefaultAlbum = currentTrackMetadata.album.isEmpty() ||
                         currentTrackMetadata.album == "未知专辑"
 
-                val updatedTitle = if (isDefaultTitle && !title.isNullOrEmpty()) title else currentTrackMetadata.title
-                val updatedArtist = if (isDefaultArtist && !artist.isNullOrEmpty()) artist else currentTrackMetadata.artist
-                val updatedAlbum = if (isDefaultAlbum && !album.isNullOrEmpty()) album else currentTrackMetadata.album
+                    val updatedTitle = if (isDefaultTitle && !title.isNullOrEmpty()) title else currentTrackMetadata.title
+                    val updatedArtist = if (isDefaultArtist && !artist.isNullOrEmpty()) artist else currentTrackMetadata.artist
+                    val updatedAlbum = if (isDefaultAlbum && !album.isNullOrEmpty()) album else currentTrackMetadata.album
 
-                currentTrackMetadata = currentTrackMetadata.copy(
-                    title = updatedTitle,
-                    artist = updatedArtist,
-                    album = updatedAlbum
-                )
-                playbackService.updateMetadata(currentTrackMetadata)
+                    currentTrackMetadata = currentTrackMetadata.copy(
+                        title = updatedTitle,
+                        artist = updatedArtist,
+                        album = updatedAlbum
+                    )
+                    if (activeUpnpSessionId != 0L && trackGenerationCounter > 0L) {
+                        emitEventLocked(
+                            MetadataPatchEvent(
+                                trackGeneration = trackGenerationCounter,
+                                title = updatedTitle.ifEmpty { null },
+                                artist = updatedArtist.ifEmpty { null },
+                                album = updatedAlbum.ifEmpty { null }
+                            )
+                        )
+                    }
+                }
             },
             onPositionUpdated = { posMs ->
-                playbackService.updatePlaybackPosition(posMs)
+                synchronized(sessionStateLock) {
+                    if (activeUpnpSessionId != 0L && snapshotProvider().sessionId == activeUpnpSessionId) {
+                        emitEventLocked(
+                            ProgressUpdateEvent(
+                                positionMs = posMs,
+                                durationMs = currentTrackMetadata.durationMs
+                            )
+                        )
+                    }
+                }
             }
         )
-
-        startHttpServer()
-        startSsdpEngine()
     }
 
     fun stop() {
@@ -217,7 +394,7 @@ class UpnpRendererServer(
                     reuseAddress = true
                     bind(InetSocketAddress(httpPort))
                 }
-                playbackService.updateServerError(null)
+                dispatchServiceEvent(ErrorClearedEvent(ErrorCode.SERVER_ERROR))
                 Logger.upnp.i(TAG, "HTTP 控制端点已在端口 $httpPort 上成功监听 (reuseAddress=true)")
 
                 while (isActive) {
@@ -229,7 +406,16 @@ class UpnpRendererServer(
             } catch (e: Exception) {
                 if (isActive) {
                     Logger.upnp.e(TAG, "HTTP Server 监听异常", e)
-                    playbackService.updateServerError("UPnP 服务端口绑定失败 ($httpPort): ${e.message}")
+                    dispatchServiceEvent(
+                        ErrorReportedEvent(
+                            PlaybackError(
+                                code = ErrorCode.SERVER_ERROR,
+                                message = "UPnP 服务端口绑定失败 ($httpPort): ${e.message}",
+                                recoverable = true,
+                                timestampMs = clockMs()
+                            )
+                        )
+                    )
                 }
             }
         }
@@ -314,7 +500,15 @@ class UpnpRendererServer(
         val soapAction = headers["soapaction"]?.removeSurrounding("\"") ?: ""
         Logger.upnp.i(TAG, "收到 SOAP Action: $soapAction")
 
-        val responseXml: String = when {
+        val responseXml = processSoapActionForTest(soapAction, body)
+        val isFault = responseXml.contains("<s:Fault>")
+        val statusCode = if (isFault) 500 else 200
+        val statusMsg = if (isFault) "Internal Server Error" else "OK"
+        sendResponse(out, statusCode, statusMsg, "text/xml; charset=\"utf-8\"", responseXml)
+    }
+
+    internal fun processSoapActionForTest(soapAction: String, body: String): String {
+        return when {
             soapAction.contains("SetNextAVTransportURI") -> handleSetNextAvTransportUri(body)
             soapAction.contains("SetAVTransportURI") -> handleSetAvTransportUri(body)
             soapAction.contains("Play") -> handlePlay()
@@ -333,11 +527,6 @@ class UpnpRendererServer(
                 buildSoapFault(401, "Invalid Action")
             }
         }
-
-        val isFault = responseXml.contains("<s:Fault>")
-        val statusCode = if (isFault) 500 else 200
-        val statusMsg = if (isFault) "Internal Server Error" else "OK"
-        sendResponse(out, statusCode, statusMsg, "text/xml; charset=\"utf-8\"", responseXml)
     }
 
     private fun handleHttpSubscribe(headers: Map<String, String>, out: OutputStream) {
@@ -393,17 +582,89 @@ class UpnpRendererServer(
         val metadataXml = extractTagValue(body, "CurrentURIMetaData")
         Logger.upnp.i(TAG, "SetAVTransportURI: uri=$uri, hasMetadata=${metadataXml.isNotEmpty()}")
 
-        if (uri.isNotEmpty() && uri != currentUri) {
-            playbackService.updatePlaybackPosition(0L)
+        val isUriChanged = uri.isNotEmpty() && uri != currentUri
+        if (isUriChanged) {
             if (demuxer?.isRunning() == true) {
                 demuxer?.stop()
             }
-        }
-        currentUri = uri
-
-        if (metadataXml.isNotEmpty() || currentTrackMetadata.title.isEmpty() || currentTrackMetadata.title == "等待音频推送") {
-            currentTrackMetadata = parseDidlLiteMetadata(metadataXml)
-            playbackService.updateMetadata(currentTrackMetadata)
+            val switchEpoch = if (sessionSetupDispatched) {
+                fastPath.emergencyMuteAndFlush(FlushReason.FLUSH_SWITCH)
+            } else {
+                0L
+            }
+            val parsedMeta = if (metadataXml.isNotEmpty() || currentTrackMetadata.title.isEmpty() || currentTrackMetadata.title == "等待音频推送") {
+                parseDidlLiteMetadata(metadataXml, uri)
+            } else {
+                currentTrackMetadata.copy(trackUri = uri)
+            }
+            synchronized(sessionStateLock) {
+                currentUri = uri
+                currentTrackMetadata = parsedMeta
+                val activeSnap = snapshotProvider()
+                val sameActiveSession = sessionSetupDispatched && activeUpnpSessionId != 0L &&
+                    (activeSnap.sessionId == activeUpnpSessionId || activeSnap.activeProtocol == StreamProtocol.UPNP_DLNA)
+                if (sameActiveSession) {
+                    trackGenerationCounter += 1L
+                    emitEventLocked(
+                        TrackSwitchEvent(
+                            flushReason = FlushReason.FLUSH_SWITCH,
+                            newEpoch = switchEpoch,
+                            trackUri = uri
+                        )
+                    )
+                    emitEventLocked(
+                        TrackBoundaryEvent(
+                            trackKey = uri,
+                            trackGeneration = trackGenerationCounter,
+                            initialDurationState = parsedMeta.durationState,
+                            seekCapability = parsedMeta.seekCapability,
+                            trackUri = uri
+                        )
+                    )
+                    emitEventLocked(
+                        MetadataPatchEvent(
+                            trackGeneration = trackGenerationCounter,
+                            title = parsedMeta.title,
+                            artist = parsedMeta.artist,
+                            album = parsedMeta.album,
+                            coverUri = parsedMeta.coverUri,
+                            durationMs = parsedMeta.durationMs,
+                            durationState = parsedMeta.durationState,
+                            seekCapability = parsedMeta.seekCapability
+                        )
+                    )
+                    emitEventLocked(
+                        ProgressUpdateEvent(
+                            positionMs = 0L,
+                            durationMs = parsedMeta.durationMs
+                        )
+                    )
+                }
+            }
+        } else {
+            if (uri.isNotEmpty()) {
+                currentUri = uri
+            }
+            if (metadataXml.isNotEmpty() || currentTrackMetadata.title.isEmpty() || currentTrackMetadata.title == "等待音频推送") {
+                val parsedMeta = parseDidlLiteMetadata(metadataXml, currentUri)
+                synchronized(sessionStateLock) {
+                    currentTrackMetadata = parsedMeta
+                    if (sessionSetupDispatched && activeUpnpSessionId != 0L && trackGenerationCounter > 0L) {
+                        emitEventLocked(
+                            MetadataPatchEvent(
+                                trackGeneration = trackGenerationCounter,
+                                title = parsedMeta.title,
+                                artist = parsedMeta.artist,
+                                album = parsedMeta.album,
+                                coverUri = parsedMeta.coverUri,
+                                durationMs = parsedMeta.durationMs,
+                                durationState = parsedMeta.durationState,
+                                seekCapability = parsedMeta.seekCapability
+                            )
+                        )
+                    }
+                }
+            }
         }
 
         // 💡 遵循 UPnP AVTransport 标准：SetAVTransportURI 仅初始化元数据，推流由 Play 动作触发
@@ -413,12 +674,23 @@ class UpnpRendererServer(
     private fun handlePlay(): String {
         Logger.upnp.i(TAG, "SOAP Play 指令触发, 当前 uri: $currentUri")
         // 💡 收到推流，突破 BAL 尝试自动唤醒大屏播放界面
-        playbackService.wakeUpUiIfInBackground()
+        onWakeUpUi?.invoke()
 
         if (currentUri.isNotEmpty() && (demuxer?.isRunning() != true || demuxer?.getCurrentUri() != currentUri)) {
-            demuxer?.start(currentUri)
+            ensureDemuxer().start(currentUri)
         } else {
-            playbackService.resumePlayback()
+            fastPath.resumeStream()
+            val resumedEpoch = fastPath.getCurrentBufferEpoch()
+            synchronized(sessionStateLock) {
+                if (activeUpnpSessionId != 0L) {
+                    emitEventLocked(
+                        StreamResumeEvent(
+                            protocol = StreamProtocol.UPNP_DLNA,
+                            resumedEpoch = resumedEpoch
+                        )
+                    )
+                }
+            }
         }
         genaNotifier.notifyTransportState("PLAYING")
         return buildSoapResponse("PlayResponse", "urn:schemas-upnp-org:service:AVTransport:1", "")
@@ -426,30 +698,55 @@ class UpnpRendererServer(
 
     private fun handlePause(): String {
         Logger.upnp.i(TAG, "SOAP Pause 指令触发")
-        playbackService.pausePlayback()
+        // 💡 硬件快路径优先静音，保持 epoch 与环形缓冲不被刷新
+        val pausedEpoch = fastPath.emergencyMuteAndFlush(FlushReason.EXPLICIT_PAUSE)
+        synchronized(sessionStateLock) {
+            if (activeUpnpSessionId != 0L) {
+                emitEventLocked(
+                    ExplicitPauseEvent(
+                        flushReason = FlushReason.EXPLICIT_PAUSE,
+                        epoch = pausedEpoch
+                    )
+                )
+            }
+        }
         genaNotifier.notifyTransportState("PAUSED_PLAYBACK")
         return buildSoapResponse("PauseResponse", "urn:schemas-upnp-org:service:AVTransport:1", "")
     }
 
     private fun handleStop(): String {
         Logger.upnp.i(TAG, "SOAP Stop 指令触发")
-        demuxer?.stop()
-        playbackService.stopPlayback(PlaybackService.StreamSource.UPNP)
-        genaNotifier.notifyTransportState("STOPPED")
+        stopPlayback(isPreempted = false)
         return buildSoapResponse("StopResponse", "urn:schemas-upnp-org:service:AVTransport:1", "")
+    }
+
+    private fun isLiveOrUnseekable(): Boolean {
+        val localMeta = currentTrackMetadata
+        val snapMeta = snapshotProvider().metadata
+        val durationState = if (localMeta.durationState != DurationState.UNKNOWN) {
+            localMeta.durationState
+        } else {
+            snapMeta.durationState
+        }
+        val seekCapability = if (localMeta.seekCapability != SeekCapability.UNKNOWN) {
+            localMeta.seekCapability
+        } else {
+            snapMeta.seekCapability
+        }
+        return durationState == DurationState.LIVE || seekCapability == SeekCapability.UNSEEKABLE
     }
 
     /**
      * 💡 SOAP Seek 寻道指令处理
-     * 符合 UPnP AVTransport 规范：对于 liveStream 实时流返回 701 (Transition not available)
+     * 符合 UPnP AVTransport 规范：对于 [DurationState.LIVE] 或 [SeekCapability.UNSEEKABLE] 返回 701 (Transition not available)
      */
     private fun handleSeek(body: String): String {
         val unit = extractTagValue(body, "Unit")
         val target = extractTagValue(body, "Target")
         Logger.upnp.i(TAG, "SOAP Seek 指令: Unit=$unit, Target=$target")
 
-        return if (currentTrackMetadata.isLiveStream) {
-            Logger.upnp.w(TAG, "实时音频流不支持 Seek 操作，按规范返回 SOAP 701 错误")
+        return if (isLiveOrUnseekable()) {
+            Logger.upnp.w(TAG, "实时或不可寻道音频流不支持 Seek 操作，按规范返回 SOAP 701 错误")
             buildSoapFault(701, "Transition not available for live stream")
         } else {
             Logger.upnp.i(TAG, "普通流 Seek 寻道请求已接受: $target")
@@ -462,7 +759,7 @@ class UpnpRendererServer(
      */
     private fun handleNext(): String {
         Logger.upnp.i(TAG, "SOAP Next 指令触发")
-        return if (currentTrackMetadata.isLiveStream) {
+        return if (isLiveOrUnseekable()) {
             Logger.upnp.w(TAG, "实时音频流不支持切歌，返回 SOAP 701 错误")
             buildSoapFault(701, "Transition not available for live stream")
         } else {
@@ -475,7 +772,7 @@ class UpnpRendererServer(
      */
     private fun handlePrevious(): String {
         Logger.upnp.i(TAG, "SOAP Previous 指令触发")
-        return if (currentTrackMetadata.isLiveStream) {
+        return if (isLiveOrUnseekable()) {
             Logger.upnp.w(TAG, "实时音频流不支持切上一曲，返回 SOAP 701 错误")
             buildSoapFault(701, "Transition not available for live stream")
         } else {
@@ -484,10 +781,10 @@ class UpnpRendererServer(
     }
 
     private fun handleGetTransportInfo(): String {
-        val status = PlaybackService.playbackStatus.value
+        val status = snapshotProvider().playbackStatus
         val stateStr = when (status) {
-            com.solo.purecast.model.PlaybackStatus.PLAYING -> "PLAYING"
-            com.solo.purecast.model.PlaybackStatus.PAUSED -> "PAUSED_PLAYBACK"
+            PlaybackStatus.PLAYING -> "PLAYING"
+            PlaybackStatus.PAUSED -> "PAUSED_PLAYBACK"
             else -> "STOPPED"
         }
         val inner = "<CurrentTransportState>$stateStr</CurrentTransportState><CurrentTransportStatus>OK</CurrentTransportStatus><CurrentSpeed>1</CurrentSpeed>"
@@ -533,7 +830,35 @@ class UpnpRendererServer(
         return buildSoapResponse("SetVolumeResponse", "urn:schemas-upnp-org:service:RenderingControl:1", "")
     }
 
-    private fun parseDidlLiteMetadata(escapedXml: String): TrackMetadata {
+    private fun emitEventLocked(payload: SessionEventPayload) {
+        val snap = snapshotProvider()
+        dispatchEvent(
+            SessionEventEnvelope(
+                origin = EventOrigin.UPNP,
+                sessionId = activeUpnpSessionId,
+                deviceGeneration = snap.deviceGeneration,
+                sequence = allocateSequence(),
+                timestampElapsedMs = clockMs(),
+                payload = payload
+            )
+        )
+    }
+
+    private fun dispatchServiceEvent(payload: SessionEventPayload) {
+        val snap = snapshotProvider()
+        dispatchEvent(
+            SessionEventEnvelope(
+                origin = EventOrigin.SERVICE,
+                sessionId = 0L,
+                deviceGeneration = snap.deviceGeneration,
+                sequence = allocateSequence(),
+                timestampElapsedMs = clockMs(),
+                payload = payload
+            )
+        )
+    }
+
+    private fun parseDidlLiteMetadata(escapedXml: String, trackUri: String = currentUri): TrackMetadata {
         val unescaped = escapedXml
             .replace("&lt;", "<")
             .replace("&gt;", ">")
@@ -569,22 +894,32 @@ class UpnpRendererServer(
             .ifEmpty { extractTagValue(unescaped, "albumArtURI") }
             .ifEmpty { extractTagValue(unescaped, "upnp:icon") }
             .ifEmpty { extractTagValue(unescaped, "icon") }
-            .ifEmpty { currentTrackMetadata.coverUri }
+            .ifEmpty { currentTrackMetadata.coverUri.orEmpty() }
 
-        val isLive = if (durationMs > 0L) {
-            false
-        } else {
-            unescaped.contains("isLive") || unescaped.isEmpty()
+        val hasLiveMarker = unescaped.contains("isLive", ignoreCase = true)
+        val durationState = when {
+            durationMs > 0L -> DurationState.FIXED
+            hasLiveMarker -> DurationState.LIVE
+            else -> DurationState.UNKNOWN
         }
+        val seekCapability = when (durationState) {
+            DurationState.FIXED -> SeekCapability.SEEKABLE
+            DurationState.LIVE -> SeekCapability.UNSEEKABLE
+            DurationState.UNKNOWN -> SeekCapability.UNKNOWN
+        }
+        val isLive = durationState == DurationState.LIVE
 
-        Logger.upnp.i(TAG, "解析 DIDL-Lite: title=$title, artist=$artist, album=$album, coverUri=$coverUri, durationMs=$durationMs, isLive=$isLive")
+        Logger.upnp.i(TAG, "解析 DIDL-Lite: title=$title, artist=$artist, album=$album, coverUri=$coverUri, durationMs=$durationMs, durationState=$durationState")
 
         return TrackMetadata(
             title = title,
             artist = artist,
             album = album,
-            coverUri = coverUri,
+            coverUri = coverUri.ifEmpty { null },
             durationMs = durationMs,
+            durationState = durationState,
+            seekCapability = seekCapability,
+            trackUri = trackUri.ifEmpty { null },
             isLiveStream = isLive
         )
     }
