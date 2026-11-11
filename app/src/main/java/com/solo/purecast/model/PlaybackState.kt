@@ -146,8 +146,8 @@ class TrackMetadata private constructor(
     @Suppress("UNUSED_PARAMETER") alreadyCopied: Boolean
 ) {
     constructor(
-        title: String = "等待音频推送",
-        artist: String = "PureCast TV",
+        title: String = DEFAULT_TITLE,
+        artist: String = DEFAULT_ARTIST,
         album: String = "",
         coverUri: String? = null,
         coverBytes: ByteArray? = null,
@@ -246,6 +246,11 @@ class TrackMetadata private constructor(
             "durationMs=$durationMs, durationState=$durationState, " +
             "seekCapability=$seekCapability, trackUri=$trackUri)"
     }
+
+    companion object {
+        const val DEFAULT_TITLE = "等待音频推送"
+        const val DEFAULT_ARTIST = "PureCast TV"
+    }
 }
 
 /**
@@ -253,7 +258,7 @@ class TrackMetadata private constructor(
  */
 data class AudioPathState(
     val isDacConnected: Boolean = false,
-    val dacName: String = "未检测到 USB DAC",
+    val dacName: String = DEFAULT_DAC_NAME,
     val isExclusive: Boolean = false,
     val sampleRate: Int = 44100,
     val bitDepth: Int = 16,
@@ -261,7 +266,11 @@ data class AudioPathState(
     val bufferAvailablePercent: Int = 100,
     val protocol: StreamProtocol = StreamProtocol.NONE,
     val codec: String = "PCM"
-)
+) {
+    companion object {
+        const val DEFAULT_DAC_NAME = "未检测到 USB DAC"
+    }
+}
 
 /**
  * 💡 全局唯一可信播放会话快照（Single Source of Truth）

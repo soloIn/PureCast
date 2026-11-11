@@ -8,6 +8,7 @@ import com.solo.purecast.core.session.ProgressUpdateEvent
 import com.solo.purecast.core.session.RemoteCommandType
 import com.solo.purecast.core.session.RemoteSkipNextEvent
 import com.solo.purecast.core.session.SessionEventEnvelope
+import com.solo.purecast.core.session.SessionEventPayload
 import com.solo.purecast.core.session.SessionHardwareBridge
 import com.solo.purecast.core.session.StreamResumeEvent
 import com.solo.purecast.core.session.StreamStopEvent
@@ -74,12 +75,18 @@ class PlaybackServiceSessionHost(
     val coordinator: PlaybackSessionCoordinator,
     private val hardwareBridge: SessionHardwareBridge,
     private val systemEffects: ServiceSystemEffects,
-    private val onSendAirPlayDacpCommand: (RemoteCommandType) -> Unit = {},
     private val clockMs: () -> Long = { System.currentTimeMillis() }
 ) {
     private var snapshotObserverJob: Job? = null
     private var airPlayTickerJob: Job? = null
     private var lastSnapshot: PlayerSessionSnapshot? = null
+
+    private var lastSyncedStatus: PlaybackStatus? = null
+    private var lastSyncedSeekCap: SeekCapability? = null
+    private var lastSyncedSessionId: Long = -1L
+    private var lastSyncedTrackGen: Long = -1L
+    private var lastSyncedPosMs: Long = 0L
+    private var lastSyncedClockMs: Long = 0L
 
     @Volatile
     private var lastAnchorPosMs: Long = 0L
@@ -133,22 +140,18 @@ class PlaybackServiceSessionHost(
 
         val origin = originForProtocol(snap.activeProtocol)
         if (snap.activeProtocol == StreamProtocol.AIRPLAY_1) {
-            onSendAirPlayDacpCommand(RemoteCommandType.PAUSE)
+            coordinator.sendDacpFireAndForget(RemoteCommandType.PAUSE)
         } else if (snap.activeProtocol == StreamProtocol.UPNP_DLNA) {
             systemEffects.notifyUpnpTransportState("PAUSED_PLAYBACK")
         }
 
-        coordinator.dispatch(
-            SessionEventEnvelope(
-                origin = origin,
-                sessionId = snap.sessionId,
-                deviceGeneration = snap.deviceGeneration,
-                sequence = coordinator.allocateSequence(),
-                timestampElapsedMs = clockMs(),
-                payload = ExplicitPauseEvent(
-                    flushReason = FlushReason.EXPLICIT_PAUSE,
-                    epoch = pausedEpoch
-                )
+        dispatchEnvelope(
+            origin = origin,
+            sessionId = snap.sessionId,
+            deviceGeneration = snap.deviceGeneration,
+            payload = ExplicitPauseEvent(
+                flushReason = FlushReason.EXPLICIT_PAUSE,
+                epoch = pausedEpoch
             )
         )
     }
@@ -161,22 +164,18 @@ class PlaybackServiceSessionHost(
 
         systemEffects.requestAudioFocus()
         if (snap.activeProtocol == StreamProtocol.AIRPLAY_1) {
-            onSendAirPlayDacpCommand(RemoteCommandType.PLAY)
+            coordinator.sendDacpFireAndForget(RemoteCommandType.PLAY)
         } else if (snap.activeProtocol == StreamProtocol.UPNP_DLNA) {
             systemEffects.notifyUpnpTransportState("PLAYING")
         }
 
-        coordinator.dispatch(
-            SessionEventEnvelope(
-                origin = originForProtocol(snap.activeProtocol),
-                sessionId = snap.sessionId,
-                deviceGeneration = snap.deviceGeneration,
-                sequence = coordinator.allocateSequence(),
-                timestampElapsedMs = clockMs(),
-                payload = StreamResumeEvent(
-                    protocol = snap.activeProtocol,
-                    resumedEpoch = snap.currentEpoch
-                )
+        dispatchEnvelope(
+            origin = originForProtocol(snap.activeProtocol),
+            sessionId = snap.sessionId,
+            deviceGeneration = snap.deviceGeneration,
+            payload = StreamResumeEvent(
+                protocol = snap.activeProtocol,
+                resumedEpoch = snap.currentEpoch
             )
         )
     }
@@ -186,18 +185,14 @@ class PlaybackServiceSessionHost(
         val stoppedEpoch = hardwareBridge.emergencyMuteAndFlush(FlushReason.STOP_OR_TEARDOWN)
         if (snap.sessionId != 0L && snap.activeProtocol != StreamProtocol.NONE) {
             systemEffects.preemptProtocol(snap.activeProtocol, snap.sessionId)
-            coordinator.dispatch(
-                SessionEventEnvelope(
-                    origin = originForProtocol(snap.activeProtocol),
-                    sessionId = snap.sessionId,
-                    deviceGeneration = snap.deviceGeneration,
-                    sequence = coordinator.allocateSequence(),
-                    timestampElapsedMs = clockMs(),
-                    payload = StreamStopEvent(
-                        flushReason = FlushReason.STOP_OR_TEARDOWN,
-                        newEpoch = stoppedEpoch,
-                        isPreempted = false
-                    )
+            dispatchEnvelope(
+                origin = originForProtocol(snap.activeProtocol),
+                sessionId = snap.sessionId,
+                deviceGeneration = snap.deviceGeneration,
+                payload = StreamStopEvent(
+                    flushReason = FlushReason.STOP_OR_TEARDOWN,
+                    newEpoch = stoppedEpoch,
+                    isPreempted = false
                 )
             )
         }
@@ -223,27 +218,65 @@ class PlaybackServiceSessionHost(
 
     private fun dispatchRemoteCommand(commandType: RemoteCommandType) {
         val snap = coordinator.snapshot.value
+        dispatchEnvelope(
+            origin = EventOrigin.USER_ACTION,
+            sessionId = snap.sessionId,
+            deviceGeneration = snap.deviceGeneration,
+            payload = RemoteSkipNextEvent(
+                commandType = commandType,
+                commandId = coordinator.allocateCommandId()
+            )
+        )
+    }
+
+    private fun dispatchEnvelope(
+        origin: EventOrigin,
+        sessionId: Long,
+        deviceGeneration: Long,
+        payload: SessionEventPayload
+    ) {
         coordinator.dispatch(
             SessionEventEnvelope(
-                origin = EventOrigin.USER_ACTION,
-                sessionId = snap.sessionId,
-                deviceGeneration = snap.deviceGeneration,
+                origin = origin,
+                sessionId = sessionId,
+                deviceGeneration = deviceGeneration,
                 sequence = coordinator.allocateSequence(),
                 timestampElapsedMs = clockMs(),
-                payload = RemoteSkipNextEvent(
-                    commandType = commandType,
-                    commandId = coordinator.allocateCommandId()
-                )
+                payload = payload
             )
         )
     }
 
     private fun handleSnapshotUpdate(prev: PlayerSessionSnapshot?, next: PlayerSessionSnapshot) {
-        systemEffects.syncMediaSessionState(
-            status = next.playbackStatus,
-            positionMs = next.progressPositionMs,
-            seekCapability = next.metadata.seekCapability
-        )
+        val nowMs = clockMs()
+        val expectedLinearPos = if (lastSyncedStatus == PlaybackStatus.PLAYING) {
+            lastSyncedPosMs + (nowMs - lastSyncedClockMs).coerceAtLeast(0L)
+        } else {
+            lastSyncedPosMs
+        }
+        val hasProgressJump = next.progressPositionMs != lastSyncedPosMs &&
+            (next.playbackStatus != PlaybackStatus.PLAYING ||
+                kotlin.math.abs(next.progressPositionMs - expectedLinearPos) >= 1500L)
+
+        val shouldSyncMediaSession = prev == null ||
+            lastSyncedStatus != next.playbackStatus ||
+            lastSyncedSeekCap != next.metadata.seekCapability ||
+            lastSyncedSessionId != next.sessionId ||
+            lastSyncedTrackGen != next.trackGeneration ||
+            hasProgressJump
+        if (shouldSyncMediaSession) {
+            lastSyncedStatus = next.playbackStatus
+            lastSyncedSeekCap = next.metadata.seekCapability
+            lastSyncedSessionId = next.sessionId
+            lastSyncedTrackGen = next.trackGeneration
+            lastSyncedPosMs = next.progressPositionMs
+            lastSyncedClockMs = nowMs
+            systemEffects.syncMediaSessionState(
+                status = next.playbackStatus,
+                positionMs = next.progressPositionMs,
+                seekCapability = next.metadata.seekCapability
+            )
+        }
 
         if (prev == null || prev.metadata != next.metadata) {
             systemEffects.syncMediaSessionMetadata(next.metadata)
@@ -259,23 +292,22 @@ class PlaybackServiceSessionHost(
             systemEffects.syncNotification(next)
         }
 
-        // 💡 依据业务稳态管理 Wi-Fi 低延迟锁与音频焦点
-        when (next.businessState) {
-            BusinessSessionState.PLAYING, BusinessSessionState.TRANSITIONING -> {
-                systemEffects.acquireWifiLowLatencyLock()
-            }
-            BusinessSessionState.PAUSED -> {
-                systemEffects.releaseWifiLowLatencyLock()
-            }
-            BusinessSessionState.STOPPED, BusinessSessionState.IDLE -> {
-                systemEffects.releaseWifiLowLatencyLock()
-                if (prev?.businessState != null &&
-                    prev.businessState != BusinessSessionState.STOPPED &&
-                    prev.businessState != BusinessSessionState.IDLE
-                ) {
-                    systemEffects.abandonAudioFocus()
-                }
-            }
+        val wasActive = prev?.businessState == BusinessSessionState.PLAYING ||
+            prev?.businessState == BusinessSessionState.TRANSITIONING
+        val isActiveNow = next.businessState == BusinessSessionState.PLAYING ||
+            next.businessState == BusinessSessionState.TRANSITIONING
+        if (isActiveNow && !wasActive) {
+            systemEffects.acquireWifiLowLatencyLock()
+        } else if (!isActiveNow && (wasActive || prev == null)) {
+            systemEffects.releaseWifiLowLatencyLock()
+        }
+
+        if ((next.businessState == BusinessSessionState.STOPPED || next.businessState == BusinessSessionState.IDLE) &&
+            prev?.businessState != null &&
+            prev.businessState != BusinessSessionState.STOPPED &&
+            prev.businessState != BusinessSessionState.IDLE
+        ) {
+            systemEffects.abandonAudioFocus()
         }
 
         // 💡 AirPlay 1 在 PLAYING 期间维护单调时钟平滑进度推进，补偿 iOS 不周期推 Progress 包的特性
@@ -322,17 +354,13 @@ class PlaybackServiceSessionHost(
                 }
                 if (pos != snap.progressPositionMs) {
                     lastTickerEmittedPosMs = pos
-                    coordinator.dispatch(
-                        SessionEventEnvelope(
-                            origin = EventOrigin.AIRPLAY,
-                            sessionId = sessionId,
-                            deviceGeneration = deviceGen,
-                            sequence = coordinator.allocateSequence(),
-                            timestampElapsedMs = clockMs(),
-                            payload = ProgressUpdateEvent(
-                                positionMs = pos,
-                                durationMs = dur
-                            )
+                    dispatchEnvelope(
+                        origin = EventOrigin.AIRPLAY,
+                        sessionId = sessionId,
+                        deviceGeneration = deviceGen,
+                        payload = ProgressUpdateEvent(
+                            positionMs = pos,
+                            durationMs = dur
                         )
                     )
                 }

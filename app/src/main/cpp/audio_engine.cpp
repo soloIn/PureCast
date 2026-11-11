@@ -620,10 +620,50 @@ void AudioEngine::release_claimed_interfaces_locked() {
     }
 }
 
+bool AudioEngine::is_valid_audio_format(int sample_rate, int bit_depth, int channels) {
+    return sample_rate > 0 && sample_rate <= 768000 &&
+        (bit_depth == 16 || bit_depth == 24 || bit_depth == 32) &&
+        channels > 0 && channels <= 8;
+}
+
+void AudioEngine::reset_ring_state_for_epoch(uint64_t target_epoch) {
+    if (ring_buffer_) {
+        ring_buffer_->clear();
+    }
+    has_pre_rolled_.store(false, std::memory_order_release);
+    consecutive_underruns_.store(0, std::memory_order_relaxed);
+    phase_accumulator_ = 0;
+    bresenham_accum_ = 0;
+    // 💡 绝不重置 warmup_packets_remaining_：URB 保活下继电器未断开，切歌无需多静音 50ms
+    consumed_epoch_.store(target_epoch, std::memory_order_release);
+}
+
+bool AudioEngine::try_unlock_preroll(uint64_t target_epoch, bool* cas_unmuted) {
+    if (cas_unmuted) {
+        *cas_unmuted = false;
+    }
+    if (has_pre_rolled_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    const size_t threshold = pre_roll_threshold_bytes_.load(std::memory_order_relaxed);
+    if (!ring_buffer_ || threshold == 0 || ring_buffer_->available_read() < threshold) {
+        return false;
+    }
+    has_pre_rolled_.store(true, std::memory_order_release);
+    uint64_t expected_packed = (target_epoch << 1) | 1ULL;
+    const uint64_t desired_packed = (target_epoch << 1) | 0ULL;
+    const bool unmuted = epoch_and_flush_.compare_exchange_strong(
+        expected_packed, desired_packed,
+        std::memory_order_acq_rel, std::memory_order_acquire
+    );
+    if (cas_unmuted) {
+        *cas_unmuted = unmuted;
+    }
+    return true;
+}
+
 int AudioEngine::open_device(int fd, int sample_rate, int bit_depth, int channels) {
-    if (sample_rate <= 0 || sample_rate > 768000 ||
-        (bit_depth != 16 && bit_depth != 24 && bit_depth != 32) ||
-        channels <= 0 || channels > 8) {
+    if (!is_valid_audio_format(sample_rate, bit_depth, channels)) {
         LOGE("open_device 非法音频参数: rate=%d, bit=%d, ch=%d", sample_rate, bit_depth, channels);
         return -22;
     }
@@ -713,9 +753,7 @@ int AudioEngine::open_device(int fd, int sample_rate, int bit_depth, int channel
 }
 
 int64_t AudioEngine::reconfigure_audio_format(int sample_rate, int bit_depth, int channels) {
-    if (sample_rate <= 0 || sample_rate > 768000 ||
-        (bit_depth != 16 && bit_depth != 24 && bit_depth != 32) ||
-        channels <= 0 || channels > 8) {
+    if (!is_valid_audio_format(sample_rate, bit_depth, channels)) {
         LOGE("reconfigure_audio_format 拒绝非法参数: rate=%d, bit=%d, ch=%d",
              sample_rate, bit_depth, channels);
         return -22;
@@ -882,15 +920,7 @@ void AudioEngine::fill_isoc_transfer(struct libusb_transfer* transfer) {
     const uint64_t packed_entry = epoch_and_flush_.load(std::memory_order_acquire);
     const uint64_t target_epoch = packed_entry >> 1;
     if (consumed_epoch_.load(std::memory_order_relaxed) != target_epoch) {
-        if (ring_buffer_) {
-            ring_buffer_->clear();
-        }
-        has_pre_rolled_.store(false, std::memory_order_release);
-        consecutive_underruns_.store(0, std::memory_order_relaxed);
-        phase_accumulator_ = 0;
-        bresenham_accum_ = 0;
-        // 💡 绝不重置 warmup_packets_remaining_：URB 保活下继电器未断开，切歌无需多静音 50ms
-        consumed_epoch_.store(target_epoch, std::memory_order_release);
+        reset_ring_state_for_epoch(target_epoch);
         LOGI("消费线程已安全清空旧代残余并追平 epoch=%llu", static_cast<unsigned long long>(target_epoch));
     }
 
@@ -898,21 +928,10 @@ void AudioEngine::fill_isoc_transfer(struct libusb_transfer* transfer) {
     size_t total_transfer_len = 0;
 
     const size_t input_bytes_per_sample = (current_bit_depth_ > 0) ? static_cast<size_t>(current_bit_depth_ / 8) : 2;
-    const size_t pre_roll_threshold = pre_roll_threshold_bytes_.load(std::memory_order_relaxed);
 
-    if (!has_pre_rolled_.load(std::memory_order_acquire)) {
-        if (ring_buffer_ && pre_roll_threshold > 0 && ring_buffer_->available_read() >= pre_roll_threshold) {
-            has_pre_rolled_.store(true, std::memory_order_release);
-            // 同步尝试在同代原子清除 FLUSH 静音锁
-            uint64_t expected_packed = (target_epoch << 1) | 1ULL;
-            const uint64_t desired_packed = (target_epoch << 1) | 0ULL;
-            epoch_and_flush_.compare_exchange_strong(
-                expected_packed, desired_packed,
-                std::memory_order_acq_rel, std::memory_order_acquire
-            );
-            LOGI("环形缓冲区预充就绪 (已缓冲 >= 100ms PCM: %zu 字节)，开启平滑输出",
-                 ring_buffer_->available_read());
-        }
+    if (try_unlock_preroll(target_epoch)) {
+        LOGI("环形缓冲区预充就绪 (已缓冲 >= 100ms PCM: %zu 字节)，开启平滑输出",
+             ring_buffer_->available_read());
     }
     const bool ready_to_play = has_pre_rolled_.load(std::memory_order_acquire);
 
@@ -1140,14 +1159,7 @@ int AudioEngine::write_pcm(const uint8_t* data, size_t size, uint64_t expected_e
                 }
                 if (active_transfers_.load(std::memory_order_acquire) == 0 &&
                     consumed_epoch_.load(std::memory_order_acquire) != expected_epoch) {
-                    if (ring_buffer_) {
-                        ring_buffer_->clear();
-                    }
-                    has_pre_rolled_.store(false, std::memory_order_release);
-                    consecutive_underruns_.store(0, std::memory_order_relaxed);
-                    phase_accumulator_ = 0;
-                    bresenham_accum_ = 0;
-                    consumed_epoch_.store(expected_epoch, std::memory_order_release);
+                    reset_ring_state_for_epoch(expected_epoch);
                     break;
                 }
             } else {
@@ -1178,15 +1190,10 @@ int AudioEngine::write_pcm(const uint8_t* data, size_t size, uint64_t expected_e
 
     const size_t written = ring_buffer_->write(data, size);
 
-    // 💡 R2 契约：写入后达到 100ms 预充阈值且仍在同一 epoch 时，原位原子解除 FLUSH 静音
-    const size_t threshold = pre_roll_threshold_bytes_.load(std::memory_order_relaxed);
-    if (written > 0 && threshold > 0 && ring_buffer_->available_read() >= threshold) {
-        has_pre_rolled_.store(true, std::memory_order_release);
-        uint64_t expected_packed = (expected_epoch << 1) | 1ULL;
-        const uint64_t desired_packed = (expected_epoch << 1) | 0ULL;
-        if (epoch_and_flush_.compare_exchange_strong(
-                expected_packed, desired_packed,
-                std::memory_order_acq_rel, std::memory_order_acquire)) {
+    // 💡 写入后达到 100ms 预充阈值且仍在同一 epoch 时，原位原子解除 FLUSH 静音
+    if (written > 0) {
+        bool cas_unmuted = false;
+        if (try_unlock_preroll(expected_epoch, &cas_unmuted) && cas_unmuted) {
             LOGI("新流达到 100ms 预充水位，Native 原位自动解除 FLUSH 静音 (epoch=%llu)",
                  static_cast<unsigned long long>(expected_epoch));
         }

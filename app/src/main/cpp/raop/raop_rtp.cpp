@@ -268,6 +268,17 @@ void RaopRtp::watchdog_loop() {
     LOGI("RAOP RTP 数据流无数据看门狗已退出");
 }
 
+void RaopRtp::emit_state_callback(bool is_paused, bool is_implicit, uint64_t epoch) {
+    StreamStateCallback cb_copy;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        cb_copy = state_cb_;
+    }
+    if (cb_copy) {
+        cb_copy(is_paused, is_implicit, epoch);
+    }
+}
+
 void RaopRtp::mark_paused_manually(bool paused, bool emit_callback) {
     is_manually_paused_.store(paused, std::memory_order_release);
     is_stream_paused_.store(paused, std::memory_order_release);
@@ -280,15 +291,7 @@ void RaopRtp::mark_paused_manually(bool paused, bool emit_callback) {
     if (!emit_callback) {
         return;
     }
-    StreamStateCallback cb_copy;
-    {
-        std::lock_guard<std::mutex> lock(state_mutex_);
-        cb_copy = state_cb_;
-    }
-    const uint64_t cur_epoch = active_epoch_.load(std::memory_order_acquire);
-    if (cb_copy) {
-        cb_copy(paused, false, cur_epoch);
-    }
+    emit_state_callback(paused, false, active_epoch_.load(std::memory_order_acquire));
 }
 
 uint64_t RaopRtp::get_ntp_timestamp() {
@@ -495,12 +498,7 @@ void RaopRtp::data_loop() {
                     if (is_stream_paused_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
                         uint64_t pause_ep = AudioEngine::instance().emergency_mute_and_flush(FlushReason::EXPLICIT_PAUSE);
                         LOGI("⏸️ 检测到连续静音保活帧 (持续 %u 帧 ~1.44s，iPhone 暂停推流)，C++ 立即静音并上报隐式暂停", sil_cnt);
-                        StreamStateCallback cb_copy;
-                        {
-                            std::lock_guard<std::mutex> lock(state_mutex_);
-                            cb_copy = state_cb_;
-                        }
-                        if (cb_copy) cb_copy(true, true, pause_ep);
+                        emit_state_callback(true, true, pause_ep);
                     }
                 }
                 if (sil_cnt == 200 || sil_cnt % 1000 == 0) {
@@ -536,12 +534,7 @@ void RaopRtp::data_loop() {
                     active_epoch_.store(next_ep, std::memory_order_release);
                     AudioEngine::instance().resume_stream();
                     if (was_paused) {
-                        StreamStateCallback cb_copy;
-                        {
-                            std::lock_guard<std::mutex> lock(state_mutex_);
-                            cb_copy = state_cb_;
-                        }
-                        if (cb_copy) cb_copy(false, false, next_ep);
+                        emit_state_callback(false, false, next_ep);
                     }
                 }
 

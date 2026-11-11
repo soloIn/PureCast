@@ -57,6 +57,9 @@ internal class AirPlayNativeEventDispatcher(
     @Volatile
     private var currentTrackDurationFixed: Boolean = false
 
+    @Volatile
+    private var currentTrackMarkedLive: Boolean = false
+
     fun resetSessions() {
         nativeToGlobalSessionMap.clear()
         lastStateSequenceByNative.clear()
@@ -98,6 +101,7 @@ internal class AirPlayNativeEventDispatcher(
             currentTrackTitle = ""
             currentTrackArtist = ""
             currentTrackDurationFixed = false
+            currentTrackMarkedLive = false
 
             val initialMetadata = TrackMetadata(
                 title = "AirPlay 音频直通",
@@ -221,7 +225,6 @@ internal class AirPlayNativeEventDispatcher(
 
             val isBoundarySwitch = trimmedTitle.isNotEmpty() &&
                 currentTrackTitle.isNotEmpty() &&
-                currentTrackTitle != "AirPlay 音频直通" &&
                 (trimmedTitle != currentTrackTitle ||
                     (trimmedArtist.isNotEmpty() && currentTrackArtist.isNotEmpty() && trimmedArtist != currentTrackArtist))
 
@@ -229,6 +232,7 @@ internal class AirPlayNativeEventDispatcher(
                 val nextTxGen = trackGenerationGenerator.incrementAndGet()
                 currentTrackGeneration = nextTxGen
                 currentTrackDurationFixed = false
+                currentTrackMarkedLive = false
                 emitLocked(
                     sessionId = globalSid,
                     payload = TrackBoundaryEvent(
@@ -248,6 +252,7 @@ internal class AirPlayNativeEventDispatcher(
             }
             if (durationMs > 0L) {
                 currentTrackDurationFixed = true
+                currentTrackMarkedLive = false
             }
 
             val patchedDurationState = when {
@@ -287,6 +292,7 @@ internal class AirPlayNativeEventDispatcher(
 
             if (durationMs > 0L && !currentTrackDurationFixed) {
                 currentTrackDurationFixed = true
+                currentTrackMarkedLive = false
                 emitLocked(
                     sessionId = globalSid,
                     payload = MetadataPatchEvent(
@@ -296,7 +302,8 @@ internal class AirPlayNativeEventDispatcher(
                         seekCapability = SeekCapability.SEEKABLE
                     )
                 )
-            } else if (durationMs == 0L && positionMs > 0L && !currentTrackDurationFixed) {
+            } else if (durationMs == 0L && positionMs > 0L && !currentTrackDurationFixed && !currentTrackMarkedLive) {
+                currentTrackMarkedLive = true
                 emitLocked(
                     sessionId = globalSid,
                     payload = MetadataPatchEvent(

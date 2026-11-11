@@ -134,26 +134,7 @@ class MainActivity : ComponentActivity() {
             Logger.ui.d(TAG, "当前 USB DAC 已就绪连接 (${audioState.dacName})，无需再次请求授权")
             return
         }
-
-        // 优先通过静默扫描自愈已有授权
-        val attached = PlaybackService.instance?.scanUsbDevice() == true
-        if (attached) {
-            Logger.ui.i(TAG, "通过静默扫描成功自愈连接 USB DAC")
-            return
-        }
-
-        // 检查系统当前是否连接了 USB 音频类设备
-        val usbManager = getSystemService(android.content.Context.USB_SERVICE) as? android.hardware.usb.UsbManager ?: return
-        val hasAudioDevice = usbManager.deviceList.values.any { device ->
-            device.vendorId == com.solo.purecast.core.usb.UsbDeviceManager.SONY_VENDOR_ID ||
-                    device.deviceClass == android.hardware.usb.UsbConstants.USB_CLASS_AUDIO ||
-                    (0 until device.interfaceCount).any { device.getInterface(it).interfaceClass == android.hardware.usb.UsbConstants.USB_CLASS_AUDIO }
-        }
-
-        // 仅当确实有物理插入且未获授权时才发起，防止无设备时空跑弹窗或并发重入
-        if (hasAudioDevice) {
-            PlaybackService.instance?.requestUsbPermission(this)
-        }
+        PlaybackService.instance?.scanAndRequestUsbPermission(this)
     }
 
     private fun updateKeepScreenOn() {

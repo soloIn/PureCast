@@ -33,6 +33,7 @@ import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -73,8 +74,7 @@ fun ProgressBarComponent(
     hasDarkBackground: Boolean = true,
     focusRequester: FocusRequester? = null,
     onPlayPauseClick: (() -> Unit)? = null,
-    playbackStatus: PlaybackStatus = PlaybackStatus.IDLE,
-    canSeek: Boolean = false
+    playbackStatus: PlaybackStatus = PlaybackStatus.IDLE
 ) {
     val isIdle = playbackStatus == PlaybackStatus.IDLE || playbackStatus == PlaybackStatus.STOPPED
     val rightLabelMode = resolveProgressRightLabel(
@@ -82,12 +82,10 @@ fun ProgressBarComponent(
         durationState = durationState,
         playbackStatus = playbackStatus
     )
-    val canFocus = (canSeek || seekCapability == SeekCapability.SEEKABLE) &&
-        seekCapability != SeekCapability.UNSEEKABLE &&
+    val canFocus = seekCapability == SeekCapability.SEEKABLE &&
         durationState == DurationState.FIXED &&
         totalDurationMs > 0L &&
         !isIdle
-    val isLivePlaying = rightLabelMode == ProgressRightLabelMode.LiveBadge
     val interactionSource = remember { MutableInteractionSource() }
     val isFocused by interactionSource.collectIsFocusedAsState()
 
@@ -103,26 +101,12 @@ fun ProgressBarComponent(
     }
     val totalTimeColor = if (hasDarkBackground) Color(0xB3FFFFFF) else Color(0xFF6E6E73)
 
-    // 💡 焦点展开动画：获得焦点时轨道由 4dp 增至 6dp，带来沉浸式反馈
     val animatedHeight by animateDpAsState(
         targetValue = if (isFocused && canFocus) 6.dp else 4.dp,
         animationSpec = tween(durationMillis = 200),
         label = "progressBarHeight"
     )
 
-    // 💡 实时流呼吸红点动画
-    val infiniteTransition = rememberInfiniteTransition(label = "liveDotTransition")
-    val liveDotAlpha by infiniteTransition.animateFloat(
-        initialValue = 0.35f,
-        targetValue = 1.0f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 800),
-            repeatMode = RepeatMode.Reverse
-        ),
-        label = "liveDotAlpha"
-    )
-
-    // 计算进度比例 (0.0f ~ 1.0f) - UNKNOWN 时长为 0.0f，显式 LIVE 为 1.0f
     val progressFraction = calculateProgressFraction(
         currentPositionMs = currentPositionMs,
         totalDurationMs = totalDurationMs,
@@ -237,6 +221,17 @@ fun ProgressBarComponent(
                 }
 
                 ProgressRightLabelMode.LiveBadge -> {
+                    // 💡 仅在直播播放分支启动呼吸动画并延后至 graphicsLayer 读取，避免非直播态空转帧渲染
+                    val infiniteTransition = rememberInfiniteTransition(label = "liveDotTransition")
+                    val liveDotAlpha by infiniteTransition.animateFloat(
+                        initialValue = 0.35f,
+                        targetValue = 1.0f,
+                        animationSpec = infiniteRepeatable(
+                            animation = tween(durationMillis = 800),
+                            repeatMode = RepeatMode.Reverse
+                        ),
+                        label = "liveDotAlpha"
+                    )
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
@@ -245,7 +240,8 @@ fun ProgressBarComponent(
                             modifier = Modifier
                                 .size(7.dp)
                                 .clip(CircleShape)
-                                .background(Color(0xFFFF453A).copy(alpha = if (isLivePlaying) liveDotAlpha else 0.8f))
+                                .graphicsLayer { alpha = liveDotAlpha }
+                                .background(Color(0xFFFF453A))
                         )
                         Text(
                             text = "LIVE / 实时直通",
@@ -306,9 +302,6 @@ internal fun resolveProgressRightLabel(
     }
     if (durationState == DurationState.LIVE && playbackStatus == PlaybackStatus.PLAYING) {
         return ProgressRightLabelMode.LiveBadge
-    }
-    if (durationState == DurationState.FIXED && totalDurationMs > 0L) {
-        return ProgressRightLabelMode.FormattedTime(formatTimeMs(totalDurationMs))
     }
     if (totalDurationMs > 0L && durationState != DurationState.UNKNOWN) {
         return ProgressRightLabelMode.FormattedTime(formatTimeMs(totalDurationMs))

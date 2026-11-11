@@ -69,11 +69,13 @@ import com.solo.purecast.ui.components.SignalPathPill
 import com.solo.purecast.ui.theme.AppPalette
 import com.solo.purecast.util.Logger
 import com.solo.purecast.util.PermissionHelper
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlin.math.roundToInt
 import kotlin.math.sin
 
@@ -348,11 +350,13 @@ fun MainTvScreen(
                         label = "coverCrossfade"
                     ) { resolvedCover ->
                         if (resolvedCover != null) {
-                            AsyncImage(
-                                model = ImageRequest.Builder(LocalContext.current)
+                            val coverRequest = remember(context, resolvedCover) {
+                                ImageRequest.Builder(context)
                                     .data(resolvedCover)
-                                    .crossfade(300)
-                                    .build(),
+                                    .build()
+                            }
+                            AsyncImage(
+                                model = coverRequest,
                                 contentDescription = "Album Cover",
                                 contentScale = ContentScale.Crop,
                                 modifier = Modifier.fillMaxSize()
@@ -468,13 +472,11 @@ fun MainTvScreen(
 
                 Spacer(modifier = Modifier.height(32.dp))
 
-                // 💡 纤细圆角进度条 (自适应深浅，直接透明悬浮于背景上，基于 DurationState 判定显示语义)
                 IsolatedProgressBar(
                     totalDurationMs = metadata.durationMs,
                     durationState = metadata.durationState,
                     seekCapability = metadata.seekCapability,
                     playbackStatus = playbackStatus,
-                    canSeek = metadata.seekCapability == SeekCapability.SEEKABLE,
                     hasDarkBackground = hasDarkBackground,
                     onPlayPauseClick = onTogglePlayPause
                 )
@@ -497,10 +499,11 @@ fun MainTvScreen(
 
         // 3. 首次开机/权限自检向导
         var showOnboarding by remember { mutableStateOf(false) }
-        val context = LocalContext.current
-        val settingsRepo = remember { SettingsRepository(context) }
         LaunchedEffect(Unit) {
-            if (!settingsRepo.isOnboardingCompleted() && PermissionHelper.hasMissingCriticalPermission(context)) {
+            val shouldShow = withContext(Dispatchers.IO) {
+                !settingsRepo.isOnboardingCompleted() && PermissionHelper.hasMissingCriticalPermission(context)
+            }
+            if (shouldShow) {
                 showOnboarding = true
             }
         }
@@ -524,7 +527,6 @@ private fun IsolatedProgressBar(
     durationState: DurationState,
     seekCapability: SeekCapability,
     playbackStatus: PlaybackStatus,
-    canSeek: Boolean = false,
     hasDarkBackground: Boolean = true,
     onPlayPauseClick: () -> Unit
 ) {
@@ -552,7 +554,6 @@ private fun IsolatedProgressBar(
         durationState = durationState,
         seekCapability = seekCapability,
         playbackStatus = playbackStatus,
-        canSeek = canSeek,
         hasDarkBackground = hasDarkBackground,
         onSeek = { newPositionMs ->
             seekPositionMs = newPositionMs

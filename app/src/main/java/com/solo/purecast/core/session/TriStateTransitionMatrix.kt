@@ -1,5 +1,6 @@
 package com.solo.purecast.core.session
 
+import com.solo.purecast.model.AudioPathState
 import com.solo.purecast.model.BusinessSessionState
 import com.solo.purecast.model.ErrorCode
 import com.solo.purecast.model.HardwarePipelineState
@@ -47,10 +48,7 @@ internal data class TransitionOutput(
 )
 
 /**
- * 💡 纯逻辑 14 行三态正交状态转换矩阵 (Zero-Side-Effect Transition Matrix)
- *
- * 将全部状态转换条件与副作用声明收口于纯函数 [reduce] 中，确保每条状态分支确定性可测，
- * 且完全剔除协程状态机合成开关对 JaCoCo 分支覆盖率的干扰。
+ * 💡 三态正交纯状态转换矩阵，将状态归约与副作用意图从调度循环解耦。
  */
 internal object TriStateTransitionMatrix {
 
@@ -203,38 +201,11 @@ internal object TriStateTransitionMatrix {
                 return TransitionOutput(ctx.copy(snapshot = nextSnap, pendingDebounceToken = 0L), effects)
             }
 
-            is TrackCompleteEvent -> {
-                effects += TransitionEffect.CancelDebouncePause
-                effects += TransitionEffect.CancelSuspendTimeout
-                effects += TransitionEffect.CancelRemoteCommandTimeout
-                effects += TransitionEffect.ScheduleHardwareIdleTimeout
+            is TrackCompleteEvent ->
+                return transitionToStopped(ctx, effects, ev.newEpoch, scheduleIdleRelease = true)
 
-                val nextSnap = snap.copy(
-                    transportState = TransportPipeState.DISCONNECTED,
-                    businessState = BusinessSessionState.STOPPED,
-                    hardwareState = muteIfExclusive(snap.hardwareState),
-                    currentEpoch = ev.newEpoch,
-                    uiProtectionActive = false
-                )
-                return TransitionOutput(ctx.copy(snapshot = nextSnap, pendingDebounceToken = 0L), effects)
-            }
-
-            is StreamStopEvent -> {
-                effects += TransitionEffect.CancelDebouncePause
-                effects += TransitionEffect.CancelSuspendTimeout
-                effects += TransitionEffect.CancelRemoteCommandTimeout
-                if (!ev.isPreempted) {
-                    effects += TransitionEffect.ScheduleHardwareIdleTimeout
-                }
-                val nextSnap = snap.copy(
-                    transportState = TransportPipeState.DISCONNECTED,
-                    businessState = BusinessSessionState.STOPPED,
-                    hardwareState = muteIfExclusive(snap.hardwareState),
-                    currentEpoch = ev.newEpoch,
-                    uiProtectionActive = false
-                )
-                return TransitionOutput(ctx.copy(snapshot = nextSnap, pendingDebounceToken = 0L), effects)
-            }
+            is StreamStopEvent ->
+                return transitionToStopped(ctx, effects, ev.newEpoch, scheduleIdleRelease = !ev.isPreempted)
 
             is StreamTeardownEvent -> {
                 effects += TransitionEffect.CancelDebouncePause
@@ -265,21 +236,7 @@ internal object TriStateTransitionMatrix {
                 if (snap.businessState != BusinessSessionState.STOPPED) {
                     return TransitionOutput(ctx, emptyList())
                 }
-                effects += TransitionEffect.ReleaseHardwareDevice
-                trackManager.reset()
-                val nextSnap = snap.copy(
-                    sessionId = 0L,
-                    transportState = TransportPipeState.DISCONNECTED,
-                    businessState = BusinessSessionState.IDLE,
-                    hardwareState = releaseUnlessDisconnected(snap.hardwareState),
-                    activeProtocol = StreamProtocol.NONE,
-                    metadata = trackManager.currentMetadata,
-                    audioPath = snap.audioPath.copy(isExclusive = false, protocol = StreamProtocol.NONE),
-                    progressPositionMs = 0L,
-                    progressDurationMs = 0L,
-                    uiProtectionActive = false
-                )
-                return TransitionOutput(ctx.copy(snapshot = nextSnap), effects)
+                return resetSessionToIdle(ctx, trackManager, effects)
             }
 
             is SuspendTimeoutEvent -> {
@@ -287,21 +244,7 @@ internal object TriStateTransitionMatrix {
                     return TransitionOutput(ctx, emptyList())
                 }
                 effects += TransitionEffect.NotifyPreemptedProtocol(snap.activeProtocol, snap.sessionId)
-                effects += TransitionEffect.ReleaseHardwareDevice
-                trackManager.reset()
-                val nextSnap = snap.copy(
-                    sessionId = 0L,
-                    transportState = TransportPipeState.DISCONNECTED,
-                    businessState = BusinessSessionState.IDLE,
-                    hardwareState = releaseUnlessDisconnected(snap.hardwareState),
-                    activeProtocol = StreamProtocol.NONE,
-                    metadata = trackManager.currentMetadata,
-                    audioPath = snap.audioPath.copy(isExclusive = false, protocol = StreamProtocol.NONE),
-                    progressPositionMs = 0L,
-                    progressDurationMs = 0L,
-                    uiProtectionActive = false
-                )
-                return TransitionOutput(ctx.copy(snapshot = nextSnap), effects)
+                return resetSessionToIdle(ctx, trackManager, effects)
             }
 
             is RemoteSkipNextEvent -> {
@@ -539,7 +482,7 @@ internal object TriStateTransitionMatrix {
                     audioPath = snap.audioPath.copy(
                         isDacConnected = false,
                         isExclusive = false,
-                        dacName = "未检测到 USB DAC"
+                        dacName = AudioPathState.DEFAULT_DAC_NAME
                     ),
                     errors = snap.errors + (ErrorCode.USB_DEVICE_DETACHED to detachErr),
                     uiProtectionActive = false
@@ -649,6 +592,51 @@ internal object TriStateTransitionMatrix {
                 )
             }
         }
+    }
+
+    private fun transitionToStopped(
+        ctx: TransitionContext,
+        effects: MutableList<TransitionEffect>,
+        newEpoch: Long,
+        scheduleIdleRelease: Boolean
+    ): TransitionOutput {
+        effects += TransitionEffect.CancelDebouncePause
+        effects += TransitionEffect.CancelSuspendTimeout
+        effects += TransitionEffect.CancelRemoteCommandTimeout
+        if (scheduleIdleRelease) {
+            effects += TransitionEffect.ScheduleHardwareIdleTimeout
+        }
+        val nextSnap = ctx.snapshot.copy(
+            transportState = TransportPipeState.DISCONNECTED,
+            businessState = BusinessSessionState.STOPPED,
+            hardwareState = muteIfExclusive(ctx.snapshot.hardwareState),
+            currentEpoch = newEpoch,
+            uiProtectionActive = false
+        )
+        return TransitionOutput(ctx.copy(snapshot = nextSnap, pendingDebounceToken = 0L), effects)
+    }
+
+    private fun resetSessionToIdle(
+        ctx: TransitionContext,
+        trackManager: TrackTransactionManager,
+        effects: MutableList<TransitionEffect>
+    ): TransitionOutput {
+        effects += TransitionEffect.ReleaseHardwareDevice
+        trackManager.reset()
+        val snap = ctx.snapshot
+        val nextSnap = snap.copy(
+            sessionId = 0L,
+            transportState = TransportPipeState.DISCONNECTED,
+            businessState = BusinessSessionState.IDLE,
+            hardwareState = releaseUnlessDisconnected(snap.hardwareState),
+            activeProtocol = StreamProtocol.NONE,
+            metadata = trackManager.currentMetadata,
+            audioPath = snap.audioPath.copy(isExclusive = false, protocol = StreamProtocol.NONE),
+            progressPositionMs = 0L,
+            progressDurationMs = 0L,
+            uiProtectionActive = false
+        )
+        return TransitionOutput(ctx.copy(snapshot = nextSnap), effects)
     }
 
     private fun isExclusiveActiveOrReconfiguring(hw: HardwarePipelineState): Boolean =

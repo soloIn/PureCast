@@ -176,6 +176,7 @@ private:
     void ctrl_loop();
     void timing_loop();
     void watchdog_loop();
+    void emit_state_callback(bool is_paused, bool is_implicit, uint64_t epoch);
 
     int bind_udp_socket(int preferred_port, int& bound_port);
     static uint64_t get_ntp_timestamp();

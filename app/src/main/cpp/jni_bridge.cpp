@@ -1,4 +1,5 @@
 #include <jni.h>
+#include <pthread.h>
 #include <string>
 #include <vector>
 #include <memory>
@@ -7,56 +8,81 @@
 #include "flac_decoder.h"
 #include "raop/raop_server.h"
 
+struct AirPlayCallbackMethods {
+    jmethodID on_stream_requested{nullptr};
+    jmethodID on_stream_stopped{nullptr};
+    jmethodID on_stream_paused{nullptr};
+    jmethodID on_stream_resumed{nullptr};
+    jmethodID on_track_switch_flushed{nullptr};
+    jmethodID on_first_data_packet{nullptr};
+    jmethodID on_metadata_received{nullptr};
+    jmethodID on_progress_updated{nullptr};
+    jmethodID on_challenge_requested{nullptr};
+};
+
 static JavaVM* g_jvm = nullptr;
 static jobject g_airplay_callback = nullptr;
+static AirPlayCallbackMethods g_cb_methods{};
 // 💡 分离回调引用锁与服务生命周期锁，绝不在持有锁时调用 Java 回调或 join 线程，彻底消除 stopAirPlayServer 互锁
 static std::mutex g_callback_mutex;
 static std::recursive_mutex g_server_mutex;
 static std::unique_ptr<purecast::raop::RaopServer> g_raop_server = nullptr;
+static pthread_key_t g_jni_detach_key;
+static pthread_once_t g_jni_key_once = PTHREAD_ONCE_INIT;
 
 namespace {
+
+void detach_current_thread_on_exit(void* jvm_ptr) {
+    if (jvm_ptr) {
+        static_cast<JavaVM*>(jvm_ptr)->DetachCurrentThread();
+    }
+}
+
+void init_jni_detach_key() {
+    pthread_key_create(&g_jni_detach_key, detach_current_thread_on_exit);
+}
 
 struct ScopedJniCallback {
     JNIEnv* env{nullptr};
     jobject callback{nullptr};
-    bool attached{false};
+    AirPlayCallbackMethods methods{};
 
     ScopedJniCallback() {
         if (!g_jvm) return;
         JNIEnv* cur_env = nullptr;
         jint res = g_jvm->GetEnv(reinterpret_cast<void**>(&cur_env), JNI_VERSION_1_6);
         if (res == JNI_EDETACHED) {
+            pthread_once(&g_jni_key_once, init_jni_detach_key);
             if (g_jvm->AttachCurrentThread(&cur_env, nullptr) != JNI_OK) {
                 return;
             }
-            attached = true;
+            // 💡 线程级持久附着 + pthread_key_t 退出自动 Detach，避免每次音频回调重复 Attach/Detach 开销
+            if (pthread_getspecific(g_jni_detach_key) == nullptr) {
+                pthread_setspecific(g_jni_detach_key, g_jvm);
+            }
         } else if (res != JNI_OK) {
             return;
         }
         jobject local_cb = nullptr;
+        AirPlayCallbackMethods local_methods{};
         {
             std::lock_guard<std::mutex> lock(g_callback_mutex);
             if (g_airplay_callback) {
                 local_cb = cur_env->NewLocalRef(g_airplay_callback);
+                local_methods = g_cb_methods;
             }
         }
         if (!local_cb) {
-            if (attached) {
-                g_jvm->DetachCurrentThread();
-                attached = false;
-            }
             return;
         }
         env = cur_env;
         callback = local_cb;
+        methods = local_methods;
     }
 
     ~ScopedJniCallback() {
         if (env && callback) {
             env->DeleteLocalRef(callback);
-        }
-        if (attached && g_jvm) {
-            g_jvm->DetachCurrentThread();
         }
     }
 
@@ -76,14 +102,7 @@ static int64_t notify_java_stream_requested(
     const purecast::raop::RaopStreamParams& params
 ) {
     ScopedJniCallback jni;
-    if (!jni) return -1;
-
-    jclass cls = jni.env->GetObjectClass(jni.callback);
-    jmethodID mid = jni.env->GetMethodID(
-        cls,
-        "onStreamRequested",
-        "(JJIIILjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;I)J"
-    );
+    if (!jni || !jni.methods.on_stream_requested) return -1;
 
     jstring j_codec = jni.env->NewStringUTF(params.codec.c_str());
     jstring j_client_ip = jni.env->NewStringUTF(params.client_ip.c_str());
@@ -92,25 +111,22 @@ static int64_t notify_java_stream_requested(
     jstring j_dacp_id = jni.env->NewStringUTF(params.dacp_id.c_str());
     jstring j_token = jni.env->NewStringUTF(params.active_remote_token.c_str());
 
-    jlong epoch_ret = -1;
-    if (mid) {
-        epoch_ret = jni.env->CallLongMethod(
-            jni.callback,
-            mid,
-            static_cast<jlong>(session_id),
-            static_cast<jlong>(sequence),
-            params.sample_rate,
-            params.bit_depth,
-            params.channels,
-            j_codec,
-            j_client_ip,
-            j_key,
-            j_iv,
-            j_dacp_id,
-            j_token,
-            params.dacp_port
-        );
-    }
+    jlong epoch_ret = jni.env->CallLongMethod(
+        jni.callback,
+        jni.methods.on_stream_requested,
+        static_cast<jlong>(session_id),
+        static_cast<jlong>(sequence),
+        params.sample_rate,
+        params.bit_depth,
+        params.channels,
+        j_codec,
+        j_client_ip,
+        j_key,
+        j_iv,
+        j_dacp_id,
+        j_token,
+        params.dacp_port
+    );
 
     jni.env->DeleteLocalRef(j_codec);
     jni.env->DeleteLocalRef(j_client_ip);
@@ -118,17 +134,20 @@ static int64_t notify_java_stream_requested(
     jni.env->DeleteLocalRef(j_iv);
     jni.env->DeleteLocalRef(j_dacp_id);
     jni.env->DeleteLocalRef(j_token);
-    jni.env->DeleteLocalRef(cls);
 
     return static_cast<int64_t>(epoch_ret);
 }
 
-static void notify_java_stream_stopped(int64_t session_id, int64_t sequence, int64_t epoch) {
+static void notify_java_session_epoch_event(
+    jmethodID AirPlayCallbackMethods::*method_ptr,
+    int64_t session_id,
+    int64_t sequence,
+    int64_t epoch
+) {
     ScopedJniCallback jni;
     if (!jni) return;
 
-    jclass cls = jni.env->GetObjectClass(jni.callback);
-    jmethodID mid = jni.env->GetMethodID(cls, "onStreamStopped", "(JJJ)V");
+    jmethodID mid = jni.methods.*method_ptr;
     if (mid) {
         jni.env->CallVoidMethod(
             jni.callback,
@@ -138,62 +157,32 @@ static void notify_java_stream_stopped(int64_t session_id, int64_t sequence, int
             static_cast<jlong>(epoch)
         );
     }
-    jni.env->DeleteLocalRef(cls);
+}
+
+static void notify_java_stream_stopped(int64_t session_id, int64_t sequence, int64_t epoch) {
+    notify_java_session_epoch_event(&AirPlayCallbackMethods::on_stream_stopped, session_id, sequence, epoch);
 }
 
 static void notify_java_stream_paused(int64_t session_id, int64_t sequence, int64_t epoch, bool is_implicit) {
     ScopedJniCallback jni;
-    if (!jni) return;
+    if (!jni || !jni.methods.on_stream_paused) return;
 
-    jclass cls = jni.env->GetObjectClass(jni.callback);
-    jmethodID mid = jni.env->GetMethodID(cls, "onStreamPaused", "(JJJZ)V");
-    if (mid) {
-        jni.env->CallVoidMethod(
-            jni.callback,
-            mid,
-            static_cast<jlong>(session_id),
-            static_cast<jlong>(sequence),
-            static_cast<jlong>(epoch),
-            is_implicit ? JNI_TRUE : JNI_FALSE
-        );
-    }
-    jni.env->DeleteLocalRef(cls);
+    jni.env->CallVoidMethod(
+        jni.callback,
+        jni.methods.on_stream_paused,
+        static_cast<jlong>(session_id),
+        static_cast<jlong>(sequence),
+        static_cast<jlong>(epoch),
+        is_implicit ? JNI_TRUE : JNI_FALSE
+    );
 }
 
 static void notify_java_stream_resumed(int64_t session_id, int64_t sequence, int64_t epoch) {
-    ScopedJniCallback jni;
-    if (!jni) return;
-
-    jclass cls = jni.env->GetObjectClass(jni.callback);
-    jmethodID mid = jni.env->GetMethodID(cls, "onStreamResumed", "(JJJ)V");
-    if (mid) {
-        jni.env->CallVoidMethod(
-            jni.callback,
-            mid,
-            static_cast<jlong>(session_id),
-            static_cast<jlong>(sequence),
-            static_cast<jlong>(epoch)
-        );
-    }
-    jni.env->DeleteLocalRef(cls);
+    notify_java_session_epoch_event(&AirPlayCallbackMethods::on_stream_resumed, session_id, sequence, epoch);
 }
 
 static void notify_java_track_switch_flushed(int64_t session_id, int64_t sequence, int64_t new_epoch) {
-    ScopedJniCallback jni;
-    if (!jni) return;
-
-    jclass cls = jni.env->GetObjectClass(jni.callback);
-    jmethodID mid = jni.env->GetMethodID(cls, "onTrackSwitchFlushed", "(JJJ)V");
-    if (mid) {
-        jni.env->CallVoidMethod(
-            jni.callback,
-            mid,
-            static_cast<jlong>(session_id),
-            static_cast<jlong>(sequence),
-            static_cast<jlong>(new_epoch)
-        );
-    }
-    jni.env->DeleteLocalRef(cls);
+    notify_java_session_epoch_event(&AirPlayCallbackMethods::on_track_switch_flushed, session_id, sequence, new_epoch);
 }
 
 static void notify_java_first_data_packet(
@@ -206,26 +195,21 @@ static void notify_java_first_data_packet(
     const std::string& codec
 ) {
     ScopedJniCallback jni;
-    if (!jni) return;
+    if (!jni || !jni.methods.on_first_data_packet) return;
 
-    jclass cls = jni.env->GetObjectClass(jni.callback);
-    jmethodID mid = jni.env->GetMethodID(cls, "onFirstDataPacket", "(JJJIIILjava/lang/String;)V");
     jstring j_codec = jni.env->NewStringUTF(codec.c_str());
-    if (mid) {
-        jni.env->CallVoidMethod(
-            jni.callback,
-            mid,
-            static_cast<jlong>(session_id),
-            static_cast<jlong>(sequence),
-            static_cast<jlong>(epoch),
-            sample_rate,
-            bit_depth,
-            channels,
-            j_codec
-        );
-    }
+    jni.env->CallVoidMethod(
+        jni.callback,
+        jni.methods.on_first_data_packet,
+        static_cast<jlong>(session_id),
+        static_cast<jlong>(sequence),
+        static_cast<jlong>(epoch),
+        sample_rate,
+        bit_depth,
+        channels,
+        j_codec
+    );
     jni.env->DeleteLocalRef(j_codec);
-    jni.env->DeleteLocalRef(cls);
 }
 
 static void notify_java_metadata(
@@ -238,96 +222,73 @@ static void notify_java_metadata(
     const std::vector<uint8_t>& cover_art
 ) {
     ScopedJniCallback jni;
-    if (!jni) return;
+    if (!jni || !jni.methods.on_metadata_received) return;
 
-    jclass cls = jni.env->GetObjectClass(jni.callback);
-    jmethodID mid = jni.env->GetMethodID(
-        cls,
-        "onMetadataReceived",
-        "(JJLjava/lang/String;Ljava/lang/String;Ljava/lang/String;J[B)V"
+    jstring j_title = jni.env->NewStringUTF(title.c_str());
+    jstring j_artist = jni.env->NewStringUTF(artist.c_str());
+    jstring j_album = jni.env->NewStringUTF(album.c_str());
+    jbyteArray j_cover = nullptr;
+
+    if (!cover_art.empty()) {
+        j_cover = jni.env->NewByteArray(static_cast<jsize>(cover_art.size()));
+        jni.env->SetByteArrayRegion(
+            j_cover,
+            0,
+            static_cast<jsize>(cover_art.size()),
+            reinterpret_cast<const jbyte*>(cover_art.data())
+        );
+    }
+
+    jni.env->CallVoidMethod(
+        jni.callback,
+        jni.methods.on_metadata_received,
+        static_cast<jlong>(session_id),
+        static_cast<jlong>(sequence),
+        j_title,
+        j_artist,
+        j_album,
+        static_cast<jlong>(duration_ms),
+        j_cover
     );
 
-    if (mid) {
-        jstring j_title = jni.env->NewStringUTF(title.c_str());
-        jstring j_artist = jni.env->NewStringUTF(artist.c_str());
-        jstring j_album = jni.env->NewStringUTF(album.c_str());
-        jbyteArray j_cover = nullptr;
-
-        if (!cover_art.empty()) {
-            j_cover = jni.env->NewByteArray(static_cast<jsize>(cover_art.size()));
-            jni.env->SetByteArrayRegion(
-                j_cover,
-                0,
-                static_cast<jsize>(cover_art.size()),
-                reinterpret_cast<const jbyte*>(cover_art.data())
-            );
-        }
-
-        jni.env->CallVoidMethod(
-            jni.callback,
-            mid,
-            static_cast<jlong>(session_id),
-            static_cast<jlong>(sequence),
-            j_title,
-            j_artist,
-            j_album,
-            static_cast<jlong>(duration_ms),
-            j_cover
-        );
-
-        jni.env->DeleteLocalRef(j_title);
-        jni.env->DeleteLocalRef(j_artist);
-        jni.env->DeleteLocalRef(j_album);
-        if (j_cover) jni.env->DeleteLocalRef(j_cover);
-    }
-    jni.env->DeleteLocalRef(cls);
+    jni.env->DeleteLocalRef(j_title);
+    jni.env->DeleteLocalRef(j_artist);
+    jni.env->DeleteLocalRef(j_album);
+    if (j_cover) jni.env->DeleteLocalRef(j_cover);
 }
 
 static void notify_java_progress_updated(int64_t session_id, int64_t sequence, long position_ms, long duration_ms) {
     ScopedJniCallback jni;
-    if (!jni) return;
+    if (!jni || !jni.methods.on_progress_updated) return;
 
-    jclass cls = jni.env->GetObjectClass(jni.callback);
-    jmethodID mid = jni.env->GetMethodID(cls, "onProgressUpdated", "(JJJJ)V");
-    if (mid) {
-        jni.env->CallVoidMethod(
-            jni.callback,
-            mid,
-            static_cast<jlong>(session_id),
-            static_cast<jlong>(sequence),
-            static_cast<jlong>(position_ms),
-            static_cast<jlong>(duration_ms)
-        );
-    }
-    jni.env->DeleteLocalRef(cls);
+    jni.env->CallVoidMethod(
+        jni.callback,
+        jni.methods.on_progress_updated,
+        static_cast<jlong>(session_id),
+        static_cast<jlong>(sequence),
+        static_cast<jlong>(position_ms),
+        static_cast<jlong>(duration_ms)
+    );
 }
 
 static std::string notify_java_challenge_requested(const std::string& challenge_b64) {
     ScopedJniCallback jni;
-    if (!jni) return "";
+    if (!jni || !jni.methods.on_challenge_requested) return "";
 
     std::string result;
-    jclass cls = jni.env->GetObjectClass(jni.callback);
-    jmethodID mid = jni.env->GetMethodID(
-        cls,
-        "onChallengeRequested",
-        "(Ljava/lang/String;)Ljava/lang/String;"
+    jstring j_challenge = jni.env->NewStringUTF(challenge_b64.c_str());
+    auto j_resp = static_cast<jstring>(
+        jni.env->CallObjectMethod(jni.callback, jni.methods.on_challenge_requested, j_challenge)
     );
-
-    if (mid) {
-        jstring j_challenge = jni.env->NewStringUTF(challenge_b64.c_str());
-        auto j_resp = static_cast<jstring>(jni.env->CallObjectMethod(jni.callback, mid, j_challenge));
-        if (j_resp) {
-            const char* chars = jni.env->GetStringUTFChars(j_resp, nullptr);
-            if (chars) {
-                result = chars;
-                jni.env->ReleaseStringUTFChars(j_resp, chars);
-            }
-            jni.env->DeleteLocalRef(j_resp);
+    if (j_resp) {
+        const char* chars = jni.env->GetStringUTFChars(j_resp, nullptr);
+        if (chars) {
+            result = chars;
+            jni.env->ReleaseStringUTFChars(j_resp, chars);
         }
-        jni.env->DeleteLocalRef(j_challenge);
+        jni.env->DeleteLocalRef(j_resp);
     }
-    jni.env->DeleteLocalRef(cls);
+    jni.env->DeleteLocalRef(j_challenge);
     return result;
 }
 
@@ -569,8 +530,28 @@ Java_com_solo_purecast_core_nativebridge_NativeAudioEngine_startAirPlayServer(
             env->DeleteGlobalRef(g_airplay_callback);
             g_airplay_callback = nullptr;
         }
+        g_cb_methods = {};
         if (callback) {
             g_airplay_callback = env->NewGlobalRef(callback);
+            jclass cb_cls = env->GetObjectClass(callback);
+            g_cb_methods.on_stream_requested = env->GetMethodID(
+                cb_cls, "onStreamRequested",
+                "(JJIIILjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;I)J"
+            );
+            g_cb_methods.on_stream_stopped = env->GetMethodID(cb_cls, "onStreamStopped", "(JJJ)V");
+            g_cb_methods.on_stream_paused = env->GetMethodID(cb_cls, "onStreamPaused", "(JJJZ)V");
+            g_cb_methods.on_stream_resumed = env->GetMethodID(cb_cls, "onStreamResumed", "(JJJ)V");
+            g_cb_methods.on_track_switch_flushed = env->GetMethodID(cb_cls, "onTrackSwitchFlushed", "(JJJ)V");
+            g_cb_methods.on_first_data_packet = env->GetMethodID(cb_cls, "onFirstDataPacket", "(JJJIIILjava/lang/String;)V");
+            g_cb_methods.on_metadata_received = env->GetMethodID(
+                cb_cls, "onMetadataReceived",
+                "(JJLjava/lang/String;Ljava/lang/String;Ljava/lang/String;J[B)V"
+            );
+            g_cb_methods.on_progress_updated = env->GetMethodID(cb_cls, "onProgressUpdated", "(JJJJ)V");
+            g_cb_methods.on_challenge_requested = env->GetMethodID(
+                cb_cls, "onChallengeRequested", "(Ljava/lang/String;)Ljava/lang/String;"
+            );
+            env->DeleteLocalRef(cb_cls);
         }
     }
 
@@ -614,6 +595,7 @@ Java_com_solo_purecast_core_nativebridge_NativeAudioEngine_stopAirPlayServer(
         env->DeleteGlobalRef(g_airplay_callback);
         g_airplay_callback = nullptr;
     }
+    g_cb_methods = {};
 }
 
 JNIEXPORT void JNICALL

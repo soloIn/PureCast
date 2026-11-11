@@ -429,22 +429,7 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
                  << apple_response_header
                  << "Server: AirTunes/105.1\r\n\r\n";
     } else if (method == "SETUP") {
-        // 解析 Active-Remote 与 DACP-ID (仅非空时覆盖，避免清空已保留的凭据)
-        std::string setup_token = parse_header(request, "Active-Remote");
-        if (!setup_token.empty()) current_params_.active_remote_token = setup_token;
-        std::string setup_dacp_id = parse_header(request, "DACP-ID");
-        if (!setup_dacp_id.empty()) current_params_.dacp_id = setup_dacp_id;
-        std::string dacp_port_str = parse_header(request, "DACP-Port");
-        if (!dacp_port_str.empty()) {
-            try {
-                current_params_.dacp_port = std::stoi(dacp_port_str);
-            } catch (const std::exception& e) {
-                LOGW("SETUP 解析 DACP-Port 异常: %s (%s)", dacp_port_str.c_str(), e.what());
-                current_params_.dacp_port = 0;
-            }
-        }
-
-        // 解析控制端口
+        // 解析控制端口 (Active-Remote / DACP-ID / DACP-Port 已在公共请求头入口统一解析)
         std::string transport = parse_header(request, "Transport");
         LOGI("=== 收到 RTSP SETUP Transport ===: %s", transport.c_str());
         size_t cport_pos = transport.find("control_port=");
@@ -594,22 +579,22 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
                     if (pstream >> start_ts >> s1 >> curr_ts >> s2 >> end_ts && s1 == '/' && s2 == '/') {
                         if (start_ts == 0 && curr_ts == 0 && end_ts == 0) {
                             LOGI("AirPlay 收到暂停/未就绪时间戳 (progress: 0/0/0)，忽略以防进度冲刷归零");
-                        } else if (end_ts > start_ts) {
-                            uint32_t rate = current_params_.sample_rate > 0 ? current_params_.sample_rate : 44100;
-                            long pos_ms = (curr_ts >= start_ts) ? static_cast<long>((curr_ts - start_ts) * 1000ULL / rate) : 0;
-                            long dur_ms = static_cast<long>((end_ts - start_ts) * 1000ULL / rate);
-                            LOGD("AirPlay 进度实时校准: pos=%ld ms, duration=%ld ms (RTP: %s)",
-                                 pos_ms, dur_ms, prog_val.c_str());
-                            if (progress_cb_) {
-                                progress_cb_(active_session_id_.load(std::memory_order_acquire), next_seq(), pos_ms, dur_ms);
-                            }
-                        } else if (end_ts == 0 && curr_ts >= start_ts && start_ts > 0) {
-                            // 💡 直播/电台流 (end_ts == 0)，上报当前已播放时长，总时长为 0
-                            uint32_t rate = current_params_.sample_rate > 0 ? current_params_.sample_rate : 44100;
-                            long pos_ms = static_cast<long>((curr_ts - start_ts) * 1000ULL / rate);
-                            LOGD("AirPlay 直播流进度校准: pos=%ld ms (RTP: %s)", pos_ms, prog_val.c_str());
-                            if (progress_cb_) {
-                                progress_cb_(active_session_id_.load(std::memory_order_acquire), next_seq(), pos_ms, 0);
+                        } else {
+                            const uint32_t rate = current_params_.sample_rate > 0 ? current_params_.sample_rate : 44100;
+                            const bool has_valid_duration = end_ts > start_ts;
+                            const bool is_live_progress = (end_ts == 0 && curr_ts >= start_ts && start_ts > 0);
+                            if (has_valid_duration || is_live_progress) {
+                                const long pos_ms = (curr_ts >= start_ts)
+                                    ? static_cast<long>((curr_ts - start_ts) * 1000ULL / rate)
+                                    : 0;
+                                const long dur_ms = has_valid_duration
+                                    ? static_cast<long>((end_ts - start_ts) * 1000ULL / rate)
+                                    : 0;
+                                LOGD("AirPlay %s进度实时校准: pos=%ld ms, duration=%ld ms (RTP: %s)",
+                                     has_valid_duration ? "" : "直播流", pos_ms, dur_ms, prog_val.c_str());
+                                if (progress_cb_) {
+                                    progress_cb_(active_session_id_.load(std::memory_order_acquire), next_seq(), pos_ms, dur_ms);
+                                }
                             }
                         }
                     }

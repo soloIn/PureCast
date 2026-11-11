@@ -179,14 +179,7 @@ class StreamDemuxer(
         activeInputStream = null
 
         // 💡 快速断开旧连接与输入流，促使阻塞在 JNI 的 dr_flac 或 read 立即抛异常退出
-        scope.launch(Dispatchers.IO) {
-            try {
-                oldStream?.close()
-                oldConn?.disconnect()
-            } catch (e: Exception) {
-                // ignore
-            }
-        }
+        closeDetachedStreamAsync(oldConn, oldStream)
 
         val thisSession = sessionToken.incrementAndGet()
         progressJob?.cancel()
@@ -206,9 +199,13 @@ class StreamDemuxer(
 
         // 💡 启动播放进度定期更新任务 (每 500ms 刷新一次)
         progressJob = scope.launch(Dispatchers.Default) {
+            var lastEmittedPosMs = -1L
             while (isActive && isDemuxing && thisSession == sessionToken.get()) {
                 val posMs = getCurrentPlayPositionSeconds() * 1000L
-                onPositionUpdated?.invoke(posMs)
+                if (posMs != lastEmittedPosMs) {
+                    lastEmittedPosMs = posMs
+                    onPositionUpdated?.invoke(posMs)
+                }
                 delay(500)
             }
         }
@@ -381,7 +378,7 @@ class StreamDemuxer(
                                     offset += written
                                     remaining -= written
                                 } else if (written == -2 || written == -1) {
-                                    // 💡 R1/U3 铁律：收到 -2 世代过期或 -1 引擎停止立即跳出，严禁阻塞或跨代覆写
+                                    // 💡 收到 -2 世代过期或 -1 引擎停止立即跳出，严禁阻塞或跨代覆写
                                     Logger.upnp.w(TAG, "WAV writePcm 因世代过期或引擎停止中止写入: ret=$written, epoch=$acquiredEpoch")
                                     abortedByEpoch = true
                                     break
@@ -447,18 +444,7 @@ class StreamDemuxer(
 
     fun stop() {
         sessionToken.incrementAndGet()
-        val oldConn = activeConnection
-        val oldStream = activeInputStream
-        activeConnection = null
-        activeInputStream = null
-        scope.launch(Dispatchers.IO) {
-            try {
-                oldStream?.close()
-                oldConn?.disconnect()
-            } catch (e: Exception) {
-                // ignore
-            }
-        }
+        detachAndCloseActiveStreamAsync()
         isDemuxing = false
         currentStreamUrl = ""
         isFlacStream = false
@@ -626,6 +612,26 @@ class StreamDemuxer(
             read += r
         }
         return true
+    }
+
+    private fun detachAndCloseActiveStreamAsync() {
+        val oldConn = activeConnection
+        val oldStream = activeInputStream
+        activeConnection = null
+        activeInputStream = null
+        closeDetachedStreamAsync(oldConn, oldStream)
+    }
+
+    private fun closeDetachedStreamAsync(conn: HttpURLConnection?, stream: InputStream?) {
+        if (conn == null && stream == null) return
+        scope.launch(Dispatchers.IO) {
+            try {
+                stream?.close()
+                conn?.disconnect()
+            } catch (e: Exception) {
+                Logger.upnp.w(TAG, "关闭分离 HTTP 流异常: ${e.message}")
+            }
+        }
     }
 
     companion object {

@@ -123,6 +123,10 @@ private:
     int lock_hardware_volume(uint8_t fu_id);
     bool parse_audio_descriptors(libusb_device* dev, int target_bit_depth);
 
+    static bool is_valid_audio_format(int sample_rate, int bit_depth, int channels);
+    void reset_ring_state_for_epoch(uint64_t target_epoch);
+    bool try_unlock_preroll(uint64_t target_epoch, bool* cas_unmuted = nullptr);
+
     uint64_t advance_epoch_and_set_flushing(bool flushing);
     int stop_transfer_pipeline_locked();
     int start_transfer_pipeline_locked(int sample_rate, int bit_depth, int channels);

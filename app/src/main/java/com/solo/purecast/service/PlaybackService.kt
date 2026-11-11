@@ -18,7 +18,6 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.net.wifi.WifiManager
-import android.os.Build
 import android.os.PowerManager
 import android.os.SystemClock
 import androidx.core.app.ServiceCompat
@@ -39,7 +38,10 @@ import com.solo.purecast.model.TrackMetadata
 import com.solo.purecast.ui.MainActivity
 import com.solo.purecast.upnp.UpnpRendererServer
 import com.solo.purecast.util.Logger
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -67,6 +69,10 @@ class PlaybackService : LifecycleService() {
     private lateinit var sessionHost: PlaybackServiceSessionHost
 
     private val fastPath = HardwareFastPathController.default
+
+    // 💡 协调器事件循环独立运行在受限单线程后台调度器，避免 sync 硬件操作阻塞 Android UI 主线程
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    private val coordinatorScope = CoroutineScope(SupervisorJob() + Dispatchers.Default.limitedParallelism(1))
 
     private var upnpServer: UpnpRendererServer? = null
     var airPlayServer: AirPlayServerManager? = null
@@ -101,21 +107,15 @@ class PlaybackService : LifecycleService() {
         val idleTimeout = settingsRepository.getIdleTimeoutSeconds()
         usbDeviceManager = UsbDeviceManager(
             context = this,
-            onDeviceStateChanged = { connected, name ->
-                Logger.service.i(TAG, "USB DAC 硬件状态通知: connected=$connected, name=$name")
-                updateNotification(_sessionSnapshot.value)
-            },
             dispatchEvent = { envelope ->
                 if (::coordinator.isInitialized) {
                     coordinator.dispatch(envelope)
                 }
             }
-        ).apply {
-            setIdleTimeoutSeconds(idleTimeout)
-        }
+        )
 
         coordinator = PlaybackSessionCoordinator(
-            scope = lifecycleScope,
+            scope = coordinatorScope,
             hardwareBridge = usbDeviceManager,
             dacpCommandSender = { commandType, _ ->
                 val client = airPlayServer?.dacpClient
@@ -128,7 +128,9 @@ class PlaybackService : LifecycleService() {
                 preemptProtocolSession(protocol, sessionId)
             },
             clockMs = { SystemClock.elapsedRealtime() }
-        )
+        ).apply {
+            setIdleTimeoutSeconds(idleTimeout)
+        }
 
         val systemEffects = object : ServiceSystemEffects {
             override fun syncMediaSessionState(
@@ -179,15 +181,10 @@ class PlaybackService : LifecycleService() {
             coordinator = coordinator,
             hardwareBridge = usbDeviceManager,
             systemEffects = systemEffects,
-            onSendAirPlayDacpCommand = { commandType ->
-                lifecycleScope.launch {
-                    airPlayServer?.dacpClient?.executeRemoteCommand(commandType)
-                }
-            },
             clockMs = { SystemClock.elapsedRealtime() }
         )
 
-        // 💡 单向发布不可变全局快照，必须在 scanAndAttachDevice() 前启动观察
+        // 💡 单向发布不可变全局快照，必须在发起硬件扫描前启动观察
         lifecycleScope.launch {
             coordinator.snapshot.collect { snap ->
                 _sessionSnapshot.value = snap
@@ -195,8 +192,8 @@ class PlaybackService : LifecycleService() {
         }
         sessionHost.startObserving()
 
-        // 冷启动扫描已连接的 USB DAC
-        usbDeviceManager.scanAndAttachDevice()
+        // 冷启动异步扫描已连接的 USB DAC，避免阻塞 Service.onCreate 主线程
+        usbDeviceManager.scanAndAttachDeviceAsync()
 
         val friendlyName = settingsRepository.getFriendlyName()
         if (settingsRepository.isUpnpEnabled()) {
@@ -489,7 +486,7 @@ class PlaybackService : LifecycleService() {
 
     fun setIdleTimeoutSeconds(seconds: Int) {
         settingsRepository.setIdleTimeoutSeconds(seconds)
-        usbDeviceManager.setIdleTimeoutSeconds(seconds)
+        coordinator.setIdleTimeoutSeconds(seconds)
     }
 
     fun bindUsbPermissionActivity(activity: Activity?) {
@@ -500,7 +497,9 @@ class PlaybackService : LifecycleService() {
         usbDeviceManager.requestPermissionWithActivity(activity)
     }
 
-    fun scanUsbDevice(): Boolean = usbDeviceManager.scanAndAttachDevice()
+    fun scanAndRequestUsbPermission(activity: Activity) {
+        usbDeviceManager.scanAndRequestPermissionAsync(activity)
+    }
 
     fun handleUsbDeviceAttachedFromIntent(device: UsbDevice) {
         usbDeviceManager.onDeviceAttachedAsync(device)
@@ -561,12 +560,8 @@ class PlaybackService : LifecycleService() {
 
     private fun startForegroundWithTypes() {
         val notification = buildNotification(_sessionSnapshot.value)
-        val foregroundServiceType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK or
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
-        } else {
-            0
-        }
+        val foregroundServiceType = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK or
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
 
         try {
             ServiceCompat.startForeground(
@@ -693,6 +688,7 @@ class PlaybackService : LifecycleService() {
         if (::sessionHost.isInitialized) {
             sessionHost.stop()
         }
+        coordinatorScope.cancel()
         mediaSession?.apply {
             isActive = false
             release()

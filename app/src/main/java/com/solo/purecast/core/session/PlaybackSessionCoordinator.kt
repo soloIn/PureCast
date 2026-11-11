@@ -73,6 +73,9 @@ class PlaybackSessionCoordinator(
     private var latestDeviceGeneration: Long = 0L
     private var lastAcceptedHardwareSequence: Long = 0L
 
+    @Volatile
+    private var idleTimeoutMillis: Long = HARDWARE_IDLE_RELEASE_MS
+
     private var debouncePauseJob: Job? = null
     private var uiProtectionJob: Job? = null
     private var hardwareIdleTimeoutJob: Job? = null
@@ -109,6 +112,21 @@ class PlaybackSessionCoordinator(
     /** 分配遥控指令追踪 ID */
     fun allocateCommandId(): Long = commandIdGenerator.incrementAndGet()
 
+    /**
+     * 💡 配置停止播放后的 USB DAC 空闲让渡延迟（0 秒表示常驻独占不自动归还）
+     */
+    fun setIdleTimeoutSeconds(seconds: Int) {
+        idleTimeoutMillis = if (seconds <= 0) 0L else seconds.coerceAtLeast(3) * 1000L
+        Logger.service.i(TAG, "更新空闲声卡让渡时间: ${idleTimeoutMillis}ms (raw=${seconds}s)")
+    }
+
+    /**
+     * 💡 入队不改变业务状态机的轻量 DACP 串行指令（如本机主动 Pause/Resume 通知 iOS）
+     */
+    fun sendDacpFireAndForget(command: RemoteCommandType) {
+        dacpCommandChannel.trySend(command to 0L)
+    }
+
     /** 非阻塞投递事件信封至协调器单线程事件循环 */
     fun dispatch(envelope: SessionEventEnvelope<SessionEventPayload>) {
         val result = eventChannel.trySend(envelope)
@@ -133,20 +151,22 @@ class PlaybackSessionCoordinator(
                     if (res.isFailure) {
                         val errMsg = res.exceptionOrNull()?.message ?: "DACP 指令执行失败"
                         Logger.service.w(TAG, "DACP 串行指令执行失败: cmd=$command, id=$commandId, err=$errMsg")
-                        dispatch(
-                            SessionEventEnvelope(
-                                origin = EventOrigin.AIRPLAY,
-                                sessionId = context.snapshot.sessionId,
-                                deviceGeneration = latestDeviceGeneration,
-                                sequence = allocateSequence(),
-                                timestampElapsedMs = clockMs(),
-                                payload = RemoteCommandFailedEvent(
-                                    commandId = commandId,
-                                    errorCode = ErrorCode.REMOTE_COMMAND_TIMEOUT,
-                                    message = errMsg
+                        if (commandId > 0L) {
+                            dispatch(
+                                SessionEventEnvelope(
+                                    origin = EventOrigin.AIRPLAY,
+                                    sessionId = context.snapshot.sessionId,
+                                    deviceGeneration = latestDeviceGeneration,
+                                    sequence = allocateSequence(),
+                                    timestampElapsedMs = clockMs(),
+                                    payload = RemoteCommandFailedEvent(
+                                        commandId = commandId,
+                                        errorCode = ErrorCode.REMOTE_COMMAND_TIMEOUT,
+                                        message = errMsg
+                                    )
                                 )
                             )
-                        )
+                        }
                     }
                 } catch (t: Throwable) {
                     Logger.service.e(TAG, "DACP 串行指令抛出异常: cmd=$command", t)
@@ -167,6 +187,9 @@ class PlaybackSessionCoordinator(
             nowMs = clockMs()
         )
         context = output.nextContext
+        if (context.snapshot.sessionId == 0L) {
+            lastAcceptedSequenceBySession.clear()
+        }
         _snapshot.value = context.snapshot
 
         for (effect in output.effects) {
@@ -202,6 +225,7 @@ class PlaybackSessionCoordinator(
                         Logger.service.d(TAG, "丢弃旧会话 StreamSetupEvent: sid=${envelope.sessionId} < $activeSid")
                         false
                     } else {
+                        lastAcceptedSequenceBySession.keys.removeIf { it != envelope.sessionId }
                         lastAcceptedSequenceBySession[envelope.sessionId] = envelope.sequence
                         true
                     }
@@ -252,83 +276,61 @@ class PlaybackSessionCoordinator(
             }
 
             is TransitionEffect.OpenHardwareDevice -> {
-                val openRes = hardwareBridge.openDeviceWithCurrentFd(
-                    effect.sampleRate,
-                    effect.bitDepth,
-                    effect.channels
-                )
-                if (openRes.isSuccess) {
-                    val ok = openRes.getOrThrow()
-                    context = context.copy(
-                        snapshot = context.snapshot.copy(
+                openDeviceAndUpdateSnapshot(
+                    sampleRate = effect.sampleRate,
+                    bitDepth = effect.bitDepth,
+                    channels = effect.channels,
+                    fallbackErrorMessage = "无法独占打开 USB DAC",
+                    onSuccess = { snap, ok ->
+                        snap.copy(
                             hardwareState = HardwarePipelineState.EXCLUSIVE_MUTED,
                             currentEpoch = ok.epoch,
-                            audioPath = context.snapshot.audioPath.copy(
+                            audioPath = snap.audioPath.copy(
                                 dacName = ok.dacName,
                                 isExclusive = true
                             ),
-                            errors = context.snapshot.errors - ErrorCode.USB_OPEN_FAILED
+                            errors = snap.errors - ErrorCode.USB_OPEN_FAILED
                         )
-                    )
-                    _snapshot.value = context.snapshot
-                } else {
-                    val err = PlaybackError(
-                        code = ErrorCode.USB_OPEN_FAILED,
-                        message = openRes.exceptionOrNull()?.message ?: "无法独占打开 USB DAC",
-                        recoverable = true,
-                        timestampMs = clockMs()
-                    )
-                    context = context.copy(
-                        snapshot = context.snapshot.copy(
+                    },
+                    onFailure = { snap, err ->
+                        snap.copy(
                             hardwareState = HardwarePipelineState.RELEASED,
-                            errors = context.snapshot.errors + (ErrorCode.USB_OPEN_FAILED to err)
+                            errors = snap.errors + (ErrorCode.USB_OPEN_FAILED to err)
                         )
-                    )
-                    _snapshot.value = context.snapshot
-                }
+                    }
+                )
             }
 
             is TransitionEffect.OpenDeviceOnResume -> {
-                val openRes = hardwareBridge.openDeviceWithCurrentFd(
-                    effect.sampleRate,
-                    effect.bitDepth,
-                    effect.channels
-                )
-                if (openRes.isSuccess) {
-                    val ok = openRes.getOrThrow()
-                    hardwareBridge.resumeNativeStream()
-                    context = context.copy(
-                        snapshot = context.snapshot.copy(
+                openDeviceAndUpdateSnapshot(
+                    sampleRate = effect.sampleRate,
+                    bitDepth = effect.bitDepth,
+                    channels = effect.channels,
+                    fallbackErrorMessage = "恢复播放时重开 USB DAC 失败",
+                    onSuccess = { snap, ok ->
+                        hardwareBridge.resumeNativeStream()
+                        snap.copy(
                             transportState = TransportPipeState.STREAMING,
                             businessState = BusinessSessionState.PLAYING,
                             hardwareState = HardwarePipelineState.EXCLUSIVE_ACTIVE,
                             currentEpoch = ok.epoch,
-                            audioPath = context.snapshot.audioPath.copy(
+                            audioPath = snap.audioPath.copy(
                                 dacName = ok.dacName,
                                 isExclusive = true
                             ),
-                            errors = context.snapshot.errors - ErrorCode.USB_OPEN_FAILED,
+                            errors = snap.errors - ErrorCode.USB_OPEN_FAILED,
                             uiProtectionActive = false
                         )
-                    )
-                    _snapshot.value = context.snapshot
-                } else {
-                    val err = PlaybackError(
-                        code = ErrorCode.USB_OPEN_FAILED,
-                        message = openRes.exceptionOrNull()?.message ?: "恢复播放时重开 USB DAC 失败",
-                        recoverable = true,
-                        timestampMs = clockMs()
-                    )
-                    context = context.copy(
-                        snapshot = context.snapshot.copy(
+                    },
+                    onFailure = { snap, err ->
+                        snap.copy(
                             businessState = BusinessSessionState.PAUSED,
                             hardwareState = HardwarePipelineState.RELEASED,
                             currentEpoch = effect.fallbackPausedEpoch,
-                            errors = context.snapshot.errors + (ErrorCode.USB_OPEN_FAILED to err)
+                            errors = snap.errors + (ErrorCode.USB_OPEN_FAILED to err)
                         )
-                    )
-                    _snapshot.value = context.snapshot
-                }
+                    }
+                )
             }
 
             is TransitionEffect.ResumeNativeOutput -> {
@@ -348,21 +350,12 @@ class PlaybackSessionCoordinator(
             }
 
             is TransitionEffect.ScheduleDebouncePause -> {
-                debouncePauseJob?.cancel()
-                val sid = context.snapshot.sessionId
-                debouncePauseJob = scope.launch {
-                    delay(DEBOUNCE_PAUSE_MS)
-                    dispatch(
-                        SessionEventEnvelope(
-                            origin = EventOrigin.SERVICE,
-                            sessionId = sid,
-                            deviceGeneration = latestDeviceGeneration,
-                            sequence = allocateSequence(),
-                            timestampElapsedMs = clockMs(),
-                            payload = DebouncePauseTimeoutEvent(effect.token)
-                        )
-                    )
-                }
+                debouncePauseJob = rescheduleServiceTimer(
+                    previous = debouncePauseJob,
+                    delayMs = DEBOUNCE_PAUSE_MS,
+                    sessionId = context.snapshot.sessionId,
+                    payload = DebouncePauseTimeoutEvent(effect.token)
+                )
             }
 
             is TransitionEffect.CancelDebouncePause -> {
@@ -371,36 +364,25 @@ class PlaybackSessionCoordinator(
             }
 
             is TransitionEffect.ScheduleUiProtection -> {
-                uiProtectionJob?.cancel()
-                val sid = context.snapshot.sessionId
-                uiProtectionJob = scope.launch {
-                    delay(UI_PROTECTION_WINDOW_MS)
-                    dispatch(
-                        SessionEventEnvelope(
-                            origin = EventOrigin.SERVICE,
-                            sessionId = sid,
-                            deviceGeneration = latestDeviceGeneration,
-                            sequence = allocateSequence(),
-                            timestampElapsedMs = clockMs(),
-                            payload = UiProtectionTimeoutEvent(effect.token)
-                        )
-                    )
-                }
+                uiProtectionJob = rescheduleServiceTimer(
+                    previous = uiProtectionJob,
+                    delayMs = UI_PROTECTION_WINDOW_MS,
+                    sessionId = context.snapshot.sessionId,
+                    payload = UiProtectionTimeoutEvent(effect.token)
+                )
             }
 
             is TransitionEffect.ScheduleHardwareIdleTimeout -> {
-                hardwareIdleTimeoutJob?.cancel()
-                hardwareIdleTimeoutJob = scope.launch {
-                    delay(HARDWARE_IDLE_RELEASE_MS)
-                    dispatch(
-                        SessionEventEnvelope(
-                            origin = EventOrigin.SERVICE,
-                            sessionId = 0L,
-                            deviceGeneration = latestDeviceGeneration,
-                            sequence = allocateSequence(),
-                            timestampElapsedMs = clockMs(),
-                            payload = HardwareIdleTimeoutEvent
-                        )
+                val timeoutMs = idleTimeoutMillis
+                hardwareIdleTimeoutJob = if (timeoutMs <= 0L) {
+                    hardwareIdleTimeoutJob?.cancel()
+                    null
+                } else {
+                    rescheduleServiceTimer(
+                        previous = hardwareIdleTimeoutJob,
+                        delayMs = timeoutMs,
+                        sessionId = 0L,
+                        payload = HardwareIdleTimeoutEvent
                     )
                 }
             }
@@ -411,20 +393,12 @@ class PlaybackSessionCoordinator(
             }
 
             is TransitionEffect.ScheduleSuspendTimeout -> {
-                suspendTimeoutJob?.cancel()
-                suspendTimeoutJob = scope.launch {
-                    delay(SUSPEND_TIMEOUT_MS)
-                    dispatch(
-                        SessionEventEnvelope(
-                            origin = EventOrigin.SERVICE,
-                            sessionId = effect.sessionId,
-                            deviceGeneration = latestDeviceGeneration,
-                            sequence = allocateSequence(),
-                            timestampElapsedMs = clockMs(),
-                            payload = SuspendTimeoutEvent
-                        )
-                    )
-                }
+                suspendTimeoutJob = rescheduleServiceTimer(
+                    previous = suspendTimeoutJob,
+                    delayMs = SUSPEND_TIMEOUT_MS,
+                    sessionId = effect.sessionId,
+                    payload = SuspendTimeoutEvent
+                )
             }
 
             is TransitionEffect.CancelSuspendTimeout -> {
@@ -433,27 +407,64 @@ class PlaybackSessionCoordinator(
             }
 
             is TransitionEffect.ScheduleRemoteCommandTimeout -> {
-                remoteCommandTimeoutJob?.cancel()
-                val sid = context.snapshot.sessionId
-                remoteCommandTimeoutJob = scope.launch {
-                    delay(REMOTE_COMMAND_TIMEOUT_MS)
-                    dispatch(
-                        SessionEventEnvelope(
-                            origin = EventOrigin.SERVICE,
-                            sessionId = sid,
-                            deviceGeneration = latestDeviceGeneration,
-                            sequence = allocateSequence(),
-                            timestampElapsedMs = clockMs(),
-                            payload = RemoteCommandTimeoutEvent(effect.commandId)
-                        )
-                    )
-                }
+                remoteCommandTimeoutJob = rescheduleServiceTimer(
+                    previous = remoteCommandTimeoutJob,
+                    delayMs = REMOTE_COMMAND_TIMEOUT_MS,
+                    sessionId = context.snapshot.sessionId,
+                    payload = RemoteCommandTimeoutEvent(effect.commandId)
+                )
             }
 
             is TransitionEffect.CancelRemoteCommandTimeout -> {
                 remoteCommandTimeoutJob?.cancel()
                 remoteCommandTimeoutJob = null
             }
+        }
+    }
+
+    private fun openDeviceAndUpdateSnapshot(
+        sampleRate: Int,
+        bitDepth: Int,
+        channels: Int,
+        fallbackErrorMessage: String,
+        onSuccess: (PlayerSessionSnapshot, HardwareOpenSuccess) -> PlayerSessionSnapshot,
+        onFailure: (PlayerSessionSnapshot, PlaybackError) -> PlayerSessionSnapshot
+    ) {
+        val openRes = hardwareBridge.openDeviceWithCurrentFd(sampleRate, bitDepth, channels)
+        val nextSnapshot = if (openRes.isSuccess) {
+            onSuccess(context.snapshot, openRes.getOrThrow())
+        } else {
+            val err = PlaybackError(
+                code = ErrorCode.USB_OPEN_FAILED,
+                message = openRes.exceptionOrNull()?.message ?: fallbackErrorMessage,
+                recoverable = true,
+                timestampMs = clockMs()
+            )
+            onFailure(context.snapshot, err)
+        }
+        context = context.copy(snapshot = nextSnapshot)
+        _snapshot.value = nextSnapshot
+    }
+
+    private fun rescheduleServiceTimer(
+        previous: Job?,
+        delayMs: Long,
+        sessionId: Long,
+        payload: SessionEventPayload
+    ): Job {
+        previous?.cancel()
+        return scope.launch {
+            delay(delayMs)
+            dispatch(
+                SessionEventEnvelope(
+                    origin = EventOrigin.SERVICE,
+                    sessionId = sessionId,
+                    deviceGeneration = latestDeviceGeneration,
+                    sequence = allocateSequence(),
+                    timestampElapsedMs = clockMs(),
+                    payload = payload
+                )
+            )
         }
     }
 

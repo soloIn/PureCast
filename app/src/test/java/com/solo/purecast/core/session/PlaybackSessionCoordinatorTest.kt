@@ -853,4 +853,56 @@ class PlaybackSessionCoordinatorTest {
         assertEquals("ZeroDur", c.snapshot.value.metadata.title)
         assertEquals(HardwarePipelineState.RELEASED, c.snapshot.value.hardwareState)
     }
+
+    @Test
+    fun `custom idleTimeoutSeconds and sendDacpFireAndForget honor configured behavior`() = runTest(StandardTestDispatcher()) {
+        val hw = FakeSessionHardwareBridge()
+        val sentCommands = mutableListOf<Pair<RemoteCommandType, Long>>()
+        val c = createCoordinator(
+            this,
+            hwBridge = hw,
+            dacpSender = { cmd, id ->
+                sentCommands += cmd to id
+                Result.failure(IllegalStateException("dacp transient error"))
+            }
+        )
+
+        // 1. 验证 sendDacpFireAndForget 触发 dacpSender(id=0L) 且失败时不发射 RemoteCommandFailedEvent / 不卡在 TRANSITIONING
+        c.dispatch(env(c, EventOrigin.USB_HARDWARE, 0L, HardwareAttachedEvent("DAC", hasPermission = true)))
+        val s1 = c.allocateSessionId()
+        c.dispatch(env(c, EventOrigin.AIRPLAY, s1, StreamSetupEvent(StreamProtocol.AIRPLAY_1)))
+        c.dispatch(env(c, EventOrigin.AIRPLAY, s1, FirstDataPacketEvent(StreamProtocol.AIRPLAY_1, 10L, 44100, 16, 2, "ALAC")))
+        runCurrent()
+
+        c.sendDacpFireAndForget(RemoteCommandType.PAUSE)
+        runCurrent()
+        assertEquals(listOf(RemoteCommandType.PAUSE to 0L), sentCommands)
+        assertEquals(BusinessSessionState.PLAYING, c.snapshot.value.businessState)
+
+        // 2. 验证 setIdleTimeoutSeconds(5) 按 5s 释放独占；setIdleTimeoutSeconds(0) 永久保持独占不释放
+        c.setIdleTimeoutSeconds(5)
+        c.dispatch(env(c, EventOrigin.AIRPLAY, s1, StreamStopEvent(FlushReason.STOP_OR_TEARDOWN, newEpoch = 11L)))
+        runCurrent()
+        advanceTimeBy(4_900)
+        runCurrent()
+        assertEquals(HardwarePipelineState.EXCLUSIVE_MUTED, c.snapshot.value.hardwareState)
+        assertEquals(0, hw.releaseDeviceCalls)
+
+        advanceTimeBy(200)
+        runCurrent()
+        assertEquals(HardwarePipelineState.RELEASED, c.snapshot.value.hardwareState)
+        assertEquals(1, hw.releaseDeviceCalls)
+
+        // 配置 0s (永久独占) -> 停播 30s 仍保持 EXCLUSIVE_MUTED 且不触发 RELEASED
+        c.setIdleTimeoutSeconds(0)
+        val s2 = c.allocateSessionId()
+        c.dispatch(env(c, EventOrigin.AIRPLAY, s2, StreamSetupEvent(StreamProtocol.AIRPLAY_1)))
+        c.dispatch(env(c, EventOrigin.AIRPLAY, s2, FirstDataPacketEvent(StreamProtocol.AIRPLAY_1, 10L, 44100, 16, 2, "ALAC")))
+        c.dispatch(env(c, EventOrigin.AIRPLAY, s2, StreamStopEvent(FlushReason.STOP_OR_TEARDOWN, newEpoch = 11L)))
+        runCurrent()
+        advanceTimeBy(30_000)
+        runCurrent()
+        assertEquals(HardwarePipelineState.EXCLUSIVE_MUTED, c.snapshot.value.hardwareState)
+        assertEquals(1, hw.releaseDeviceCalls)
+    }
 }

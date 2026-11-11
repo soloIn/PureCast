@@ -117,10 +117,7 @@ dependencies {
     testImplementation(libs.kotlinx.coroutines.test)
 }
 
-// =========================================================================
-// 💡 U2/U7 覆盖率强校验门禁：PlaybackSessionCoordinator & TrackTransactionManager
-// 契约：指令/行覆盖率 >= 90%，状态转换核心逻辑分支覆盖率 = 100%
-// =========================================================================
+// 💡 焦点与状态转换核心单元覆盖率强校验门禁
 val sessionClassesTree = fileTree(layout.buildDirectory.dir("tmp/kotlin-classes/debug")) {
     include(
         "com/solo/purecast/core/session/PlaybackSessionCoordinator*.class",

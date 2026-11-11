@@ -165,9 +165,7 @@ class UpnpRendererServer(
         localIpAddress = getActiveLocalIpAddress()
         Logger.upnp.i(TAG, "启动 UPnP MediaRenderer: 名称=$friendlyName, 本地IP=$localIpAddress, 端口=$httpPort")
 
-        demuxer = buildDemuxer().also {
-            // 仅在 Play 动作触发推流，不在 Server 初始化阶段启动网络请求
-        }
+        demuxer = buildDemuxer()
 
         startHttpServer()
         startSsdpEngine()
@@ -313,12 +311,12 @@ class UpnpRendererServer(
                 Logger.upnp.i(TAG, "从音频流容器提取到内嵌元数据: title=$title, artist=$artist, album=$album")
                 synchronized(sessionStateLock) {
                     val isDefaultTitle = currentTrackMetadata.title.isEmpty() ||
-                        currentTrackMetadata.title == "等待音频推送" ||
+                        currentTrackMetadata.title == TrackMetadata.DEFAULT_TITLE ||
                         currentTrackMetadata.title == "AirPlay 无损音频" ||
-                        currentTrackMetadata.title == "UPnP 音频流"
+                        currentTrackMetadata.title == DEFAULT_UPNP_TITLE
                     val isDefaultArtist = currentTrackMetadata.artist.isEmpty() ||
                         currentTrackMetadata.artist == "PureCast UPnP / DLNA 接收端" ||
-                        currentTrackMetadata.artist == "PureCast" ||
+                        currentTrackMetadata.artist == DEFAULT_UPNP_ARTIST ||
                         currentTrackMetadata.artist == "Apple Music"
                     val isDefaultAlbum = currentTrackMetadata.album.isEmpty() ||
                         currentTrackMetadata.album == "未知专辑"
@@ -592,7 +590,7 @@ class UpnpRendererServer(
             } else {
                 0L
             }
-            val parsedMeta = if (metadataXml.isNotEmpty() || currentTrackMetadata.title.isEmpty() || currentTrackMetadata.title == "等待音频推送") {
+            val parsedMeta = if (metadataXml.isNotEmpty() || currentTrackMetadata.title.isEmpty() || currentTrackMetadata.title == TrackMetadata.DEFAULT_TITLE) {
                 parseDidlLiteMetadata(metadataXml, uri)
             } else {
                 currentTrackMetadata.copy(trackUri = uri)
@@ -621,18 +619,7 @@ class UpnpRendererServer(
                             trackUri = uri
                         )
                     )
-                    emitEventLocked(
-                        MetadataPatchEvent(
-                            trackGeneration = trackGenerationCounter,
-                            title = parsedMeta.title,
-                            artist = parsedMeta.artist,
-                            album = parsedMeta.album,
-                            coverUri = parsedMeta.coverUri,
-                            durationMs = parsedMeta.durationMs,
-                            durationState = parsedMeta.durationState,
-                            seekCapability = parsedMeta.seekCapability
-                        )
-                    )
+                    emitFullMetadataPatchLocked(parsedMeta)
                     emitEventLocked(
                         ProgressUpdateEvent(
                             positionMs = 0L,
@@ -645,23 +632,12 @@ class UpnpRendererServer(
             if (uri.isNotEmpty()) {
                 currentUri = uri
             }
-            if (metadataXml.isNotEmpty() || currentTrackMetadata.title.isEmpty() || currentTrackMetadata.title == "等待音频推送") {
+            if (metadataXml.isNotEmpty() || currentTrackMetadata.title.isEmpty() || currentTrackMetadata.title == TrackMetadata.DEFAULT_TITLE) {
                 val parsedMeta = parseDidlLiteMetadata(metadataXml, currentUri)
                 synchronized(sessionStateLock) {
                     currentTrackMetadata = parsedMeta
                     if (sessionSetupDispatched && activeUpnpSessionId != 0L && trackGenerationCounter > 0L) {
-                        emitEventLocked(
-                            MetadataPatchEvent(
-                                trackGeneration = trackGenerationCounter,
-                                title = parsedMeta.title,
-                                artist = parsedMeta.artist,
-                                album = parsedMeta.album,
-                                coverUri = parsedMeta.coverUri,
-                                durationMs = parsedMeta.durationMs,
-                                durationState = parsedMeta.durationState,
-                                seekCapability = parsedMeta.seekCapability
-                            )
-                        )
+                        emitFullMetadataPatchLocked(parsedMeta)
                     }
                 }
             }
@@ -757,27 +733,38 @@ class UpnpRendererServer(
     /**
      * 💡 SOAP Next 切下一曲指令处理
      */
-    private fun handleNext(): String {
-        Logger.upnp.i(TAG, "SOAP Next 指令触发")
-        return if (isLiveOrUnseekable()) {
-            Logger.upnp.w(TAG, "实时音频流不支持切歌，返回 SOAP 701 错误")
-            buildSoapFault(701, "Transition not available for live stream")
-        } else {
-            buildSoapResponse("NextResponse", "urn:schemas-upnp-org:service:AVTransport:1", "")
-        }
-    }
+    private fun handleNext(): String =
+        handleTrackStepAction("Next", "NextResponse")
 
     /**
      * 💡 SOAP Previous 切上一曲指令处理
      */
-    private fun handlePrevious(): String {
-        Logger.upnp.i(TAG, "SOAP Previous 指令触发")
+    private fun handlePrevious(): String =
+        handleTrackStepAction("Previous", "PreviousResponse")
+
+    private fun handleTrackStepAction(actionName: String, responseTag: String): String {
+        Logger.upnp.i(TAG, "SOAP $actionName 指令触发")
         return if (isLiveOrUnseekable()) {
-            Logger.upnp.w(TAG, "实时音频流不支持切上一曲，返回 SOAP 701 错误")
+            Logger.upnp.w(TAG, "实时音频流不支持切歌($actionName)，返回 SOAP 701 错误")
             buildSoapFault(701, "Transition not available for live stream")
         } else {
-            buildSoapResponse("PreviousResponse", "urn:schemas-upnp-org:service:AVTransport:1", "")
+            buildSoapResponse(responseTag, "urn:schemas-upnp-org:service:AVTransport:1", "")
         }
+    }
+
+    private fun emitFullMetadataPatchLocked(parsedMeta: TrackMetadata) {
+        emitEventLocked(
+            MetadataPatchEvent(
+                trackGeneration = trackGenerationCounter,
+                title = parsedMeta.title,
+                artist = parsedMeta.artist,
+                album = parsedMeta.album,
+                coverUri = parsedMeta.coverUri,
+                durationMs = parsedMeta.durationMs,
+                durationState = parsedMeta.durationState,
+                seekCapability = parsedMeta.seekCapability
+            )
+        )
     }
 
     private fun handleGetTransportInfo(): String {
@@ -880,7 +867,7 @@ class UpnpRendererServer(
 
         val title = extractTagValue(unescaped, "dc:title")
             .ifEmpty { extractTagValue(unescaped, "title") }
-            .ifEmpty { "UPnP 音频流" }
+            .ifEmpty { DEFAULT_UPNP_TITLE }
 
         val artist = extractTagValue(unescaped, "upnp:artist")
             .ifEmpty { extractTagValue(unescaped, "dc:creator") }
@@ -1213,5 +1200,7 @@ class UpnpRendererServer(
 
     companion object {
         private const val TAG = "UpnpRendererServer"
+        private const val DEFAULT_UPNP_TITLE = "UPnP 音频流"
+        private const val DEFAULT_UPNP_ARTIST = "PureCast"
     }
 }

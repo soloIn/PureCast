@@ -12,11 +12,9 @@ import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbManager
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
-import android.os.Build
-import android.os.Handler
-import android.os.Looper
 import android.os.SystemClock
 import androidx.core.content.ContextCompat
+import androidx.core.content.IntentCompat
 import com.solo.purecast.core.nativebridge.NativeAudioEngine
 import com.solo.purecast.core.session.EventOrigin
 import com.solo.purecast.core.session.HardwareAttachedEvent
@@ -139,18 +137,13 @@ internal class AndroidUsbSystemBridge(
     override fun requestPermission(device: UsbDeviceDescriptor, activity: Activity?) {
         val raw = device.rawDevice ?: findRawDevice(device) ?: return
         val targetCtx: Context = activity ?: context
-        val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        } else {
-            PendingIntent.FLAG_UPDATE_CURRENT
-        }
         val permissionIntent = PendingIntent.getBroadcast(
             targetCtx,
             0,
             Intent(UsbDeviceManager.ACTION_USB_PERMISSION).apply {
                 setPackage(context.packageName)
             },
-            flags
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
         usbManager.requestPermission(raw, permissionIntent)
     }
@@ -238,14 +231,12 @@ class UsbDeviceManager internal constructor(
     private val hardwareExecutor: ExecutorService = createSingleThreadHardwareExecutor(),
     private val ownsExecutor: Boolean = false,
     private val context: Context? = null,
-    private val onDeviceStateChanged: (connected: Boolean, deviceName: String?) -> Unit = { _, _ -> },
     private val dispatchEvent: (SessionEventEnvelope<SessionEventPayload>) -> Unit = {},
     private val clockMs: () -> Long = { SystemClock.elapsedRealtime() }
 ) : SessionHardwareBridge {
 
     constructor(
         context: Context,
-        onDeviceStateChanged: (connected: Boolean, deviceName: String?) -> Unit,
         dispatchEvent: (SessionEventEnvelope<SessionEventPayload>) -> Unit = {}
     ) : this(
         systemBridge = AndroidUsbSystemBridge(context),
@@ -253,11 +244,8 @@ class UsbDeviceManager internal constructor(
         hardwareExecutor = createSingleThreadHardwareExecutor(),
         ownsExecutor = true,
         context = context,
-        onDeviceStateChanged = onDeviceStateChanged,
         dispatchEvent = dispatchEvent
     )
-
-    private val idleHandler: Handler? = if (context != null) Handler(Looper.getMainLooper()) else null
 
     // 💡 重入检测标识：若已经在 HardwareExecutor 线程中直接调用同步方法，避免向单线程池 submit 自锁
     private val inHardwareExecutor = ThreadLocal.withInitial { false }
@@ -278,24 +266,14 @@ class UsbDeviceManager internal constructor(
     private var currentBitDepth: Int = 0
     private var currentChannels: Int = 0
 
-    // 💡 10 秒空闲自动归还调度任务（兼容旧直接调度入口；主逻辑于 U5 由协调器接管）
-    private var idleTimeoutMillis = 10_000L
-    private val releaseRunnable = Runnable {
-        Logger.usb.i(TAG, "推流暂停/空闲已满 ${idleTimeoutMillis / 1000} 秒，触发内核声卡让渡时序...")
-        executeOnHardwareAsync {
-            releaseUsbExclusiveInternal()
-        }
-    }
-
     private val permissionReceiver = object : BroadcastReceiver() {
         override fun onReceive(c: Context, intent: Intent) {
             if (ACTION_USB_PERMISSION != intent.action) return
-            val device: UsbDevice? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
-            } else {
-                @Suppress("DEPRECATION")
-                intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
-            }
+            val device: UsbDevice? = IntentCompat.getParcelableExtra(
+                intent,
+                UsbManager.EXTRA_DEVICE,
+                UsbDevice::class.java
+            )
             val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
             val descriptor = device?.toDescriptor()
             // 💡 严禁在 BroadcastReceiver 主线程中加锁或调用阻塞 JNI，仅非阻塞投递给 HardwareExecutor
@@ -328,12 +306,32 @@ class UsbDeviceManager internal constructor(
         scanAndAttachDeviceInternal()
     }
 
+    /**
+     * 💡 非阻塞启动冷开机 USB 扫描，避免在 Service.onCreate 主线程排队等待 HardwareExecutor
+     */
+    fun scanAndAttachDeviceAsync() {
+        executeOnHardwareAsync {
+            scanAndAttachDeviceInternal()
+        }
+    }
+
+    /**
+     * 💡 在 HardwareExecutor 线程一次扫描并在未授权时发起系统授权弹窗，消除 UI 主线程阻塞与重复遍历
+     */
+    fun scanAndRequestPermissionAsync(activity: Activity) {
+        bindPermissionActivity(activity)
+        executeOnHardwareAsync {
+            if (!scanAndAttachDeviceInternal() && activeDevice != null) {
+                requestPermissionInternal(activity, null)
+            }
+        }
+    }
+
     private fun scanAndAttachDeviceInternal(): Boolean {
         Logger.usb.i(TAG, "HardwareExecutor 扫描 USB Audio 设备列表...")
         val candidate = systemBridge.scanAudioDevice()
         if (candidate == null) {
             Logger.usb.w(TAG, "未发现符合规范的 USB Audio Class 设备")
-            onDeviceStateChanged(false, null)
             return false
         }
         return handleAttachedDescriptorInternal(candidate)
@@ -365,7 +363,6 @@ class UsbDeviceManager internal constructor(
         val hasPerm = systemBridge.hasPermission(descriptor)
 
         if (!isSameActive) {
-            // 💡 物理设备新插拔事件递增独立 deviceGeneration，隔离上一代过期硬件事件
             deviceGeneration.incrementAndGet()
             isPermissionRequesting.set(false)
             Logger.usb.i(
@@ -387,13 +384,10 @@ class UsbDeviceManager internal constructor(
             )
         }
 
-        return if (hasPerm) {
-            onDeviceStateChanged(true, descriptor.productName)
-            true
-        } else {
+        if (!hasPerm) {
             Logger.usb.i(TAG, "USB DAC (${descriptor.productName}) 尚未获授权，维持 ATTACHED/PERMISSION_PENDING 等待授权")
-            false
         }
+        return hasPerm
     }
 
     /**
@@ -434,7 +428,6 @@ class UsbDeviceManager internal constructor(
         emitHardwareEventLocked(
             HardwareDetachedEvent(reason = "usb_detached")
         )
-        onDeviceStateChanged(false, null)
         return true
     }
 
@@ -462,10 +455,6 @@ class UsbDeviceManager internal constructor(
                 granted = granted
             )
         )
-        if (granted) {
-            // 💡 U4 统一落态规则：授权通过仅进入 RELEASED 待命态，绝不提前 openDevice 空转 URB
-            onDeviceStateChanged(true, resolved.productName)
-        }
     }
 
     /**
@@ -497,7 +486,6 @@ class UsbDeviceManager internal constructor(
             emitHardwareEventLocked(
                 UsbPermissionGrantedEvent(deviceName = device.productName, granted = true)
             )
-            onDeviceStateChanged(true, device.productName)
             return
         }
 
@@ -539,8 +527,6 @@ class UsbDeviceManager internal constructor(
     }
 
     private fun openOrReconfigureInternal(sampleRate: Int, bitDepth: Int, channels: Int): Result<HardwareOpenSuccess> {
-        idleHandler?.removeCallbacks(releaseRunnable)
-
         val device = activeDevice ?: systemBridge.scanAudioDevice()?.also { activeDevice = it }
         if (device == null) {
             Logger.usb.e(TAG, "openDeviceWithCurrentFd 失败: 无可用 USB 设备")
@@ -561,7 +547,6 @@ class UsbDeviceManager internal constructor(
                 return Result.success(HardwareOpenSuccess(epoch = epoch, dacName = device.productName))
             }
 
-            // 💡 U4 三元组原位切频时序：通知进入 AUDIO_RECONFIGURING 并仅传递 (sampleRate, bitDepth, channels)
             Logger.usb.i(
                 TAG,
                 "HardwareExecutor 执行三元组原位切频: ${currentSampleRate}Hz/${currentBitDepth}bit -> ${sampleRate}Hz/${bitDepth}bit/${channels}ch"
@@ -588,7 +573,7 @@ class UsbDeviceManager internal constructor(
                 return Result.success(HardwareOpenSuccess(epoch = reconfigEpoch, dacName = device.productName))
             }
 
-            // 💡 U4 契约：原位切频返回负值 -> 安全回滚（释放旧句柄 + 重开新 fd 并打开新规格）
+            // 💡 原位切频返回负值时释放旧句柄并重开新 fd 完成安全回滚
             Logger.usb.w(TAG, "原位切频失败 ($reconfigEpoch)，执行安全回滚释放旧连接并重开...")
             releaseUsbExclusiveInternal()
             val fallbackResult = freshOpenDeviceInternal(device, sampleRate, bitDepth, channels, isReconfigureRollback = true)
@@ -616,50 +601,33 @@ class UsbDeviceManager internal constructor(
     ): Result<HardwareOpenSuccess> {
         Logger.usb.i(TAG, "打开 UsbDeviceConnection 并穿透 Linux usbfs fd 到 Native 驱动...")
         val connection = systemBridge.openConnection(device)
-        if (connection == null) {
-            Logger.usb.e(TAG, "openConnection 返回 null，无法获取设备句柄")
-            if (!isReconfigureRollback) {
-                emitHardwareEventLocked(
-                    HardwareReconfigureFailedEvent(
-                        errorCode = ErrorCode.USB_OPEN_FAILED,
-                        message = "无法打开 USB 设备连接句柄 (${device.productName})",
-                        fallbackState = HardwarePipelineState.RELEASED
-                    )
-                )
-            }
-            return Result.failure(IllegalStateException("openConnection returned null"))
-        }
+            ?: return failFreshOpen(
+                logMessage = "openConnection 返回 null，无法获取设备句柄",
+                userMessage = "无法打开 USB 设备连接句柄 (${device.productName})",
+                cause = "openConnection returned null",
+                isReconfigureRollback = isReconfigureRollback
+            )
 
         val fd = connection.fileDescriptor
         if (fd < 0) {
-            Logger.usb.e(TAG, "获取底层 Linux usbfs fd 失败 (fd=$fd)")
-            connection.close()
-            if (!isReconfigureRollback) {
-                emitHardwareEventLocked(
-                    HardwareReconfigureFailedEvent(
-                        errorCode = ErrorCode.USB_OPEN_FAILED,
-                        message = "无效的 USB 文件描述符 (fd=$fd)",
-                        fallbackState = HardwarePipelineState.RELEASED
-                    )
-                )
-            }
-            return Result.failure(IllegalStateException("Invalid usbfs fd=$fd"))
+            return failFreshOpen(
+                logMessage = "获取底层 Linux usbfs fd 失败 (fd=$fd)",
+                userMessage = "无效的 USB 文件描述符 (fd=$fd)",
+                cause = "Invalid usbfs fd=$fd",
+                isReconfigureRollback = isReconfigureRollback,
+                connection = connection
+            )
         }
 
         val ret = nativeBridge.openDevice(fd, sampleRate, bitDepth, channels)
         if (ret != 0) {
-            Logger.usb.e(TAG, "Native openDevice 失败: ret=$ret, fd=$fd")
-            connection.close()
-            if (!isReconfigureRollback) {
-                emitHardwareEventLocked(
-                    HardwareReconfigureFailedEvent(
-                        errorCode = ErrorCode.USB_OPEN_FAILED,
-                        message = "Native openDevice 失败 ($ret)",
-                        fallbackState = HardwarePipelineState.RELEASED
-                    )
-                )
-            }
-            return Result.failure(IllegalStateException("Native openDevice returned $ret"))
+            return failFreshOpen(
+                logMessage = "Native openDevice 失败: ret=$ret, fd=$fd",
+                userMessage = "Native openDevice 失败 ($ret)",
+                cause = "Native openDevice returned $ret",
+                isReconfigureRollback = isReconfigureRollback,
+                connection = connection
+            )
         }
 
         activeConnection = connection
@@ -723,7 +691,6 @@ class UsbDeviceManager internal constructor(
     }
 
     private fun releaseUsbExclusiveInternal() {
-        idleHandler?.removeCallbacks(releaseRunnable)
         val wasExclusive = isExclusiveTaken.getAndSet(false)
         val conn = activeConnection
         activeConnection = null
@@ -748,24 +715,29 @@ class UsbDeviceManager internal constructor(
         systemBridge.triggerAudioSelfHealing()
     }
 
-    fun scheduleIdleRelease(customTimeoutMillis: Long = idleTimeoutMillis) {
-        val handler = idleHandler ?: return
-        handler.removeCallbacks(releaseRunnable)
-        if (idleTimeoutMillis <= 0L || customTimeoutMillis <= 0L) {
-            Logger.usb.i(TAG, "已配置常驻独占策略 (0秒)，保持声卡独占不自动让渡")
-            return
+    private fun failFreshOpen(
+        logMessage: String,
+        userMessage: String,
+        cause: String,
+        isReconfigureRollback: Boolean,
+        connection: UsbOpenFdHandle? = null
+    ): Result<HardwareOpenSuccess> {
+        Logger.usb.e(TAG, logMessage)
+        try {
+            connection?.close()
+        } catch (e: Exception) {
+            Logger.usb.w(TAG, "释放失败的 UsbOpenFdHandle 异常", e)
         }
-        Logger.usb.i(TAG, "启动 ${customTimeoutMillis / 1000} 秒空闲声卡让渡倒计时...")
-        handler.postDelayed(releaseRunnable, customTimeoutMillis)
-    }
-
-    fun cancelIdleRelease() {
-        idleHandler?.removeCallbacks(releaseRunnable)
-    }
-
-    fun setIdleTimeoutSeconds(seconds: Int) {
-        idleTimeoutMillis = if (seconds <= 0) 0L else seconds.coerceAtLeast(3) * 1000L
-        Logger.usb.i(TAG, "更新空闲声卡让渡时间为: $seconds 秒 (0秒为常驻独占)")
+        if (!isReconfigureRollback) {
+            emitHardwareEventLocked(
+                HardwareReconfigureFailedEvent(
+                    errorCode = ErrorCode.USB_OPEN_FAILED,
+                    message = userMessage,
+                    fallbackState = HardwarePipelineState.RELEASED
+                )
+            )
+        }
+        return Result.failure(IllegalStateException(cause))
     }
 
     fun isExclusive(): Boolean = isExclusiveTaken.get()
@@ -774,7 +746,6 @@ class UsbDeviceManager internal constructor(
 
     fun destroy() {
         if (!isDestroyed.compareAndSet(false, true)) return
-        idleHandler?.removeCallbacks(releaseRunnable)
         try {
             runOnHardwareSync {
                 releaseUsbExclusiveInternal()
@@ -816,36 +787,35 @@ class UsbDeviceManager internal constructor(
         )
     }
 
+    private inline fun <T> withHardwareExecutorFlag(block: () -> T): T {
+        val prev = inHardwareExecutor.get() ?: false
+        inHardwareExecutor.set(true)
+        return try {
+            block()
+        } finally {
+            inHardwareExecutor.set(prev)
+        }
+    }
+
     private fun executeOnHardwareAsync(block: () -> Unit) {
         if (hardwareExecutor.isShutdown) return
         hardwareExecutor.execute {
-            val prev = inHardwareExecutor.get() ?: false
-            inHardwareExecutor.set(true)
-            try {
-                block()
-            } catch (t: Throwable) {
-                Logger.usb.e(TAG, "HardwareExecutor 异步任务执行异常", t)
-            } finally {
-                inHardwareExecutor.set(prev)
+            withHardwareExecutorFlag {
+                try {
+                    block()
+                } catch (t: Throwable) {
+                    Logger.usb.e(TAG, "HardwareExecutor 异步任务执行异常", t)
+                }
             }
         }
     }
 
     private fun <T> runOnHardwareSync(block: () -> T): T {
-        if (inHardwareExecutor.get() == true) {
-            return block()
-        }
-        if (hardwareExecutor.isShutdown) {
+        if (inHardwareExecutor.get() == true || hardwareExecutor.isShutdown) {
             return block()
         }
         return hardwareExecutor.submit(Callable {
-            val prev = inHardwareExecutor.get() ?: false
-            inHardwareExecutor.set(true)
-            try {
-                block()
-            } finally {
-                inHardwareExecutor.set(prev)
-            }
+            withHardwareExecutorFlag(block)
         }).get()
     }
 
