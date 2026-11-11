@@ -138,15 +138,19 @@ class PlaybackService : LifecycleService() {
         }
 
         val idleTimeout = settingsRepository.getIdleTimeoutSeconds()
-        usbDeviceManager = UsbDeviceManager(this) { connected, name ->
-            Logger.service.i(TAG, "USB DAC 硬件状态通知: connected=$connected, name=$name")
-            _audioPathState.value = _audioPathState.value.copy(
-                isDacConnected = connected,
-                dacName = name ?: if (connected) "Sony DAC" else "未检测到 USB DAC",
-                isExclusive = usbDeviceManager.isExclusive()
-            )
-            updateNotification()
-        }.apply {
+        usbDeviceManager = UsbDeviceManager(
+            context = this,
+            onDeviceStateChanged = { connected, name ->
+                Logger.service.i(TAG, "USB DAC 硬件状态通知: connected=$connected, name=$name")
+                _audioPathState.value = _audioPathState.value.copy(
+                    isDacConnected = connected,
+                    dacName = name ?: if (connected) "Sony DAC" else "未检测到 USB DAC",
+                    isExclusive = usbDeviceManager.isExclusive()
+                )
+                updateNotification()
+            },
+            dispatchEvent = { envelope -> handleLegacySessionEnvelope(envelope) }
+        ).apply {
             setIdleTimeoutSeconds(idleTimeout)
         }
 
@@ -896,6 +900,10 @@ class PlaybackService : LifecycleService() {
         usbDeviceManager.setIdleTimeoutSeconds(seconds)
     }
 
+    fun bindUsbPermissionActivity(activity: android.app.Activity?) {
+        usbDeviceManager.bindPermissionActivity(activity)
+    }
+
     fun requestUsbPermission(activity: android.app.Activity) {
         usbDeviceManager.requestPermissionWithActivity(activity)
     }
@@ -975,16 +983,12 @@ class PlaybackService : LifecycleService() {
     }
 
     fun handleUsbDeviceAttachedFromIntent(device: android.hardware.usb.UsbDevice) {
-        usbDeviceManager.onDeviceAttachedFromIntent(device)
+        usbDeviceManager.onDeviceAttachedAsync(device)
     }
 
     fun handleUsbDeviceDetached(device: android.hardware.usb.UsbDevice?) {
-        Logger.service.w(TAG, "收到 USB 设备拔出通知: ${device?.deviceName}")
-        val isCurrentDacDetached = usbDeviceManager.handleDeviceDetached(device)
-        if (isCurrentDacDetached && _playbackStatus.value == PlaybackStatus.PLAYING) {
-            Logger.service.i(TAG, "当前活跃的 USB DAC 已物理拔出，自动暂停当前音频播放")
-            pausePlayback()
-        }
+        Logger.service.w(TAG, "收到 USB 设备拔出通知，异步投递给 HardwareExecutor: ${device?.deviceName}")
+        usbDeviceManager.handleDeviceDetachedAsync(device)
     }
 
     private fun registerNetworkCallback() {
@@ -1250,6 +1254,17 @@ class PlaybackService : LifecycleService() {
                     bitDepth = payload.bitDepth,
                     channels = payload.channels
                 )
+            }
+
+            is com.solo.purecast.core.session.HardwareDetachedEvent -> {
+                if (_playbackStatus.value == PlaybackStatus.PLAYING) {
+                    Logger.service.i(TAG, "当前活跃 USB DAC 已拔出，仅播放态切换为 PAUSED")
+                    pausePlayback()
+                }
+            }
+
+            is com.solo.purecast.core.session.HardwareReconfigureFailedEvent -> {
+                updateServerError(payload.message)
             }
 
             is ErrorReportedEvent -> {

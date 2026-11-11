@@ -99,6 +99,7 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         Logger.ui.i(TAG, "MainActivity onResume: 检查 USB DAC 授权状态与屏保常亮状态...")
+        PlaybackService.instance?.bindUsbPermissionActivity(this)
         checkAndRequestUsbPermission()
         updateKeepScreenOn()
     }
@@ -160,6 +161,7 @@ class MainActivity : ComponentActivity() {
     override fun onStop() {
         super.onStop()
         Logger.ui.i(TAG, "MainActivity onStop: 退入后台，清除 FLAG_KEEP_SCREEN_ON 释放屏保控制权")
+        PlaybackService.instance?.bindUsbPermissionActivity(null)
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
     }
 

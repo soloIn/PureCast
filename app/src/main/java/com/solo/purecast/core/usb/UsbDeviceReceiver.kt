@@ -23,13 +23,17 @@ class UsbDeviceReceiver : BroadcastReceiver() {
             UsbManager.ACTION_USB_DEVICE_ATTACHED -> {
                 val device: UsbDevice? = IntentCompat.getParcelableExtra(intent, UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
                 Logger.usb.i(TAG, "检测到 USB 设备插入: ${device?.deviceName}, VendorID=0x${device?.vendorId?.toString(16)}")
-                // 启动或通知前台服务挂载设备
+                // 💡 严禁在广播接收器阻塞：拉起服务并将设备异步投递给单线程 HardwareExecutor
                 PlaybackService.start(context)
+                if (device != null) {
+                    PlaybackService.instance?.handleUsbDeviceAttachedFromIntent(device)
+                }
             }
 
             UsbManager.ACTION_USB_DEVICE_DETACHED -> {
                 val device: UsbDevice? = IntentCompat.getParcelableExtra(intent, UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
                 Logger.usb.i(TAG, "检测到 USB 设备拔出: ${device?.deviceName}")
+                // 💡 非阻塞投递拔出事件给 HardwareExecutor，规避 Broadcast 超时 ANR
                 PlaybackService.instance?.handleUsbDeviceDetached(device)
             }
 
