@@ -199,13 +199,6 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * 💡 全局按键分发
-     */
-    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
-        return super.dispatchKeyEvent(event)
-    }
-
-    /**
      * 💡 物理遥控器按键精确拦截
      */
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {

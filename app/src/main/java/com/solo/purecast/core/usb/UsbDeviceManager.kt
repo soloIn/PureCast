@@ -16,6 +16,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import androidx.core.content.ContextCompat
 import com.solo.purecast.core.nativebridge.NativeAudioEngine
 import com.solo.purecast.core.session.EventOrigin
 import com.solo.purecast.core.session.HardwareAttachedEvent
@@ -307,11 +308,12 @@ class UsbDeviceManager internal constructor(
     init {
         if (context != null) {
             val filter = IntentFilter(ACTION_USB_PERMISSION)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                context.registerReceiver(permissionReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
-            } else {
-                context.registerReceiver(permissionReceiver, filter)
-            }
+            ContextCompat.registerReceiver(
+                context,
+                permissionReceiver,
+                filter,
+                ContextCompat.RECEIVER_NOT_EXPORTED
+            )
         }
     }
 
