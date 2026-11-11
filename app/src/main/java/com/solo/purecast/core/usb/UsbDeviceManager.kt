@@ -700,6 +700,26 @@ class UsbDeviceManager internal constructor(
         }
     }
 
+    /**
+     * 💡 外部音频焦点彻底丢失（AUDIOFOCUS_LOSS）时立即归还 USB 独占句柄，
+     * 并在串行硬件线程同步最新硬件状态回协调器（保证 hardwareSequence 单调递增）。
+     */
+    fun releaseForExternalFocusLoss() {
+        executeOnHardwareAsync {
+            val hadExclusive = isExclusiveTaken.get() || activeConnection != null
+            releaseUsbExclusiveInternal()
+            val dev = activeDevice
+            if (hadExclusive && dev != null) {
+                val targetState = if (systemBridge.hasPermission(dev)) {
+                    HardwarePipelineState.RELEASED
+                } else {
+                    HardwarePipelineState.PERMISSION_PENDING
+                }
+                emitHardwareEventLocked(HardwareStateSyncedEvent(targetState))
+            }
+        }
+    }
+
     private fun releaseUsbExclusiveInternal() {
         idleHandler?.removeCallbacks(releaseRunnable)
         val wasExclusive = isExclusiveTaken.getAndSet(false)

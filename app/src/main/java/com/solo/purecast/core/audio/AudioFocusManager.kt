@@ -41,10 +41,13 @@ class AudioFocusManager(
             AudioManager.AUDIOFOCUS_LOSS -> {
                 Logger.audio.w(TAG, "完全失去音频焦点 (AUDIOFOCUS_LOSS)，执行声卡归还让渡时序...")
                 hasFocus = false
-                onPlaybackStateChange(false)
-                // 💡 彻底归还 USB 声卡给系统内核，确保 UsbDeviceConnection 同步释放并触发路由自愈
-                com.solo.purecast.service.PlaybackService.instance?.pausePlayback()
-                com.solo.purecast.service.PlaybackService.instance?.usbDeviceManager?.releaseUsbExclusive()
+                // 💡 彻底归还 USB 声卡给系统内核，确保 UsbDeviceConnection 同步释放并回传协调器
+                val svc = com.solo.purecast.service.PlaybackService.instance
+                if (svc != null) {
+                    svc.handleAudioFocusLost()
+                } else {
+                    onPlaybackStateChange(false)
+                }
             }
 
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {

@@ -84,6 +84,22 @@ class PlaybackSessionCoordinator(
         startDacpSerialLoop()
     }
 
+    /** 释放协调器定时器与通道，停止事件循环 */
+    fun shutdown() {
+        debouncePauseJob?.cancel()
+        debouncePauseJob = null
+        uiProtectionJob?.cancel()
+        uiProtectionJob = null
+        hardwareIdleTimeoutJob?.cancel()
+        hardwareIdleTimeoutJob = null
+        suspendTimeoutJob?.cancel()
+        suspendTimeoutJob = null
+        remoteCommandTimeoutJob?.cancel()
+        remoteCommandTimeoutJob = null
+        eventChannel.close()
+        dacpCommandChannel.close()
+    }
+
     /** 分配全局单调会话身份 ID */
     fun allocateSessionId(): Long = sessionIdGenerator.incrementAndGet()
 

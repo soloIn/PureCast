@@ -431,4 +431,68 @@ class UsbDeviceManagerTest {
         hwExecutor.shutdownNow()
         hwExecutor.awaitTermination(1, TimeUnit.SECONDS)
     }
+
+    @Test
+    fun externalAudioFocusLossReleasesExclusiveAndSyncsHardwareState() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val systemBridge = FakeUsbSystemBridge().apply {
+            scannedDevice = sonyDac()
+            permissionGranted = true
+            nextFd = 77
+        }
+        val nativeBridge = FakeUsbNativeAudioBridge()
+        var coordinator: PlaybackSessionCoordinator? = null
+
+        val hwExecutor = directExecutor()
+        val usbManager = UsbDeviceManager(
+            systemBridge = systemBridge,
+            nativeBridge = nativeBridge,
+            hardwareExecutor = hwExecutor,
+            dispatchEvent = { env -> coordinator?.dispatch(env) }
+        )
+        coordinator = PlaybackSessionCoordinator(
+            scope = TestScope(dispatcher),
+            hardwareBridge = usbManager
+        )
+
+        assertTrue(usbManager.scanAndAttachDevice())
+        assertTrue(usbManager.claimUsbExclusive(44100, 16, 2))
+        val sid = coordinator.allocateSessionId()
+        coordinator.dispatch(
+            SessionEventEnvelope(
+                origin = com.solo.purecast.core.session.EventOrigin.AIRPLAY,
+                sessionId = sid,
+                deviceGeneration = usbManager.currentDeviceGeneration(),
+                sequence = coordinator.allocateSequence(),
+                timestampElapsedMs = 1L,
+                payload = StreamSetupEvent(StreamProtocol.AIRPLAY_1, 44100, 16, 2, "ALAC", nativeBridge.epoch)
+            )
+        )
+        coordinator.dispatch(
+            SessionEventEnvelope(
+                origin = com.solo.purecast.core.session.EventOrigin.AIRPLAY,
+                sessionId = sid,
+                deviceGeneration = usbManager.currentDeviceGeneration(),
+                sequence = coordinator.allocateSequence(),
+                timestampElapsedMs = 2L,
+                payload = FirstDataPacketEvent(StreamProtocol.AIRPLAY_1, nativeBridge.epoch, 44100, 16, 2, "ALAC")
+            )
+        )
+        testScheduler.runCurrent()
+        assertEquals(HardwarePipelineState.EXCLUSIVE_ACTIVE, coordinator.snapshot.value.hardwareState)
+
+        usbManager.releaseForExternalFocusLoss()
+        flushExecutor(hwExecutor)
+        testScheduler.runCurrent()
+
+        assertFalse(usbManager.isExclusive())
+        assertEquals(1, nativeBridge.releaseCalls)
+        assertTrue(systemBridge.openedHandles[0].closed)
+        assertTrue(systemBridge.selfHealCalls >= 1)
+        assertEquals(HardwarePipelineState.RELEASED, coordinator.snapshot.value.hardwareState)
+
+        usbManager.destroy()
+        hwExecutor.shutdownNow()
+        hwExecutor.awaitTermination(1, TimeUnit.SECONDS)
+    }
 }

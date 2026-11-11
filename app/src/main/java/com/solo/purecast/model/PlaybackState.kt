@@ -295,4 +295,8 @@ data class PlayerSessionSnapshot(
     /** 💡 唯一派生的 UI/MediaSession 状态，严格杜绝外部覆写 */
     val playbackStatus: PlaybackStatus
         get() = businessState.toPlaybackStatus()
+
+    /** 💡 按固定优先级提取当前最高优先级错误（与 ErrorCode 枚举声明序一致） */
+    val highestPriorityError: PlaybackError?
+        get() = errors.values.minByOrNull { it.code.ordinal }
 }

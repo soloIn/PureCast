@@ -182,5 +182,16 @@ class AirPlayServerManager(
         dacpClient.clearSession()
     }
 
+    /**
+     * 💡 抢占或 10 分钟挂起超时时仅清理当前 AirPlay 流与 DACP 会话，保留 RTSP/mDNS 在线待连
+     */
+    fun preemptActiveSession() {
+        Logger.airplay.i(TAG, "中止当前活跃 AirPlay 会话并保留 mDNS/RTSP 监听")
+        NativeAudioEngine.emergencyMuteAndFlush(com.solo.purecast.model.FlushReason.PREEMPT.nativeCode)
+        nativeDispatcher.resetSessions()
+        dacpClient.stop()
+        clearDacpSession()
+    }
+
     fun isRunning(): Boolean = isRunning
 }
