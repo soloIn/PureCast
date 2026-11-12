@@ -38,6 +38,7 @@ class PlaybackSessionCoordinatorTest {
         val recordedFlushes = mutableListOf<FlushReason>()
         var reconfigureResultEpoch: Long? = null
         var resumeResult = 0
+        var resumeCalls = 0
 
         override fun emergencyMuteAndFlush(reason: FlushReason): Long {
             recordedFlushes += reason
@@ -64,6 +65,7 @@ class PlaybackSessionCoordinatorTest {
         }
 
         override fun resumeStream(): Int {
+            resumeCalls++
             paused = false
             return resumeResult
         }
@@ -77,6 +79,7 @@ class PlaybackSessionCoordinatorTest {
         var openDeviceCalls = 0
         var lastOpenSpec: Triple<Int, Int, Int>? = null
         var openDeviceShouldFail = false
+        var throwOnOpenAttempt: RuntimeException? = null
         var openEpochToReturn = 10L
         var openDacName = "Sony ZX300A"
         var releaseDeviceCalls = 0
@@ -85,8 +88,13 @@ class PlaybackSessionCoordinatorTest {
         override fun openDeviceWithCurrentFd(
             sampleRate: Int,
             bitDepth: Int,
-            channels: Int
+            channels: Int,
+            forceNewEpoch: Boolean
         ): Result<HardwareOpenSuccess> {
+            throwOnOpenAttempt?.let { ex ->
+                throwOnOpenAttempt = null
+                throw ex
+            }
             openDeviceCalls++
             lastOpenSpec = Triple(sampleRate, bitDepth, channels)
             return if (openDeviceShouldFail) {
@@ -122,13 +130,16 @@ class PlaybackSessionCoordinatorTest {
         testScope: TestScope,
         hwBridge: FakeSessionHardwareBridge = FakeSessionHardwareBridge(),
         dacpSender: suspend (RemoteCommandType, Long) -> Result<Unit> = { _, _ -> Result.success(Unit) },
-        onPreempted: (StreamProtocol, Long) -> Unit = { _, _ -> }
+        onPreempted: (StreamProtocol, Long) -> Unit = { _, _ -> },
+        onProtocolResumeAfterReopen: (StreamProtocol, Long, Long) -> ProtocolResumeReopenResult =
+            { _, _, _ -> ProtocolResumeReopenResult.STREAMING_READY }
     ): PlaybackSessionCoordinator {
         return PlaybackSessionCoordinator(
             scope = testScope.backgroundScope,
             hardwareBridge = hwBridge,
             dacpCommandSender = dacpSender,
             onSessionTerminated = onPreempted,
+            onProtocolResumeAfterReopen = onProtocolResumeAfterReopen,
             clockMs = { testScope.testScheduler.currentTime }
         )
     }
@@ -904,5 +915,183 @@ class PlaybackSessionCoordinatorTest {
         runCurrent()
         assertEquals(HardwarePipelineState.EXCLUSIVE_MUTED, c.snapshot.value.hardwareState)
         assertEquals(1, hw.releaseDeviceCalls)
+    }
+
+    @Test
+    fun `TriStateTransitionMatrix ignores StreamResumeEvent in IDLE and STOPPED states`() = runTest(StandardTestDispatcher()) {
+        // 1. 直接验证归约器在 IDLE 下收到 StreamResumeEvent 直接返回且不产生副作用 (#23)
+        val idleCtx = TransitionContext()
+        val idleResumeEnv = SessionEventEnvelope<SessionEventPayload>(
+            origin = EventOrigin.UPNP,
+            sessionId = 1L,
+            deviceGeneration = 1L,
+            sequence = 1L,
+            timestampElapsedMs = 100L,
+            payload = StreamResumeEvent(StreamProtocol.UPNP_DLNA, resumedEpoch = 2L)
+        )
+        val idleOut = TriStateTransitionMatrix.reduce(idleCtx, idleResumeEnv, TrackTransactionManager(), 100L)
+        assertEquals(idleCtx, idleOut.nextContext)
+        assertTrue(idleOut.effects.isEmpty())
+
+        // 2. 验证协调器在 STOPPED（停播但保留最后快照）状态下收到同会话迟到 StreamResumeEvent 时仍保持 STOPPED (#23)
+        val hw = FakeSessionHardwareBridge()
+        val c = createCoordinator(this, hwBridge = hw)
+        c.dispatch(env(c, EventOrigin.USB_HARDWARE, 0L, HardwareAttachedEvent("ZX300A", hasPermission = true)))
+        val sid = c.allocateSessionId()
+        c.dispatch(env(c, EventOrigin.UPNP, sid, StreamSetupEvent(StreamProtocol.UPNP_DLNA)))
+        c.dispatch(env(c, EventOrigin.UPNP, sid, FirstDataPacketEvent(StreamProtocol.UPNP_DLNA, 10L, 48000, 24, 2, "WAV")))
+        c.dispatch(env(c, EventOrigin.UPNP, sid, StreamStopEvent(FlushReason.STOP_OR_TEARDOWN, newEpoch = 11L)))
+        runCurrent()
+        assertEquals(BusinessSessionState.STOPPED, c.snapshot.value.businessState)
+
+        // 直接在 STOPPED 状态下投递迟到 StreamResumeEvent，确认绝不重开 DAC、恢复推流或变为 PLAYING
+        val opensBefore = hw.openDeviceCalls
+        val resumesBefore = hw.fastPath.resumeCalls
+        c.dispatch(env(c, EventOrigin.UPNP, sid, StreamResumeEvent(StreamProtocol.UPNP_DLNA, resumedEpoch = 12L)))
+        runCurrent()
+        assertEquals(BusinessSessionState.STOPPED, c.snapshot.value.businessState)
+        assertEquals(HardwarePipelineState.EXCLUSIVE_MUTED, c.snapshot.value.hardwareState)
+        assertEquals(opensBefore, hw.openDeviceCalls)
+        assertEquals(resumesBefore, hw.fastPath.resumeCalls)
+    }
+
+    @Test
+    fun `RemoteCommandFailedEvent rolls back active TRANSITIONING state and clears transient UI state`() = runTest(StandardTestDispatcher()) {
+        val hw = FakeSessionHardwareBridge()
+        val c = createCoordinator(this, hwBridge = hw)
+        c.dispatch(env(c, EventOrigin.USB_HARDWARE, 0L, HardwareAttachedEvent("ZX300A", hasPermission = true)))
+        val sid = c.allocateSessionId()
+        c.dispatch(env(c, EventOrigin.AIRPLAY, sid, StreamSetupEvent(StreamProtocol.AIRPLAY_1)))
+        c.dispatch(env(c, EventOrigin.AIRPLAY, sid, FirstDataPacketEvent(StreamProtocol.AIRPLAY_1, 10L, 44100, 16, 2, "ALAC")))
+        runCurrent()
+        assertEquals(BusinessSessionState.PLAYING, c.snapshot.value.businessState)
+        assertEquals(HardwarePipelineState.EXCLUSIVE_ACTIVE, c.snapshot.value.hardwareState)
+
+        // 切歌指令先进入 TRANSITIONING + EXCLUSIVE_MUTED，再由发送端异步回报 RemoteCommandFailedEvent (#22)
+        val cmdId = c.allocateCommandId()
+        c.dispatch(env(c, EventOrigin.USER_ACTION, sid, RemoteSkipNextEvent(RemoteCommandType.NEXT, cmdId)))
+        runCurrent()
+        assertEquals(BusinessSessionState.TRANSITIONING, c.snapshot.value.businessState)
+        assertEquals(HardwarePipelineState.EXCLUSIVE_MUTED, c.snapshot.value.hardwareState)
+        assertTrue(c.snapshot.value.uiProtectionActive)
+
+        val resumesBefore = hw.fastPath.resumeCalls
+        c.dispatch(env(c, EventOrigin.AIRPLAY, sid, RemoteCommandFailedEvent(cmdId, ErrorCode.REMOTE_COMMAND_UNSUPPORTED, "http 404")))
+        runCurrent()
+
+        assertEquals(BusinessSessionState.PLAYING, c.snapshot.value.businessState)
+        assertEquals(HardwarePipelineState.EXCLUSIVE_ACTIVE, c.snapshot.value.hardwareState)
+        assertFalse(c.snapshot.value.uiProtectionActive)
+        assertEquals(resumesBefore + 1, hw.fastPath.resumeCalls)
+        assertEquals("http 404", c.snapshot.value.errors[ErrorCode.REMOTE_COMMAND_UNSUPPORTED]?.message)
+
+        // 用户关闭或自动消除错误提示 (#31)
+        c.dispatch(env(c, EventOrigin.USER_ACTION, sid, ErrorClearedEvent(ErrorCode.REMOTE_COMMAND_UNSUPPORTED)))
+        runCurrent()
+        assertFalse(c.snapshot.value.errors.containsKey(ErrorCode.REMOTE_COMMAND_UNSUPPORTED))
+    }
+
+    @Test
+    fun `OpenDeviceOnResume handles STREAMING_READY RESTARTING and PRODUCER_DEAD uniformly`() = runTest(StandardTestDispatcher()) {
+        var resumeBehavior = ProtocolResumeReopenResult.STREAMING_READY
+        val resumeCallbacks = mutableListOf<Triple<StreamProtocol, Long, Long>>()
+        val hw = FakeSessionHardwareBridge()
+        val c = createCoordinator(
+            this,
+            hwBridge = hw,
+            onProtocolResumeAfterReopen = { proto, sid, epoch ->
+                resumeCallbacks += Triple(proto, sid, epoch)
+                resumeBehavior
+            }
+        )
+        c.dispatch(env(c, EventOrigin.USB_HARDWARE, 0L, HardwareAttachedEvent("ZX300A", hasPermission = true)))
+
+        // Case 1: STREAMING_READY -> 模拟暂停期间 USB 热插拔后进入 RELEASED，恢复时重开 DAC 并直接进入 PLAYING + EXCLUSIVE_ACTIVE (#2)
+        val s1 = c.allocateSessionId()
+        var gen = 1L
+        c.dispatch(env(c, EventOrigin.UPNP, s1, StreamSetupEvent(StreamProtocol.UPNP_DLNA), deviceGen = gen))
+        c.dispatch(env(c, EventOrigin.UPNP, s1, FirstDataPacketEvent(StreamProtocol.UPNP_DLNA, 10L, 96000, 24, 2, "WAV"), deviceGen = gen))
+        c.dispatch(env(c, EventOrigin.UPNP, s1, ImplicitPauseEvent(10L), deviceGen = gen))
+        c.dispatch(env(c, EventOrigin.USB_HARDWARE, 0L, HardwareDetachedEvent("unplug-1"), deviceGen = ++gen))
+        c.dispatch(env(c, EventOrigin.USB_HARDWARE, 0L, HardwareAttachedEvent("ZX300A", hasPermission = true), deviceGen = ++gen))
+        runCurrent()
+        assertEquals(BusinessSessionState.PAUSED, c.snapshot.value.businessState)
+        assertEquals(HardwarePipelineState.RELEASED, c.snapshot.value.hardwareState)
+
+        hw.openEpochToReturn = 21L
+        resumeBehavior = ProtocolResumeReopenResult.STREAMING_READY
+        val resumesBeforeReady = hw.fastPath.resumeCalls
+        c.dispatch(env(c, EventOrigin.UPNP, s1, StreamResumeEvent(StreamProtocol.UPNP_DLNA, resumedEpoch = 20L), deviceGen = gen))
+        runCurrent()
+        assertEquals(BusinessSessionState.PLAYING, c.snapshot.value.businessState)
+        assertEquals(HardwarePipelineState.EXCLUSIVE_ACTIVE, c.snapshot.value.hardwareState)
+        assertEquals(21L, c.snapshot.value.currentEpoch)
+        assertEquals(resumesBeforeReady + 1, hw.fastPath.resumeCalls)
+        assertEquals(Triple(StreamProtocol.UPNP_DLNA, s1, 21L), resumeCallbacks.last())
+
+        // Case 2: RESTARTING -> 重开 DAC 后管线重连中，停留在 TRANSITIONING + PREPARING + EXCLUSIVE_MUTED 等首包 (#2)
+        c.dispatch(env(c, EventOrigin.UPNP, s1, ImplicitPauseEvent(21L), deviceGen = gen))
+        c.dispatch(env(c, EventOrigin.USB_HARDWARE, 0L, HardwareDetachedEvent("unplug-2"), deviceGen = ++gen))
+        c.dispatch(env(c, EventOrigin.USB_HARDWARE, 0L, HardwareAttachedEvent("ZX300A", hasPermission = true), deviceGen = ++gen))
+        runCurrent()
+        assertEquals(HardwarePipelineState.RELEASED, c.snapshot.value.hardwareState)
+
+        hw.openEpochToReturn = 22L
+        resumeBehavior = ProtocolResumeReopenResult.RESTARTING
+        val resumesBeforeRestart = hw.fastPath.resumeCalls
+        c.dispatch(env(c, EventOrigin.UPNP, s1, StreamResumeEvent(StreamProtocol.UPNP_DLNA, resumedEpoch = 21L), deviceGen = gen))
+        runCurrent()
+        assertEquals(BusinessSessionState.TRANSITIONING, c.snapshot.value.businessState)
+        assertEquals(TransportPipeState.PREPARING, c.snapshot.value.transportState)
+        assertEquals(HardwarePipelineState.EXCLUSIVE_MUTED, c.snapshot.value.hardwareState)
+        assertEquals(resumesBeforeRestart, hw.fastPath.resumeCalls)
+
+        // 首包到达后顺利进入 PLAYING
+        c.dispatch(env(c, EventOrigin.UPNP, s1, FirstDataPacketEvent(StreamProtocol.UPNP_DLNA, 22L, 96000, 24, 2, "WAV"), deviceGen = gen))
+        runCurrent()
+        assertEquals(BusinessSessionState.PLAYING, c.snapshot.value.businessState)
+        assertEquals(HardwarePipelineState.EXCLUSIVE_ACTIVE, c.snapshot.value.hardwareState)
+
+        // Case 3: PRODUCER_DEAD -> 标记 INTERRUPTED + PAUSED 并触发 10 分钟挂起回收 (#2)
+        c.dispatch(env(c, EventOrigin.UPNP, s1, ImplicitPauseEvent(22L), deviceGen = gen))
+        c.dispatch(env(c, EventOrigin.USB_HARDWARE, 0L, HardwareDetachedEvent("unplug-3"), deviceGen = ++gen))
+        c.dispatch(env(c, EventOrigin.USB_HARDWARE, 0L, HardwareAttachedEvent("ZX300A", hasPermission = true), deviceGen = ++gen))
+        runCurrent()
+        assertEquals(HardwarePipelineState.RELEASED, c.snapshot.value.hardwareState)
+
+        hw.openEpochToReturn = 23L
+        resumeBehavior = ProtocolResumeReopenResult.PRODUCER_DEAD
+        c.dispatch(env(c, EventOrigin.UPNP, s1, StreamResumeEvent(StreamProtocol.UPNP_DLNA, resumedEpoch = 22L), deviceGen = gen))
+        runCurrent()
+        assertEquals(BusinessSessionState.PAUSED, c.snapshot.value.businessState)
+        assertEquals(TransportPipeState.INTERRUPTED, c.snapshot.value.transportState)
+        assertEquals(HardwarePipelineState.EXCLUSIVE_MUTED, c.snapshot.value.hardwareState)
+        advanceTimeBy(PlaybackSessionCoordinator.SUSPEND_TIMEOUT_MS + 100L)
+        runCurrent()
+        assertEquals(BusinessSessionState.IDLE, c.snapshot.value.businessState)
+    }
+
+    @Test
+    fun `startEventLoop survives transient non-cancellation RuntimeException and processes next events`() = runTest(StandardTestDispatcher()) {
+        val hw = FakeSessionHardwareBridge()
+        val c = createCoordinator(this, hwBridge = hw)
+        c.dispatch(env(c, EventOrigin.USB_HARDWARE, 0L, HardwareAttachedEvent("ZX300A", hasPermission = true)))
+
+        // 让首次 openDeviceWithCurrentFd 直接抛未捕获 RuntimeException (#21)
+        hw.throwOnOpenAttempt = IllegalStateException("transient jni failure")
+        val s1 = c.allocateSessionId()
+        c.dispatch(env(c, EventOrigin.UPNP, s1, StreamSetupEvent(StreamProtocol.UPNP_DLNA)))
+        c.dispatch(env(c, EventOrigin.UPNP, s1, FirstDataPacketEvent(StreamProtocol.UPNP_DLNA, 10L, 48000, 16, 2, "WAV")))
+        runCurrent()
+
+        // 异常被事件循环兜底拦截后，事件队列消费协程依然存活，能正常处理后续新会话
+        val s2 = c.allocateSessionId()
+        c.dispatch(env(c, EventOrigin.AIRPLAY, s2, StreamSetupEvent(StreamProtocol.AIRPLAY_1)))
+        c.dispatch(env(c, EventOrigin.AIRPLAY, s2, FirstDataPacketEvent(StreamProtocol.AIRPLAY_1, 11L, 44100, 16, 2, "ALAC")))
+        runCurrent()
+
+        assertEquals(s2, c.snapshot.value.sessionId)
+        assertEquals(BusinessSessionState.PLAYING, c.snapshot.value.businessState)
+        assertEquals(HardwarePipelineState.EXCLUSIVE_ACTIVE, c.snapshot.value.hardwareState)
     }
 }

@@ -66,6 +66,17 @@ internal class AirPlayNativeEventDispatcher(
         onRtpActiveChanged(false)
     }
 
+    /**
+     * 💡 校验给定全局会话是否仍属于当前最新活跃 AirPlay 原生会话，防止延迟到达的抢占清理误杀后续新会话
+     */
+    fun hasSession(globalSessionId: Long): Boolean {
+        if (globalSessionId <= 0L) return false
+        synchronized(eventDispatchLock) {
+            val latestNative = latestNativeSessionId.get()
+            return nativeToGlobalSessionMap[latestNative] == globalSessionId
+        }
+    }
+
     override fun onStreamRequested(
         nativeSessionId: Long,
         sequence: Long,
@@ -257,12 +268,12 @@ internal class AirPlayNativeEventDispatcher(
 
             val patchedDurationState = when {
                 durationMs > 0L -> DurationState.FIXED
-                !currentTrackDurationFixed -> DurationState.UNKNOWN
+                !currentTrackDurationFixed && !currentTrackMarkedLive -> DurationState.UNKNOWN
                 else -> null
             }
             val patchedSeek = when {
                 durationMs > 0L -> SeekCapability.SEEKABLE
-                !currentTrackDurationFixed -> SeekCapability.UNSEEKABLE
+                !currentTrackDurationFixed && !currentTrackMarkedLive -> SeekCapability.UNSEEKABLE
                 else -> null
             }
 

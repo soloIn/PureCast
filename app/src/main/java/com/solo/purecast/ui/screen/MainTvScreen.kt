@@ -90,7 +90,8 @@ internal enum class BannerSeverity {
 internal data class UiErrorBanner(
     val code: ErrorCode,
     val message: String,
-    val severity: BannerSeverity
+    val severity: BannerSeverity,
+    val timestampMs: Long = 0L
 )
 
 /**
@@ -113,7 +114,8 @@ internal fun resolveUiErrorBanner(snapshot: PlayerSessionSnapshot): UiErrorBanne
     return UiErrorBanner(
         code = err.code,
         message = err.message,
-        severity = severity
+        severity = severity,
+        timestampMs = err.timestampMs
     )
 }
 
@@ -188,6 +190,20 @@ fun MainTvScreen(
     val metadata = uiState.metadata
     val audioPathState = uiState.audioPath
     val errorBanner = uiState.errorBanner
+    var autoDismissedBannerKey by remember { mutableStateOf<Pair<ErrorCode, Long>?>(null) }
+    LaunchedEffect(errorBanner?.code, errorBanner?.timestampMs) {
+        val current = errorBanner ?: return@LaunchedEffect
+        if (current.code == ErrorCode.REMOTE_COMMAND_UNSUPPORTED ||
+            current.code == ErrorCode.REMOTE_COMMAND_TIMEOUT
+        ) {
+            delay(3_500L)
+            autoDismissedBannerKey = current.code to current.timestampMs
+            PlaybackService.instance?.clearError(current.code)
+        }
+    }
+    val visibleErrorBanner = errorBanner?.takeUnless {
+        autoDismissedBannerKey == (it.code to it.timestampMs)
+    }
 
     val playPauseFocusRequester = remember { FocusRequester() }
     val settingsFocusRequester = remember { FocusRequester() }
@@ -382,8 +398,8 @@ fun MainTvScreen(
                 verticalArrangement = Arrangement.Center
             ) {
                 // 分级异常告警条（不可获焦，严禁抢夺 D-Pad 当前焦点；恢复后随快照自动消除）
-                if (errorBanner != null) {
-                    val isBlocking = errorBanner.severity == BannerSeverity.WARNING_BLOCKING
+                if (visibleErrorBanner != null) {
+                    val isBlocking = visibleErrorBanner.severity == BannerSeverity.WARNING_BLOCKING
                     val bannerBg = if (isBlocking) {
                         Color(0xFF8B0000).copy(alpha = 0.88f)
                     } else {
@@ -404,7 +420,7 @@ fun MainTvScreen(
                             .padding(horizontal = 12.dp, vertical = 6.dp)
                     ) {
                         Text(
-                            text = "$prefix ${errorBanner.message}",
+                            text = "$prefix ${visibleErrorBanner.message}",
                             color = Color.White,
                             fontSize = 13.sp,
                             fontWeight = FontWeight.Medium

@@ -28,8 +28,10 @@ import com.solo.purecast.airplay.AirPlayServerManager
 import com.solo.purecast.core.audio.AudioFocusManager
 import com.solo.purecast.core.session.HardwareFastPathController
 import com.solo.purecast.core.session.PlaybackSessionCoordinator
+import com.solo.purecast.core.session.ProtocolResumeReopenResult
 import com.solo.purecast.core.usb.UsbDeviceManager
 import com.solo.purecast.data.SettingsRepository
+import com.solo.purecast.model.ErrorCode
 import com.solo.purecast.model.PlaybackStatus
 import com.solo.purecast.model.PlayerSessionSnapshot
 import com.solo.purecast.model.SeekCapability
@@ -86,7 +88,6 @@ class PlaybackService : LifecycleService() {
 
     override fun onCreate() {
         super.onCreate()
-        instance = this
         Logger.service.i(TAG, "PlaybackService onCreate: 启动核心服务 (三状态协调器架构)...")
 
         settingsRepository = SettingsRepository(this)
@@ -126,6 +127,9 @@ class PlaybackService : LifecycleService() {
             },
             onSessionTerminated = { protocol, sessionId ->
                 preemptProtocolSession(protocol, sessionId)
+            },
+            onProtocolResumeAfterReopen = { protocol, sessionId, newEpoch ->
+                resumeProtocolAfterDeviceReopen(protocol, sessionId, newEpoch)
             },
             clockMs = { SystemClock.elapsedRealtime() }
         ).apply {
@@ -174,6 +178,14 @@ class PlaybackService : LifecycleService() {
             override fun preemptProtocol(protocol: StreamProtocol, sessionId: Long) {
                 preemptProtocolSession(protocol, sessionId)
             }
+
+            override fun resumeProtocolAfterDeviceReopen(
+                protocol: StreamProtocol,
+                sessionId: Long,
+                newEpoch: Long
+            ): ProtocolResumeReopenResult {
+                return this@PlaybackService.resumeProtocolAfterDeviceReopen(protocol, sessionId, newEpoch)
+            }
         }
 
         sessionHost = PlaybackServiceSessionHost(
@@ -207,15 +219,39 @@ class PlaybackService : LifecycleService() {
             airPlayServer?.start(formatAirPlayName(friendlyName))
         }
 
+        // 💡 必须在所有 lateinit 核心协作者（sessionHost、usbDeviceManager、coordinator 等）就绪后再对外发布单实例引用
+        instance = this
         startBootNetworkWatchdog()
     }
 
     private fun preemptProtocolSession(protocol: StreamProtocol, sessionId: Long) {
         Logger.service.i(TAG, "终止/抢占协议底层会话: protocol=$protocol, sessionId=$sessionId")
         when (protocol) {
-            StreamProtocol.UPNP_DLNA -> upnpServer?.stopPlayback(isPreempted = true)
-            StreamProtocol.AIRPLAY_1 -> airPlayServer?.preemptActiveSession()
+            StreamProtocol.UPNP_DLNA -> upnpServer?.stopPlayback(isPreempted = true, targetSessionId = sessionId)
+            StreamProtocol.AIRPLAY_1 -> airPlayServer?.preemptActiveSession(targetGlobalSessionId = sessionId)
             StreamProtocol.NONE -> Unit
+        }
+    }
+
+    private fun resumeProtocolAfterDeviceReopen(
+        protocol: StreamProtocol,
+        sessionId: Long,
+        newEpoch: Long
+    ): ProtocolResumeReopenResult = when (protocol) {
+        StreamProtocol.AIRPLAY_1 ->
+            airPlayServer?.resumeAfterDeviceReopen(sessionId, newEpoch)
+                ?: ProtocolResumeReopenResult.PRODUCER_DEAD
+
+        StreamProtocol.UPNP_DLNA ->
+            upnpServer?.resumeStreamAfterDeviceReopen(sessionId)
+                ?: ProtocolResumeReopenResult.PRODUCER_DEAD
+
+        StreamProtocol.NONE -> ProtocolResumeReopenResult.PRODUCER_DEAD
+    }
+
+    fun clearError(code: ErrorCode) {
+        if (::sessionHost.isInitialized) {
+            sessionHost.clearError(code)
         }
     }
 
@@ -421,26 +457,32 @@ class PlaybackService : LifecycleService() {
     }
 
     fun pausePlayback() {
+        if (!::sessionHost.isInitialized) return
         sessionHost.pausePlayback()
     }
 
     fun resumePlayback() {
+        if (!::sessionHost.isInitialized) return
         sessionHost.resumePlayback()
     }
 
     fun stopPlayback() {
+        if (!::sessionHost.isInitialized) return
         sessionHost.stopPlayback()
     }
 
     fun togglePlayPause() {
+        if (!::sessionHost.isInitialized) return
         sessionHost.togglePlayPause()
     }
 
     fun handleNextTrack() {
+        if (!::sessionHost.isInitialized) return
         sessionHost.handleNextTrack()
     }
 
     fun handlePreviousTrack() {
+        if (!::sessionHost.isInitialized) return
         sessionHost.handlePreviousTrack()
     }
 
@@ -449,8 +491,12 @@ class PlaybackService : LifecycleService() {
      * 先暂停并快路径静音，再在硬件串行线程立即归还 USB DAC 给系统。
      */
     fun handleAudioFocusLost() {
-        sessionHost.pausePlayback()
-        usbDeviceManager.releaseForExternalFocusLoss()
+        if (::sessionHost.isInitialized) {
+            sessionHost.pausePlayback()
+        }
+        if (::usbDeviceManager.isInitialized) {
+            usbDeviceManager.releaseForExternalFocusLoss()
+        }
     }
 
     fun updateFriendlyName(newName: String) {
@@ -490,23 +536,28 @@ class PlaybackService : LifecycleService() {
     }
 
     fun bindUsbPermissionActivity(activity: Activity?) {
+        if (!::usbDeviceManager.isInitialized) return
         usbDeviceManager.bindPermissionActivity(activity)
     }
 
     fun requestUsbPermission(activity: Activity) {
+        if (!::usbDeviceManager.isInitialized) return
         usbDeviceManager.requestPermissionWithActivity(activity)
     }
 
     fun scanAndRequestUsbPermission(activity: Activity) {
+        if (!::usbDeviceManager.isInitialized) return
         usbDeviceManager.scanAndRequestPermissionAsync(activity)
     }
 
     fun handleUsbDeviceAttachedFromIntent(device: UsbDevice) {
+        if (!::usbDeviceManager.isInitialized) return
         usbDeviceManager.onDeviceAttachedAsync(device)
     }
 
     fun handleUsbDeviceDetached(device: UsbDevice?) {
         Logger.service.w(TAG, "收到 USB 设备拔出通知，异步投递给 HardwareExecutor: ${device?.deviceName}")
+        if (!::usbDeviceManager.isInitialized) return
         usbDeviceManager.handleDeviceDetachedAsync(device)
     }
 
@@ -654,12 +705,7 @@ class PlaybackService : LifecycleService() {
     private fun createUpnpServer(friendlyName: String): UpnpRendererServer {
         return UpnpRendererServer(
             scope = lifecycleScope,
-            dispatchEvent = { envelope -> coordinator.dispatch(envelope) },
-            allocateSessionId = { coordinator.allocateSessionId() },
-            allocateSequence = { coordinator.allocateSequence() },
-            onAcquireHardwareForStream = { sampleRate, bitDepth, channels, _ ->
-                sessionHost.acquireHardwareForStream(sampleRate, bitDepth, channels)
-            },
+            sessionBridge = sessionHost,
             snapshotProvider = { coordinator.snapshot.value },
             fastPath = fastPath,
             onWakeUpUi = { wakeUpUiIfInBackground() },
@@ -672,12 +718,7 @@ class PlaybackService : LifecycleService() {
         return AirPlayServerManager(
             context = this,
             scope = lifecycleScope,
-            dispatchEvent = { envelope -> coordinator.dispatch(envelope) },
-            allocateSessionId = { coordinator.allocateSessionId() },
-            allocateSequence = { coordinator.allocateSequence() },
-            onAcquireHardwareForStream = { sampleRate, bitDepth, channels, _ ->
-                sessionHost.acquireHardwareForStream(sampleRate, bitDepth, channels)
-            }
+            sessionBridge = sessionHost
         )
     }
 
@@ -714,6 +755,7 @@ class PlaybackService : LifecycleService() {
         private const val CHANNEL_ID = "purecast_playback_channel"
         private const val NOTIFICATION_ID = 1001
 
+        @Volatile
         var instance: PlaybackService? = null
             private set
 

@@ -18,6 +18,7 @@ import com.solo.purecast.model.DurationState
 import com.solo.purecast.model.SeekCapability
 import com.solo.purecast.model.StreamProtocol
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -127,6 +128,32 @@ class AirPlayServerEventDispatchTest {
         assertTrue(events.dropLast(1).last().payload is MetadataPatchEvent)
         val livePatch = events.firstOrNull { it.payload is MetadataPatchEvent && (it.payload as MetadataPatchEvent).durationState == DurationState.LIVE }
         assertTrue(livePatch != null)
+
+        // 曲目已被标记为 LIVE 后，同曲目迟到且 durationMs == 0 的 DMAP 元数据绝不能将状态退回 UNKNOWN (#29)
+        val beforeDelayedMeta = events.size
+        dispatcher.onMetadataReceived(1L, 7L, "稻香", "周杰伦", "魔杰座专辑", 0L, null)
+        val delayedPatch = events.drop(beforeDelayedMeta).first { it.payload is MetadataPatchEvent }.payload as MetadataPatchEvent
+        assertNull("LIVE 状态确立后 duration=0 补丁不得覆写为 UNKNOWN", delayedPatch.durationState)
+        assertNull("LIVE 状态确立后 duration=0 补丁不得覆写 SeekCapability", delayedPatch.seekCapability)
+    }
+
+    @Test
+    fun `hasSession reflects active session ownership across preemption and teardown`() {
+        val (dispatcher, events) = createDispatcher()
+        dispatcher.onStreamRequested(10L, 1L, 44100, 16, 2, "ALAC", "10.0.0.1", "", "", "", "", 0)
+        val firstGlobalSid = events.last { it.payload is StreamSetupEvent }.sessionId
+        assertTrue(firstGlobalSid > 0L)
+        assertTrue(dispatcher.hasSession(firstGlobalSid))
+
+        // 切至新会话后旧 globalSessionId 不再属于活跃会话 (#13)
+        dispatcher.onStreamRequested(11L, 1L, 48000, 24, 2, "ALAC", "10.0.0.2", "", "", "", "", 0)
+        val secondGlobalSid = events.last { it.payload is StreamSetupEvent }.sessionId
+        assertFalse(dispatcher.hasSession(firstGlobalSid))
+        assertTrue(dispatcher.hasSession(secondGlobalSid))
+
+        // 抢占 / 停止调用 resetSessions() 后活跃 globalSessionId 失效 (#13)
+        dispatcher.resetSessions()
+        assertFalse(dispatcher.hasSession(secondGlobalSid))
     }
 
     @Test

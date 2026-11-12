@@ -37,6 +37,7 @@ import java.util.concurrent.Callable
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
@@ -232,7 +233,8 @@ class UsbDeviceManager internal constructor(
     private val ownsExecutor: Boolean = false,
     private val context: Context? = null,
     private val dispatchEvent: (SessionEventEnvelope<SessionEventPayload>) -> Unit = {},
-    private val clockMs: () -> Long = { SystemClock.elapsedRealtime() }
+    private val clockMs: () -> Long = { SystemClock.elapsedRealtime() },
+    private val syncTimeoutMs: Long = HARDWARE_SYNC_TIMEOUT_MS
 ) : SessionHardwareBridge {
 
     constructor(
@@ -302,9 +304,9 @@ class UsbDeviceManager internal constructor(
     /**
      * 冷启动或手动触发扫描连接 USB Audio 设备（在 HardwareExecutor 上串行执行）
      */
-    fun scanAndAttachDevice(): Boolean = runOnHardwareSync {
+    fun scanAndAttachDevice(): Boolean = runOnHardwareSyncResult {
         scanAndAttachDeviceInternal()
-    }
+    }.getOrElse { false }
 
     /**
      * 💡 非阻塞启动冷开机 USB 扫描，避免在 Service.onCreate 主线程排队等待 HardwareExecutor
@@ -403,9 +405,9 @@ class UsbDeviceManager internal constructor(
     /**
      * 💡 串行执行 USB 设备物理拔出与停机让渡
      */
-    fun handleDeviceDetached(device: UsbDevice?): Boolean = runOnHardwareSync {
+    fun handleDeviceDetached(device: UsbDevice?): Boolean = runOnHardwareSyncResult {
         handleDeviceDetachedInternal(device?.toDescriptor())
-    }
+    }.getOrElse { false }
 
     private fun handleDeviceDetachedInternal(descriptor: UsbDeviceDescriptor?): Boolean {
         val current = activeDevice ?: return false
@@ -435,7 +437,7 @@ class UsbDeviceManager internal constructor(
      * 💡 处理权限回调（同步版本供单测调用，生产广播通过 executeOnHardwareAsync 派发）
      */
     fun onPermissionResult(device: UsbDeviceDescriptor?, granted: Boolean) {
-        runOnHardwareSync {
+        runOnHardwareSyncResult {
             handlePermissionResultInternal(device, granted)
         }
     }
@@ -512,21 +514,32 @@ class UsbDeviceManager internal constructor(
      * - 已独占且规格变化时优先执行 [reconfigureAudioFormat] 原位切频，失败则释放重开安全回滚；
      * - 未独占时使用新获取的 Linux usbfs fd 调用 `openDevice` 进入独占。
      */
-    override fun openDeviceWithCurrentFd(sampleRate: Int, bitDepth: Int, channels: Int): Result<HardwareOpenSuccess> {
-        return runOnHardwareSync {
-            openOrReconfigureInternal(sampleRate, bitDepth, channels)
-        }
+    override fun openDeviceWithCurrentFd(
+        sampleRate: Int,
+        bitDepth: Int,
+        channels: Int,
+        forceNewEpoch: Boolean
+    ): Result<HardwareOpenSuccess> {
+        return runOnHardwareSyncResult {
+            openOrReconfigureInternal(sampleRate, bitDepth, channels, forceNewEpoch)
+        }.fold(
+            onSuccess = { it },
+            onFailure = { Result.failure(it) }
+        )
     }
 
     override fun reconfigureAudioFormat(sampleRate: Int, bitDepth: Int, channels: Int): Long {
-        return runOnHardwareSync {
-            openOrReconfigureInternal(sampleRate, bitDepth, channels)
-                .map { it.epoch }
-                .getOrElse { -1L }
-        }
+        return openDeviceWithCurrentFd(sampleRate, bitDepth, channels, forceNewEpoch = false)
+            .map { it.epoch }
+            .getOrElse { -1L }
     }
 
-    private fun openOrReconfigureInternal(sampleRate: Int, bitDepth: Int, channels: Int): Result<HardwareOpenSuccess> {
+    private fun openOrReconfigureInternal(
+        sampleRate: Int,
+        bitDepth: Int,
+        channels: Int,
+        forceNewEpoch: Boolean = false
+    ): Result<HardwareOpenSuccess> {
         val device = activeDevice ?: systemBridge.scanAudioDevice()?.also { activeDevice = it }
         if (device == null) {
             Logger.usb.e(TAG, "openDeviceWithCurrentFd 失败: 无可用 USB 设备")
@@ -542,8 +555,15 @@ class UsbDeviceManager internal constructor(
         val currentlyExclusive = isExclusiveTaken.get() && activeConnection != null
         if (currentlyExclusive) {
             if (currentSampleRate == sampleRate && currentBitDepth == bitDepth && currentChannels == channels) {
-                val epoch = nativeBridge.getCurrentBufferEpoch().coerceAtLeast(1L)
-                Logger.usb.i(TAG, "USB 设备已按相同规格独占 ($sampleRate Hz, $bitDepth bit, $channels ch), 复用 epoch=$epoch")
+                val epoch = if (forceNewEpoch) {
+                    nativeBridge.emergencyMuteAndFlush(FlushReason.PREEMPT).coerceAtLeast(1L)
+                } else {
+                    nativeBridge.getCurrentBufferEpoch().coerceAtLeast(1L)
+                }
+                Logger.usb.i(
+                    TAG,
+                    "USB 设备已按相同规格独占 ($sampleRate Hz, $bitDepth bit, $channels ch), forceNewEpoch=$forceNewEpoch, epoch=$epoch"
+                )
                 return Result.success(HardwareOpenSuccess(epoch = epoch, dacName = device.productName))
             }
 
@@ -637,17 +657,19 @@ class UsbDeviceManager internal constructor(
         isExclusiveTaken.set(true)
 
         val epoch = nativeBridge.getCurrentBufferEpoch().coerceAtLeast(1L)
-        if (isReconfigureRollback) {
-            emitHardwareEventLocked(
-                HardwareReconfiguredEvent(
-                    sampleRate = sampleRate,
-                    bitDepth = bitDepth,
-                    channels = channels,
-                    epoch = epoch
-                )
+        // 💡 每次新获取 usbfs fd 并独占声卡时始终上报最新规格/epoch 快照，保证重配和首建均同步硬件状态
+        emitHardwareEventLocked(
+            HardwareReconfiguredEvent(
+                sampleRate = sampleRate,
+                bitDepth = bitDepth,
+                channels = channels,
+                epoch = epoch
             )
-        }
-        Logger.usb.i(TAG, "🎉 成功独占 USB 声卡 (${sampleRate}Hz / ${bitDepth}bit / ${channels}ch), fd=$fd, epoch=$epoch")
+        )
+        Logger.usb.i(
+            TAG,
+            "🎉 成功独占 USB 声卡 (${sampleRate}Hz / ${bitDepth}bit / ${channels}ch), fd=$fd, epoch=$epoch, rollback=$isReconfigureRollback"
+        )
         return Result.success(HardwareOpenSuccess(epoch = epoch, dacName = device.productName))
     }
 
@@ -665,7 +687,7 @@ class UsbDeviceManager internal constructor(
     }
 
     fun releaseUsbExclusive() {
-        runOnHardwareSync {
+        runOnHardwareSyncResult {
             releaseUsbExclusiveInternal()
         }
     }
@@ -746,13 +768,6 @@ class UsbDeviceManager internal constructor(
 
     fun destroy() {
         if (!isDestroyed.compareAndSet(false, true)) return
-        try {
-            runOnHardwareSync {
-                releaseUsbExclusiveInternal()
-            }
-        } catch (e: Exception) {
-            Logger.usb.w(TAG, "destroy 执行释放收尾时捕获异常: ${e.message}")
-        }
         permissionActivityRef = null
         if (context != null) {
             try {
@@ -761,10 +776,25 @@ class UsbDeviceManager internal constructor(
                 Logger.usb.w(TAG, "注销 USB 权限广播接收器异常: ${e.message}")
             }
         }
+        try {
+            if (inHardwareExecutor.get() == true) {
+                releaseUsbExclusiveInternal()
+            } else if (!hardwareExecutor.isShutdown) {
+                // 💡 非阻塞入队收尾释放在单线程尾部执行，并由 awaitTermination(1500ms) 上限兜底防主线程 ANR
+                hardwareExecutor.execute {
+                    withHardwareExecutorFlag {
+                        releaseUsbExclusiveInternal()
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Logger.usb.w(TAG, "destroy 提交释放任务时捕获异常: ${e.message}")
+        }
         if (ownsExecutor) {
             hardwareExecutor.shutdown()
             try {
-                if (!hardwareExecutor.awaitTermination(1500L, TimeUnit.MILLISECONDS)) {
+                if (!hardwareExecutor.awaitTermination(HARDWARE_DESTROY_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+                    Logger.usb.w(TAG, "destroy 等待 HardwareExecutor 排空超时 (${HARDWARE_DESTROY_TIMEOUT_MS}ms)，强制中断")
                     hardwareExecutor.shutdownNow()
                 }
             } catch (_: InterruptedException) {
@@ -810,17 +840,37 @@ class UsbDeviceManager internal constructor(
         }
     }
 
-    private fun <T> runOnHardwareSync(block: () -> T): T {
+    private fun <T> runOnHardwareSyncResult(
+        timeoutMs: Long = syncTimeoutMs,
+        block: () -> T
+    ): Result<T> {
         if (inHardwareExecutor.get() == true || hardwareExecutor.isShutdown) {
-            return block()
+            return runCatching { block() }
         }
-        return hardwareExecutor.submit(Callable {
+        val future = hardwareExecutor.submit(Callable {
             withHardwareExecutorFlag(block)
-        }).get()
+        })
+        return try {
+            Result.success(future.get(timeoutMs, TimeUnit.MILLISECONDS))
+        } catch (e: TimeoutException) {
+            future.cancel(true)
+            Logger.usb.e(TAG, "HardwareExecutor 同步调用超时 (${timeoutMs}ms)", e)
+            Result.failure(e)
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            Logger.usb.w(TAG, "HardwareExecutor 同步调用被中断", e)
+            Result.failure(e)
+        } catch (t: Throwable) {
+            val cause = (t as? java.util.concurrent.ExecutionException)?.cause ?: t
+            Logger.usb.e(TAG, "HardwareExecutor 同步调用异常: ${cause.message}", cause)
+            Result.failure(cause)
+        }
     }
 
     companion object {
         private const val TAG = "UsbDeviceManager"
+        const val HARDWARE_SYNC_TIMEOUT_MS = 3_000L
+        const val HARDWARE_DESTROY_TIMEOUT_MS = 1_500L
         const val ACTION_USB_PERMISSION = "com.solo.purecast.USB_PERMISSION"
         const val SONY_VENDOR_ID = 0x054c // 索尼 Vendor ID (十进制 1356)
 

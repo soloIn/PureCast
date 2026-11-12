@@ -8,9 +8,11 @@ import com.solo.purecast.core.session.HardwareDetachedEvent
 import com.solo.purecast.core.session.HardwareOpenSuccess
 import com.solo.purecast.core.session.MetadataPatchEvent
 import com.solo.purecast.core.session.PlaybackSessionCoordinator
+import com.solo.purecast.core.session.ProtocolResumeReopenResult
 import com.solo.purecast.core.session.RemoteCommandType
 import com.solo.purecast.core.session.SessionEventEnvelope
 import com.solo.purecast.core.session.SessionHardwareBridge
+import com.solo.purecast.core.session.StreamResumeEvent
 import com.solo.purecast.core.session.StreamSetupEvent
 import com.solo.purecast.core.session.StreamStopEvent
 import com.solo.purecast.core.session.StreamTeardownEvent
@@ -48,9 +50,20 @@ class PlaybackServiceIntegrationTest {
         var nextEpoch = 10L
         var openShouldFail = false
         var releaseCalls = 0
+        var resumeCalls = 0
         val muteCalls = CopyOnWriteArrayList<FlushReason>()
 
-        override fun openDeviceWithCurrentFd(sampleRate: Int, bitDepth: Int, channels: Int): Result<HardwareOpenSuccess> {
+        var lastForceNewEpoch = false
+        var eventLog: MutableList<String>? = null
+
+        override fun openDeviceWithCurrentFd(
+            sampleRate: Int,
+            bitDepth: Int,
+            channels: Int,
+            forceNewEpoch: Boolean
+        ): Result<HardwareOpenSuccess> {
+            eventLog?.add("openDevice(forceNewEpoch=$forceNewEpoch)")
+            lastForceNewEpoch = forceNewEpoch
             if (openShouldFail) return Result.failure(IllegalStateException("usb open fail"))
             return Result.success(HardwareOpenSuccess(++nextEpoch, "Sony NW-ZX300A"))
         }
@@ -67,7 +80,10 @@ class PlaybackServiceIntegrationTest {
             return nextEpoch
         }
 
-        override fun resumeNativeStream(): Int = 0
+        override fun resumeNativeStream(): Int {
+            resumeCalls++
+            return 0
+        }
 
         override fun requestUsbPermission(deviceName: String) = Unit
     }
@@ -84,6 +100,8 @@ class PlaybackServiceIntegrationTest {
         val upnpStates = CopyOnWriteArrayList<String>()
         val preempted = CopyOnWriteArrayList<Pair<StreamProtocol, Long>>()
         val dacpSent = CopyOnWriteArrayList<String>()
+        var reopenResult = ProtocolResumeReopenResult.STREAMING_READY
+        var eventLog: MutableList<String>? = null
 
         override fun syncMediaSessionState(status: PlaybackStatus, positionMs: Long, seekCapability: SeekCapability) {
             lastStatus = status
@@ -124,7 +142,17 @@ class PlaybackServiceIntegrationTest {
         }
 
         override fun preemptProtocol(protocol: StreamProtocol, sessionId: Long) {
+            eventLog?.add("preempt($protocol,$sessionId)")
             preempted += protocol to sessionId
+        }
+
+        override fun resumeProtocolAfterDeviceReopen(
+            protocol: StreamProtocol,
+            sessionId: Long,
+            newEpoch: Long
+        ): ProtocolResumeReopenResult {
+            eventLog?.add("reopenResume($protocol,$sessionId,$newEpoch)")
+            return reopenResult
         }
     }
 
@@ -142,6 +170,7 @@ class PlaybackServiceIntegrationTest {
             hardwareBridge = hw,
             dacpCommandSender = dacpSender,
             onSessionTerminated = { proto, sid -> preemptHook(proto, sid) },
+            onProtocolResumeAfterReopen = { proto, sid, ep -> fx.resumeProtocolAfterDeviceReopen(proto, sid, ep) },
             clockMs = { testScheduler.currentTime }
         )
         val host = PlaybackServiceSessionHost(
@@ -421,6 +450,192 @@ class PlaybackServiceIntegrationTest {
         testScheduler.runCurrent()
         assertFalse(coord.snapshot.value.errors.containsKey(ErrorCode.USB_DEVICE_DETACHED))
         assertEquals(HardwarePipelineState.RELEASED, coord.snapshot.value.hardwareState)
+
+        host.stop()
+    }
+
+    @Test
+    fun `synchronous cross-protocol preemption precedes forceNewEpoch hardware open and resumePlayback guards IDLE STOPPED`() = runTest {
+        val log = mutableListOf<String>()
+        val hw = FakeHardwareBridge().apply { eventLog = log }
+        val fx = FakeSystemEffects().apply { eventLog = log }
+        val testScope = TestScope(StandardTestDispatcher(testScheduler))
+        val (host, coord) = testScope.createHost(hw, fx)
+
+        // 1. IDLE 下触发 resumePlayback() 必须安全阻断，不重开设备或不发送 DACP (#23)
+        host.resumePlayback()
+        testScheduler.runCurrent()
+        assertEquals(BusinessSessionState.IDLE, coord.snapshot.value.businessState)
+        assertTrue(fx.dacpSent.isEmpty())
+
+        // 2. 启动 AirPlay 会话 -> PLAYING
+        val airEpoch = host.acquireHardwareForStream(StreamProtocol.AIRPLAY_1, 44100, 16, 2, "ALAC")
+        val airSid = host.nextSessionId()
+        coord.dispatch(
+            SessionEventEnvelope(
+                origin = EventOrigin.AIRPLAY,
+                sessionId = airSid,
+                deviceGeneration = 0L,
+                sequence = coord.allocateSequence(),
+                timestampElapsedMs = 1L,
+                payload = StreamSetupEvent(StreamProtocol.AIRPLAY_1, 44100, 16, 2, "ALAC", airEpoch)
+            )
+        )
+        coord.dispatch(
+            SessionEventEnvelope(
+                origin = EventOrigin.AIRPLAY,
+                sessionId = airSid,
+                deviceGeneration = 0L,
+                sequence = coord.allocateSequence(),
+                timestampElapsedMs = 2L,
+                payload = FirstDataPacketEvent(StreamProtocol.AIRPLAY_1, airEpoch, 44100, 16, 2, "ALAC")
+            )
+        )
+        testScheduler.runCurrent()
+        assertEquals(BusinessSessionState.PLAYING, coord.snapshot.value.businessState)
+        log.clear()
+
+        // 3. UPnP 抢占式请求硬件：必须同步先调 preemptProtocol(AIRPLAY_1, airSid)，再调 openDeviceWithCurrentFd(forceNewEpoch=true) (#1 #13)
+        val upnpEpoch = host.acquireHardwareForStream(StreamProtocol.UPNP_DLNA, 44100, 16, 2, "WAV")
+        assertTrue(upnpEpoch > airEpoch)
+        assertTrue(hw.lastForceNewEpoch)
+        assertEquals(
+            listOf("preempt(AIRPLAY_1,$airSid)", "openDevice(forceNewEpoch=true)"),
+            log.take(2)
+        )
+
+        // 4. 若 UPnP 停播至 STOPPED，调用 host.resumePlayback() 也必须安全阻断 (#23)
+        val upnpSid = host.nextSessionId()
+        coord.dispatch(
+            SessionEventEnvelope(
+                origin = EventOrigin.UPNP,
+                sessionId = upnpSid,
+                deviceGeneration = 0L,
+                sequence = coord.allocateSequence(),
+                timestampElapsedMs = 3L,
+                payload = StreamSetupEvent(StreamProtocol.UPNP_DLNA, 44100, 16, 2, "WAV", upnpEpoch)
+            )
+        )
+        coord.dispatch(
+            SessionEventEnvelope(
+                origin = EventOrigin.UPNP,
+                sessionId = upnpSid,
+                deviceGeneration = 0L,
+                sequence = coord.allocateSequence(),
+                timestampElapsedMs = 4L,
+                payload = FirstDataPacketEvent(StreamProtocol.UPNP_DLNA, upnpEpoch, 44100, 16, 2, "WAV")
+            )
+        )
+        coord.dispatch(
+            SessionEventEnvelope(
+                origin = EventOrigin.UPNP,
+                sessionId = upnpSid,
+                deviceGeneration = 0L,
+                sequence = coord.allocateSequence(),
+                timestampElapsedMs = 5L,
+                payload = StreamStopEvent(FlushReason.STOP_OR_TEARDOWN, newEpoch = upnpEpoch + 1L)
+            )
+        )
+        testScheduler.runCurrent()
+        assertEquals(BusinessSessionState.STOPPED, coord.snapshot.value.businessState)
+
+        val resBefore = hw.resumeCalls
+        host.resumePlayback()
+        testScheduler.runCurrent()
+        assertEquals(BusinessSessionState.STOPPED, coord.snapshot.value.businessState)
+        assertEquals(resBefore, hw.resumeCalls)
+
+        host.stop()
+    }
+
+    @Test
+    fun `resumeProtocolAfterDeviceReopen coordinates MediaSession across STREAMING_READY RESTARTING and PRODUCER_DEAD`() = runTest {
+        val hw = FakeHardwareBridge()
+        val fx = FakeSystemEffects()
+        val testScope = TestScope(StandardTestDispatcher(testScheduler))
+        val (host, coord) = testScope.createHost(hw, fx)
+
+        val ep1 = host.acquireHardwareForStream(StreamProtocol.UPNP_DLNA, 96000, 24, 2, "FLAC")
+        val sid = host.nextSessionId()
+        coord.dispatch(
+            SessionEventEnvelope(
+                origin = EventOrigin.UPNP,
+                sessionId = sid,
+                deviceGeneration = 0L,
+                sequence = coord.allocateSequence(),
+                timestampElapsedMs = 1L,
+                payload = StreamSetupEvent(StreamProtocol.UPNP_DLNA, 96000, 24, 2, "FLAC", ep1)
+            )
+        )
+        coord.dispatch(
+            SessionEventEnvelope(
+                origin = EventOrigin.UPNP,
+                sessionId = sid,
+                deviceGeneration = 0L,
+                sequence = coord.allocateSequence(),
+                timestampElapsedMs = 2L,
+                payload = FirstDataPacketEvent(StreamProtocol.UPNP_DLNA, ep1, 96000, 24, 2, "FLAC")
+            )
+        )
+        // USB 拔出 -> PAUSED + DISCONNECTED；插回 -> PAUSED + RELEASED
+        coord.dispatch(
+            SessionEventEnvelope(
+                origin = EventOrigin.USB_HARDWARE,
+                sessionId = 0L,
+                deviceGeneration = 1L,
+                sequence = coord.allocateSequence(),
+                timestampElapsedMs = 3L,
+                payload = HardwareDetachedEvent("pull")
+            )
+        )
+        coord.dispatch(
+            SessionEventEnvelope(
+                origin = EventOrigin.USB_HARDWARE,
+                sessionId = 0L,
+                deviceGeneration = 2L,
+                sequence = coord.allocateSequence(),
+                timestampElapsedMs = 4L,
+                payload = HardwareAttachedEvent("Sony ZX300A", hasPermission = true)
+            )
+        )
+        testScheduler.runCurrent()
+        assertEquals(HardwarePipelineState.RELEASED, coord.snapshot.value.hardwareState)
+
+        // 配置 STREAMING_READY 后从宿主恢复播放，MediaSession 必须进入 PLAYING (#2)
+        fx.reopenResult = ProtocolResumeReopenResult.STREAMING_READY
+        host.resumePlayback()
+        testScheduler.runCurrent()
+        assertEquals(PlaybackStatus.PLAYING, fx.lastStatus)
+        assertEquals(HardwarePipelineState.EXCLUSIVE_ACTIVE, coord.snapshot.value.hardwareState)
+
+        // 再经历 USB 重插并用 PRODUCER_DEAD 恢复 -> 回落为 PAUSED，不进入 PLAYING (#2)
+        coord.dispatch(
+            SessionEventEnvelope(
+                origin = EventOrigin.USB_HARDWARE,
+                sessionId = 0L,
+                deviceGeneration = 3L,
+                sequence = coord.allocateSequence(),
+                timestampElapsedMs = 5L,
+                payload = HardwareDetachedEvent("pull2")
+            )
+        )
+        coord.dispatch(
+            SessionEventEnvelope(
+                origin = EventOrigin.USB_HARDWARE,
+                sessionId = 0L,
+                deviceGeneration = 4L,
+                sequence = coord.allocateSequence(),
+                timestampElapsedMs = 6L,
+                payload = HardwareAttachedEvent("Sony ZX300A", hasPermission = true)
+            )
+        )
+        testScheduler.runCurrent()
+
+        fx.reopenResult = ProtocolResumeReopenResult.PRODUCER_DEAD
+        host.resumePlayback()
+        testScheduler.runCurrent()
+        assertEquals(PlaybackStatus.PAUSED, fx.lastStatus)
+        assertEquals(HardwarePipelineState.EXCLUSIVE_MUTED, coord.snapshot.value.hardwareState)
 
         host.stop()
     }

@@ -31,7 +31,12 @@ data class HardwareOpenSuccess(
  * 💡 协调器依赖的硬件生命周期桥接契约
  */
 interface SessionHardwareBridge {
-    fun openDeviceWithCurrentFd(sampleRate: Int, bitDepth: Int, channels: Int): Result<HardwareOpenSuccess>
+    fun openDeviceWithCurrentFd(
+        sampleRate: Int,
+        bitDepth: Int,
+        channels: Int,
+        forceNewEpoch: Boolean = false
+    ): Result<HardwareOpenSuccess>
     fun reconfigureAudioFormat(sampleRate: Int, bitDepth: Int, channels: Int): Long
     fun releaseDevice()
     fun emergencyMuteAndFlush(reason: FlushReason): Long
@@ -55,15 +60,23 @@ class PlaybackSessionCoordinator(
     private val hardwareBridge: SessionHardwareBridge,
     private val dacpCommandSender: suspend (RemoteCommandType, Long) -> Result<Unit> = { _, _ -> Result.success(Unit) },
     private val onSessionTerminated: (StreamProtocol, Long) -> Unit = { _, _ -> },
+    private val onProtocolResumeAfterReopen: (StreamProtocol, Long, Long) -> ProtocolResumeReopenResult =
+        { _, _, _ -> ProtocolResumeReopenResult.STREAMING_READY },
     private val clockMs: () -> Long = { System.currentTimeMillis() }
 ) {
+    private data class DacpCommandItem(
+        val command: RemoteCommandType,
+        val commandId: Long,
+        val sessionId: Long
+    )
+
     private val sessionIdGenerator = AtomicLong(0L)
     private val sequenceGenerator = AtomicLong(0L)
     private val commandIdGenerator = AtomicLong(0L)
 
     private val trackTransactionManager = TrackTransactionManager()
     private val eventChannel = Channel<SessionEventEnvelope<SessionEventPayload>>(Channel.UNLIMITED)
-    private val dacpCommandChannel = Channel<Pair<RemoteCommandType, Long>>(Channel.UNLIMITED)
+    private val dacpCommandChannel = Channel<DacpCommandItem>(Channel.UNLIMITED)
 
     private val _snapshot = MutableStateFlow(PlayerSessionSnapshot())
     val snapshot: StateFlow<PlayerSessionSnapshot> = _snapshot.asStateFlow()
@@ -124,7 +137,7 @@ class PlaybackSessionCoordinator(
      * 💡 入队不改变业务状态机的轻量 DACP 串行指令（如本机主动 Pause/Resume 通知 iOS）
      */
     fun sendDacpFireAndForget(command: RemoteCommandType) {
-        dacpCommandChannel.trySend(command to 0L)
+        dacpCommandChannel.trySend(DacpCommandItem(command, 0L, context.snapshot.sessionId))
     }
 
     /** 非阻塞投递事件信封至协调器单线程事件循环 */
@@ -138,14 +151,25 @@ class PlaybackSessionCoordinator(
     private fun startEventLoop() {
         scope.launch {
             for (envelope in eventChannel) {
-                processEnvelope(envelope)
+                // 💡 保护单线程事件循环：任何单个事件归约或副作用抛出非致命异常时绝不终止消费协程
+                try {
+                    processEnvelope(envelope)
+                } catch (t: Throwable) {
+                    if (t is kotlinx.coroutines.CancellationException) throw t
+                    Logger.service.e(
+                        TAG,
+                        "协调器事件循环处理异常 (sid=${envelope.sessionId}, payload=${envelope.payload::class.simpleName})",
+                        t
+                    )
+                }
             }
         }
     }
 
     private fun startDacpSerialLoop() {
         scope.launch {
-            for ((command, commandId) in dacpCommandChannel) {
+            for (item in dacpCommandChannel) {
+                val (command, commandId, capturedSessionId) = item
                 try {
                     val res = dacpCommandSender(command, commandId)
                     if (res.isFailure) {
@@ -155,7 +179,7 @@ class PlaybackSessionCoordinator(
                             dispatch(
                                 SessionEventEnvelope(
                                     origin = EventOrigin.AIRPLAY,
-                                    sessionId = context.snapshot.sessionId,
+                                    sessionId = capturedSessionId,
                                     deviceGeneration = latestDeviceGeneration,
                                     sequence = allocateSequence(),
                                     timestampElapsedMs = clockMs(),
@@ -169,6 +193,7 @@ class PlaybackSessionCoordinator(
                         }
                     }
                 } catch (t: Throwable) {
+                    if (t is kotlinx.coroutines.CancellationException) throw t
                     Logger.service.e(TAG, "DACP 串行指令抛出异常: cmd=$command", t)
                 }
             }
@@ -308,19 +333,60 @@ class PlaybackSessionCoordinator(
                     channels = effect.channels,
                     fallbackErrorMessage = "恢复播放时重开 USB DAC 失败",
                     onSuccess = { snap, ok ->
-                        hardwareBridge.resumeNativeStream()
-                        snap.copy(
-                            transportState = TransportPipeState.STREAMING,
-                            businessState = BusinessSessionState.PLAYING,
-                            hardwareState = HardwarePipelineState.EXCLUSIVE_ACTIVE,
-                            currentEpoch = ok.epoch,
-                            audioPath = snap.audioPath.copy(
-                                dacName = ok.dacName,
-                                isExclusive = true
-                            ),
-                            errors = snap.errors - ErrorCode.USB_OPEN_FAILED,
-                            uiProtectionActive = false
-                        )
+                        val resumeStatus = onProtocolResumeAfterReopen(effect.protocol, effect.sessionId, ok.epoch)
+                        when (resumeStatus) {
+                            ProtocolResumeReopenResult.STREAMING_READY -> {
+                                hardwareBridge.resumeNativeStream()
+                                snap.copy(
+                                    transportState = TransportPipeState.STREAMING,
+                                    businessState = BusinessSessionState.PLAYING,
+                                    hardwareState = HardwarePipelineState.EXCLUSIVE_ACTIVE,
+                                    currentEpoch = ok.epoch,
+                                    audioPath = snap.audioPath.copy(
+                                        dacName = ok.dacName,
+                                        isExclusive = true
+                                    ),
+                                    errors = snap.errors - ErrorCode.USB_OPEN_FAILED,
+                                    uiProtectionActive = false
+                                )
+                            }
+
+                            ProtocolResumeReopenResult.RESTARTING -> {
+                                snap.copy(
+                                    transportState = TransportPipeState.PREPARING,
+                                    businessState = BusinessSessionState.TRANSITIONING,
+                                    hardwareState = HardwarePipelineState.EXCLUSIVE_MUTED,
+                                    currentEpoch = ok.epoch,
+                                    audioPath = snap.audioPath.copy(
+                                        dacName = ok.dacName,
+                                        isExclusive = true
+                                    ),
+                                    errors = snap.errors - ErrorCode.USB_OPEN_FAILED,
+                                    uiProtectionActive = false
+                                )
+                            }
+
+                            ProtocolResumeReopenResult.PRODUCER_DEAD -> {
+                                suspendTimeoutJob = rescheduleServiceTimer(
+                                    previous = suspendTimeoutJob,
+                                    delayMs = SUSPEND_TIMEOUT_MS,
+                                    sessionId = snap.sessionId,
+                                    payload = SuspendTimeoutEvent
+                                )
+                                snap.copy(
+                                    transportState = TransportPipeState.INTERRUPTED,
+                                    businessState = BusinessSessionState.PAUSED,
+                                    hardwareState = HardwarePipelineState.EXCLUSIVE_MUTED,
+                                    currentEpoch = ok.epoch,
+                                    audioPath = snap.audioPath.copy(
+                                        dacName = ok.dacName,
+                                        isExclusive = true
+                                    ),
+                                    errors = snap.errors - ErrorCode.USB_OPEN_FAILED,
+                                    uiProtectionActive = false
+                                )
+                            }
+                        }
                     },
                     onFailure = { snap, err ->
                         snap.copy(
@@ -346,7 +412,7 @@ class PlaybackSessionCoordinator(
             }
 
             is TransitionEffect.EnqueueDacpCommand -> {
-                dacpCommandChannel.trySend(effect.command to effect.commandId)
+                dacpCommandChannel.trySend(DacpCommandItem(effect.command, effect.commandId, context.snapshot.sessionId))
             }
 
             is TransitionEffect.ScheduleDebouncePause -> {

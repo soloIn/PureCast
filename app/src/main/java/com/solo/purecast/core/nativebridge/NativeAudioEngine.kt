@@ -156,6 +156,16 @@ object NativeAudioEngine {
     external fun stopAirPlayServer()
 
     /**
+     * 💡 跨协议抢占时仅中止当前 AirPlay 客户端 UDP 推流与活动 RTSP client_fd，保持 server_fd 监听在线
+     */
+    external fun preemptAirPlayClient()
+
+    /**
+     * 💡 DAC 重新独占后刷新 RaopRtp 活跃 epoch 并解除暂停态，返回 true 表示 UDP/RTSP 管线仍在线
+     */
+    external fun updateAirPlayActiveEpoch(newEpoch: Long): Boolean
+
+    /**
      * 💡 注入经由 RSA-2048 私钥解密出的原始 AES-128 密钥与 IV
      */
     external fun setAirPlayCryptoKey(aesKey: ByteArray, aesIv: ByteArray)

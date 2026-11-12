@@ -6,9 +6,11 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <sstream>
 #include <android/log.h>
 #include <cctype>
+#include <cerrno>
 #include <algorithm>
 
 #define RAOP_TAG "PureCastRAOP"
@@ -111,20 +113,82 @@ void RaopServer::stop() {
     LOGI("正在停止 RaopServer...");
     rtp_.stop();
 
-    if (server_fd_ >= 0) {
-        shutdown(server_fd_, SHUT_RDWR);
-        close(server_fd_);
-        server_fd_ = -1;
+    {
+        std::lock_guard<std::mutex> lk(client_fd_mutex_);
+        const int cfd = active_client_fd_.load(std::memory_order_acquire);
+        if (cfd >= 0) {
+            shutdown(cfd, SHUT_RDWR);
+        }
     }
 
+    if (server_fd_ >= 0) {
+        shutdown(server_fd_, SHUT_RDWR);
+    }
+
+    // 💡 TSan 安全时序：必须先 join() 终止 server_loop 线程，再 close/清零 server_fd_，避免跨线程数据竞争与 fd 复用竞态
     if (server_thread_.joinable()) {
         server_thread_.join();
+    }
+
+    if (server_fd_ >= 0) {
+        close(server_fd_);
+        server_fd_ = -1;
     }
     LOGI("RaopServer 已安全停止");
 }
 
+void RaopServer::preempt_active_client() {
+    // 💡 P0 #1 跨协议抢占安全闭环：保留 RTSP server_fd_ 监听，立即停撤当前 UDP 推流线程并打断活动 client_fd，
+    // 防止旧 AirPlay 发射端继续向环形缓冲区 write_pcm 污染新协议会话。
+    has_paused_without_flush_.store(false, std::memory_order_release);
+    rtp_.stop();
+
+    std::lock_guard<std::mutex> lk(client_fd_mutex_);
+    const int cfd = active_client_fd_.load(std::memory_order_acquire);
+    if (cfd >= 0) {
+        shutdown(cfd, SHUT_RDWR);
+        LOGI("已向当前活动 RTSP 客户端 (fd=%d) 发送 shutdown 以加速退出", cfd);
+    }
+}
+
+bool RaopServer::resume_after_reopen(uint64_t new_epoch) {
+    // 💡 P0 #2 重开声卡闭环校验：仅当 RAOP 服务器与 UDP 接收管线以及活跃客户端均存活时允许原地接续，
+    // 并重置 JitterBuffer / 更新 active_epoch / 解除暂停标记；若管线已退化则返回 false 由上层保持 PAUSED。
+    if (!is_running_.load(std::memory_order_acquire) ||
+        !rtp_.is_running() ||
+        active_client_fd_.load(std::memory_order_acquire) < 0) {
+        LOGW("RaopServer resume_after_reopen 拒绝恢复：UDP/RTSP 管线未存活 (epoch=%llu)",
+             static_cast<unsigned long long>(new_epoch));
+        return false;
+    }
+    rtp_.set_active_epoch(new_epoch);
+    rtp_.reset_buffer();
+    has_paused_without_flush_.store(false, std::memory_order_release);
+    rtp_.mark_paused_manually(false, false);
+    LOGI("RaopServer 已同步新世代并恢复消费管线 (newEpoch=%llu)",
+         static_cast<unsigned long long>(new_epoch));
+    return true;
+}
+
 void RaopServer::server_loop() {
-    while (is_running_.load()) {
+    while (is_running_.load(std::memory_order_acquire)) {
+        struct pollfd pfd{};
+        pfd.fd = server_fd_;
+        pfd.events = POLLIN;
+        int pr = poll(&pfd, 1, 50);
+        if (pr == 0) {
+            continue;
+        }
+        if (pr < 0) {
+            if (errno == EINTR && is_running_.load(std::memory_order_acquire)) {
+                continue;
+            }
+            break;
+        }
+        if (!is_running_.load(std::memory_order_acquire)) {
+            break;
+        }
+
         sockaddr_in client_addr{};
         socklen_t client_len = sizeof(client_addr);
         int client_fd = accept(server_fd_, (struct sockaddr*)&client_addr, &client_len);
@@ -135,14 +199,30 @@ void RaopServer::server_loop() {
             break;
         }
 
+        // 💡 配置 2 秒 RTSP recv 超时，确保 stop()/preempt 时即便内核未立刻唤醒也不会无限挂起
+        struct timeval rcv_tv{};
+        rcv_tv.tv_sec = 2;
+        rcv_tv.tv_usec = 0;
+        setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &rcv_tv, sizeof(rcv_tv));
+
         char ip_str[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &client_addr.sin_addr, ip_str, INET_ADDRSTRLEN);
         current_params_.client_ip = ip_str;
         LOGI("收到来自 %s 的 AirPlay RTSP 连接请求", ip_str);
 
+        {
+            std::lock_guard<std::mutex> lk(client_fd_mutex_);
+            active_client_fd_.store(client_fd, std::memory_order_release);
+        }
+
         // 处理该客户端连接
         handle_client(client_fd);
-        close(client_fd);
+
+        {
+            std::lock_guard<std::mutex> lk(client_fd_mutex_);
+            active_client_fd_.store(-1, std::memory_order_release);
+            close(client_fd);
+        }
     }
 }
 
@@ -153,7 +233,14 @@ void RaopServer::handle_client(int client_fd) {
     try {
         while (is_running_.load()) {
             ssize_t bytes_read = recv(client_fd, buffer.data(), buffer.size() - 1, 0);
-            if (bytes_read <= 0) {
+            if (bytes_read < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+                    continue;
+                }
+                LOGI("RTSP 客户端读取异常断开 (errno=%d)", errno);
+                break;
+            }
+            if (bytes_read == 0) {
                 LOGI("RTSP 客户端连接已关闭或断开");
                 break;
             }

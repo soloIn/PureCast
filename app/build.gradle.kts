@@ -76,6 +76,7 @@ android {
 
     testOptions {
         unitTests.isReturnDefaultValues = true
+        unitTests.isIncludeAndroidResources = true
         unitTests.all {
             it.extensions.configure(JacocoTaskExtension::class.java) {
                 isIncludeNoLocationClasses = true
@@ -115,6 +116,14 @@ dependencies {
     // Testing
     testImplementation(libs.junit)
     testImplementation(libs.kotlinx.coroutines.test)
+    testImplementation(libs.robolectric)
+    testImplementation(libs.androidx.test.core)
+    androidTestImplementation(libs.junit)
+    androidTestImplementation(libs.androidx.test.core)
+    androidTestImplementation(libs.androidx.test.runner)
+    androidTestImplementation(libs.androidx.test.ext.junit)
+    androidTestImplementation(libs.androidx.compose.ui.test.junit4)
+    debugImplementation(libs.androidx.compose.ui.test.manifest)
 }
 
 // 💡 焦点与状态转换核心单元覆盖率强校验门禁
@@ -172,6 +181,24 @@ val jacocoTestCoverageVerification by tasks.registering(JacocoCoverageVerificati
     }
 }
 
+// 💡 Native C++ ASan / UBSan / TSan 宿主机状态机与 RAOP 协议栈测试门禁 (#7)
+val runNativeSanitizerTests by tasks.registering(Exec::class) {
+    group = "verification"
+    description = "Configure, build, and run C++ ASan/UBSan/TSan host tests via CTest"
+    workingDir = projectDir
+    commandLine(
+        "sh",
+        "-c",
+        """
+        export PATH="/opt/homebrew/bin:/usr/local/bin:${'$'}PATH"
+        cmake -S src/main/cpp/tests -B src/main/cpp/tests/build &&
+        cmake --build src/main/cpp/tests/build -j8 &&
+        ctest --test-dir src/main/cpp/tests/build --output-on-failure --timeout 20 --repeat until-fail:2
+        """.trimIndent()
+    )
+}
+
 tasks.named("check") {
     dependsOn(jacocoTestCoverageVerification)
+    dependsOn(runNativeSanitizerTests)
 }

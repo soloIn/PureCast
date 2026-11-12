@@ -29,6 +29,11 @@ void MockLibusbController::reset() {
         alt_setting_[i] = 0;
     }
     configured_sample_rate_ = 0;
+    configured_uac1_sample_rate_ = 0;
+    fu_volume_count_ = 0;
+    fu_mute_count_ = 0;
+    invalid_control_count_ = 0;
+    uac1_mode_.store(false);
     isoc_completion_paused_.store(false);
     fail_next_alt_setting_.store(0);
     fail_next_clock_control_.store(0);
@@ -78,6 +83,10 @@ void MockLibusbController::set_feedback_rate_override(uint32_t q16_rate) {
     feedback_rate_override_.store(q16_rate);
 }
 
+void MockLibusbController::set_uac1_mode(bool enabled) {
+    uac1_mode_.store(enabled, std::memory_order_release);
+}
+
 bool MockLibusbController::is_kernel_driver_attached(int iface) const {
     std::lock_guard<std::mutex> lock(mutex_);
     return (iface >= 0 && iface < 4) ? kernel_driver_attached_[iface] : false;
@@ -96,6 +105,26 @@ int MockLibusbController::get_alt_setting(int iface) const {
 int MockLibusbController::get_configured_sample_rate() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return configured_sample_rate_;
+}
+
+int MockLibusbController::get_uac1_sample_rate() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return configured_uac1_sample_rate_;
+}
+
+int MockLibusbController::get_fu_volume_count() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return fu_volume_count_;
+}
+
+int MockLibusbController::get_fu_mute_count() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return fu_mute_count_;
+}
+
+int MockLibusbController::get_invalid_control_count() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return invalid_control_count_;
 }
 
 int MockLibusbController::get_in_flight_count() const {
@@ -337,6 +366,46 @@ const libusb_config_descriptor kConfigDesc = {
     9, 0x02, 128, 2, 1, 0, 0x80, 50, kInterfaces, nullptr, 0
 };
 
+// 💡 P1 #7: UAC1 完整描述符树，用于验证 UAC1 3-byte SAMPLING_FREQ_CONTROL 与 AltSetting 解析
+const unsigned char kUac1AcExtra[] = {
+    // UAC1 Feature Unit (type=0x24, subtype=0x06, unit_id=5, source_id=1)
+    6, 0x24, 0x06, 5, 1, 0x00
+};
+
+const unsigned char kUac1AsAlt1Extra[] = {
+    // UAC1 Format Type I: bNrChannels=2, bSubframeSize=2, bBitResolution=16
+    8, 0x24, 0x02, 0x01, 2, 2, 16, 1
+};
+
+const unsigned char kUac1AsAlt2Extra[] = {
+    // UAC1 Format Type I: bNrChannels=2, bSubframeSize=3, bBitResolution=24
+    8, 0x24, 0x02, 0x01, 2, 3, 24, 1
+};
+
+const libusb_endpoint_descriptor kUac1AltEndpoints[] = {
+    // UAC1 OUT Isochronous Adaptive/Async EP 0x01
+    { 7, 0x05, 0x01, 0x09, 1024, 1, 0, 0x00, nullptr, 0 }
+};
+
+const libusb_interface_descriptor kUac1AcAlts[] = {
+    { 9, 0x04, 0, 0, 0, 0x01, 0x01, 0x00, 0, nullptr, kUac1AcExtra, sizeof(kUac1AcExtra) }
+};
+
+const libusb_interface_descriptor kUac1AsAlts[] = {
+    { 9, 0x04, 1, 0, 0, 0x01, 0x02, 0x00, 0, nullptr, nullptr, 0 },
+    { 9, 0x04, 1, 1, 1, 0x01, 0x02, 0x00, 0, kUac1AltEndpoints, kUac1AsAlt1Extra, sizeof(kUac1AsAlt1Extra) },
+    { 9, 0x04, 1, 2, 1, 0x01, 0x02, 0x00, 0, kUac1AltEndpoints, kUac1AsAlt2Extra, sizeof(kUac1AsAlt2Extra) }
+};
+
+const libusb_interface kUac1Interfaces[] = {
+    { kUac1AcAlts, 1 },
+    { kUac1AsAlts, 3 }
+};
+
+const libusb_config_descriptor kUac1ConfigDesc = {
+    9, 0x02, 128, 2, 1, 0, 0x80, 50, kUac1Interfaces, nullptr, 0
+};
+
 const libusb_version kVersion = { 1, 0, 26, 0, "", "mock-libusb" };
 
 } // namespace
@@ -380,7 +449,8 @@ void libusb_close(libusb_device_handle* dev_handle) {
 
 int libusb_get_active_config_descriptor(libusb_device* /*dev*/, struct libusb_config_descriptor** config) {
     if (!config) return LIBUSB_ERROR_INVALID_PARAM;
-    *config = const_cast<libusb_config_descriptor*>(&kConfigDesc);
+    const bool use_uac1 = purecast::test::MockLibusbController::instance().is_uac1_mode();
+    *config = const_cast<libusb_config_descriptor*>(use_uac1 ? &kUac1ConfigDesc : &kConfigDesc);
     return LIBUSB_SUCCESS;
 }
 
@@ -445,7 +515,7 @@ int libusb_set_interface_alt_setting(libusb_device_handle* /*dev_handle*/, int i
 
 int libusb_control_transfer(
     libusb_device_handle* /*dev_handle*/,
-    uint8_t /*request_type*/,
+    uint8_t request_type,
     uint8_t bRequest,
     uint16_t wValue,
     uint16_t /*wIndex*/,
@@ -454,8 +524,11 @@ int libusb_control_transfer(
     unsigned int /*timeout*/
 ) {
     auto& ctrl = purecast::test::MockLibusbController::instance();
-    // 识别 UAC2 CS_SAM_FREQ_CONTROL (bRequest=0x01, wValue=0x0100)
-    if (bRequest == 0x01 && wValue == 0x0100 && data && wLength >= 4) {
+    constexpr uint8_t kClassInterfaceOut = LIBUSB_REQUEST_TYPE_CLASS | LIBUSB_RECIPIENT_INTERFACE;
+    constexpr uint8_t kClassEndpointOut = LIBUSB_REQUEST_TYPE_CLASS | LIBUSB_RECIPIENT_ENDPOINT;
+
+    // 1. UAC2 Clock Source CS_SAM_FREQ_CONTROL (req_type=0x21, bRequest=0x01, wValue=0x0100, wLength=4)
+    if (request_type == kClassInterfaceOut && bRequest == 0x01 && wValue == 0x0100 && data && wLength == 4) {
         int fail = ctrl.fail_next_clock_control_.exchange(0);
         if (fail != 0) return fail;
         int rate = static_cast<int>(data[0]) |
@@ -466,7 +539,38 @@ int libusb_control_transfer(
         ctrl.configured_sample_rate_ = rate;
         return 4;
     }
-    return static_cast<int>(wLength);
+
+    // 2. UAC1 Endpoint SAMPLING_FREQ_CONTROL (req_type=0x22, bRequest=0x01, wValue=0x0100, wLength=3)
+    if (request_type == kClassEndpointOut && bRequest == 0x01 && wValue == 0x0100 && data && wLength == 3) {
+        int fail = ctrl.fail_next_clock_control_.exchange(0);
+        if (fail != 0) return fail;
+        int rate = static_cast<int>(data[0]) |
+                   (static_cast<int>(data[1]) << 8) |
+                   (static_cast<int>(data[2]) << 16);
+        std::lock_guard<std::mutex> lock(ctrl.mutex_);
+        ctrl.configured_uac1_sample_rate_ = rate;
+        ctrl.configured_sample_rate_ = rate;
+        return 3;
+    }
+
+    // 3. Feature Unit Volume (req_type=0x21, bRequest=0x01, CS=0x02, wLength=2)
+    if (request_type == kClassInterfaceOut && bRequest == 0x01 && ((wValue >> 8) == 0x02) && data && wLength == 2) {
+        std::lock_guard<std::mutex> lock(ctrl.mutex_);
+        ctrl.fu_volume_count_++;
+        return 2;
+    }
+
+    // 4. Feature Unit Mute (req_type=0x21, bRequest=0x01, CS=0x01, wLength=1)
+    if (request_type == kClassInterfaceOut && bRequest == 0x01 && ((wValue >> 8) == 0x01) && data && wLength == 1) {
+        std::lock_guard<std::mutex> lock(ctrl.mutex_);
+        ctrl.fu_mute_count_++;
+        return 1;
+    }
+
+    // 💡 P1 #7: 未知或畸形控制传输不再静默放行，明确返回 LIBUSB_ERROR_PIPE 以捕获协议错误
+    std::lock_guard<std::mutex> lock(ctrl.mutex_);
+    ctrl.invalid_control_count_++;
+    return LIBUSB_ERROR_PIPE;
 }
 
 struct libusb_transfer* libusb_alloc_transfer(int iso_packets) {

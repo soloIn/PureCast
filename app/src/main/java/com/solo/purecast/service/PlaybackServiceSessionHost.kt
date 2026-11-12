@@ -1,10 +1,13 @@
 package com.solo.purecast.service
 
 import android.media.session.PlaybackState
+import com.solo.purecast.core.session.ErrorClearedEvent
 import com.solo.purecast.core.session.EventOrigin
 import com.solo.purecast.core.session.ExplicitPauseEvent
 import com.solo.purecast.core.session.PlaybackSessionCoordinator
 import com.solo.purecast.core.session.ProgressUpdateEvent
+import com.solo.purecast.core.session.ProtocolResumeReopenResult
+import com.solo.purecast.core.session.ProtocolSessionBridge
 import com.solo.purecast.core.session.RemoteCommandType
 import com.solo.purecast.core.session.RemoteSkipNextEvent
 import com.solo.purecast.core.session.SessionEventEnvelope
@@ -13,6 +16,7 @@ import com.solo.purecast.core.session.SessionHardwareBridge
 import com.solo.purecast.core.session.StreamResumeEvent
 import com.solo.purecast.core.session.StreamStopEvent
 import com.solo.purecast.model.BusinessSessionState
+import com.solo.purecast.model.ErrorCode
 import com.solo.purecast.model.FlushReason
 import com.solo.purecast.model.PlaybackStatus
 import com.solo.purecast.model.PlayerSessionSnapshot
@@ -60,6 +64,11 @@ interface ServiceSystemEffects {
     fun wakeUpUiIfInBackground()
     fun notifyUpnpTransportState(state: String)
     fun preemptProtocol(protocol: StreamProtocol, sessionId: Long)
+    fun resumeProtocolAfterDeviceReopen(
+        protocol: StreamProtocol,
+        sessionId: Long,
+        newEpoch: Long
+    ): ProtocolResumeReopenResult = ProtocolResumeReopenResult.STREAMING_READY
 }
 
 /**
@@ -76,7 +85,7 @@ class PlaybackServiceSessionHost(
     private val hardwareBridge: SessionHardwareBridge,
     private val systemEffects: ServiceSystemEffects,
     private val clockMs: () -> Long = { System.currentTimeMillis() }
-) {
+) : ProtocolSessionBridge {
     private var snapshotObserverJob: Job? = null
     private var airPlayTickerJob: Job? = null
     private var lastSnapshot: PlayerSessionSnapshot? = null
@@ -112,14 +121,53 @@ class PlaybackServiceSessionHost(
      * 💡 建流硬件准入（由协议解复用回调在首帧写入前同步调用）：
      * 唤醒大屏 UI -> 申请音频焦点 -> 打开/三元组切频 USB DAC -> 返回最新有效 epoch (`< 0` 拒绝)
      */
-    fun acquireHardwareForStream(sampleRate: Int, bitDepth: Int, channels: Int): Long {
+    override fun dispatch(envelope: SessionEventEnvelope<SessionEventPayload>) {
+        coordinator.dispatch(envelope)
+    }
+
+    override fun nextSessionId(): Long = coordinator.allocateSessionId()
+
+    override fun nextSequence(): Long = coordinator.allocateSequence()
+
+    fun acquireHardwareForStream(sampleRate: Int, bitDepth: Int, channels: Int): Long =
+        acquireHardwareForStream(StreamProtocol.NONE, sampleRate, bitDepth, channels, "")
+
+    /**
+     * 💡 建流硬件准入（由协议解复用回调在首帧写入前同步调用）：
+     * 唤醒大屏 UI -> 申请音频焦点 -> 同步抢占对侧协议 -> 打开/三元组切频 USB DAC -> 返回最新有效 epoch (`< 0` 拒绝)
+     */
+    override fun acquireHardwareForStream(
+        protocol: StreamProtocol,
+        sampleRate: Int,
+        bitDepth: Int,
+        channels: Int,
+        codec: String
+    ): Long {
         systemEffects.wakeUpUiIfInBackground()
         if (!systemEffects.requestAudioFocus()) {
-            Logger.service.w(TAG, "申请音频焦点被拒绝，拒绝建流 ($sampleRate/$bitDepth/$channels)")
+            Logger.service.w(TAG, "申请音频焦点被拒绝，拒绝建流 ($protocol $sampleRate/$bitDepth/$channels)")
             return -1L
         }
 
-        val openResult = hardwareBridge.openDeviceWithCurrentFd(sampleRate, bitDepth, channels)
+        val currentSnap = coordinator.snapshot.value
+        val shouldPreemptOther = protocol != StreamProtocol.NONE &&
+            currentSnap.sessionId != 0L &&
+            currentSnap.activeProtocol != StreamProtocol.NONE &&
+            currentSnap.activeProtocol != protocol
+        if (shouldPreemptOther) {
+            Logger.service.i(
+                TAG,
+                "新协议 ($protocol) 建流前同步抢占对侧协议 (${currentSnap.activeProtocol}, sid=${currentSnap.sessionId})"
+            )
+            systemEffects.preemptProtocol(currentSnap.activeProtocol, currentSnap.sessionId)
+        }
+
+        val openResult = hardwareBridge.openDeviceWithCurrentFd(
+            sampleRate = sampleRate,
+            bitDepth = bitDepth,
+            channels = channels,
+            forceNewEpoch = shouldPreemptOther
+        )
         if (openResult.isFailure) {
             Logger.service.w(
                 TAG,
@@ -158,7 +206,15 @@ class PlaybackServiceSessionHost(
 
     fun resumePlayback() {
         val snap = coordinator.snapshot.value
-        if (snap.sessionId == 0L || snap.activeProtocol == StreamProtocol.NONE) {
+        if (snap.sessionId == 0L ||
+            snap.activeProtocol == StreamProtocol.NONE ||
+            snap.businessState == BusinessSessionState.IDLE ||
+            snap.businessState == BusinessSessionState.STOPPED
+        ) {
+            Logger.service.d(
+                TAG,
+                "当前业务态不允许恢复播放: state=${snap.businessState}, protocol=${snap.activeProtocol}"
+            )
             return
         }
 
@@ -177,6 +233,17 @@ class PlaybackServiceSessionHost(
                 protocol = snap.activeProtocol,
                 resumedEpoch = snap.currentEpoch
             )
+        )
+    }
+
+    fun clearError(code: ErrorCode) {
+        val snap = coordinator.snapshot.value
+        if (!snap.errors.containsKey(code)) return
+        dispatchEnvelope(
+            origin = EventOrigin.SERVICE,
+            sessionId = 0L,
+            deviceGeneration = snap.deviceGeneration,
+            payload = ErrorClearedEvent(code)
         )
     }
 

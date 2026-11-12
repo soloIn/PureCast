@@ -1,12 +1,16 @@
 package com.solo.purecast
 
 import com.solo.purecast.airplay.DacpClient
+import com.solo.purecast.core.session.RemoteCommandType
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.test.TestScope
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
-import kotlinx.coroutines.ExperimentalCoroutinesApi
-import kotlinx.coroutines.test.TestScope
+import java.net.ServerSocket
+import java.util.concurrent.CopyOnWriteArrayList
 
 /**
  * 💡 DacpClientTest: 验证 Apple DACP 遥控协议客户端的 URL 构建、凭证管理与指令规范
@@ -67,5 +71,60 @@ class DacpClientTest {
         // 再次更新同端口不应产生额外暂存指令副作用
         client.updatePort(49152)
         assertEquals(49152, client.getCurrentPort())
+    }
+
+    @Test
+    fun `executeRemoteCommand sends Active-Remote GET request and maps HTTP 200 vs errors`() = runBlocking {
+        val capturedRequests = CopyOnWriteArrayList<List<String>>()
+        val server = ServerSocket(0)
+        val port = server.localPort
+        val serverThread = Thread {
+            repeat(2) { idx ->
+                try {
+                    server.accept().use { client ->
+                        val reader = client.getInputStream().bufferedReader()
+                        val lines = mutableListOf<String>()
+                        while (true) {
+                            val line = reader.readLine() ?: break
+                            if (line.isEmpty()) break
+                            lines += line
+                        }
+                        capturedRequests += lines
+                        val status = if (idx == 0) "200 OK" else "404 Not Found"
+                        client.getOutputStream().write(
+                            "HTTP/1.1 $status\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                                .toByteArray(Charsets.US_ASCII)
+                        )
+                        client.getOutputStream().flush()
+                    }
+                } catch (_: Exception) {
+                }
+            }
+        }.apply {
+            isDaemon = true
+            start()
+        }
+
+        try {
+            val client = DacpClient(testScope)
+            client.updateSession("127.0.0.1", port, "9876543210")
+
+            val okRes = client.executeRemoteCommand(RemoteCommandType.NEXT)
+            assertTrue("HTTP 200 应返回成功", okRes.isSuccess)
+            assertEquals(1, capturedRequests.size)
+            assertTrue(capturedRequests[0].first().startsWith("GET /ctrl-int/1/nextitem "))
+            assertTrue(capturedRequests[0].any { it.equals("Active-Remote: 9876543210", ignoreCase = true) })
+
+            val errRes = client.executeRemoteCommand(RemoteCommandType.PREVIOUS)
+            assertTrue("HTTP 404 应返回 failure", errRes.isFailure)
+
+            // 连接被关闭的端口应稳定返回 Result.failure 而非抛出未捕获异常 (#20)
+            server.close()
+            val closedRes = client.executeRemoteCommand(RemoteCommandType.PLAY_PAUSE)
+            assertTrue(closedRes.isFailure)
+        } finally {
+            runCatching { server.close() }
+            serverThread.join(1000L)
+        }
     }
 }

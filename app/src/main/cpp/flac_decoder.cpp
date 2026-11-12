@@ -75,8 +75,21 @@ bool FlacDecoder::decode_stream(
     s_flac_decoded_frames.store(0, std::memory_order_relaxed);
 
     jclass is_class = env->GetObjectClass(input_stream);
+    if (!is_class || env->ExceptionCheck()) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        return false;
+    }
     jmethodID read_method = env->GetMethodID(is_class, "read", "([BII)I");
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        read_method = nullptr;
+    }
     jmethodID skip_method = env->GetMethodID(is_class, "skip", "(J)J");
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        skip_method = nullptr;
+    }
+    env->DeleteLocalRef(is_class);
     if (!read_method || !skip_method) {
         LOGE("获取 InputStream.read 或 skip 方法失败");
         return false;
@@ -135,6 +148,13 @@ bool FlacDecoder::decode_stream(
     auto write_pcm_chunk = [&](const uint8_t* data, size_t bytes_to_write) -> bool {
         size_t written_total = 0;
         while (written_total < bytes_to_write && AudioEngine::instance().is_running()) {
+            if (AudioEngine::instance().get_current_buffer_epoch() != stream_epoch) {
+                LOGW("FLAC 写入挂起期间世代已失效，提前退出: expected=%llu, actual=%llu",
+                     static_cast<unsigned long long>(stream_epoch),
+                     static_cast<unsigned long long>(AudioEngine::instance().get_current_buffer_epoch()));
+                aborted_by_epoch = true;
+                return false;
+            }
             if (AudioEngine::instance().is_paused()) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 continue;
@@ -169,6 +189,13 @@ bool FlacDecoder::decode_stream(
     const size_t bytes_per_frame = channels * (is_24bit ? 3U : sizeof(drflac_int16));
 
     while (AudioEngine::instance().is_running() && !aborted_by_epoch) {
+        if (AudioEngine::instance().get_current_buffer_epoch() != stream_epoch) {
+            LOGW("FLAC 解码挂起期间世代已失效，提前退出: expected=%llu, actual=%llu",
+                 static_cast<unsigned long long>(stream_epoch),
+                 static_cast<unsigned long long>(AudioEngine::instance().get_current_buffer_epoch()));
+            aborted_by_epoch = true;
+            break;
+        }
         if (AudioEngine::instance().is_paused()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;

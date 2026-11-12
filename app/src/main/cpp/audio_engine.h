@@ -83,7 +83,7 @@ public:
     int release_device();
 
     [[nodiscard]] uint64_t get_current_buffer_epoch() const {
-        return epoch_and_flush_.load(std::memory_order_acquire) >> 1;
+        return epoch_and_flush_.load(std::memory_order_acquire) >> EPOCH_SHIFT;
     }
 
     [[nodiscard]] uint64_t get_consumed_buffer_epoch() const {
@@ -95,7 +95,7 @@ public:
     // 💡 R2 契约：is_paused() 仅反映显式暂停，不包含切歌 Flush，确保 FLAC 解码器不会误眠死锁
     [[nodiscard]] bool is_paused() const { return is_explicitly_paused_.load(std::memory_order_acquire); }
     [[nodiscard]] bool is_flushing_until_reroll() const {
-        return (epoch_and_flush_.load(std::memory_order_acquire) & 1ULL) != 0ULL;
+        return (epoch_and_flush_.load(std::memory_order_acquire) & FLAG_FLUSHING) != 0ULL;
     }
     [[nodiscard]] bool is_muted() const { return is_paused() || is_flushing_until_reroll(); }
     [[nodiscard]] int get_active_transfers() const { return active_transfers_.load(std::memory_order_acquire); }
@@ -142,17 +142,22 @@ private:
 
     std::unique_ptr<SpscRingBuffer> ring_buffer_{nullptr};
 
+    static constexpr int EPOCH_SHIFT = 2;
+    static constexpr uint64_t FLAG_FLUSHING = 1ULL;
+    static constexpr uint64_t FLAG_PREROLLED = 2ULL;
+
     std::atomic<bool> is_running_{false};
     // 💡 双静音标志隔离：显式暂停 vs 切歌 Flush 预充自动解除
     std::atomic<bool> is_explicitly_paused_{false};
-    // 💡 高 63 位为单调递增的 buffer_epoch_ (初始 1)，最低位 bit0 为 is_flushing_until_reroll_，单条 CAS 杜绝竞态覆盖
-    std::atomic<uint64_t> epoch_and_flush_{(1ULL << 1) | 0ULL};
+    // 💡 高 62 位为单调递增的 buffer_epoch_ (初始 1)，bit1=has_pre_rolled，bit0=is_flushing_until_reroll_，单字 CAS 消除双变量竞态
+    std::atomic<uint64_t> epoch_and_flush_{(1ULL << EPOCH_SHIFT)};
     std::atomic<uint64_t> consumed_epoch_{1ULL};
     std::atomic<size_t> pre_roll_threshold_bytes_{0};
 
     std::atomic<bool> is_claimed_{false};
     std::atomic<bool> is_control_claimed_{false};
-    std::atomic<bool> has_pre_rolled_{false};
+    // 💡 在途 ring_buffer_ 外部读/写线程计数：stop_transfer_pipeline_locked 在释放或重建前等待归零，彻底消除 UAF
+    mutable std::atomic<int> active_writers_{0};
     // 💡 在途等时传输 URB 计数器 (用于在 release/reconfigure 时安全同步等待所有取消回调完成，杜绝 Use-After-Free)
     std::atomic<int> active_transfers_{0};
     // 💡 DAC Warmup 50ms 静音预充微帧计数器 (仅首次开流/物理重配设置，切歌 Flush 绝不重置)

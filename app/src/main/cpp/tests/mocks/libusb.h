@@ -228,12 +228,18 @@ public:
     void set_fail_next_submit(int error_code);
     void set_fail_all_submits(int error_code);
     void set_feedback_rate_override(uint32_t q16_rate);
+    void set_uac1_mode(bool enabled);
 
     // 运行态观测指标
     bool is_kernel_driver_attached(int iface) const;
     bool is_interface_claimed(int iface) const;
     int get_alt_setting(int iface) const;
     int get_configured_sample_rate() const;
+    int get_uac1_sample_rate() const;
+    int get_fu_volume_count() const;
+    int get_fu_mute_count() const;
+    int get_invalid_control_count() const;
+    bool is_uac1_mode() const { return uac1_mode_.load(std::memory_order_acquire); }
     int get_in_flight_count() const;
     uint64_t get_completed_out_urbs() const;
 
@@ -257,7 +263,12 @@ public:
     bool interface_claimed_[4]{false, false, false, false};
     int alt_setting_[4]{0, 0, 0, 0};
     int configured_sample_rate_{0};
+    int configured_uac1_sample_rate_{0};
+    int fu_volume_count_{0};
+    int fu_mute_count_{0};
+    int invalid_control_count_{0};
 
+    std::atomic<bool> uac1_mode_{false};
     std::atomic<bool> isoc_completion_paused_{false};
     std::atomic<int> fail_next_alt_setting_{0};
     std::atomic<int> fail_next_clock_control_{0};

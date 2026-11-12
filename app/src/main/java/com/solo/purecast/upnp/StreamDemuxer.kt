@@ -416,8 +416,10 @@ class StreamDemuxer(
                 abortedByEpoch = true
                 Logger.upnp.i(TAG, "音频拉取流被主动取消 (session=$thisSession)")
             } catch (e: Exception) {
+                // 💡 异常报错后标记 abortedByEpoch = true，避免 finally 块再重复派发虚假的自然播完 (EOF) 事件
+                abortedByEpoch = true
                 Logger.upnp.e(TAG, "音频流拉取/解包异常 (session=$thisSession)", e)
-                if (thisSession == sessionToken.get() && !abortedByEpoch) {
+                if (thisSession == sessionToken.get()) {
                     onError("音频流传输异常: ${e.message}")
                 }
             } finally {

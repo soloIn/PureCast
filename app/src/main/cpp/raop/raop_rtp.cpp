@@ -44,6 +44,13 @@ int RaopRtp::bind_udp_socket(int preferred_port, int& bound_port) {
     int rcvbuf = 1024 * 1024;
     setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
+    // 💡 为无连接 UDP Socket 设置 50ms 接收超时，确保 stop()/抢占时在 macOS/Linux 上均可确定性唤醒 recvfrom 退出，
+    // 防止 shutdown(SOCK_DGRAM) 返回 ENOTCONN 导致 join() 死锁。
+    struct timeval rcv_tv{};
+    rcv_tv.tv_sec = 0;
+    rcv_tv.tv_usec = 50000;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rcv_tv, sizeof(rcv_tv));
+
     struct sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
@@ -311,14 +318,14 @@ void RaopRtp::data_loop() {
 
     LOGI("RAOP RTP 数据接收线程已启动");
 
-    while (is_running_.load(std::memory_order_relaxed)) {
+    while (is_running_.load(std::memory_order_acquire)) {
         struct sockaddr_in client_addr{};
         socklen_t addr_len = sizeof(client_addr);
 
         ssize_t n = recvfrom(data_fd_, buffer.data(), buffer.size(), 0,
                              reinterpret_cast<struct sockaddr*>(&client_addr), &addr_len);
         if (n <= 0) {
-            if (errno == EINTR || errno == EAGAIN) continue;
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
             break; // Socket 已关闭
         }
 
@@ -516,10 +523,13 @@ void RaopRtp::data_loop() {
                 }
 
                 // 💡 关键时钟基准重置与状态同步：
-                // 1. 若此前处于隐式暂停状态，或切歌过渡期丢弃了静音帧导致序列号断层，重置 JitterBuffer 并更新 epoch；
-                // 2. 非手动暂停状态下确保等时输出唤醒，恢复状态机为 PLAYING。
-                bool was_paused = is_stream_paused_.load(std::memory_order_relaxed) && !is_manually_paused_.load(std::memory_order_relaxed);
-                bool had_transition_silence = skipped_silence_in_transition_.exchange(false, std::memory_order_acq_rel);
+                // 1. 仅当 TV 端与远端均未主动暂停时，才允许有效音频解除隐式静默暂停并唤醒；
+                // 2. 非暂停状态下若此前有隐式暂停或切歌过渡静音断层，重置 JitterBuffer 并更新 epoch。
+                const bool tv_or_manual_paused =
+                    is_manually_paused_.load(std::memory_order_acquire) || AudioEngine::instance().is_paused();
+                bool was_paused = !tv_or_manual_paused && is_stream_paused_.load(std::memory_order_relaxed);
+                bool had_transition_silence = !tv_or_manual_paused &&
+                    skipped_silence_in_transition_.exchange(false, std::memory_order_acq_rel);
 
                 if (was_paused || had_transition_silence) {
                     if (was_paused) {
@@ -532,23 +542,17 @@ void RaopRtp::data_loop() {
                     jitter_buffer_.reset();
                     uint64_t next_ep = AudioEngine::instance().emergency_mute_and_flush(FlushReason::FLUSH_SWITCH);
                     active_epoch_.store(next_ep, std::memory_order_release);
-                    AudioEngine::instance().resume_stream();
                     if (was_paused) {
+                        AudioEngine::instance().resume_stream();
                         emit_state_callback(false, false, next_ep);
                     }
                 }
-
-                // 💡 仅在非手动/非流暂停状态下恢复等时输出，防止手动暂停期瞬间误解封
-                if (!is_stream_paused_.load(std::memory_order_acquire) &&
-                    !is_manually_paused_.load(std::memory_order_acquire) &&
-                    AudioEngine::instance().is_paused()) {
-                    LOGI("▶️ 收到有效解码音频帧且 AudioEngine 处于暂停态，底层主动调用 resume_stream");
-                    AudioEngine::instance().resume_stream();
-                }
             }
 
-            // 💡 若处于暂停态（例如手动暂停），丢弃音频帧防止在暂停期间灌满 RingBuffer
-            if (is_stream_paused_.load(std::memory_order_relaxed)) {
+            // 💡 若处于隐式/手动暂停或 TV 端 / 音频焦点显式暂停态，严禁越权调用 resume_stream 并在暂停期间丢弃音频帧防止灌满 RingBuffer
+            if (is_stream_paused_.load(std::memory_order_acquire) ||
+                is_manually_paused_.load(std::memory_order_acquire) ||
+                AudioEngine::instance().is_paused()) {
                 continue;
             }
 
@@ -605,14 +609,14 @@ void RaopRtp::ctrl_loop() {
 
     LOGI("RAOP RTP 控制接收线程已启动");
 
-    while (is_running_.load(std::memory_order_relaxed)) {
+    while (is_running_.load(std::memory_order_acquire)) {
         struct sockaddr_in client_addr{};
         socklen_t addr_len = sizeof(client_addr);
 
         ssize_t n = recvfrom(ctrl_fd_, buffer.data(), buffer.size(), 0,
                              reinterpret_cast<struct sockaddr*>(&client_addr), &addr_len);
         if (n <= 0) {
-            if (errno == EINTR || errno == EAGAIN) continue;
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
             break;
         }
 
@@ -642,14 +646,14 @@ void RaopRtp::timing_loop() {
 
     LOGI("RAOP RTP 授时接收线程已启动");
 
-    while (is_running_.load(std::memory_order_relaxed)) {
+    while (is_running_.load(std::memory_order_acquire)) {
         struct sockaddr_in client_addr{};
         socklen_t addr_len = sizeof(client_addr);
 
         ssize_t n = recvfrom(timing_fd_, buffer.data(), buffer.size(), 0,
                              reinterpret_cast<struct sockaddr*>(&client_addr), &addr_len);
         if (n <= 0) {
-            if (errno == EINTR || errno == EAGAIN) continue;
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
             break;
         }
 

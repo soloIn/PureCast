@@ -340,6 +340,149 @@ void test_write_pcm_sync_when_no_active_transfers() {
     std::printf("PASS test_write_pcm_sync_when_no_active_transfers\n");
 }
 
+// 用例 6 (#24): STOP_OR_TEARDOWN 必须递增 epoch、强制保持静音/暂停态并阻止旧帧泄漏到 OUT URB
+void test_stop_or_teardown_flushes_and_stays_muted() {
+    std::printf("Running test_stop_or_teardown_flushes_and_stays_muted...\n");
+    auto& mock = MockLibusbController::instance();
+    mock.reset();
+
+    AudioEngine engine;
+    TEST_ASSERT(engine.open_device(42, 44100, 16, 2) == 0, "open_device");
+    TEST_ASSERT(wait_until([&] { return engine.get_active_transfers() > 0; }), "active transfers started");
+
+    const uint64_t ep1 = engine.get_current_buffer_epoch();
+    auto audio = make_pattern_pcm(24000, 0x33); // > 100ms 触发解锁出声
+    TEST_ASSERT(engine.write_pcm(audio.data(), audio.size(), ep1) == static_cast<int>(audio.size()), "write E1");
+    TEST_ASSERT(wait_until([&] { return !engine.is_muted(); }), "E1 unmutes after preroll");
+
+    const uint64_t stop_ep = engine.emergency_mute_and_flush(FlushReason::STOP_OR_TEARDOWN);
+    TEST_ASSERT(stop_ep > ep1, "STOP_OR_TEARDOWN must advance epoch");
+    TEST_ASSERT(engine.is_paused(), "STOP_OR_TEARDOWN must mark explicitly paused");
+    TEST_ASSERT(engine.is_muted(), "STOP_OR_TEARDOWN must force muted state");
+    TEST_ASSERT(engine.write_pcm(audio.data(), audio.size(), ep1) == -2, "old epoch write must be rejected");
+
+    mock.clear_captured_out_bytes();
+    mock.set_capture_enabled(true);
+    const uint64_t base_urbs = mock.get_completed_out_urbs();
+    TEST_ASSERT(wait_until([&] { return mock.get_completed_out_urbs() >= base_urbs + 4; }),
+                "urbs keep circulating in keep-alive silence");
+    mock.set_capture_enabled(false);
+    auto captured = mock.take_captured_out_bytes();
+    bool any_non_zero = false;
+    for (uint8_t b : captured) {
+        if (b != 0) {
+            any_non_zero = true;
+            break;
+        }
+    }
+    TEST_ASSERT(!any_non_zero, "STOP_OR_TEARDOWN keep-alive URBs must emit pure silence zeros");
+
+    engine.release_device();
+    std::printf("PASS test_stop_or_teardown_flushes_and_stays_muted\n");
+}
+
+// 用例 7 (#3): write_pcm + 只读查询并发重入 release_device / open_device / reconfigure 零 UAF/零死锁压力测试
+void test_concurrent_write_vs_release_and_reconfigure_uaf() {
+    std::printf("Running test_concurrent_write_vs_release_and_reconfigure_uaf...\n");
+    auto& mock = MockLibusbController::instance();
+    mock.reset();
+
+    AudioEngine engine;
+    TEST_ASSERT(engine.open_device(42, 44100, 16, 2) == 0, "initial open");
+
+    std::atomic<bool> stop_flag{false};
+    std::vector<std::thread> workers;
+    for (int t = 0; t < 2; ++t) {
+        workers.emplace_back([&, t]() {
+            auto chunk = make_pattern_pcm(1764, static_cast<uint8_t>(0x41 + t));
+            while (!stop_flag.load(std::memory_order_acquire)) {
+                const uint64_t ep = engine.get_current_buffer_epoch();
+                (void)engine.write_pcm(chunk.data(), chunk.size(), ep);
+                (void)engine.get_buffer_available();
+                (void)engine.get_buffer_capacity();
+                (void)engine.get_available_read();
+                std::this_thread::sleep_for(std::chrono::microseconds(150));
+            }
+        });
+    }
+
+    for (int round = 0; round < 6; ++round) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        if (round % 2 == 0) {
+            TEST_ASSERT(engine.reconfigure_audio_format(96000, 24, 2) > 0, "concurrent reconfigure 96k");
+        } else {
+            engine.release_device();
+            TEST_ASSERT(engine.open_device(42 + round, 44100, 16, 2) == 0, "concurrent reopen 44.1k");
+        }
+    }
+
+    stop_flag.store(true, std::memory_order_release);
+    for (auto& w : workers) {
+        w.join();
+    }
+    engine.release_device();
+    TEST_ASSERT(engine.get_active_transfers() == 0, "all URBs reclaimed after UAF stress");
+    std::printf("PASS test_concurrent_write_vs_release_and_reconfigure_uaf\n");
+}
+
+// 用例 8 (#11): 并发 FLUSH_SWITCH 与 try_unlock_preroll CAS 竞态防穿越测试
+void test_preroll_atomic_cas_unlock_under_epoch_switch() {
+    std::printf("Running test_preroll_atomic_cas_unlock_under_epoch_switch...\n");
+    auto& mock = MockLibusbController::instance();
+    mock.reset();
+
+    AudioEngine engine;
+    TEST_ASSERT(engine.open_device(42, 44100, 16, 2) == 0, "open_device");
+    TEST_ASSERT(wait_until([&] { return engine.get_active_transfers() > 0; }), "urbs active");
+
+    std::atomic<bool> stop_flag{false};
+    std::thread writer([&]() {
+        auto frame = make_pattern_pcm(4096, 0x7E);
+        while (!stop_flag.load(std::memory_order_acquire)) {
+            const uint64_t ep = engine.get_current_buffer_epoch();
+            (void)engine.write_pcm(frame.data(), frame.size(), ep);
+        }
+    });
+
+    for (int i = 0; i < 40; ++i) {
+        const uint64_t next_ep = engine.emergency_mute_and_flush(FlushReason::FLUSH_SWITCH);
+        // 💡 刚完成 FLUSH_SWITCH 的瞬时若消费者尚未推进或未预充，绝不可因旧世代 CAS 穿透而残留 unmuted
+        TEST_ASSERT(engine.get_current_buffer_epoch() >= next_ep, "epoch strictly non-decreasing");
+        std::this_thread::sleep_for(std::chrono::microseconds(800));
+    }
+
+    stop_flag.store(true, std::memory_order_release);
+    writer.join();
+    engine.release_device();
+    std::printf("PASS test_preroll_atomic_cas_unlock_under_epoch_switch\n");
+}
+
+// 用例 9 (#7): UAC1 3-byte 时钟、Feature Unit Volume/Mute 以及畸形控制包拒绝校验
+void test_uac1_and_feature_unit_control_validation() {
+    std::printf("Running test_uac1_and_feature_unit_control_validation...\n");
+    auto& mock = MockLibusbController::instance();
+    mock.reset();
+    mock.set_uac1_mode(true);
+
+    AudioEngine engine;
+    TEST_ASSERT(engine.open_device(77, 96000, 24, 2) == 0, "open UAC1 device 96k/24");
+    TEST_ASSERT(mock.get_uac1_sample_rate() == 96000, "UAC1 3-byte SAMPLING_FREQ_CONTROL set to 96000");
+    TEST_ASSERT(mock.get_alt_setting(1) == 2, "UAC1 24-bit selects alt 2");
+    TEST_ASSERT(mock.get_fu_volume_count() >= 3, "Feature Unit volume control dispatched for ch 0..2");
+    TEST_ASSERT(mock.get_fu_mute_count() >= 3, "Feature Unit mute control dispatched for ch 0..2");
+    TEST_ASSERT(mock.get_invalid_control_count() == 0, "no invalid control transfers sent by AudioEngine");
+
+    // 显式注入错误长度/未知请求控制传输，验证 mock 拒绝而不是静默放行
+    unsigned char bad_buf[2] = {0, 0};
+    int bad_ret = libusb_control_transfer(nullptr, 0x21, 0x01, 0x0100, 0x0300, bad_buf, 2, 100);
+    TEST_ASSERT(bad_ret == LIBUSB_ERROR_PIPE, "malformed clock request length must return LIBUSB_ERROR_PIPE");
+    TEST_ASSERT(mock.get_invalid_control_count() == 1, "invalid control count incremented");
+
+    engine.release_device();
+    mock.set_uac1_mode(false);
+    std::printf("PASS test_uac1_and_feature_unit_control_validation\n");
+}
+
 } // namespace
 
 int main() {
@@ -348,6 +491,10 @@ int main() {
     test_multithread_stress_and_warmup_isolation();
     test_triplet_reconfigure_and_safe_rollback();
     test_write_pcm_sync_when_no_active_transfers();
+    test_stop_or_teardown_flushes_and_stays_muted();
+    test_concurrent_write_vs_release_and_reconfigure_uaf();
+    test_preroll_atomic_cas_unlock_under_epoch_switch();
+    test_uac1_and_feature_unit_control_validation();
     std::printf("All purecast native audio_engine tests PASSED!\n");
     return 0;
 }

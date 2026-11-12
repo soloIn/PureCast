@@ -25,6 +25,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -490,6 +491,119 @@ class UsbDeviceManagerTest {
         assertTrue(systemBridge.openedHandles[0].closed)
         assertTrue(systemBridge.selfHealCalls >= 1)
         assertEquals(HardwarePipelineState.RELEASED, coordinator.snapshot.value.hardwareState)
+
+        usbManager.destroy()
+        hwExecutor.shutdownNow()
+        hwExecutor.awaitTermination(1, TimeUnit.SECONDS)
+    }
+
+    @Test
+    fun `bounded syncTimeoutMs returns failure fast when hardwareExecutor blocks and destroy is non-blocking`() = runTest {
+        val systemBridge = FakeUsbSystemBridge().apply {
+            scannedDevice = sonyDac()
+            permissionGranted = true
+        }
+        val nativeBridge = FakeUsbNativeAudioBridge()
+        val hwExecutor = directExecutor()
+        val blockStarted = CountDownLatch(1)
+        val releaseBlock = CountDownLatch(1)
+        val usbManager = UsbDeviceManager(
+            systemBridge = systemBridge,
+            nativeBridge = nativeBridge,
+            hardwareExecutor = hwExecutor,
+            ownsExecutor = true,
+            dispatchEvent = {},
+            clockMs = { testScheduler.currentTime },
+            syncTimeoutMs = 50L
+        )
+
+        try {
+            // 占用单线程 hardwareExecutor 模拟 JNI / 内核卡顿 (#8)
+            hwExecutor.submit {
+                blockStarted.countDown()
+                releaseBlock.await(2, TimeUnit.SECONDS)
+            }
+            assertTrue(blockStarted.await(1, TimeUnit.SECONDS))
+
+            val t0 = System.nanoTime()
+            val attached = usbManager.scanAndAttachDevice()
+            val elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t0)
+            assertFalse("同步调用超时必须返回失败而不是无限等待", attached)
+            assertTrue("同步调用应在约 50ms 超时边界附近返回 (实测 ${elapsedMs}ms)", elapsedMs < 800L)
+
+            val openRes = usbManager.openDeviceWithCurrentFd(44100, 16, 2)
+            assertTrue("openDeviceWithCurrentFd 超时应返回 Result.failure", openRes.isFailure)
+        } finally {
+            releaseBlock.countDown()
+            usbManager.destroy()
+        }
+    }
+
+    @Test
+    fun `async attach detach dispatch cleanly and forceNewEpoch flushes PREEMPT on identical spec`() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val systemBridge = FakeUsbSystemBridge().apply {
+            scannedDevice = sonyDac()
+            permissionGranted = true
+        }
+        val nativeBridge = FakeUsbNativeAudioBridge()
+        val dispatched = CopyOnWriteArrayList<SessionEventEnvelope<SessionEventPayload>>()
+        var coordinator: PlaybackSessionCoordinator? = null
+        val hwExecutor = directExecutor()
+        val usbManager = UsbDeviceManager(
+            systemBridge = systemBridge,
+            nativeBridge = nativeBridge,
+            hardwareExecutor = hwExecutor,
+            dispatchEvent = { env ->
+                dispatched += env
+                coordinator?.dispatch(env)
+            },
+            clockMs = { testScheduler.currentTime }
+        )
+        coordinator = PlaybackSessionCoordinator(
+            scope = this.backgroundScope,
+            hardwareBridge = usbManager,
+            clockMs = { testScheduler.currentTime }
+        )
+
+        // 1. 异步扫描入队，不阻塞调用方且发回附着事件 (#8)
+        usbManager.scanAndAttachDeviceAsync()
+        flushExecutor(hwExecutor)
+        testScheduler.runCurrent()
+        assertTrue(dispatched.any { it.payload is com.solo.purecast.core.session.HardwareAttachedEvent })
+
+        // 2. 首次打开 44.1kHz/16bit 成功并产生 HardwareReconfiguredEvent (#14)
+        val firstOpen = usbManager.openDeviceWithCurrentFd(44100, 16, 2)
+        assertTrue(firstOpen.isSuccess)
+        assertEquals(1, dispatched.count { it.payload is com.solo.purecast.core.session.HardwareReconfiguredEvent })
+
+        // 3. 相同规格但 forceNewEpoch=true (跨协议抢占) 必须强制触发 FlushReason.PREEMPT 并推进 epoch (#1)
+        val epochBeforePreempt = firstOpen.getOrThrow().epoch
+        val preemptOpen = usbManager.openDeviceWithCurrentFd(44100, 16, 2, forceNewEpoch = true)
+        assertTrue(preemptOpen.isSuccess)
+        assertTrue(nativeBridge.muteCalls.contains(FlushReason.PREEMPT))
+        assertTrue(
+            "forceNewEpoch=true 在同规格下也必须推进 epoch 拦截旧推流写入",
+            preemptOpen.getOrThrow().epoch > epochBeforePreempt
+        )
+
+        // 4. 释放后以完全相同规格再次 freshOpen 时，仍必须发射 HardwareReconfiguredEvent 同步快照 (#14)
+        usbManager.releaseDevice()
+        val reopensBefore = dispatched.count { it.payload is com.solo.purecast.core.session.HardwareReconfiguredEvent }
+        val reopenSameSpec = usbManager.openDeviceWithCurrentFd(44100, 16, 2)
+        assertTrue(reopenSameSpec.isSuccess)
+        assertEquals(
+            "freshOpen 每次成功必须发射 HardwareReconfiguredEvent",
+            reopensBefore + 1,
+            dispatched.count { it.payload is com.solo.purecast.core.session.HardwareReconfiguredEvent }
+        )
+
+        // 4. 异步拔出同样走单线程排队并清除独占状态 (#8)
+        usbManager.handleDeviceDetachedAsync(null)
+        flushExecutor(hwExecutor)
+        testScheduler.runCurrent()
+        assertFalse(usbManager.isExclusive())
+        assertTrue(dispatched.any { it.payload is com.solo.purecast.core.session.HardwareDetachedEvent })
 
         usbManager.destroy()
         hwExecutor.shutdownNow()

@@ -12,6 +12,8 @@ import com.solo.purecast.core.session.StreamSetupEvent
 import com.solo.purecast.core.session.StreamStopEvent
 import com.solo.purecast.core.session.TrackCompleteEvent
 import com.solo.purecast.core.session.FirstDataPacketEvent
+import com.solo.purecast.core.session.TrackBoundaryEvent
+import com.solo.purecast.core.session.TrackSwitchEvent
 import com.solo.purecast.model.BusinessSessionState
 import com.solo.purecast.model.DurationState
 import com.solo.purecast.model.FlushReason
@@ -43,7 +45,8 @@ import java.util.concurrent.atomic.AtomicLong
 class StreamDemuxerTransactionTest {
 
     private class FakeAudioGateway(
-        private val writeResultOverride: Int? = null
+        private val writeResultOverride: Int? = null,
+        private val throwOnWrite: Exception? = null
     ) : DemuxerAudioGateway {
         val writtenEpochs = CopyOnWriteArrayList<Long>()
         val writtenBytesTotal = AtomicInteger(0)
@@ -52,6 +55,7 @@ class StreamDemuxerTransactionTest {
         var flacFrames = 0L
 
         override fun writePcm(data: ByteArray, offset: Int, length: Int, expectedEpoch: Long): Int {
+            throwOnWrite?.let { throw it }
             writeCallCount.incrementAndGet()
             writtenEpochs += expectedEpoch
             if (writeResultOverride != null) {
@@ -412,6 +416,131 @@ class StreamDemuxerTransactionTest {
         for (file in files) {
             val content = file.readText()
             assertFalse("${file.name} 严禁引用 PlaybackService", content.contains("PlaybackService"))
+        }
+    }
+
+    @Test
+    fun `SetAVTransportURI with identical URI replays track cleanly with flush and TrackBoundaryEvent`(): Unit = runBlocking {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val fakeNative = FakeNativeFastPath()
+        val fastPath = HardwareFastPathController(fakeNative)
+        val events = CopyOnWriteArrayList<SessionEventEnvelope<SessionEventPayload>>()
+        val sidGen = AtomicLong(0L)
+        val seqGen = AtomicLong(0L)
+
+        val wavBytes = buildWavStreamBytes(44100, 16, 2, 4096)
+        val serverSocket = ServerSocket(0)
+        val port = serverSocket.localPort
+        val serverThread = Thread {
+            while (!serverSocket.isClosed) {
+                try {
+                    serverSocket.accept().use { client ->
+                        val reader = client.getInputStream().bufferedReader()
+                        while (true) {
+                            val l = reader.readLine() ?: break
+                            if (l.isEmpty()) break
+                        }
+                        val out = client.getOutputStream()
+                        out.write(
+                            "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nConnection: close\r\n\r\n"
+                                .toByteArray(Charsets.US_ASCII)
+                        )
+                        out.write(wavBytes)
+                        out.flush()
+                    }
+                } catch (_: Exception) {
+                }
+            }
+        }.apply {
+            isDaemon = true
+            start()
+        }
+
+        try {
+            val server = UpnpRendererServer(
+                scope = scope,
+                dispatchEvent = { events += it },
+                allocateSessionId = { sidGen.incrementAndGet() },
+                allocateSequence = { seqGen.incrementAndGet() },
+                onAcquireHardwareForStream = { _, _, _, _ -> fakeNative.currentEpoch },
+                snapshotProvider = {
+                    PlayerSessionSnapshot(
+                        sessionId = 1L,
+                        activeProtocol = StreamProtocol.UPNP_DLNA,
+                        businessState = BusinessSessionState.PLAYING
+                    )
+                },
+                fastPath = fastPath,
+                audioGateway = FakeAudioGateway()
+            )
+
+            val uri = "http://127.0.0.1:$port/replay.wav"
+            val soapUriBody = "<InstanceID>0</InstanceID><CurrentURI>$uri</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>"
+            server.processSoapActionForTest("SetAVTransportURI", soapUriBody)
+            server.processSoapActionForTest("Play", "")
+
+            val deadline1 = System.currentTimeMillis() + 5000L
+            while (events.none { it.payload is FirstDataPacketEvent } && System.currentTimeMillis() < deadline1) {
+                delay(20)
+            }
+            assertEquals(1, events.count { it.payload is FirstDataPacketEvent })
+            val beforeReplayCount = events.size
+
+            // 发送完全相同 URI 的 SetAVTransportURI 请求重播 (#26)
+            server.processSoapActionForTest("SetAVTransportURI", soapUriBody)
+            assertTrue("同 URI 重播必须执行 FLUSH_SWITCH", fakeNative.muteCalls.contains(FlushReason.FLUSH_SWITCH))
+            assertTrue(
+                "同 URI 重播必须发射 TrackSwitchEvent",
+                events.drop(beforeReplayCount).any { it.payload is TrackSwitchEvent }
+            )
+            assertTrue(
+                "同 URI 重播必须发射 TrackBoundaryEvent 重置曲目进度",
+                events.drop(beforeReplayCount).any { it.payload is TrackBoundaryEvent }
+            )
+
+            server.processSoapActionForTest("Play", "")
+            val deadline2 = System.currentTimeMillis() + 5000L
+            while (events.count { it.payload is FirstDataPacketEvent } < 2 && System.currentTimeMillis() < deadline2) {
+                delay(20)
+            }
+            assertEquals("同 URI 重播应再次触发 FirstDataPacketEvent", 2, events.count { it.payload is FirstDataPacketEvent })
+            server.processSoapActionForTest("Stop", "")
+            Unit
+        } finally {
+            serverSocket.close()
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun `StreamDemuxer marks abortedByEpoch true when stream throws unexpected exception`() = runBlocking {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val gateway = FakeAudioGateway(throwOnWrite = IllegalStateException("usb write aborted"))
+        var endedAborted: Boolean? = null
+        var recordedError: String? = null
+
+        val wavBytes = buildWavStreamBytes(44100, 16, 2, 4096)
+        val (url, serverSocket) = serveOnceOverHttp(scope, wavBytes)
+
+        try {
+            val demuxer = StreamDemuxer(
+                scope = scope,
+                audioGateway = gateway,
+                onAcquireStreamEpoch = { 77L },
+                onFirstDataPacket = { _, _ -> },
+                onStreamEnded = { aborted, _ -> endedAborted = aborted },
+                onError = { err -> recordedError = err }
+            )
+            demuxer.start(url)
+            val deadline = System.currentTimeMillis() + 5000L
+            while (endedAborted == null && System.currentTimeMillis() < deadline) {
+                delay(20)
+            }
+            assertEquals("流读取/写入抛出异常必须将 abortedByEpoch 标为 true (#17)", true, endedAborted)
+            assertTrue(recordedError != null)
+        } finally {
+            serverSocket.close()
+            scope.cancel()
         }
     }
 }

@@ -2,8 +2,12 @@ package com.solo.purecast.airplay
 
 import android.content.Context
 import com.solo.purecast.core.nativebridge.NativeAudioEngine
+import com.solo.purecast.core.session.ProtocolResumeReopenResult
+import com.solo.purecast.core.session.ProtocolSessionBridge
 import com.solo.purecast.core.session.SessionEventEnvelope
 import com.solo.purecast.core.session.SessionEventPayload
+import com.solo.purecast.model.FlushReason
+import com.solo.purecast.model.StreamProtocol
 import com.solo.purecast.util.Logger
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -27,6 +31,29 @@ class AirPlayServerManager(
         private const val TAG = "AirPlayServerManager"
         const val DEFAULT_RTSP_PORT = 5000
     }
+
+    constructor(
+        context: Context,
+        scope: CoroutineScope,
+        sessionBridge: ProtocolSessionBridge,
+        clockMs: () -> Long = { android.os.SystemClock.elapsedRealtime() }
+    ) : this(
+        context = context,
+        scope = scope,
+        dispatchEvent = { envelope -> sessionBridge.dispatch(envelope) },
+        allocateSessionId = { sessionBridge.nextSessionId() },
+        allocateSequence = { sessionBridge.nextSequence() },
+        onAcquireHardwareForStream = { sampleRate, bitDepth, channels, codec ->
+            sessionBridge.acquireHardwareForStream(
+                StreamProtocol.AIRPLAY_1,
+                sampleRate,
+                bitDepth,
+                channels,
+                codec
+            )
+        },
+        clockMs = clockMs
+    )
 
     private val jmdnsDiscoveryService = JmDnsDiscoveryService(context)
     val dacpClient = DacpClient(scope)
@@ -185,12 +212,36 @@ class AirPlayServerManager(
     /**
      * 💡 抢占或 10 分钟挂起超时时仅清理当前 AirPlay 流与 DACP 会话，保留 RTSP/mDNS 在线待连
      */
-    fun preemptActiveSession() {
-        Logger.airplay.i(TAG, "中止当前活跃 AirPlay 会话并保留 mDNS/RTSP 监听")
-        NativeAudioEngine.emergencyMuteAndFlush(com.solo.purecast.model.FlushReason.PREEMPT.nativeCode)
+    fun preemptActiveSession(targetGlobalSessionId: Long? = null) {
+        if (targetGlobalSessionId != null && !nativeDispatcher.hasSession(targetGlobalSessionId)) {
+            Logger.airplay.d(TAG, "忽略过期 AirPlay 抢占指令: targetSid=$targetGlobalSessionId")
+            return
+        }
+        Logger.airplay.i(TAG, "中止当前活跃 AirPlay 会话并保留 mDNS/RTSP 监听 (targetSid=$targetGlobalSessionId)")
+        NativeAudioEngine.preemptAirPlayClient()
+        NativeAudioEngine.emergencyMuteAndFlush(FlushReason.PREEMPT.nativeCode)
         nativeDispatcher.resetSessions()
         dacpClient.stop()
         clearDacpSession()
+    }
+
+    /**
+     * 💡 P0 #2 重开 USB DAC 后校验 AirPlay 底层管线是否仍可恢复，并同步刷新 Native RTP active_epoch
+     */
+    fun resumeAfterDeviceReopen(sessionId: Long, newEpoch: Long): ProtocolResumeReopenResult {
+        if (!isRunning || !nativeDispatcher.hasSession(sessionId)) {
+            Logger.airplay.w(TAG, "AirPlay 重开声卡校验失败：会话不存在 (sid=$sessionId)")
+            return ProtocolResumeReopenResult.PRODUCER_DEAD
+        }
+        val alive = NativeAudioEngine.updateAirPlayActiveEpoch(newEpoch)
+        if (!alive) {
+            Logger.airplay.w(TAG, "AirPlay 重开声卡校验失败：Native RTSP/RTP 管线已失活 (sid=$sessionId, epoch=$newEpoch)")
+            isRtpActive = false
+            return ProtocolResumeReopenResult.PRODUCER_DEAD
+        }
+        isRtpActive = true
+        Logger.airplay.i(TAG, "AirPlay 重开声卡并同步 epoch=$newEpoch 成功，恢复推流")
+        return ProtocolResumeReopenResult.STREAMING_READY
     }
 
     fun isRunning(): Boolean = isRunning

@@ -10,6 +10,18 @@
 
 namespace purecast {
 
+namespace {
+struct ScopedActiveWriter {
+    std::atomic<int>& counter;
+    explicit ScopedActiveWriter(std::atomic<int>& c) : counter(c) {
+        counter.fetch_add(1, std::memory_order_seq_cst);
+    }
+    ~ScopedActiveWriter() {
+        counter.fetch_sub(1, std::memory_order_seq_cst);
+    }
+};
+} // namespace
+
 AudioEngine& AudioEngine::instance() {
     static AudioEngine inst;
     return inst;
@@ -64,11 +76,11 @@ uint64_t AudioEngine::advance_epoch_and_set_flushing(bool flushing) {
     uint64_t cur = epoch_and_flush_.load(std::memory_order_relaxed);
     uint64_t next = 0;
     do {
-        const uint64_t next_epoch = (cur >> 1) + 1ULL;
-        next = (next_epoch << 1) | (flushing ? 1ULL : 0ULL);
+        const uint64_t next_epoch = (cur >> EPOCH_SHIFT) + 1ULL;
+        next = (next_epoch << EPOCH_SHIFT) | (flushing ? FLAG_FLUSHING : 0ULL);
     } while (!epoch_and_flush_.compare_exchange_weak(
         cur, next, std::memory_order_acq_rel, std::memory_order_relaxed));
-    return next >> 1;
+    return next >> EPOCH_SHIFT;
 }
 
 bool AudioEngine::parse_audio_descriptors(libusb_device* dev, int target_bit_depth) {
@@ -421,11 +433,10 @@ int AudioEngine::start_transfer_pipeline_locked(int sample_rate, int bit_depth, 
 
     // 💡 重置会话状态并单调推进世代
     is_explicitly_paused_.store(false, std::memory_order_release);
-    has_pre_rolled_.store(false, std::memory_order_release);
     feedback_locked_.store(false, std::memory_order_release);
     const uint64_t new_epoch = advance_epoch_and_set_flushing(false);
     consumed_epoch_.store(new_epoch, std::memory_order_release);
-    is_running_.store(true, std::memory_order_release);
+    is_running_.store(true, std::memory_order_seq_cst);
 
     transfers_.assign(NUM_TRANSFERS, nullptr);
     transfer_buffers_.assign(NUM_TRANSFERS, {});
@@ -541,7 +552,7 @@ int AudioEngine::start_transfer_pipeline_locked(int sample_rate, int bit_depth, 
 }
 
 int AudioEngine::stop_transfer_pipeline_locked() {
-    is_running_.store(false, std::memory_order_release);
+    is_running_.store(false, std::memory_order_seq_cst);
     warmup_packets_remaining_.store(0, std::memory_order_release);
 
     for (auto* xfer : transfers_) {
@@ -561,6 +572,11 @@ int AudioEngine::stop_transfer_pipeline_locked() {
     LOGI("所有在途等时传输 URB 已完成注销与内核回收 (active=%d)",
          active_transfers_.load(std::memory_order_relaxed));
     active_transfers_.store(0, std::memory_order_release);
+
+    // 💡 排空仍在 write_pcm / 只读查询中的外部生产线程，确保后续 ring_buffer_ 销毁或重配绝不产生 UAF
+    while (active_writers_.load(std::memory_order_seq_cst) > 0) {
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
 
     for (auto* xfer : transfers_) {
         if (xfer) {
@@ -630,7 +646,6 @@ void AudioEngine::reset_ring_state_for_epoch(uint64_t target_epoch) {
     if (ring_buffer_) {
         ring_buffer_->clear();
     }
-    has_pre_rolled_.store(false, std::memory_order_release);
     consecutive_underruns_.store(0, std::memory_order_relaxed);
     phase_accumulator_ = 0;
     bresenham_accum_ = 0;
@@ -642,22 +657,25 @@ bool AudioEngine::try_unlock_preroll(uint64_t target_epoch, bool* cas_unmuted) {
     if (cas_unmuted) {
         *cas_unmuted = false;
     }
-    if (has_pre_rolled_.load(std::memory_order_acquire)) {
+    uint64_t cur = epoch_and_flush_.load(std::memory_order_acquire);
+    if ((cur >> EPOCH_SHIFT) != target_epoch || (cur & FLAG_PREROLLED) != 0ULL) {
         return false;
     }
     const size_t threshold = pre_roll_threshold_bytes_.load(std::memory_order_relaxed);
     if (!ring_buffer_ || threshold == 0 || ring_buffer_->available_read() < threshold) {
         return false;
     }
-    has_pre_rolled_.store(true, std::memory_order_release);
-    uint64_t expected_packed = (target_epoch << 1) | 1ULL;
-    const uint64_t desired_packed = (target_epoch << 1) | 0ULL;
-    const bool unmuted = epoch_and_flush_.compare_exchange_strong(
-        expected_packed, desired_packed,
-        std::memory_order_acq_rel, std::memory_order_acquire
-    );
+    // 💡 仅当 epoch 与未预充位仍匹配时，用单条 CAS 原子置位 FLAG_PREROLLED 并清除 FLAG_FLUSHING，严防过期线程污染新世代
+    const uint64_t desired = (target_epoch << EPOCH_SHIFT) | FLAG_PREROLLED;
+    while (!epoch_and_flush_.compare_exchange_weak(
+        cur, desired, std::memory_order_acq_rel, std::memory_order_acquire
+    )) {
+        if ((cur >> EPOCH_SHIFT) != target_epoch || (cur & FLAG_PREROLLED) != 0ULL) {
+            return false;
+        }
+    }
     if (cas_unmuted) {
-        *cas_unmuted = unmuted;
+        *cas_unmuted = ((cur & FLAG_FLUSHING) != 0ULL);
     }
     return true;
 }
@@ -918,7 +936,7 @@ void LIBUSB_CALL AudioEngine::isoc_transfer_cb(struct libusb_transfer* transfer)
 void AudioEngine::fill_isoc_transfer(struct libusb_transfer* transfer) {
     // 💡 R2/KTD2：仅由消费线程检查世代并安全排空 SPSC tail_
     const uint64_t packed_entry = epoch_and_flush_.load(std::memory_order_acquire);
-    const uint64_t target_epoch = packed_entry >> 1;
+    const uint64_t target_epoch = packed_entry >> EPOCH_SHIFT;
     if (consumed_epoch_.load(std::memory_order_relaxed) != target_epoch) {
         reset_ring_state_for_epoch(target_epoch);
         LOGI("消费线程已安全清空旧代残余并追平 epoch=%llu", static_cast<unsigned long long>(target_epoch));
@@ -933,7 +951,10 @@ void AudioEngine::fill_isoc_transfer(struct libusb_transfer* transfer) {
         LOGI("环形缓冲区预充就绪 (已缓冲 >= 100ms PCM: %zu 字节)，开启平滑输出",
              ring_buffer_->available_read());
     }
-    const bool ready_to_play = has_pre_rolled_.load(std::memory_order_acquire);
+    const uint64_t packed_after_unlock = epoch_and_flush_.load(std::memory_order_acquire);
+    const bool ready_to_play =
+        ((packed_after_unlock >> EPOCH_SHIFT) == target_epoch) &&
+        ((packed_after_unlock & FLAG_PREROLLED) != 0ULL);
 
     static thread_local std::vector<uint8_t> temp_pcm_in;
 
@@ -968,8 +989,8 @@ void AudioEngine::fill_isoc_transfer(struct libusb_transfer* transfer) {
 
         // 💡 每微帧实时采样原子静音标记，确保快路径哪怕在 URB 填充中途触发也能立刻切全 0
         const uint64_t packed_now = epoch_and_flush_.load(std::memory_order_acquire);
-        const bool epoch_changed = (packed_now >> 1) != target_epoch;
-        const bool flushing_now = (packed_now & 1ULL) != 0ULL;
+        const bool epoch_changed = (packed_now >> EPOCH_SHIFT) != target_epoch;
+        const bool flushing_now = (packed_now & FLAG_FLUSHING) != 0ULL;
         const bool paused_now = is_explicitly_paused_.load(std::memory_order_acquire);
         const bool muted = paused_now || flushing_now || epoch_changed;
 
@@ -984,9 +1005,20 @@ void AudioEngine::fill_isoc_transfer(struct libusb_transfer* transfer) {
             if (!muted && ready_to_play && ring_buffer_ && ring_buffer_->available_read() < raw_input_bytes) {
                 int underruns = consecutive_underruns_.fetch_add(1, std::memory_order_relaxed) + 1;
                 if (underruns >= 50) {
-                    has_pre_rolled_.store(false, std::memory_order_release);
+                    uint64_t cur_state = epoch_and_flush_.load(std::memory_order_acquire);
+                    while ((cur_state >> EPOCH_SHIFT) == target_epoch &&
+                           (cur_state & FLAG_PREROLLED) != 0ULL) {
+                        if (epoch_and_flush_.compare_exchange_weak(
+                                cur_state,
+                                cur_state & ~FLAG_PREROLLED,
+                                std::memory_order_acq_rel,
+                                std::memory_order_acquire
+                            )) {
+                            LOGW("环形缓冲区持续下溢超 50ms，重新进入 100ms 预充保护");
+                            break;
+                        }
+                    }
                     consecutive_underruns_.store(0, std::memory_order_relaxed);
-                    LOGW("环形缓冲区持续下溢超 50ms，重新进入 100ms 预充保护");
                 }
             } else {
                 consecutive_underruns_.store(0, std::memory_order_relaxed);
@@ -1126,7 +1158,11 @@ void AudioEngine::process_feedback_transfer(struct libusb_transfer* transfer) {
 }
 
 int AudioEngine::write_pcm(const uint8_t* data, size_t size, uint64_t expected_epoch) {
-    if (!ring_buffer_ || !is_running_.load(std::memory_order_acquire)) {
+    // 💡 P0 #3 并发防御：先登记 active_writers_，再以 seq_cst 检查 is_running_，
+    // 配合 stop_transfer_pipeline_locked() 先设 is_running_=false (seq_cst) 再排空 active_writers_，
+    // 确保 ring_buffer_ 在整个写入期间存活且不被 release_device()/reconfigure() 并发销毁。
+    ScopedActiveWriter writer_guard(active_writers_);
+    if (!is_running_.load(std::memory_order_seq_cst) || !ring_buffer_) {
         return -1;
     }
     if (!data || size == 0) {
@@ -1142,7 +1178,7 @@ int AudioEngine::write_pcm(const uint8_t* data, size_t size, uint64_t expected_e
     if (consumed_epoch_.load(std::memory_order_acquire) != expected_epoch) {
         const auto wait_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
         while (consumed_epoch_.load(std::memory_order_acquire) != expected_epoch) {
-            if (!is_running_.load(std::memory_order_acquire)) {
+            if (!is_running_.load(std::memory_order_seq_cst)) {
                 return -1;
             }
             if (get_current_buffer_epoch() != expected_epoch) {
@@ -1150,8 +1186,20 @@ int AudioEngine::write_pcm(const uint8_t* data, size_t size, uint64_t expected_e
             }
             // 💡 严禁误用 is_streaming() (静音期间恒 false)！仅以 is_running_ && active_transfers_ > 0 判定消费线程存活
             if (active_transfers_.load(std::memory_order_acquire) == 0) {
-                std::lock_guard<std::recursive_mutex> lock(op_mutex_);
-                if (!is_running_.load(std::memory_order_acquire)) {
+                // 💡 必须使用 try_to_lock：若控制线程正持 op_mutex_ 执行 stop_transfer_pipeline_locked() 等待 active_writers_==0，
+                // 阻塞等待 op_mutex_ 会引发互相等待的锁序死锁！
+                std::unique_lock<std::recursive_mutex> lock(op_mutex_, std::try_to_lock);
+                if (!lock.owns_lock()) {
+                    if (!is_running_.load(std::memory_order_seq_cst)) {
+                        return -1;
+                    }
+                    if (std::chrono::steady_clock::now() >= wait_deadline) {
+                        return -3;
+                    }
+                    std::this_thread::sleep_for(std::chrono::microseconds(100));
+                    continue;
+                }
+                if (!is_running_.load(std::memory_order_seq_cst)) {
                     return -1;
                 }
                 if (get_current_buffer_epoch() != expected_epoch) {
@@ -1175,6 +1223,9 @@ int AudioEngine::write_pcm(const uint8_t* data, size_t size, uint64_t expected_e
     }
 
     // 追平唤醒后再次校验世代，防止等待期间已发生新的切歌 Flush
+    if (!is_running_.load(std::memory_order_seq_cst)) {
+        return -1;
+    }
     if (get_current_buffer_epoch() != expected_epoch) {
         return -2;
     }
@@ -1231,15 +1282,18 @@ bool AudioEngine::is_streaming() const {
 }
 
 size_t AudioEngine::get_buffer_available() const {
-    return ring_buffer_ ? ring_buffer_->available_write() : 0;
+    ScopedActiveWriter writer_guard(active_writers_);
+    return (is_running_.load(std::memory_order_seq_cst) && ring_buffer_) ? ring_buffer_->available_write() : 0;
 }
 
 size_t AudioEngine::get_buffer_capacity() const {
-    return ring_buffer_ ? ring_buffer_->capacity() : 0;
+    ScopedActiveWriter writer_guard(active_writers_);
+    return (is_running_.load(std::memory_order_seq_cst) && ring_buffer_) ? ring_buffer_->capacity() : 0;
 }
 
 size_t AudioEngine::get_available_read() const {
-    return ring_buffer_ ? ring_buffer_->available_read() : 0;
+    ScopedActiveWriter writer_guard(active_writers_);
+    return (is_running_.load(std::memory_order_seq_cst) && ring_buffer_) ? ring_buffer_->available_read() : 0;
 }
 
 } // namespace purecast

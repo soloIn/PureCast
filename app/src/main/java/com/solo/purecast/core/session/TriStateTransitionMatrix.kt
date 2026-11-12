@@ -39,7 +39,14 @@ internal sealed interface TransitionEffect {
     data object CancelSuspendTimeout : TransitionEffect
     data class ScheduleRemoteCommandTimeout(val commandId: Long) : TransitionEffect
     data object CancelRemoteCommandTimeout : TransitionEffect
-    data class OpenDeviceOnResume(val sampleRate: Int, val bitDepth: Int, val channels: Int, val fallbackPausedEpoch: Long) : TransitionEffect
+    data class OpenDeviceOnResume(
+        val sampleRate: Int,
+        val bitDepth: Int,
+        val channels: Int,
+        val fallbackPausedEpoch: Long,
+        val protocol: StreamProtocol = StreamProtocol.NONE,
+        val sessionId: Long = 0L
+    ) : TransitionEffect
 }
 
 internal data class TransitionOutput(
@@ -307,64 +314,30 @@ internal object TriStateTransitionMatrix {
                 )
             }
 
-            is RemoteCommandTimeoutEvent -> {
-                if (ev.commandId != ctx.activeRemoteCommandId || snap.businessState != BusinessSessionState.TRANSITIONING) {
-                    return TransitionOutput(ctx, emptyList())
-                }
-                val fallbackState = ctx.preCommandBusinessState
-                val nextHw = if (fallbackState == BusinessSessionState.PLAYING &&
-                    isExclusiveActiveOrReconfiguring(snap.hardwareState)
-                ) {
-                    effects += TransitionEffect.ResumeNativeOutput
-                    HardwarePipelineState.EXCLUSIVE_ACTIVE
-                } else {
-                    snap.hardwareState
-                }
-                val timeoutErr = PlaybackError(
-                    code = ErrorCode.REMOTE_COMMAND_TIMEOUT,
-                    message = "远端设备未响应切歌指令",
-                    recoverable = true,
-                    timestampMs = nowMs
-                )
-                val nextSnap = snap.copy(
-                    businessState = fallbackState,
-                    hardwareState = nextHw,
-                    uiProtectionActive = false,
-                    errors = snap.errors + (ErrorCode.REMOTE_COMMAND_TIMEOUT to timeoutErr)
-                )
-                return TransitionOutput(
-                    ctx.copy(
-                        snapshot = nextSnap,
-                        activeRemoteCommandId = 0L,
-                        activeUiProtectionToken = 0L
-                    ),
-                    effects
-                )
-            }
+            is RemoteCommandTimeoutEvent -> return rollbackRemoteCommandFailure(
+                ctx = ctx,
+                commandId = ev.commandId,
+                errorCode = ErrorCode.REMOTE_COMMAND_TIMEOUT,
+                message = "远端设备未响应切歌指令",
+                nowMs = nowMs,
+                cancelTimeout = false
+            )
 
-            is RemoteCommandFailedEvent -> {
-                val err = PlaybackError(
-                    code = ev.errorCode,
-                    message = ev.message,
-                    recoverable = true,
-                    timestampMs = nowMs
-                )
-                val shouldRollback = snap.businessState == BusinessSessionState.TRANSITIONING &&
-                    ev.commandId == ctx.activeRemoteCommandId
-                val nextBiz = if (shouldRollback) ctx.preCommandBusinessState else snap.businessState
-                return TransitionOutput(
-                    ctx.copy(
-                        snapshot = snap.copy(
-                            businessState = nextBiz,
-                            uiProtectionActive = false,
-                            errors = snap.errors + (ev.errorCode to err)
-                        )
-                    ),
-                    if (shouldRollback) listOf(TransitionEffect.CancelRemoteCommandTimeout) else emptyList()
-                )
-            }
+            is RemoteCommandFailedEvent -> return rollbackRemoteCommandFailure(
+                ctx = ctx,
+                commandId = ev.commandId,
+                errorCode = ev.errorCode,
+                message = ev.message,
+                nowMs = nowMs,
+                cancelTimeout = true
+            )
 
             is StreamResumeEvent -> {
+                if (snap.businessState == BusinessSessionState.IDLE ||
+                    snap.businessState == BusinessSessionState.STOPPED
+                ) {
+                    return TransitionOutput(ctx, emptyList())
+                }
                 addCancelAllTimers(effects)
                 return when {
                     isDetachedOrPendingPermission(snap.hardwareState) -> {
@@ -376,7 +349,9 @@ internal object TriStateTransitionMatrix {
                             sampleRate = snap.audioPath.sampleRate,
                             bitDepth = snap.audioPath.bitDepth,
                             channels = snap.audioPath.channels,
-                            fallbackPausedEpoch = ev.resumedEpoch
+                            fallbackPausedEpoch = ev.resumedEpoch,
+                            protocol = snap.activeProtocol,
+                            sessionId = snap.sessionId
                         )
                         TransitionOutput(ctx.copy(pendingDebounceToken = 0L), effects)
                     }
@@ -611,6 +586,7 @@ internal object TriStateTransitionMatrix {
             businessState = BusinessSessionState.STOPPED,
             hardwareState = muteIfExclusive(ctx.snapshot.hardwareState),
             currentEpoch = newEpoch,
+            errors = clearTransientCommandErrors(ctx.snapshot.errors),
             uiProtectionActive = false
         )
         return TransitionOutput(ctx.copy(snapshot = nextSnap, pendingDebounceToken = 0L), effects)
@@ -634,9 +610,60 @@ internal object TriStateTransitionMatrix {
             audioPath = snap.audioPath.copy(isExclusive = false, protocol = StreamProtocol.NONE),
             progressPositionMs = 0L,
             progressDurationMs = 0L,
+            errors = clearTransientCommandErrors(snap.errors),
             uiProtectionActive = false
         )
         return TransitionOutput(ctx.copy(snapshot = nextSnap), effects)
+    }
+
+    /**
+     * 💡 统一处理 DACP 切歌失败/超时回滚，校验 commandId 与 TRANSITIONING 态防止旧响应污染新指令，并同步恢复硬件声卡输出
+     */
+    private fun rollbackRemoteCommandFailure(
+        ctx: TransitionContext,
+        commandId: Long,
+        errorCode: ErrorCode,
+        message: String,
+        nowMs: Long,
+        cancelTimeout: Boolean
+    ): TransitionOutput {
+        val snap = ctx.snapshot
+        if (commandId != ctx.activeRemoteCommandId || snap.businessState != BusinessSessionState.TRANSITIONING) {
+            return TransitionOutput(ctx, emptyList())
+        }
+        val effects = mutableListOf<TransitionEffect>()
+        if (cancelTimeout) {
+            effects += TransitionEffect.CancelRemoteCommandTimeout
+        }
+        val fallbackState = ctx.preCommandBusinessState
+        val nextHw = if (fallbackState == BusinessSessionState.PLAYING &&
+            isExclusiveActiveOrReconfiguring(snap.hardwareState)
+        ) {
+            effects += TransitionEffect.ResumeNativeOutput
+            HardwarePipelineState.EXCLUSIVE_ACTIVE
+        } else {
+            snap.hardwareState
+        }
+        val err = PlaybackError(
+            code = errorCode,
+            message = message,
+            recoverable = true,
+            timestampMs = nowMs
+        )
+        val nextSnap = snap.copy(
+            businessState = fallbackState,
+            hardwareState = nextHw,
+            uiProtectionActive = false,
+            errors = snap.errors + (errorCode to err)
+        )
+        return TransitionOutput(
+            ctx.copy(
+                snapshot = nextSnap,
+                activeRemoteCommandId = 0L,
+                activeUiProtectionToken = 0L
+            ),
+            effects
+        )
     }
 
     private fun isExclusiveActiveOrReconfiguring(hw: HardwarePipelineState): Boolean =

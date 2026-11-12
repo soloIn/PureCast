@@ -4,6 +4,7 @@
 #include <functional>
 #include <thread>
 #include <atomic>
+#include <mutex>
 #include <vector>
 #include <cstdint>
 
@@ -46,6 +47,16 @@ public:
     bool start(int port = 5000);
     void stop();
 
+    /**
+     * 💡 被其他协议抢占或 10 分钟挂起超时时：同步停撤 RaopRtp UDP 线程并关闭当前客户端 RTSP 连接，保留 listening server_fd_
+     */
+    void preempt_active_client();
+
+    /**
+     * 💡 设备因焦点丢失或拔插释放后重新独占恢复时：同步刷新 RaopRtp 活跃 epoch 并解除暂停
+     */
+    bool resume_after_reopen(uint64_t new_epoch);
+
     bool is_running() const { return is_running_.load(); }
 
     void set_stream_request_callback(StreamRequestCallback cb) { stream_request_cb_ = std::move(cb); }
@@ -79,6 +90,8 @@ private:
 private:
     int server_port_{5000};
     int server_fd_{-1};
+    std::mutex client_fd_mutex_;
+    std::atomic<int> active_client_fd_{-1};
     std::atomic<bool> is_running_{false};
     std::thread server_thread_;
 

@@ -9,6 +9,8 @@ import com.solo.purecast.core.session.HardwareFastPathController
 import com.solo.purecast.core.session.HardwareReconfiguredEvent
 import com.solo.purecast.core.session.MetadataPatchEvent
 import com.solo.purecast.core.session.ProgressUpdateEvent
+import com.solo.purecast.core.session.ProtocolResumeReopenResult
+import com.solo.purecast.core.session.ProtocolSessionBridge
 import com.solo.purecast.core.session.SessionEventEnvelope
 import com.solo.purecast.core.session.SessionEventPayload
 import com.solo.purecast.core.session.StreamResumeEvent
@@ -94,6 +96,39 @@ class UpnpRendererServer(
     @Volatile
     private var currentTrackMetadata = TrackMetadata()
 
+    constructor(
+        scope: CoroutineScope,
+        sessionBridge: ProtocolSessionBridge,
+        snapshotProvider: () -> PlayerSessionSnapshot,
+        fastPath: HardwareFastPathController = HardwareFastPathController.default,
+        audioGateway: DemuxerAudioGateway = NativeDemuxerAudioGateway,
+        onWakeUpUi: (() -> Unit)? = null,
+        clockMs: () -> Long = { System.currentTimeMillis() },
+        friendlyName: String = "PureCast TV",
+        httpPort: Int = 7952
+    ) : this(
+        scope = scope,
+        dispatchEvent = { envelope -> sessionBridge.dispatch(envelope) },
+        allocateSessionId = { sessionBridge.nextSessionId() },
+        allocateSequence = { sessionBridge.nextSequence() },
+        onAcquireHardwareForStream = { sampleRate, bitDepth, channels, codec ->
+            sessionBridge.acquireHardwareForStream(
+                StreamProtocol.UPNP_DLNA,
+                sampleRate,
+                bitDepth,
+                channels,
+                codec
+            )
+        },
+        snapshotProvider = snapshotProvider,
+        fastPath = fastPath,
+        audioGateway = audioGateway,
+        onWakeUpUi = onWakeUpUi,
+        clockMs = clockMs,
+        friendlyName = friendlyName,
+        httpPort = httpPort
+    )
+
     /**
      * 💡 获取当前流播放进度秒数
      */
@@ -130,8 +165,17 @@ class UpnpRendererServer(
     /**
      * 💡 主动中止当前 UPnP 解复用器与流传输（如被 AirPlay 抢占或停止广播时调用）
      */
-    fun stopPlayback(isPreempted: Boolean = true) {
-        Logger.upnp.i(TAG, "主动中止 UPnP 流播放 (isPreempted=$isPreempted)")
+    fun stopPlayback(isPreempted: Boolean = true, targetSessionId: Long? = null) {
+        synchronized(sessionStateLock) {
+            if (targetSessionId != null && activeUpnpSessionId != targetSessionId) {
+                Logger.upnp.d(
+                    TAG,
+                    "忽略过期 UPnP 停止/抢占指令: targetSid=$targetSessionId, activeSid=$activeUpnpSessionId"
+                )
+                return
+            }
+        }
+        Logger.upnp.i(TAG, "主动中止 UPnP 流播放 (isPreempted=$isPreempted, targetSid=$targetSessionId)")
         demuxer?.stop()
         val reason = if (isPreempted) FlushReason.PREEMPT else FlushReason.STOP_OR_TEARDOWN
         val stoppedEpoch = fastPath.emergencyMuteAndFlush(reason)
@@ -143,8 +187,37 @@ class UpnpRendererServer(
                 emitEventLocked(StreamStopEvent(newEpoch = stoppedEpoch, isPreempted = isPreempted))
             }
             sessionSetupDispatched = false
+            if (isPreempted) {
+                activeUpnpSessionId = 0L
+            }
         }
         notifyTransportState("STOPPED")
+    }
+
+    /**
+     * 💡 P0 #2 重开 USB DAC 后恢复 UPnP 拉流或复用仍活跃的解复用器
+     */
+    fun resumeStreamAfterDeviceReopen(sessionId: Long): ProtocolResumeReopenResult {
+        val uriToRestart = synchronized(sessionStateLock) {
+            if (activeUpnpSessionId == 0L || activeUpnpSessionId != sessionId || currentUri.isBlank()) {
+                null
+            } else {
+                currentUri
+            }
+        } ?: run {
+            Logger.upnp.w(TAG, "UPnP 重开声卡校验失败：会话或 URI 无效 (sid=$sessionId)")
+            return ProtocolResumeReopenResult.PRODUCER_DEAD
+        }
+
+        val existing = demuxer
+        if (existing != null && existing.isRunning() && existing.getCurrentUri() == uriToRestart) {
+            Logger.upnp.i(TAG, "UPnP 重开声卡校验通过：Demuxer 仍在推流 (sid=$sessionId)")
+            return ProtocolResumeReopenResult.STREAMING_READY
+        }
+
+        Logger.upnp.i(TAG, "UPnP 重开声卡后重新拉起 Demuxer 等待首帧 (sid=$sessionId, uri=$uriToRestart)")
+        ensureDemuxer().start(uriToRestart)
+        return ProtocolResumeReopenResult.RESTARTING
     }
 
     /**
@@ -580,8 +653,8 @@ class UpnpRendererServer(
         val metadataXml = extractTagValue(body, "CurrentURIMetaData")
         Logger.upnp.i(TAG, "SetAVTransportURI: uri=$uri, hasMetadata=${metadataXml.isNotEmpty()}")
 
-        val isUriChanged = uri.isNotEmpty() && uri != currentUri
-        if (isUriChanged) {
+        if (uri.isNotEmpty()) {
+            val isSameUriReplay = uri == currentUri
             if (demuxer?.isRunning() == true) {
                 demuxer?.stop()
             }
@@ -590,7 +663,7 @@ class UpnpRendererServer(
             } else {
                 0L
             }
-            val parsedMeta = if (metadataXml.isNotEmpty() || currentTrackMetadata.title.isEmpty() || currentTrackMetadata.title == TrackMetadata.DEFAULT_TITLE) {
+            val parsedMeta = if (metadataXml.isNotEmpty() || !isSameUriReplay || currentTrackMetadata.title.isEmpty() || currentTrackMetadata.title == TrackMetadata.DEFAULT_TITLE) {
                 parseDidlLiteMetadata(metadataXml, uri)
             } else {
                 currentTrackMetadata.copy(trackUri = uri)
@@ -629,9 +702,6 @@ class UpnpRendererServer(
                 }
             }
         } else {
-            if (uri.isNotEmpty()) {
-                currentUri = uri
-            }
             if (metadataXml.isNotEmpty() || currentTrackMetadata.title.isEmpty() || currentTrackMetadata.title == TrackMetadata.DEFAULT_TITLE) {
                 val parsedMeta = parseDidlLiteMetadata(metadataXml, currentUri)
                 synchronized(sessionStateLock) {
