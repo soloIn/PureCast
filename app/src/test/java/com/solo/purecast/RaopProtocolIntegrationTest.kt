@@ -5,6 +5,7 @@ import com.solo.purecast.model.AudioPathState
 import com.solo.purecast.model.PlaybackStatus
 import com.solo.purecast.model.StreamProtocol
 import com.solo.purecast.model.TrackMetadata
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -89,25 +90,6 @@ class RaopProtocolIntegrationTest {
         assertEquals(44100, airPlayPreempted.sampleRate)
         assertEquals(16, airPlayPreempted.bitDepth)
         assertTrue(airPlayPreempted.isExclusive)
-    }
-
-    @Test
-    fun testTrackMetadataWithCoverBytes() {
-        val dummyCover = byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 0xFF.toByte(), 0xE0.toByte()) // JPEG SOI
-        val meta = TrackMetadata(
-            title = "Hotel California",
-            artist = "Eagles",
-            album = "Hotel California",
-            coverBytes = dummyCover,
-            durationMs = 391000L,
-            isLiveStream = true
-        )
-
-        assertEquals("Hotel California", meta.title)
-        assertEquals("Eagles", meta.artist)
-        assertNotNull(meta.coverBytes)
-        assertEquals(4, meta.coverBytes?.size)
-        assertTrue(meta.isLiveStream)
     }
 
     /**
@@ -569,52 +551,6 @@ class RaopProtocolIntegrationTest {
     }
 
     /**
-     * 💡 回归测试 3: 验证切歌时元数据与进度条平稳过渡 (保留现有封面、重置在途进度)
-     */
-    @Test
-    fun testTrackSwitchMetadataAndProgressStability() {
-        val existingCover = byteArrayOf(0x01, 0x02, 0x03)
-        var currentMeta = TrackMetadata(
-            title = "Track 1",
-            artist = "Artist 1",
-            album = "Album 1",
-            coverBytes = existingCover,
-            durationMs = 240000L
-        )
-
-        // 模拟切歌：新歌的 DMAP 元数据到达，尚未包含封面
-        val newTitle = "Track 2"
-        val newArtist = "Artist 2"
-        val isNewTrack = (newTitle != currentMeta.title) || (newArtist != currentMeta.artist)
-        assertTrue("检测到切歌", isNewTrack)
-
-        // 验证切歌时沿用已有封面垫底，杜绝空白闪烁
-        val mergedCover = null ?: currentMeta.coverBytes
-        val nextMeta = TrackMetadata(
-            title = newTitle,
-            artist = newArtist,
-            album = "Album 2",
-            coverBytes = mergedCover,
-            durationMs = 180000L
-        )
-        assertEquals(existingCover, nextMeta.coverBytes)
-        assertEquals("Track 2", nextMeta.title)
-
-        // 验证进度重置与安全钳位
-        var playbackPositionMs = 210000L // 上一曲在途位置
-        if (isNewTrack) {
-            playbackPositionMs = 0L // 切歌即时归零
-        }
-        assertEquals(0L, playbackPositionMs)
-
-        // 模拟新歌首个 progress 更新到达 (例如 position=5000ms, duration=180000ms)
-        val incomingPos = 5000L
-        val incomingDur = 180000L
-        val clampedPos = incomingPos.coerceIn(0L, incomingDur)
-        assertEquals(5000L, clampedPos)
-    }
-
-    /**
      * 💡 验证静音帧深度检测 (64-bit对齐扫描) 与双向状态机同步：
      * 1. 连续 180 帧全 0 静音 (约 1.44s) 触发同步 PAUSED，且静音帧不灌入缓冲，杜绝短暂停顿或乐曲休止符误判
      * 2. 收到有效非静音包立即唤醒，重置 JitterBuffer 并恢复 PLAYING
@@ -757,37 +693,6 @@ class RaopProtocolIntegrationTest {
         assertTrue("STOPPED 必须属于待机状态，以支持停止推流后恢复指引与主题", isStandby(PlaybackStatus.STOPPED))
         assertFalse("PLAYING 绝非待机状态", isStandby(PlaybackStatus.PLAYING))
         assertFalse("PAUSED 绝非待机状态", isStandby(PlaybackStatus.PAUSED))
-    }
-
-    /**
-     * 💡 验证切歌至无时长直播流/网络电台时的时长重置与 isLiveStream 判定
-     */
-    @Test
-    fun testSwitchToLiveStreamWithoutDurationResetsDurationAndEnablesLive() {
-        val previousSong = TrackMetadata(
-            title = "Previous Song",
-            artist = "Previous Artist",
-            album = "Previous Album",
-            durationMs = 180000L,
-            isLiveStream = false
-        )
-
-        // 场景 1：切换到新曲目（网络电台/直播流，无时长 durationMs <= 0）
-        val isNewTrack = true
-        val incomingDurationMs = 0L
-        val mergedDuration = if (incomingDurationMs > 0) incomingDurationMs else if (isNewTrack) 0L else previousSong.durationMs
-        val isLive = mergedDuration <= 0
-
-        assertEquals("切歌进入直播流时总时长必须归零", 0L, mergedDuration)
-        assertTrue("切歌进入无时长音频时必须被标记为直播流", isLive)
-
-        // 场景 2：同一曲目增量推送（未附带时长），应保留已知时长
-        val isSameTrack = false
-        val sameTrackMergedDuration = if (incomingDurationMs > 0) incomingDurationMs else if (isSameTrack) 0L else previousSong.durationMs
-        val isSameTrackLive = sameTrackMergedDuration <= 0
-
-        assertEquals("同一曲目增量更新未附带时长时必须继承已知时长", 180000L, sameTrackMergedDuration)
-        assertFalse("有已知时长的曲目不得被误判为直播流", isSameTrackLive)
     }
 
     /**

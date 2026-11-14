@@ -46,28 +46,39 @@ object NativeAudioEngine {
     ): Int
 
     /**
-     * 向无锁 SPSC 环形缓冲区写入原始 PCM 数据包
-     * @param data PCM 字节数组
-     * @param offset 偏移量
-     * @param length 写入长度
-     * @return 实际写入的字节数，负数表示缓冲区异常
+     * 💡 UAC 原位三元组切频与安全回滚
+     * 严禁在上层暴露 altSetting，由 Native 内部通过 parse_audio_descriptors 匹配
+     * @return 成功返回新激活的 buffer_epoch (>= 1L)，失败返回负错误码
      */
-    external fun writePcm(data: ByteArray, offset: Int, length: Int): Int
+    external fun reconfigureAudioFormat(
+        sampleRate: Int,
+        bitDepth: Int,
+        channels: Int
+    ): Long
 
     /**
-     * 暂停等时传输流
+     * 💡 无锁硬件快路径：按 FlushReason 立即静音保活并可选递增 epoch 排空旧流
+     * @param reason 0=EXPLICIT_PAUSE, 1=FLUSH_SWITCH, 2=STOP_OR_TEARDOWN, 3=PREEMPT
+     * @return 最新有效的 buffer_epoch (>= 1L)
      */
-    external fun pauseStream(): Int
+    external fun emergencyMuteAndFlush(reason: Int): Long
+
+    /**
+     * 获取当前活跃的无锁环形缓冲区世代 (Epoch)
+     */
+    external fun getCurrentBufferEpoch(): Long
+
+    /**
+     * 💡 带世代防串扰与消费追平门闩的 PCM 直通写入
+     * @param expectedEpoch 切频/开流时获取的世代令牌
+     * @return >0 实际写入字节，0 整包满载丢弃，负数表示停止/过期/超时错误
+     */
+    external fun writePcm(data: ByteArray, offset: Int, length: Int, expectedEpoch: Long): Int
 
     /**
      * 恢复等时传输流
      */
     external fun resumeStream(): Int
-
-    /**
-     * 停止 URB 传输并清空缓冲区
-     */
-    external fun stopStream(): Int
 
     /**
      * 彻底释放 USB 设备独占权，触发内核驱动重绑时序
@@ -96,10 +107,18 @@ object NativeAudioEngine {
     external fun isStreaming(): Boolean
 
     /**
-     * FLAC 解码器采样格式解析就绪回调
+     * FLAC 解码器采样格式解析与首帧写入事件回调
      */
-    fun interface FlacFormatCallback {
-        fun onFormatReady(sampleRate: Int, bitDepth: Int, channels: Int, totalPcmFrames: Long)
+    interface FlacFormatCallback {
+        /**
+         * 同步完成硬件三元组重配并锁定流世代，返回 >0 的 expectedEpoch；<= 0 则中止解码
+         */
+        fun onFormatReady(sampleRate: Int, bitDepth: Int, channels: Int, totalPcmFrames: Long): Long
+
+        /**
+         * 首包有效 decoded PCM 写入环形缓冲时触发，用于解锁 PLAYING 状态
+         */
+        fun onFirstPcmWritten() {}
     }
 
     /**
@@ -135,6 +154,16 @@ object NativeAudioEngine {
      * 💡 停止底层 Native RAOP 服务并释放全部网络与音频管道
      */
     external fun stopAirPlayServer()
+
+    /**
+     * 💡 跨协议抢占时仅中止当前 AirPlay 客户端 UDP 推流与活动 RTSP client_fd，保持 server_fd 监听在线
+     */
+    external fun preemptAirPlayClient()
+
+    /**
+     * 💡 DAC 重新独占后刷新 RaopRtp 活跃 epoch 并解除暂停态，返回 true 表示 UDP/RTSP 管线仍在线
+     */
+    external fun updateAirPlayActiveEpoch(newEpoch: Long): Boolean
 
     /**
      * 💡 注入经由 RSA-2048 私钥解密出的原始 AES-128 密钥与 IV

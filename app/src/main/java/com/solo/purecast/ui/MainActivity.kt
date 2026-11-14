@@ -21,6 +21,8 @@ import com.solo.purecast.ui.screen.MainTvScreen
 import com.solo.purecast.ui.screen.SettingsScreen
 import com.solo.purecast.ui.theme.PureCastTheme
 import com.solo.purecast.util.Logger
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 
 /** 顶层页面枚举 */
 enum class TvNavScreen { PLAYBACK, SETTINGS }
@@ -45,18 +47,33 @@ class MainActivity : ComponentActivity() {
         // 初始化外观色彩系统
         com.solo.purecast.ui.theme.AppPalette.init(this)
 
-        // 确保后台音频前台服务与 UPnP 监听已就绪
-        PlaybackService.start(this)
-        handleUsbAttachedIntent(intent)
+        val coldAttachedDevice: android.hardware.usb.UsbDevice? = if (intent?.action == android.hardware.usb.UsbManager.ACTION_USB_DEVICE_ATTACHED) {
+            androidx.core.content.IntentCompat.getParcelableExtra(
+                intent,
+                android.hardware.usb.UsbManager.EXTRA_DEVICE,
+                android.hardware.usb.UsbDevice::class.java
+            )
+        } else null
+
+        // 确保后台音频前台服务与 UPnP 监听已就绪，透传冷启动设备
+        PlaybackService.start(this, attachedUsbDevice = coldAttachedDevice)
 
         setContent {
             PureCastTheme {
                 var currentScreen by remember { mutableStateOf(TvNavScreen.PLAYBACK) }
-                val audioPathState by PlaybackService.audioPathState.collectAsState()
-                val playbackStatus by PlaybackService.playbackStatus.collectAsState()
+                val audioPathState by remember {
+                    PlaybackService.sessionSnapshot
+                        .map { it.audioPath }
+                        .distinctUntilChanged()
+                }.collectAsState(initial = remember { PlaybackService.sessionSnapshot.value.audioPath })
+                val playbackStatus by remember {
+                    PlaybackService.sessionSnapshot
+                        .map { it.playbackStatus }
+                        .distinctUntilChanged()
+                }.collectAsState(initial = remember { PlaybackService.sessionSnapshot.value.playbackStatus })
 
                 // 💡 屏保智能防休眠联动：
-                // 仅当位于播放界面 (PLAYBACK) 且实际处于播放中 (PLAYING) 时，持有 FLAG_KEEP_SCREEN_ON 阻止系统屏保介入；
+                // 仅当位于播放界面 (PLAYBACK) 且实际处于播放中 (PLAYING / TRANSITIONING) 时，持有 FLAG_KEEP_SCREEN_ON 阻止系统屏保介入；
                 // 一旦暂停 (PAUSED)、停止 (STOPPED)、无流空闲 (IDLE) 或进入设置界面 (SETTINGS)，立即清除常亮标志，恢复系统标准屏保倒计时
                 LaunchedEffect(currentScreen, playbackStatus) {
                     currentNavScreen = currentScreen
@@ -81,7 +98,8 @@ class MainActivity : ComponentActivity() {
                                 onTogglePlayPause = { togglePlayPause() },
                                 onPreviousTrack = { handlePreviousTrack() },
                                 onNextTrack = { handleNextTrack() },
-                                onOpenSettings = { currentScreen = TvNavScreen.SETTINGS }
+                                onOpenSettings = { currentScreen = TvNavScreen.SETTINGS },
+                                onSeekTo = { posMs -> PlaybackService.instance?.seekTo(posMs) }
                             )
                         }
                         TvNavScreen.SETTINGS -> {
@@ -99,7 +117,7 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         Logger.ui.i(TAG, "MainActivity onResume: 检查 USB DAC 授权状态与屏保常亮状态...")
-        checkAndRequestUsbPermission()
+        PlaybackService.instance?.registerUsbPermissionActivity(this)
         updateKeepScreenOn()
     }
 
@@ -118,36 +136,17 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun checkAndRequestUsbPermission() {
-        val audioState = PlaybackService.audioPathState.value
+        val audioState = PlaybackService.sessionSnapshot.value.audioPath
         if (audioState.isDacConnected) {
             Logger.ui.d(TAG, "当前 USB DAC 已就绪连接 (${audioState.dacName})，无需再次请求授权")
             return
         }
-
-        // 优先通过静默扫描自愈已有授权
-        val attached = PlaybackService.instance?.scanUsbDevice() == true
-        if (attached) {
-            Logger.ui.i(TAG, "通过静默扫描成功自愈连接 USB DAC")
-            return
-        }
-
-        // 检查系统当前是否连接了 USB 音频类设备
-        val usbManager = getSystemService(android.content.Context.USB_SERVICE) as? android.hardware.usb.UsbManager ?: return
-        val hasAudioDevice = usbManager.deviceList.values.any { device ->
-            device.vendorId == com.solo.purecast.core.usb.UsbDeviceManager.SONY_VENDOR_ID ||
-                    device.deviceClass == android.hardware.usb.UsbConstants.USB_CLASS_AUDIO ||
-                    (0 until device.interfaceCount).any { device.getInterface(it).interfaceClass == android.hardware.usb.UsbConstants.USB_CLASS_AUDIO }
-        }
-
-        // 仅当确实有物理插入且未获授权时才发起，防止无设备时空跑弹窗或并发重入
-        if (hasAudioDevice) {
-            PlaybackService.instance?.requestUsbPermission(this)
-        }
+        PlaybackService.instance?.scanAndRequestUsbPermission(this)
     }
 
     private fun updateKeepScreenOn() {
         val shouldKeepScreenOn = currentNavScreen == TvNavScreen.PLAYBACK &&
-                PlaybackService.playbackStatus.value == PlaybackStatus.PLAYING
+                PlaybackService.sessionSnapshot.value.playbackStatus == PlaybackStatus.PLAYING
         if (shouldKeepScreenOn) {
             window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             Logger.ui.i(TAG, "大屏处于有效播放中: 激活 FLAG_KEEP_SCREEN_ON (保持屏幕常亮)")
@@ -160,6 +159,7 @@ class MainActivity : ComponentActivity() {
     override fun onStop() {
         super.onStop()
         Logger.ui.i(TAG, "MainActivity onStop: 退入后台，清除 FLAG_KEEP_SCREEN_ON 释放屏保控制权")
+        PlaybackService.instance?.registerUsbPermissionActivity(null)
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
     }
 
@@ -172,14 +172,8 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun togglePlayPause() {
-        val currentStatus = PlaybackService.playbackStatus.value
-        if (currentStatus == PlaybackStatus.PLAYING) {
-            Logger.ui.i(TAG, "遥控器触发: 暂停播放")
-            PlaybackService.instance?.pausePlayback()
-        } else {
-            Logger.ui.i(TAG, "遥控器触发: 恢复播放")
-            PlaybackService.instance?.resumePlayback()
-        }
+        Logger.ui.i(TAG, "遥控器触发: 播放/暂停切换")
+        PlaybackService.instance?.togglePlayPause()
     }
 
     private fun handlePreviousTrack() {
@@ -190,13 +184,6 @@ class MainActivity : ComponentActivity() {
     private fun handleNextTrack() {
         Logger.ui.i(TAG, "遥控器触发: 下一曲")
         PlaybackService.instance?.handleNextTrack()
-    }
-
-    /**
-     * 💡 全局按键分发
-     */
-    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
-        return super.dispatchKeyEvent(event)
     }
 
     /**
@@ -212,10 +199,20 @@ class MainActivity : ComponentActivity() {
                 return true
             }
 
-            KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE,
-            KeyEvent.KEYCODE_MEDIA_PLAY,
-            KeyEvent.KEYCODE_MEDIA_PAUSE -> {
+            KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> {
                 togglePlayPause()
+                return true
+            }
+
+            KeyEvent.KEYCODE_MEDIA_PLAY -> {
+                Logger.ui.i(TAG, "遥控器触发: KEYCODE_MEDIA_PLAY 恢复播放")
+                PlaybackService.instance?.resumePlayback()
+                return true
+            }
+
+            KeyEvent.KEYCODE_MEDIA_PAUSE -> {
+                Logger.ui.i(TAG, "遥控器触发: KEYCODE_MEDIA_PAUSE 暂停播放")
+                PlaybackService.instance?.pausePlayback()
                 return true
             }
 

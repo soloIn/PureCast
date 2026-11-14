@@ -33,39 +33,59 @@ import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.tv.material3.ExperimentalTvMaterial3Api
 import androidx.tv.material3.Text
+import com.solo.purecast.model.DurationState
 import com.solo.purecast.model.PlaybackStatus
+import com.solo.purecast.model.SeekCapability
+
+/**
+ * 💡 进度条右侧状态标签语义模式（严格由 DurationState + PlaybackStatus 派生）
+ */
+internal sealed interface ProgressRightLabelMode {
+    data object Standby : ProgressRightLabelMode
+    data object LiveBadge : ProgressRightLabelMode
+    data class Placeholder(val text: String) : ProgressRightLabelMode
+    data class FormattedTime(val text: String) : ProgressRightLabelMode
+}
 
 /**
  * 💡 PureCast 纤细圆角进度条与时间轴组件 (ProgressBarComponent)
  * 遵循 Apple TV 极简工业美学设计：
  * 1. 轨道高度默认为 4dp，D-Pad 获得焦点时动态平滑展开至 6dp 并点亮白色微光发光边框与游标。
  * 2. 悬浮对比度保护：轨道底槽采用高透半白 [Color(0x40FFFFFF)]，填充条使用高纯亮白 [Color.White]，在任意流光背景下清晰可见。
- * 3. 左侧展示当前播放时间 (mm:ss)，右侧展示总时长、"等待投屏接入" 或实时流 "LIVE / 实时直通" 状态。
- * 4. 针对非实时流且支持主动寻道的流支持遥控器 D-Pad 左右键快进 / 快退 10 秒；针对实时广播流自适应禁用寻道。
+ * 3. 左侧展示当前播放时间 (mm:ss)，右侧依据 [DurationState] 展示总时长、"等待投屏接入"、"--:--" 或实时流 "LIVE / 实时直通" 状态。
+ * 4. 仅当 [SeekCapability.SEEKABLE] 且为固定点播时长 [DurationState.FIXED] 时启用遥控器 D-Pad 寻道焦点。
  */
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
 fun ProgressBarComponent(
     currentPositionMs: Long,
     totalDurationMs: Long,
-    isLiveStream: Boolean,
+    durationState: DurationState,
+    seekCapability: SeekCapability,
     onSeek: (newPositionMs: Long) -> Unit,
     modifier: Modifier = Modifier,
     hasDarkBackground: Boolean = true,
     focusRequester: FocusRequester? = null,
     onPlayPauseClick: (() -> Unit)? = null,
-    playbackStatus: PlaybackStatus = PlaybackStatus.IDLE,
-    canSeek: Boolean = false
+    playbackStatus: PlaybackStatus = PlaybackStatus.IDLE
 ) {
     val isIdle = playbackStatus == PlaybackStatus.IDLE || playbackStatus == PlaybackStatus.STOPPED
-    val canFocus = canSeek && !isLiveStream && totalDurationMs > 0L && !isIdle
-    val isLivePlaying = playbackStatus == PlaybackStatus.PLAYING && (isLiveStream || totalDurationMs <= 0L)
+    val rightLabelMode = resolveProgressRightLabel(
+        totalDurationMs = totalDurationMs,
+        durationState = durationState,
+        playbackStatus = playbackStatus
+    )
+    val canFocus = seekCapability == SeekCapability.SEEKABLE &&
+        durationState == DurationState.FIXED &&
+        totalDurationMs > 0L &&
+        !isIdle
     val interactionSource = remember { MutableInteractionSource() }
     val isFocused by interactionSource.collectIsFocusedAsState()
 
@@ -81,30 +101,16 @@ fun ProgressBarComponent(
     }
     val totalTimeColor = if (hasDarkBackground) Color(0xB3FFFFFF) else Color(0xFF6E6E73)
 
-    // 💡 焦点展开动画：获得焦点时轨道由 4dp 增至 6dp，带来沉浸式反馈
     val animatedHeight by animateDpAsState(
         targetValue = if (isFocused && canFocus) 6.dp else 4.dp,
         animationSpec = tween(durationMillis = 200),
         label = "progressBarHeight"
     )
 
-    // 💡 实时流呼吸红点动画
-    val infiniteTransition = rememberInfiniteTransition(label = "liveDotTransition")
-    val liveDotAlpha by infiniteTransition.animateFloat(
-        initialValue = 0.35f,
-        targetValue = 1.0f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 800),
-            repeatMode = RepeatMode.Reverse
-        ),
-        label = "liveDotAlpha"
-    )
-
-    // 计算进度比例 (0.0f ~ 1.0f) - 待机状态下展示 0 进度，活跃实时流展示满条
     val progressFraction = calculateProgressFraction(
         currentPositionMs = currentPositionMs,
         totalDurationMs = totalDurationMs,
-        isLiveStream = isLiveStream,
+        durationState = durationState,
         isIdle = isIdle
     )
 
@@ -172,7 +178,7 @@ fun ProgressBarComponent(
             )
 
             // 💡 获得焦点时的进度发光游标点 (Thumb Indicator)
-            if (isFocused && !isLiveStream && totalDurationMs > 0L) {
+            if (isFocused && canFocus) {
                 Box(
                     modifier = Modifier.fillMaxWidth(progressFraction),
                     contentAlignment = Alignment.CenterEnd
@@ -190,7 +196,7 @@ fun ProgressBarComponent(
 
         Spacer(modifier = Modifier.height(6.dp))
 
-        // 底部时间指示栏 (左侧已播放，右侧总时长或实时流徽章)
+        // 底部时间指示栏 (左侧已播放，右侧总时长 / "--:--" / LIVE 徽章)
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -204,39 +210,65 @@ fun ProgressBarComponent(
                 color = currentTimeColor
             )
 
-            // 右侧总时长、实时流状态或待机接入状态
-            if (isIdle) {
-                Text(
-                    text = "等待投屏接入",
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.Normal,
-                    color = totalTimeColor
-                )
-            } else if (isLivePlaying) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .size(7.dp)
-                            .clip(CircleShape)
-                            .background(Color(0xFFFF453A).copy(alpha = liveDotAlpha))
-                    )
+            when (rightLabelMode) {
+                ProgressRightLabelMode.Standby -> {
                     Text(
-                        text = "LIVE / 实时直通",
+                        text = "等待投屏接入",
                         fontSize = 12.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        color = Color(0xFFFF453A)
+                        fontWeight = FontWeight.Normal,
+                        color = totalTimeColor
                     )
                 }
-            } else {
-                Text(
-                    text = formatTimeMs(totalDurationMs),
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.Medium,
-                    color = totalTimeColor
-                )
+
+                ProgressRightLabelMode.LiveBadge -> {
+                    // 💡 仅在直播播放分支启动呼吸动画并延后至 graphicsLayer 读取，避免非直播态空转帧渲染
+                    val infiniteTransition = rememberInfiniteTransition(label = "liveDotTransition")
+                    val liveDotAlpha by infiniteTransition.animateFloat(
+                        initialValue = 0.35f,
+                        targetValue = 1.0f,
+                        animationSpec = infiniteRepeatable(
+                            animation = tween(durationMillis = 800),
+                            repeatMode = RepeatMode.Reverse
+                        ),
+                        label = "liveDotAlpha"
+                    )
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(7.dp)
+                                .clip(CircleShape)
+                                .graphicsLayer { alpha = liveDotAlpha }
+                                .background(Color(0xFFFF453A))
+                        )
+                        Text(
+                            text = "LIVE / 实时直通",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = Color(0xFFFF453A)
+                        )
+                    }
+                }
+
+                is ProgressRightLabelMode.Placeholder -> {
+                    Text(
+                        text = rightLabelMode.text,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = totalTimeColor
+                    )
+                }
+
+                is ProgressRightLabelMode.FormattedTime -> {
+                    Text(
+                        text = rightLabelMode.text,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = totalTimeColor
+                    )
+                }
             }
         }
     }
@@ -245,7 +277,7 @@ fun ProgressBarComponent(
 /**
  * 💡 辅助工具：将毫秒时间平滑转换为 mm:ss 格式
  */
-private fun formatTimeMs(ms: Long): String {
+internal fun formatTimeMs(ms: Long): String {
     if (ms <= 0L) return "00:00"
     val totalSeconds = ms / 1000
     val minutes = totalSeconds / 60
@@ -254,22 +286,49 @@ private fun formatTimeMs(ms: Long): String {
 }
 
 /**
+ * 💡 纯函数：解析进度条右侧展示文本模式
+ * - IDLE / STOPPED：显示待机等待接入；
+ * - UNKNOWN：绝不误标红点 LIVE，显示中性 "--:--" 占位；
+ * - LIVE 且 PLAYING：显示呼吸红点 LIVE；
+ * - FIXED（或带有效总时长）：格式化为 mm:ss。
+ */
+internal fun resolveProgressRightLabel(
+    totalDurationMs: Long,
+    durationState: DurationState,
+    playbackStatus: PlaybackStatus
+): ProgressRightLabelMode {
+    if (playbackStatus == PlaybackStatus.IDLE || playbackStatus == PlaybackStatus.STOPPED) {
+        return ProgressRightLabelMode.Standby
+    }
+    if (durationState == DurationState.LIVE && playbackStatus == PlaybackStatus.PLAYING) {
+        return ProgressRightLabelMode.LiveBadge
+    }
+    if (totalDurationMs > 0L && durationState != DurationState.UNKNOWN) {
+        return ProgressRightLabelMode.FormattedTime(formatTimeMs(totalDurationMs))
+    }
+    return ProgressRightLabelMode.Placeholder("--:--")
+}
+
+/**
  * 💡 纯函数：计算进度百分比 (0.0f ~ 1.0f)
- * - 待机或未播放 (totalDurationMs <= 0L 且 currentPositionMs <= 0L)：归零为 0.0f；
- * - 活跃实时流 (isLiveStream 为 true 且当前有推流时长/时间戳推进)：满条为 1.0f；
- * - 普通点播流：按当前播放位置比例推进。
+ * - 待机 / 空闲 / 时长未知 ([DurationState.UNKNOWN])：保持 0.0f（杜绝未获取时长前进度条误满）；
+ * - 显式实时流 ([DurationState.LIVE])：当前有推流位置推进则展示满条 1.0f；
+ * - 固定时长点播 ([DurationState.FIXED])：按当前播放位置与总时长精确比例推进。
  */
 internal fun calculateProgressFraction(
     currentPositionMs: Long,
     totalDurationMs: Long,
-    isLiveStream: Boolean,
+    durationState: DurationState,
     isIdle: Boolean = false
 ): Float {
-    if (isIdle || (totalDurationMs <= 0L && currentPositionMs <= 0L)) {
+    if (isIdle || durationState == DurationState.UNKNOWN) {
         return 0.0f
     }
-    return when {
-        isLiveStream || totalDurationMs <= 0L -> 1.0f
-        else -> (currentPositionMs.toFloat() / totalDurationMs.toFloat()).coerceIn(0.0f, 1.0f)
+    if (durationState == DurationState.LIVE) {
+        return if (currentPositionMs > 0L || totalDurationMs > 0L) 1.0f else 0.0f
     }
+    if (totalDurationMs <= 0L) {
+        return 0.0f
+    }
+    return (currentPositionMs.toFloat() / totalDurationMs.toFloat()).coerceIn(0.0f, 1.0f)
 }

@@ -74,14 +74,9 @@ fun MacBackground(
     var artwork by remember { mutableStateOf<MacArtworkFrame?>(null) }
 
     LaunchedEffect(coverData, isIdle, sceneClock.meshIndex) {
-        if (isIdle) {
-            // 💡 待机空闲态：彻底释放已有 artwork 位图与离屏渲染资源，优雅回退至自适应纯净背景，杜绝浅色模式文字对比度崩溃
+        if (isIdle || coverData == null) {
+            // 💡 待机空闲或确定无封面态：彻底释放已有 artwork 位图与离屏渲染资源，优雅回退至自适应纯净背景，杜绝浅色模式文字对比度崩溃
             artwork = null
-            return@LaunchedEffect
-        }
-        if (coverData == null) {
-            // 💡 切歌过渡或新曲目封面异步拉取期间，保留当前已有 artwork 背景，绝不将其置空！
-            // 置空会导致全屏背景瞬间闪回黑底，产生强烈的视觉闪烁 (闪两下)
             return@LaunchedEffect
         }
         try {

@@ -1,16 +1,45 @@
 package com.solo.purecast.upnp
 
-import com.solo.purecast.util.NetworkUtils
+import com.solo.purecast.core.session.ErrorClearedEvent
+import com.solo.purecast.core.session.ErrorReportedEvent
+import com.solo.purecast.core.session.EventOrigin
+import com.solo.purecast.core.session.ExplicitPauseEvent
+import com.solo.purecast.core.session.FirstDataPacketEvent
+import com.solo.purecast.core.session.HardwareFastPathController
+import com.solo.purecast.core.session.HardwareReconfiguredEvent
+import com.solo.purecast.core.session.MetadataPatchEvent
+import com.solo.purecast.core.session.ProgressUpdateEvent
+import com.solo.purecast.core.session.ProtocolResumeReopenResult
+import com.solo.purecast.core.session.ProtocolSessionBridge
+import com.solo.purecast.core.session.SessionEventEnvelope
+import com.solo.purecast.core.session.SessionEventPayload
+import com.solo.purecast.core.session.StreamResumeEvent
+import com.solo.purecast.core.session.StreamSetupEvent
+import com.solo.purecast.core.session.StreamStopEvent
+import com.solo.purecast.core.session.TrackBoundaryEvent
+import com.solo.purecast.core.session.TrackCompleteEvent
+import com.solo.purecast.core.session.TrackSwitchEvent
+import com.solo.purecast.model.DurationState
+import com.solo.purecast.model.ErrorCode
+import com.solo.purecast.model.FlushReason
+import com.solo.purecast.model.PlaybackError
+import com.solo.purecast.model.PlaybackStatus
+import com.solo.purecast.model.PlayerSessionSnapshot
+import com.solo.purecast.model.SeekCapability
+import com.solo.purecast.model.StreamProtocol
 import com.solo.purecast.model.TrackMetadata
-import com.solo.purecast.service.PlaybackService
 import com.solo.purecast.util.Logger
+import com.solo.purecast.util.NetworkUtils
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import java.io.BufferedInputStream
 import java.io.BufferedReader
+import java.io.ByteArrayOutputStream
+import java.io.InputStream
 import java.io.InputStreamReader
 import java.io.OutputStream
 import java.net.DatagramPacket
@@ -26,17 +55,24 @@ import java.util.UUID
 import java.util.regex.Pattern
 
 /**
- * 💡 PureCast UPnP / DLNA MediaRenderer 协议栈核心服务端
- * 零冗余、纯 Kotlin 实现：
- * 1. SSDP 组播发现与心跳宣告 (239.255.255.250:1900)
- * 2. HTTP 控制端点与 SCPD 描述符托管 (支持 SetAVTransportURI, Play, Pause, Stop, Seek, Next, Previous)
- * 3. DIDL-Lite XML 元数据流式提取、LIST INFO 回退与 GENA 双向状态同步
- * 4. 精确上报基于已消费 PCM 采样的播放时间戳 RelTime
- * 5. 支持局域网设备广播名称即时更新与 SSDP 重新宣告
+ * 💡 PureCast 无状态 UPnP / DLNA MediaRenderer 协议栈服务端
+ *
+ * 架构边界（R1/U3）：
+ * 1. 不直接持有或依赖 Android 前台播放保活服务；所有播放态变化统一封包 [SessionEventEnvelope] 上报协调器；
+ * 2. SOAP Pause / Stop / Preempt 同步直通 [HardwareFastPathController] 执行无锁快路径静音；
+ * 3. `GetTransportInfo` 等查询仅只读投影当前状态快照。
  */
 class UpnpRendererServer(
     private val scope: CoroutineScope,
-    private val playbackService: PlaybackService,
+    private val dispatchEvent: (SessionEventEnvelope<SessionEventPayload>) -> Unit,
+    private val allocateSessionId: () -> Long,
+    private val allocateSequence: () -> Long,
+    private val onAcquireHardwareForStream: (sampleRate: Int, bitDepth: Int, channels: Int, codec: String) -> Long,
+    private val snapshotProvider: () -> PlayerSessionSnapshot,
+    private val fastPath: HardwareFastPathController = HardwareFastPathController.default,
+    private val audioGateway: DemuxerAudioGateway = NativeDemuxerAudioGateway,
+    private val onWakeUpUi: (() -> Unit)? = null,
+    private val clockMs: () -> Long = { System.currentTimeMillis() },
     private var friendlyName: String = "PureCast TV",
     private val httpPort: Int = 7952
 ) {
@@ -52,8 +88,49 @@ class UpnpRendererServer(
     val genaNotifier = GenaEventNotifier(scope)
     private var demuxer: StreamDemuxer? = null
 
+    private val sessionStateLock = Any()
+    private var activeUpnpSessionId: Long = 0L
+    private var trackGenerationCounter: Long = 0L
+    private var sessionSetupDispatched: Boolean = false
+
+    @Volatile
     private var currentUri: String = ""
+
+    @Volatile
     private var currentTrackMetadata = TrackMetadata()
+
+    constructor(
+        scope: CoroutineScope,
+        sessionBridge: ProtocolSessionBridge,
+        snapshotProvider: () -> PlayerSessionSnapshot,
+        fastPath: HardwareFastPathController = HardwareFastPathController.default,
+        audioGateway: DemuxerAudioGateway = NativeDemuxerAudioGateway,
+        onWakeUpUi: (() -> Unit)? = null,
+        clockMs: () -> Long = { System.currentTimeMillis() },
+        friendlyName: String = "PureCast TV",
+        httpPort: Int = 7952
+    ) : this(
+        scope = scope,
+        dispatchEvent = { envelope -> sessionBridge.dispatch(envelope) },
+        allocateSessionId = { sessionBridge.nextSessionId() },
+        allocateSequence = { sessionBridge.nextSequence() },
+        onAcquireHardwareForStream = { sampleRate, bitDepth, channels, codec ->
+            sessionBridge.acquireHardwareForStream(
+                StreamProtocol.UPNP_DLNA,
+                sampleRate,
+                bitDepth,
+                channels,
+                codec
+            )
+        },
+        snapshotProvider = snapshotProvider,
+        fastPath = fastPath,
+        audioGateway = audioGateway,
+        onWakeUpUi = onWakeUpUi,
+        clockMs = clockMs,
+        friendlyName = friendlyName,
+        httpPort = httpPort
+    )
 
     /**
      * 💡 获取当前流播放进度秒数
@@ -88,23 +165,62 @@ class UpnpRendererServer(
         genaNotifier.notifyTransportState(state)
     }
 
-    fun notifyNextTrack() {
-        Logger.upnp.i(TAG, "电视端触发切下一曲通知")
-        genaNotifier.notifyTransportState("TRANSITIONING")
-    }
-
-    fun notifyPreviousTrack() {
-        Logger.upnp.i(TAG, "电视端触发切上一曲通知")
-        genaNotifier.notifyTransportState("TRANSITIONING")
+    /**
+     * 💡 主动中止当前 UPnP 解复用器与流传输（如被 AirPlay 抢占或停止广播时调用）
+     */
+    fun stopPlayback(isPreempted: Boolean = true, targetSessionId: Long? = null) {
+        synchronized(sessionStateLock) {
+            if (targetSessionId != null && activeUpnpSessionId != targetSessionId) {
+                Logger.upnp.d(
+                    TAG,
+                    "忽略过期 UPnP 停止/抢占指令: targetSid=$targetSessionId, activeSid=$activeUpnpSessionId"
+                )
+                return
+            }
+        }
+        Logger.upnp.i(TAG, "主动中止 UPnP 流播放 (isPreempted=$isPreempted, targetSid=$targetSessionId)")
+        demuxer?.stop()
+        val reason = if (isPreempted) FlushReason.PREEMPT else FlushReason.STOP_OR_TEARDOWN
+        val stoppedEpoch = fastPath.emergencyMuteAndFlush(reason)
+        synchronized(sessionStateLock) {
+            val activeSnap = snapshotProvider()
+            val canEmitStop = activeUpnpSessionId != 0L && sessionSetupDispatched &&
+                (activeSnap.sessionId == activeUpnpSessionId || (!isPreempted && (activeSnap.sessionId == 0L || activeSnap.activeProtocol == StreamProtocol.UPNP_DLNA)))
+            if (canEmitStop) {
+                emitEventLocked(StreamStopEvent(newEpoch = stoppedEpoch, isPreempted = isPreempted))
+            }
+            sessionSetupDispatched = false
+            if (isPreempted) {
+                activeUpnpSessionId = 0L
+            }
+        }
+        notifyTransportState("STOPPED")
     }
 
     /**
-     * 💡 主动中止当前 UPnP 解复用器与流传输
+     * 💡 P0 #2 重开 USB DAC 后恢复 UPnP 拉流或复用仍活跃的解复用器
      */
-    fun stopPlayback() {
-        Logger.upnp.i(TAG, "主动中止 UPnP 流播放")
-        demuxer?.stop()
-        notifyTransportState("STOPPED")
+    fun resumeStreamAfterDeviceReopen(sessionId: Long): ProtocolResumeReopenResult {
+        val uriToRestart = synchronized(sessionStateLock) {
+            if (activeUpnpSessionId == 0L || activeUpnpSessionId != sessionId || currentUri.isBlank()) {
+                null
+            } else {
+                currentUri
+            }
+        } ?: run {
+            Logger.upnp.w(TAG, "UPnP 重开声卡校验失败：会话或 URI 无效 (sid=$sessionId)")
+            return ProtocolResumeReopenResult.PRODUCER_DEAD
+        }
+
+        val existing = demuxer
+        if (existing != null && existing.isRunning() && existing.getCurrentUri() == uriToRestart) {
+            Logger.upnp.i(TAG, "UPnP 重开声卡校验通过：Demuxer 仍在推流 (sid=$sessionId)")
+            return ProtocolResumeReopenResult.STREAMING_READY
+        }
+
+        Logger.upnp.i(TAG, "UPnP 重开声卡后重新拉起 Demuxer 等待首帧 (sid=$sessionId, uri=$uriToRestart)")
+        ensureDemuxer().start(uriToRestart)
+        return ProtocolResumeReopenResult.RESTARTING
     }
 
     /**
@@ -125,61 +241,201 @@ class UpnpRendererServer(
         localIpAddress = getActiveLocalIpAddress()
         Logger.upnp.i(TAG, "启动 UPnP MediaRenderer: 名称=$friendlyName, 本地IP=$localIpAddress, 端口=$httpPort")
 
-        demuxer = StreamDemuxer(
+        demuxer = buildDemuxer()
+
+        startHttpServer()
+        startSsdpEngine()
+    }
+
+    private fun ensureDemuxer(): StreamDemuxer {
+        val existing = demuxer
+        if (existing != null) return existing
+        return buildDemuxer().also { demuxer = it }
+    }
+
+    private fun buildDemuxer(): StreamDemuxer {
+        return StreamDemuxer(
             scope = scope,
-            onStreamStarted = { sampleRate, bitDepth, channels, codec ->
-                Logger.upnp.i(TAG, "StreamDemuxer 回调流启动: $sampleRate Hz, $bitDepth bit, $codec")
-                val totalDur = demuxer?.getTotalDurationSeconds() ?: 0L
-                if (totalDur > 0L && currentTrackMetadata.durationMs == 0L) {
-                    currentTrackMetadata = currentTrackMetadata.copy(
-                        durationMs = totalDur * 1000L,
-                        isLiveStream = false
-                    )
-                    playbackService.updateMetadata(currentTrackMetadata)
+            audioGateway = audioGateway,
+            onAcquireStreamEpoch = { spec ->
+                val acquiredEpoch = onAcquireHardwareForStream(spec.sampleRate, spec.bitDepth, spec.channels, spec.codec)
+                if (acquiredEpoch <= 0L) {
+                    return@StreamDemuxer -1L
                 }
-                playbackService.startStreaming(sampleRate, bitDepth, channels, PlaybackService.StreamSource.UPNP, codec = codec)
+                synchronized(sessionStateLock) {
+                    val resolvedDurMs = when {
+                        spec.durationState == DurationState.LIVE -> 0L
+                        spec.durationMs > 0L -> spec.durationMs
+                        else -> currentTrackMetadata.durationMs
+                    }
+                    val resolvedDurState = when {
+                        spec.durationState == DurationState.LIVE -> DurationState.LIVE
+                        resolvedDurMs > 0L -> DurationState.FIXED
+                        else -> spec.durationState
+                    }
+                    val resolvedSeekCap = if (resolvedDurState == DurationState.LIVE) {
+                        SeekCapability.UNSEEKABLE
+                    } else if (resolvedDurState == DurationState.FIXED) {
+                        SeekCapability.SEEKABLE
+                    } else {
+                        spec.seekCapability
+                    }
+                    currentTrackMetadata = currentTrackMetadata.copy(
+                        durationMs = resolvedDurMs,
+                        durationState = resolvedDurState,
+                        seekCapability = resolvedSeekCap,
+                        trackUri = currentUri.ifEmpty { currentTrackMetadata.trackUri }
+                    )
+
+                    val activeSnap = snapshotProvider()
+                    if (activeUpnpSessionId == 0L || activeSnap.sessionId != activeUpnpSessionId) {
+                        activeUpnpSessionId = allocateSessionId()
+                        trackGenerationCounter += 1L
+                        sessionSetupDispatched = false
+                    }
+
+                    if (!sessionSetupDispatched || activeSnap.sessionId != activeUpnpSessionId) {
+                        sessionSetupDispatched = true
+                        emitEventLocked(
+                            StreamSetupEvent(
+                                protocol = StreamProtocol.UPNP_DLNA,
+                                sampleRate = spec.sampleRate,
+                                bitDepth = spec.bitDepth,
+                                channels = spec.channels,
+                                codec = spec.codec,
+                                initialEpoch = acquiredEpoch,
+                                trackGeneration = trackGenerationCounter,
+                                initialMetadata = currentTrackMetadata
+                            )
+                        )
+                    } else {
+                        emitEventLocked(
+                            HardwareReconfiguredEvent(
+                                sampleRate = spec.sampleRate,
+                                bitDepth = spec.bitDepth,
+                                channels = spec.channels,
+                                epoch = acquiredEpoch
+                            )
+                        )
+                        emitEventLocked(
+                            MetadataPatchEvent(
+                                trackGeneration = trackGenerationCounter,
+                                durationMs = resolvedDurMs,
+                                durationState = resolvedDurState,
+                                seekCapability = resolvedSeekCap
+                            )
+                        )
+                    }
+                }
+                acquiredEpoch
+            },
+            onFirstDataPacket = { epoch, spec ->
+                synchronized(sessionStateLock) {
+                    if (activeUpnpSessionId != 0L) {
+                        emitEventLocked(
+                            FirstDataPacketEvent(
+                                epoch = epoch,
+                                sampleRate = spec.sampleRate,
+                                bitDepth = spec.bitDepth,
+                                channels = spec.channels,
+                                codec = spec.codec,
+                                protocol = StreamProtocol.UPNP_DLNA
+                            )
+                        )
+                    }
+                }
                 genaNotifier.notifyTransportState("PLAYING")
             },
-            onStreamEnded = {
-                Logger.upnp.i(TAG, "StreamDemuxer 回调流结束")
-                playbackService.stopPlayback(PlaybackService.StreamSource.UPNP)
-                genaNotifier.notifyTransportState("STOPPED")
+            onStreamEnded = { abortedByEpoch, _ ->
+                Logger.upnp.i(TAG, "StreamDemuxer 回调流结束 (abortedByEpoch=$abortedByEpoch)")
+                if (!abortedByEpoch) {
+                    val ep = fastPath.emergencyMuteAndFlush(FlushReason.STOP_OR_TEARDOWN)
+                    synchronized(sessionStateLock) {
+                        if (activeUpnpSessionId != 0L && snapshotProvider().sessionId == activeUpnpSessionId) {
+                            emitEventLocked(TrackCompleteEvent(newEpoch = ep))
+                        }
+                        sessionSetupDispatched = false
+                    }
+                    genaNotifier.notifyTransportState("STOPPED")
+                }
             },
             onError = { err ->
                 Logger.upnp.e(TAG, "StreamDemuxer 报错: $err")
-                playbackService.stopPlayback(PlaybackService.StreamSource.UPNP)
-                playbackService.updateServerError(err)
+                val ep = fastPath.emergencyMuteAndFlush(FlushReason.STOP_OR_TEARDOWN)
+                synchronized(sessionStateLock) {
+                    if (activeUpnpSessionId == 0L) {
+                        activeUpnpSessionId = allocateSessionId()
+                    }
+                    emitEventLocked(
+                        ErrorReportedEvent(
+                            PlaybackError(
+                                code = ErrorCode.NETWORK_STREAM_ERROR,
+                                message = err,
+                                recoverable = true,
+                                timestampMs = clockMs()
+                            )
+                        )
+                    )
+                    if (snapshotProvider().sessionId == activeUpnpSessionId) {
+                        emitEventLocked(StreamStopEvent(newEpoch = ep, isPreempted = false))
+                    }
+                    sessionSetupDispatched = false
+                }
                 genaNotifier.notifyTransportState("STOPPED")
             },
             onMetadataParsed = { title, artist, album ->
                 Logger.upnp.i(TAG, "从音频流容器提取到内嵌元数据: title=$title, artist=$artist, album=$album")
-                val isDefaultTitle = currentTrackMetadata.title.isEmpty() ||
-                        currentTrackMetadata.title == "等待音频推送" ||
-                        currentTrackMetadata.title == "AirPlay 无损音频"
-                val isDefaultArtist = currentTrackMetadata.artist.isEmpty() ||
+                synchronized(sessionStateLock) {
+                    val isDefaultTitle = currentTrackMetadata.title.isEmpty() ||
+                        currentTrackMetadata.title == TrackMetadata.DEFAULT_TITLE ||
+                        currentTrackMetadata.title == "AirPlay 无损音频" ||
+                        currentTrackMetadata.title == DEFAULT_UPNP_TITLE
+                    val isDefaultArtist = currentTrackMetadata.artist.isEmpty() ||
                         currentTrackMetadata.artist == "PureCast UPnP / DLNA 接收端" ||
+                        currentTrackMetadata.artist == DEFAULT_UPNP_ARTIST ||
                         currentTrackMetadata.artist == "Apple Music"
-                val isDefaultAlbum = currentTrackMetadata.album.isEmpty() ||
+                    val isDefaultAlbum = currentTrackMetadata.album.isEmpty() ||
                         currentTrackMetadata.album == "未知专辑"
 
-                val updatedTitle = if (isDefaultTitle && !title.isNullOrEmpty()) title else currentTrackMetadata.title
-                val updatedArtist = if (isDefaultArtist && !artist.isNullOrEmpty()) artist else currentTrackMetadata.artist
-                val updatedAlbum = if (isDefaultAlbum && !album.isNullOrEmpty()) album else currentTrackMetadata.album
+                    val updatedTitle = if (isDefaultTitle && !title.isNullOrEmpty()) title else currentTrackMetadata.title
+                    val updatedArtist = if (isDefaultArtist && !artist.isNullOrEmpty()) artist else currentTrackMetadata.artist
+                    val updatedAlbum = if (isDefaultAlbum && !album.isNullOrEmpty()) album else currentTrackMetadata.album
 
-                currentTrackMetadata = currentTrackMetadata.copy(
-                    title = updatedTitle,
-                    artist = updatedArtist,
-                    album = updatedAlbum
-                )
-                playbackService.updateMetadata(currentTrackMetadata)
+                    currentTrackMetadata = currentTrackMetadata.copy(
+                        title = updatedTitle,
+                        artist = updatedArtist,
+                        album = updatedAlbum
+                    )
+                    if (activeUpnpSessionId != 0L && trackGenerationCounter > 0L) {
+                        emitEventLocked(
+                            MetadataPatchEvent(
+                                trackGeneration = trackGenerationCounter,
+                                title = updatedTitle.ifEmpty { null },
+                                artist = updatedArtist.ifEmpty { null },
+                                album = updatedAlbum.ifEmpty { null }
+                            )
+                        )
+                    }
+                }
             },
             onPositionUpdated = { posMs ->
-                playbackService.updatePlaybackPosition(posMs)
+                synchronized(sessionStateLock) {
+                    if (activeUpnpSessionId != 0L && snapshotProvider().sessionId == activeUpnpSessionId) {
+                        emitEventLocked(
+                            ProgressUpdateEvent(
+                                positionMs = posMs,
+                                durationMs = currentTrackMetadata.durationMs
+                            )
+                        )
+                    }
+                }
+            },
+            onSeekFlush = {
+                val newEpoch = fastPath.emergencyMuteAndFlush(FlushReason.FLUSH_SWITCH)
+                fastPath.resumeStream()
+                newEpoch
             }
         )
-
-        startHttpServer()
-        startSsdpEngine()
     }
 
     fun stop() {
@@ -217,7 +473,7 @@ class UpnpRendererServer(
                     reuseAddress = true
                     bind(InetSocketAddress(httpPort))
                 }
-                playbackService.updateServerError(null)
+                dispatchServiceEvent(ErrorClearedEvent(ErrorCode.SERVER_ERROR))
                 Logger.upnp.i(TAG, "HTTP 控制端点已在端口 $httpPort 上成功监听 (reuseAddress=true)")
 
                 while (isActive) {
@@ -229,7 +485,16 @@ class UpnpRendererServer(
             } catch (e: Exception) {
                 if (isActive) {
                     Logger.upnp.e(TAG, "HTTP Server 监听异常", e)
-                    playbackService.updateServerError("UPnP 服务端口绑定失败 ($httpPort): ${e.message}")
+                    dispatchServiceEvent(
+                        ErrorReportedEvent(
+                            PlaybackError(
+                                code = ErrorCode.SERVER_ERROR,
+                                message = "UPnP 服务端口绑定失败 ($httpPort): ${e.message}",
+                                recoverable = true,
+                                timestampMs = clockMs()
+                            )
+                        )
+                    )
                 }
             }
         }
@@ -240,8 +505,8 @@ class UpnpRendererServer(
             socket.use { s ->
                 // 💡 针对连接配置 5000ms 超时防护，防止局域网异常客户端挂起连接耗尽 Dispatchers.IO 线程池
                 s.soTimeout = 5000
-                val reader = BufferedReader(InputStreamReader(s.getInputStream()))
-                val firstLine = reader.readLine() ?: return
+                val bis = BufferedInputStream(s.getInputStream(), 8192)
+                val firstLine = readHttpLine(bis) ?: return
                 val parts = firstLine.split(" ")
                 if (parts.size < 2) return
 
@@ -249,7 +514,7 @@ class UpnpRendererServer(
                 val path = parts[1]
 
                 val headers = mutableMapOf<String, String>()
-                var line = reader.readLine()
+                var line = readHttpLine(bis)
                 var contentLength = 0
                 while (!line.isNullOrEmpty()) {
                     val colonIdx = line.indexOf(':')
@@ -261,22 +526,69 @@ class UpnpRendererServer(
                             contentLength = v.toIntOrNull() ?: 0
                         }
                     }
-                    line = reader.readLine()
-                }
-
-                var body = ""
-                if (contentLength > 0) {
-                    val bodyChars = CharArray(contentLength)
-                    var readTotal = 0
-                    while (readTotal < contentLength) {
-                        val r = reader.read(bodyChars, readTotal, contentLength - readTotal)
-                        if (r == -1) break
-                        readTotal += r
-                    }
-                    body = String(bodyChars, 0, readTotal)
+                    line = readHttpLine(bis)
                 }
 
                 val out = s.getOutputStream()
+                val maxBodyBytes = 4 * 1024 * 1024
+                if (contentLength > maxBodyBytes) {
+                    sendResponse(out, 413, "Payload Too Large", "text/plain", "")
+                    return
+                }
+
+                if (headers["expect"]?.equals("100-continue", ignoreCase = true) == true) {
+                    out.write("HTTP/1.1 100 Continue\r\n\r\n".toByteArray(Charsets.US_ASCII))
+                    out.flush()
+                }
+
+                val isChunked = headers["transfer-encoding"]?.contains("chunked", ignoreCase = true) == true
+                val bodyBytes: ByteArray = when {
+                    isChunked -> {
+                        val baos = ByteArrayOutputStream()
+                        while (true) {
+                            val sizeLine = readHttpLine(bis) ?: break
+                            val chunkHeader = sizeLine.trim().split(";")[0]
+                            val chunkSize = chunkHeader.toIntOrNull(16) ?: break
+                            if (chunkSize == 0) {
+                                while (!readHttpLine(bis).isNullOrEmpty()) {}
+                                break
+                            }
+                            if (baos.size() + chunkSize > maxBodyBytes) {
+                                sendResponse(out, 413, "Payload Too Large", "text/plain", "")
+                                return
+                            }
+                            val chunkBuf = ByteArray(chunkSize)
+                            var readTotal = 0
+                            while (readTotal < chunkSize) {
+                                val r = bis.read(chunkBuf, readTotal, chunkSize - readTotal)
+                                if (r == -1) break
+                                readTotal += r
+                            }
+                            baos.write(chunkBuf, 0, readTotal)
+                            readHttpLine(bis) // skip trailing \r\n
+                        }
+                        baos.toByteArray()
+                    }
+                    contentLength > 0 -> {
+                        val buf = ByteArray(contentLength)
+                        var readTotal = 0
+                        while (readTotal < contentLength) {
+                            val r = bis.read(buf, readTotal, contentLength - readTotal)
+                            if (r == -1) break
+                            readTotal += r
+                        }
+                        if (readTotal < contentLength) {
+                            buf.copyOf(readTotal)
+                        } else {
+                            buf
+                        }
+                    }
+                    else -> ByteArray(0)
+                }
+
+                val charset = parseCharsetFromContentType(headers["content-type"]) ?: Charsets.UTF_8
+                val body = if (bodyBytes.isNotEmpty()) String(bodyBytes, charset) else ""
+
                 when (method) {
                     "GET" -> handleHttpGet(path, out)
                     "POST" -> handleHttpPost(path, headers, body, out)
@@ -287,6 +599,32 @@ class UpnpRendererServer(
             }
         } catch (e: Exception) {
             Logger.upnp.w(TAG, "处理 HTTP 请求异常: ${e.message}")
+        }
+    }
+
+    private fun readHttpLine(input: InputStream): String? {
+        val baos = ByteArrayOutputStream(128)
+        var sawAny = false
+        while (true) {
+            val b = input.read()
+            if (b == -1) {
+                if (!sawAny) return null
+                break
+            }
+            sawAny = true
+            if (b == '\n'.code) break
+            if (b != '\r'.code) {
+                baos.write(b)
+            }
+        }
+        return baos.toString(Charsets.US_ASCII.name())
+    }
+
+    private fun parseCharsetFromContentType(contentType: String?): java.nio.charset.Charset? {
+        if (contentType == null) return null
+        val match = Regex("charset\\s*=\\s*\"?([a-zA-Z0-9_-]+)\"?", RegexOption.IGNORE_CASE).find(contentType)
+        return match?.groupValues?.get(1)?.let {
+            try { java.nio.charset.Charset.forName(it) } catch (_: Exception) { null }
         }
     }
 
@@ -314,7 +652,15 @@ class UpnpRendererServer(
         val soapAction = headers["soapaction"]?.removeSurrounding("\"") ?: ""
         Logger.upnp.i(TAG, "收到 SOAP Action: $soapAction")
 
-        val responseXml: String = when {
+        val responseXml = processSoapActionForTest(soapAction, body)
+        val isFault = responseXml.contains("<s:Fault>")
+        val statusCode = if (isFault) 500 else 200
+        val statusMsg = if (isFault) "Internal Server Error" else "OK"
+        sendResponse(out, statusCode, statusMsg, "text/xml; charset=\"utf-8\"", responseXml)
+    }
+
+    internal fun processSoapActionForTest(soapAction: String, body: String): String {
+        return when {
             soapAction.contains("SetNextAVTransportURI") -> handleSetNextAvTransportUri(body)
             soapAction.contains("SetAVTransportURI") -> handleSetAvTransportUri(body)
             soapAction.contains("Play") -> handlePlay()
@@ -333,11 +679,6 @@ class UpnpRendererServer(
                 buildSoapFault(401, "Invalid Action")
             }
         }
-
-        val isFault = responseXml.contains("<s:Fault>")
-        val statusCode = if (isFault) 500 else 200
-        val statusMsg = if (isFault) "Internal Server Error" else "OK"
-        sendResponse(out, statusCode, statusMsg, "text/xml; charset=\"utf-8\"", responseXml)
     }
 
     private fun handleHttpSubscribe(headers: Map<String, String>, out: OutputStream) {
@@ -393,17 +734,64 @@ class UpnpRendererServer(
         val metadataXml = extractTagValue(body, "CurrentURIMetaData")
         Logger.upnp.i(TAG, "SetAVTransportURI: uri=$uri, hasMetadata=${metadataXml.isNotEmpty()}")
 
-        if (uri.isNotEmpty() && uri != currentUri) {
-            playbackService.updatePlaybackPosition(0L)
+        if (uri.isNotEmpty()) {
+            val isSameUriReplay = uri == currentUri
             if (demuxer?.isRunning() == true) {
                 demuxer?.stop()
             }
-        }
-        currentUri = uri
-
-        if (metadataXml.isNotEmpty() || currentTrackMetadata.title.isEmpty() || currentTrackMetadata.title == "等待音频推送") {
-            currentTrackMetadata = parseDidlLiteMetadata(metadataXml)
-            playbackService.updateMetadata(currentTrackMetadata)
+            val switchEpoch = if (sessionSetupDispatched) {
+                fastPath.emergencyMuteAndFlush(FlushReason.FLUSH_SWITCH)
+            } else {
+                0L
+            }
+            val parsedMeta = if (metadataXml.isNotEmpty() || !isSameUriReplay || currentTrackMetadata.title.isEmpty() || currentTrackMetadata.title == TrackMetadata.DEFAULT_TITLE) {
+                parseDidlLiteMetadata(metadataXml, uri, preserveCoverWhenEmpty = isSameUriReplay)
+            } else {
+                currentTrackMetadata.copy(trackUri = uri)
+            }
+            synchronized(sessionStateLock) {
+                currentUri = uri
+                currentTrackMetadata = parsedMeta
+                val activeSnap = snapshotProvider()
+                val sameActiveSession = sessionSetupDispatched && activeUpnpSessionId != 0L &&
+                    (activeSnap.sessionId == activeUpnpSessionId || activeSnap.activeProtocol == StreamProtocol.UPNP_DLNA)
+                if (sameActiveSession) {
+                    trackGenerationCounter += 1L
+                    emitEventLocked(
+                        TrackSwitchEvent(
+                            flushReason = FlushReason.FLUSH_SWITCH,
+                            newEpoch = switchEpoch,
+                            trackUri = uri
+                        )
+                    )
+                    emitEventLocked(
+                        TrackBoundaryEvent(
+                            trackKey = uri,
+                            trackGeneration = trackGenerationCounter,
+                            initialDurationState = parsedMeta.durationState,
+                            seekCapability = parsedMeta.seekCapability,
+                            trackUri = uri
+                        )
+                    )
+                    emitFullMetadataPatchLocked(parsedMeta)
+                    emitEventLocked(
+                        ProgressUpdateEvent(
+                            positionMs = 0L,
+                            durationMs = parsedMeta.durationMs
+                        )
+                    )
+                }
+            }
+        } else {
+            if (metadataXml.isNotEmpty() || currentTrackMetadata.title.isEmpty() || currentTrackMetadata.title == TrackMetadata.DEFAULT_TITLE) {
+                val parsedMeta = parseDidlLiteMetadata(metadataXml, currentUri)
+                synchronized(sessionStateLock) {
+                    currentTrackMetadata = parsedMeta
+                    if (sessionSetupDispatched && activeUpnpSessionId != 0L && trackGenerationCounter > 0L) {
+                        emitFullMetadataPatchLocked(parsedMeta)
+                    }
+                }
+            }
         }
 
         // 💡 遵循 UPnP AVTransport 标准：SetAVTransportURI 仅初始化元数据，推流由 Play 动作触发
@@ -413,12 +801,24 @@ class UpnpRendererServer(
     private fun handlePlay(): String {
         Logger.upnp.i(TAG, "SOAP Play 指令触发, 当前 uri: $currentUri")
         // 💡 收到推流，突破 BAL 尝试自动唤醒大屏播放界面
-        playbackService.wakeUpUiIfInBackground()
+        onWakeUpUi?.invoke()
 
         if (currentUri.isNotEmpty() && (demuxer?.isRunning() != true || demuxer?.getCurrentUri() != currentUri)) {
-            demuxer?.start(currentUri)
+            fastPath.resumeStream()
+            ensureDemuxer().start(currentUri)
         } else {
-            playbackService.resumePlayback()
+            fastPath.resumeStream()
+            val resumedEpoch = fastPath.getCurrentBufferEpoch()
+            synchronized(sessionStateLock) {
+                if (activeUpnpSessionId != 0L) {
+                    emitEventLocked(
+                        StreamResumeEvent(
+                            protocol = StreamProtocol.UPNP_DLNA,
+                            resumedEpoch = resumedEpoch
+                        )
+                    )
+                }
+            }
         }
         genaNotifier.notifyTransportState("PLAYING")
         return buildSoapResponse("PlayResponse", "urn:schemas-upnp-org:service:AVTransport:1", "")
@@ -426,32 +826,84 @@ class UpnpRendererServer(
 
     private fun handlePause(): String {
         Logger.upnp.i(TAG, "SOAP Pause 指令触发")
-        playbackService.pausePlayback()
+        // 💡 硬件快路径优先静音，保持 epoch 与环形缓冲不被刷新
+        val pausedEpoch = fastPath.emergencyMuteAndFlush(FlushReason.EXPLICIT_PAUSE)
+        synchronized(sessionStateLock) {
+            if (activeUpnpSessionId != 0L) {
+                emitEventLocked(
+                    ExplicitPauseEvent(
+                        flushReason = FlushReason.EXPLICIT_PAUSE,
+                        epoch = pausedEpoch
+                    )
+                )
+            }
+        }
         genaNotifier.notifyTransportState("PAUSED_PLAYBACK")
         return buildSoapResponse("PauseResponse", "urn:schemas-upnp-org:service:AVTransport:1", "")
     }
 
     private fun handleStop(): String {
         Logger.upnp.i(TAG, "SOAP Stop 指令触发")
-        demuxer?.stop()
-        playbackService.stopPlayback(PlaybackService.StreamSource.UPNP)
-        genaNotifier.notifyTransportState("STOPPED")
+        stopPlayback(isPreempted = false)
         return buildSoapResponse("StopResponse", "urn:schemas-upnp-org:service:AVTransport:1", "")
+    }
+
+    private fun isLiveOrUnseekable(): Boolean {
+        val localMeta = currentTrackMetadata
+        val snapMeta = snapshotProvider().metadata
+        val durationState = if (localMeta.durationState != DurationState.UNKNOWN) {
+            localMeta.durationState
+        } else {
+            snapMeta.durationState
+        }
+        val seekCapability = if (localMeta.seekCapability != SeekCapability.UNKNOWN) {
+            localMeta.seekCapability
+        } else {
+            snapMeta.seekCapability
+        }
+        return durationState == DurationState.LIVE || seekCapability == SeekCapability.UNSEEKABLE
+    }
+
+    fun seekToPositionMs(positionMs: Long): Boolean {
+        val d = demuxer ?: return false
+        return d.seekTo(positionMs)
+    }
+
+    private fun parseRelTimeToMs(target: String): Long? {
+        val parts = target.trim().split(":")
+        if (parts.size != 3) return null
+        val h = parts[0].toLongOrNull() ?: return null
+        val m = parts[1].toLongOrNull() ?: return null
+        val sParts = parts[2].split(".")
+        val s = sParts[0].toLongOrNull() ?: return null
+        val ms = if (sParts.size > 1) {
+            val fraction = sParts[1].padEnd(3, '0').substring(0, 3)
+            fraction.toLongOrNull() ?: 0L
+        } else 0L
+        return (h * 3600L + m * 60L + s) * 1000L + ms
     }
 
     /**
      * 💡 SOAP Seek 寻道指令处理
-     * 符合 UPnP AVTransport 规范：对于 liveStream 实时流返回 701 (Transition not available)
+     * 符合 UPnP AVTransport 规范：对于 [DurationState.LIVE] 或 [SeekCapability.UNSEEKABLE] 返回 701 (Transition not available)
      */
     private fun handleSeek(body: String): String {
         val unit = extractTagValue(body, "Unit")
         val target = extractTagValue(body, "Target")
         Logger.upnp.i(TAG, "SOAP Seek 指令: Unit=$unit, Target=$target")
 
-        return if (currentTrackMetadata.isLiveStream) {
-            Logger.upnp.w(TAG, "实时音频流不支持 Seek 操作，按规范返回 SOAP 701 错误")
+        return if (isLiveOrUnseekable()) {
+            Logger.upnp.w(TAG, "实时或不可寻道音频流不支持 Seek 操作，按规范返回 SOAP 701 错误")
             buildSoapFault(701, "Transition not available for live stream")
         } else {
+            val targetMs = parseRelTimeToMs(target)
+            if (targetMs != null) {
+                val ok = seekToPositionMs(targetMs)
+                if (!ok) {
+                    Logger.upnp.w(TAG, "Seek 寻道执行失败或底层流不支持: $target")
+                    return buildSoapFault(701, "Seek operation failed or unsupported for current stream")
+                }
+            }
             Logger.upnp.i(TAG, "普通流 Seek 寻道请求已接受: $target")
             buildSoapResponse("SeekResponse", "urn:schemas-upnp-org:service:AVTransport:1", "")
         }
@@ -460,34 +912,45 @@ class UpnpRendererServer(
     /**
      * 💡 SOAP Next 切下一曲指令处理
      */
-    private fun handleNext(): String {
-        Logger.upnp.i(TAG, "SOAP Next 指令触发")
-        return if (currentTrackMetadata.isLiveStream) {
-            Logger.upnp.w(TAG, "实时音频流不支持切歌，返回 SOAP 701 错误")
-            buildSoapFault(701, "Transition not available for live stream")
-        } else {
-            buildSoapResponse("NextResponse", "urn:schemas-upnp-org:service:AVTransport:1", "")
-        }
-    }
+    private fun handleNext(): String =
+        handleTrackStepAction("Next", "NextResponse")
 
     /**
      * 💡 SOAP Previous 切上一曲指令处理
      */
-    private fun handlePrevious(): String {
-        Logger.upnp.i(TAG, "SOAP Previous 指令触发")
-        return if (currentTrackMetadata.isLiveStream) {
-            Logger.upnp.w(TAG, "实时音频流不支持切上一曲，返回 SOAP 701 错误")
+    private fun handlePrevious(): String =
+        handleTrackStepAction("Previous", "PreviousResponse")
+
+    private fun handleTrackStepAction(actionName: String, responseTag: String): String {
+        Logger.upnp.i(TAG, "SOAP $actionName 指令触发")
+        return if (isLiveOrUnseekable()) {
+            Logger.upnp.w(TAG, "实时音频流不支持切歌($actionName)，返回 SOAP 701 错误")
             buildSoapFault(701, "Transition not available for live stream")
         } else {
-            buildSoapResponse("PreviousResponse", "urn:schemas-upnp-org:service:AVTransport:1", "")
+            buildSoapResponse(responseTag, "urn:schemas-upnp-org:service:AVTransport:1", "")
         }
     }
 
+    private fun emitFullMetadataPatchLocked(parsedMeta: TrackMetadata) {
+        emitEventLocked(
+            MetadataPatchEvent(
+                trackGeneration = trackGenerationCounter,
+                title = parsedMeta.title,
+                artist = parsedMeta.artist,
+                album = parsedMeta.album,
+                coverUri = parsedMeta.coverUri,
+                durationMs = parsedMeta.durationMs,
+                durationState = parsedMeta.durationState,
+                seekCapability = parsedMeta.seekCapability
+            )
+        )
+    }
+
     private fun handleGetTransportInfo(): String {
-        val status = PlaybackService.playbackStatus.value
+        val status = snapshotProvider().playbackStatus
         val stateStr = when (status) {
-            com.solo.purecast.model.PlaybackStatus.PLAYING -> "PLAYING"
-            com.solo.purecast.model.PlaybackStatus.PAUSED -> "PAUSED_PLAYBACK"
+            PlaybackStatus.PLAYING -> "PLAYING"
+            PlaybackStatus.PAUSED -> "PAUSED_PLAYBACK"
             else -> "STOPPED"
         }
         val inner = "<CurrentTransportState>$stateStr</CurrentTransportState><CurrentTransportStatus>OK</CurrentTransportStatus><CurrentSpeed>1</CurrentSpeed>"
@@ -533,7 +996,39 @@ class UpnpRendererServer(
         return buildSoapResponse("SetVolumeResponse", "urn:schemas-upnp-org:service:RenderingControl:1", "")
     }
 
-    private fun parseDidlLiteMetadata(escapedXml: String): TrackMetadata {
+    private fun emitEventLocked(payload: SessionEventPayload) {
+        val snap = snapshotProvider()
+        dispatchEvent(
+            SessionEventEnvelope(
+                origin = EventOrigin.UPNP,
+                sessionId = activeUpnpSessionId,
+                deviceGeneration = snap.deviceGeneration,
+                sequence = allocateSequence(),
+                timestampElapsedMs = clockMs(),
+                payload = payload
+            )
+        )
+    }
+
+    private fun dispatchServiceEvent(payload: SessionEventPayload) {
+        val snap = snapshotProvider()
+        dispatchEvent(
+            SessionEventEnvelope(
+                origin = EventOrigin.SERVICE,
+                sessionId = 0L,
+                deviceGeneration = snap.deviceGeneration,
+                sequence = allocateSequence(),
+                timestampElapsedMs = clockMs(),
+                payload = payload
+            )
+        )
+    }
+
+    private fun parseDidlLiteMetadata(
+        escapedXml: String,
+        trackUri: String = currentUri,
+        preserveCoverWhenEmpty: Boolean = false
+    ): TrackMetadata {
         val unescaped = escapedXml
             .replace("&lt;", "<")
             .replace("&gt;", ">")
@@ -555,7 +1050,7 @@ class UpnpRendererServer(
 
         val title = extractTagValue(unescaped, "dc:title")
             .ifEmpty { extractTagValue(unescaped, "title") }
-            .ifEmpty { "UPnP 音频流" }
+            .ifEmpty { DEFAULT_UPNP_TITLE }
 
         val artist = extractTagValue(unescaped, "upnp:artist")
             .ifEmpty { extractTagValue(unescaped, "dc:creator") }
@@ -569,23 +1064,31 @@ class UpnpRendererServer(
             .ifEmpty { extractTagValue(unescaped, "albumArtURI") }
             .ifEmpty { extractTagValue(unescaped, "upnp:icon") }
             .ifEmpty { extractTagValue(unescaped, "icon") }
-            .ifEmpty { currentTrackMetadata.coverUri }
+            .ifEmpty { if (preserveCoverWhenEmpty) currentTrackMetadata.coverUri.orEmpty() else "" }
 
-        val isLive = if (durationMs > 0L) {
-            false
-        } else {
-            unescaped.contains("isLive") || unescaped.isEmpty()
+        val hasLiveMarker = unescaped.contains("isLive", ignoreCase = true)
+        val durationState = when {
+            durationMs > 0L -> DurationState.FIXED
+            hasLiveMarker -> DurationState.LIVE
+            else -> DurationState.UNKNOWN
+        }
+        val seekCapability = when (durationState) {
+            DurationState.FIXED -> SeekCapability.SEEKABLE
+            DurationState.LIVE -> SeekCapability.UNSEEKABLE
+            DurationState.UNKNOWN -> SeekCapability.UNKNOWN
         }
 
-        Logger.upnp.i(TAG, "解析 DIDL-Lite: title=$title, artist=$artist, album=$album, coverUri=$coverUri, durationMs=$durationMs, isLive=$isLive")
+        Logger.upnp.i(TAG, "解析 DIDL-Lite: title=$title, artist=$artist, album=$album, coverUri=$coverUri, durationMs=$durationMs, durationState=$durationState")
 
         return TrackMetadata(
             title = title,
             artist = artist,
             album = album,
-            coverUri = coverUri,
+            coverUri = coverUri.ifEmpty { null },
             durationMs = durationMs,
-            isLiveStream = isLive
+            durationState = durationState,
+            seekCapability = seekCapability,
+            trackUri = trackUri.ifEmpty { null }
         )
     }
 
@@ -880,5 +1383,7 @@ class UpnpRendererServer(
 
     companion object {
         private const val TAG = "UpnpRendererServer"
+        private const val DEFAULT_UPNP_TITLE = "UPnP 音频流"
+        private const val DEFAULT_UPNP_ARTIST = "PureCast"
     }
 }

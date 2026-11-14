@@ -24,9 +24,38 @@ import androidx.compose.ui.unit.sp
 import androidx.tv.material3.ExperimentalTvMaterial3Api
 import androidx.tv.material3.Text
 import com.solo.purecast.model.AudioPathState
+import com.solo.purecast.model.HardwarePipelineState
 import com.solo.purecast.model.StreamProtocol
 import com.solo.purecast.ui.theme.AppPalette
 import java.util.Locale
+
+/** 💡 胶囊软状态提示类型 */
+internal enum class HardwarePillHintKind {
+    PERMISSION_PENDING,
+    RECONFIGURING
+}
+
+internal data class HardwarePillHint(
+    val kind: HardwarePillHintKind,
+    val label: String
+)
+
+/**
+ * 💡 将 7 态硬件管道态映射为温和视觉提示（音频重配/授权等待不以红色报错渲染）
+ */
+internal fun resolveHardwarePillHint(hardwareState: HardwarePipelineState): HardwarePillHint? {
+    return when (hardwareState) {
+        HardwarePipelineState.AUDIO_RECONFIGURING -> HardwarePillHint(
+            kind = HardwarePillHintKind.RECONFIGURING,
+            label = "切换采样率中..."
+        )
+        HardwarePipelineState.ATTACHED, HardwarePipelineState.PERMISSION_PENDING -> HardwarePillHint(
+            kind = HardwarePillHintKind.PERMISSION_PENDING,
+            label = "等待 USB 权限..."
+        )
+        else -> null
+    }
+}
 
 /**
  * 💡 PureCast 物理音频链路与品质指示胶囊 (SignalPathPill)
@@ -35,6 +64,7 @@ import java.util.Locale
  * 2. 文本格式统一为：协议 · 音频格式 | 设备名称。
  * 3. 彻底去除 (独占) / (非独占) 等文字后缀，完全通过「设备名称」的颜色传达硬件状态：
  *    - 绿色 (#30D158)：USB DAC 硬件独占接管成功，处于 Bit-Perfect 源码直通状态；
+ *    - 琥珀 (#FFD60A / #FF9F0A)：硬件三元组重配或权限审批过渡软提示；
  *    - 红色 (#FF453A)：未独占 / 声卡让渡 / 共享系统输出 / 设备异常；
  *    - 中性灰：待机空闲状态。
  * 4. 完整适配无推流待机状态下的浅色模式自适应外观。
@@ -43,14 +73,18 @@ import java.util.Locale
 @Composable
 fun SignalPathPill(
     audioState: AudioPathState,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    hardwareState: HardwarePipelineState = HardwarePipelineState.DISCONNECTED
 ) {
     val isExclusive = audioState.isDacConnected && audioState.isExclusive
     val isPlayingStream = audioState.protocol != StreamProtocol.NONE && audioState.sampleRate > 0
+    val hardwareHint = resolveHardwarePillHint(hardwareState)
     val isDark = AppPalette.isDark
 
-    // 设备名着色：独占为亮绿，未独占为亮红，待机为自适应次级灰
+    // 设备名着色：独占为亮绿，未独占为亮红，过渡提示为琥珀黄，待机为自适应次级灰
     val deviceNameColor = when {
+        hardwareHint?.kind == HardwarePillHintKind.RECONFIGURING -> Color(0xFFFFD60A)
+        hardwareHint?.kind == HardwarePillHintKind.PERMISSION_PENDING -> Color(0xFFFF9F0A)
         !isPlayingStream -> if (isDark) Color(0xFF8E8E93) else Color(0xFF6E6E73)
         isExclusive -> Color(0xFF30D158) // Apple Green
         else -> Color(0xFFFF453A) // Apple Red
@@ -58,13 +92,15 @@ fun SignalPathPill(
 
     // 状态呼吸小圆点颜色
     val dotColor = when {
+        hardwareHint?.kind == HardwarePillHintKind.RECONFIGURING -> Color(0xFFFFD60A)
+        hardwareHint?.kind == HardwarePillHintKind.PERMISSION_PENDING -> Color(0xFFFF9F0A)
         !isPlayingStream -> if (isDark) Color(0xFF636366) else Color(0xFF8E8E93)
         isExclusive -> Color(0xFF30D158)
         else -> Color(0xFFFF453A)
     }
 
-    // 格式化文本：协议 · 音频格式 | 设备名称
-    val pillAnnotatedText = remember(audioState, isPlayingStream, isDark) {
+    // 格式化文本：协议 · 音频格式 | 设备名称 (附温和硬件过渡提示)
+    val pillAnnotatedText = remember(audioState, hardwareHint, isPlayingStream, isDark) {
         buildAnnotatedString {
             if (!isPlayingStream) {
                 val statusTextColor = if (isDark) Color(0xFFD1D1D6) else Color(0xFF3C3C43)
@@ -77,7 +113,11 @@ fun SignalPathPill(
                     append("  |  ")
                 }
                 withStyle(SpanStyle(color = deviceNameColor, fontWeight = FontWeight.SemiBold)) {
-                    val displayName = if (audioState.isDacConnected) audioState.dacName else "未连接 USB DAC"
+                    val displayName = when {
+                        hardwareHint != null -> hardwareHint.label
+                        audioState.isDacConnected -> audioState.dacName
+                        else -> "未连接 USB DAC"
+                    }
                     append(displayName)
                 }
             } else {
@@ -106,10 +146,14 @@ fun SignalPathPill(
                     append("  |  ")
                 }
 
-                // 3. 设备名称（纯色彩语义指示独占）
+                // 3. 设备名称（纯色彩语义指示独占 / 重配软提示）
                 withStyle(SpanStyle(color = deviceNameColor, fontWeight = FontWeight.SemiBold)) {
-                    val displayName = if (audioState.isDacConnected) audioState.dacName else "系统默认输出"
-                    append(displayName)
+                    val baseDevice = if (audioState.isDacConnected) audioState.dacName else "系统默认输出"
+                    if (hardwareHint != null) {
+                        append("$baseDevice (${hardwareHint.label})")
+                    } else {
+                        append(baseDevice)
+                    }
                 }
             }
         }

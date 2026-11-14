@@ -2,11 +2,25 @@
 #include <sys/resource.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cerrno>
 #include <cstring>
 
 namespace purecast {
+
+namespace {
+struct ScopedActiveWriter {
+    std::atomic<int>& counter;
+    explicit ScopedActiveWriter(std::atomic<int>& c) : counter(c) {
+        counter.fetch_add(1, std::memory_order_seq_cst);
+    }
+    ~ScopedActiveWriter() {
+        counter.fetch_sub(1, std::memory_order_seq_cst);
+    }
+};
+} // namespace
 
 AudioEngine& AudioEngine::instance() {
     static AudioEngine inst;
@@ -56,6 +70,17 @@ int AudioEngine::init_context() {
 
     LOGI("libusb 上下文初始化完成 (无 Root usbfs 模式), 版本: %s", get_libusb_version().c_str());
     return 0;
+}
+
+uint64_t AudioEngine::advance_epoch_and_set_flushing(bool flushing) {
+    uint64_t cur = epoch_and_flush_.load(std::memory_order_relaxed);
+    uint64_t next = 0;
+    do {
+        const uint64_t next_epoch = (cur >> EPOCH_SHIFT) + 1ULL;
+        next = (next_epoch << EPOCH_SHIFT) | (flushing ? FLAG_FLUSHING : 0ULL);
+    } while (!epoch_and_flush_.compare_exchange_weak(
+        cur, next, std::memory_order_acq_rel, std::memory_order_relaxed));
+    return next >> EPOCH_SHIFT;
 }
 
 bool AudioEngine::parse_audio_descriptors(libusb_device* dev, int target_bit_depth) {
@@ -211,8 +236,6 @@ bool AudioEngine::parse_audio_descriptors(libusb_device* dev, int target_bit_dep
     }
 
     // 💡 匹配原则：精准匹配源位深！
-    // 如果源文件是 16-bit，优先匹配 16-bit Alt 1；如果是 24-bit，优先匹配 24-bit Alt 2。
-    // 不改变源文件格式以保持最佳 Bit-Perfect 音质。
     const AltCandidate* selected = nullptr;
 
     // 1. 完全精确匹配 bit_resolution == target_bit_depth
@@ -258,10 +281,6 @@ int AudioEngine::configure_clock(int sample_rate) {
 
     if (endpoint_info_.is_uac2) {
         // 💡 UAC2 规范：发送 CS_SAM_FREQ_CONTROL 至 Clock Source Entity
-        // bmRequestType: 0x21 (Host to Interface, Class-specific)
-        // bRequest: 0x01 (CS_CUR / SET_CUR)
-        // wValue: (CS_SAM_FREQ_CONTROL << 8) -> 0x0100
-        // wIndex: (clock_id << 8) | (control_interface_number & 0xFF)
         const uint8_t req_type = static_cast<uint8_t>(LIBUSB_REQUEST_TYPE_CLASS) | static_cast<uint8_t>(LIBUSB_RECIPIENT_INTERFACE);
         const uint8_t bRequest = uac::uac2::CS_CUR;
         const uint16_t wValue = (uac::uac2::CS_SAM_FREQ_CONTROL << 8);
@@ -278,16 +297,13 @@ int AudioEngine::configure_clock(int sample_rate) {
         if (r < 0) {
             LOGW("UAC2 CS_SAM_FREQ_CONTROL 发送返回 %d (clock_id=%u, iface=%d)",
                  r, endpoint_info_.clock_id, endpoint_info_.control_interface_number);
-        } else {
-            LOGI("UAC2 时钟设置成功: %d Hz (clock_id=%u, iface=%d)",
-                 sample_rate, endpoint_info_.clock_id, endpoint_info_.control_interface_number);
+            return r;
         }
+        LOGI("UAC2 时钟设置成功: %d Hz (clock_id=%u, iface=%d)",
+             sample_rate, endpoint_info_.clock_id, endpoint_info_.control_interface_number);
+        return 0;
     } else {
         // 💡 UAC1 规范：发送 SAMPLING_FREQ_CONTROL 至端点
-        // bmRequestType: 0x22 (Host to Endpoint, Class-specific)
-        // bRequest: 0x01 (SET_CUR)
-        // wValue: (SAMPLING_FREQ_CONTROL << 8) -> 0x0100
-        // wIndex: endpoint_address
         const uint8_t req_type = static_cast<uint8_t>(LIBUSB_REQUEST_TYPE_CLASS) | static_cast<uint8_t>(LIBUSB_RECIPIENT_ENDPOINT);
         const uint8_t bRequest = uac::uac1::SET_CUR;
         const uint16_t wValue = (uac::uac1::SAMPLING_FREQ_CONTROL << 8);
@@ -301,12 +317,11 @@ int AudioEngine::configure_clock(int sample_rate) {
         int r = libusb_control_transfer(dev_handle_, req_type, bRequest, wValue, wIndex, data, sizeof(data), 1000);
         if (r < 0) {
             LOGW("UAC1 SAMPLING_FREQ_CONTROL 发送返回 %d", r);
-        } else {
-            LOGI("UAC1 端点采样率设置成功: %d Hz", sample_rate);
+            return r;
         }
+        LOGI("UAC1 端点采样率设置成功: %d Hz", sample_rate);
+        return 0;
     }
-
-    return 0;
 }
 
 int AudioEngine::lock_hardware_volume(uint8_t fu_id) {
@@ -318,11 +333,9 @@ int AudioEngine::lock_hardware_volume(uint8_t fu_id) {
     const uint8_t bRequest = endpoint_info_.is_uac2 ? uac::uac2::CS_CUR : uac::uac1::SET_CUR;
     const uint16_t wIndex = (static_cast<uint16_t>(fu_id) << 8) | (endpoint_info_.control_interface_number & 0xFF);
 
-    // 💡 0x0000 对应 0.0 dB (Unity Gain 100% 满幅输出，每 LSB 对应 1/256 dB)
     uint8_t vol_data[2] = {0x00, 0x00};
     bool any_success = false;
 
-    // 💡 遍历 Channel 0 (Master), Channel 1 (Left), Channel 2 (Right)
     for (uint8_t ch = 0; ch <= 2; ++ch) {
         const uint16_t wValue = (static_cast<uint16_t>(uac::FU_VOLUME_CONTROL) << 8) | ch;
         int r = libusb_control_transfer(
@@ -339,11 +352,9 @@ int AudioEngine::lock_hardware_volume(uint8_t fu_id) {
             any_success = true;
             LOGI("UAC Feature Unit (id=%u, ch=%u) 音量已成功设置为 0.0dB", fu_id, ch);
         } else {
-            // 部分声卡仅支持 Master(0) 或仅支持分声道(1/2)，返回 STALL/PIPE 属于标准内的预期表现
             LOGD("UAC Feature Unit (id=%u, ch=%u) 音量设置响应: %d", fu_id, ch, r);
         }
 
-        // 💡 尝试同时发送 FU_MUTE_CONTROL 设为 0 (解静音) 确保声音畅通
         uint8_t mute_data[1] = {0x00};
         const uint16_t wValueMute = (static_cast<uint16_t>(uac::FU_MUTE_CONTROL) << 8) | ch;
         libusb_control_transfer(
@@ -367,37 +378,11 @@ int AudioEngine::lock_hardware_volume(uint8_t fu_id) {
     return any_success ? 0 : -1;
 }
 
-int AudioEngine::open_device(int fd, int sample_rate, int bit_depth, int channels) {
-    std::lock_guard<std::recursive_mutex> lock(op_mutex_);
-    LOGI("接管 USB 硬件设备: fd=%d, rate=%d, bit=%d, ch=%d", fd, sample_rate, bit_depth, channels);
-
-    if (init_context() != 0) {
-        return -1;
-    }
-
-    // 若此前已打开，先优雅归还
-    if (dev_handle_) {
-        release_device();
-    }
-
-    current_fd_ = fd;
+int AudioEngine::start_transfer_pipeline_locked(int sample_rate, int bit_depth, int channels) {
     current_sample_rate_ = sample_rate;
     current_bit_depth_ = bit_depth;
     current_channels_ = channels;
     consecutive_underruns_.store(0, std::memory_order_relaxed);
-
-    int r = libusb_wrap_sys_device(ctx_, static_cast<intptr_t>(fd), &dev_handle_);
-    if (r != LIBUSB_SUCCESS || !dev_handle_) {
-        LOGE("libusb_wrap_sys_device 失败: %d", r);
-        return r;
-    }
-
-    libusb_device* dev = libusb_get_device(dev_handle_);
-    if (!parse_audio_descriptors(dev, bit_depth)) {
-        libusb_close(dev_handle_);
-        dev_handle_ = nullptr;
-        return -2;
-    }
 
     // 💡 确定物理输出格式
     if (endpoint_info_.subslot_size == 3) {
@@ -411,97 +396,33 @@ int AudioEngine::open_device(int fd, int sample_rate, int bit_depth, int channel
         LOGI("确定声卡输出物理子帧格式: S16_LE (2 bytes per sample)");
     }
 
-    if (current_bit_depth_ == 24) {
-        LOGI("24-bit 输入格式化就绪, 采样率: %d Hz, 声道数: %d, 目标物理子帧: %s",
-             sample_rate, channels,
-             (current_output_format_ == PcmFormatter::OutputFormat::S32_LE ? "S32_LE" :
-              (current_output_format_ == PcmFormatter::OutputFormat::S24_3LE ? "S24_3LE" : "S16_LE")));
-    } else {
-        LOGI("16-bit 输入格式化就绪, 采样率: %d Hz, 声道数: %d, 目标物理子帧: %s",
-             sample_rate, channels,
-             (current_output_format_ == PcmFormatter::OutputFormat::S32_LE ? "S32_LE" :
-              (current_output_format_ == PcmFormatter::OutputFormat::S24_3LE ? "S24_3LE" : "S16_LE")));
-    }
-
-    // 💡 步骤 1: 卸载 Linux 内核驱动 snd-usb-audio，实现全链路接口独占
-    if (endpoint_info_.control_interface_number >= 0 &&
-        endpoint_info_.control_interface_number != endpoint_info_.interface_number) {
-        if (libusb_kernel_driver_active(dev_handle_, endpoint_info_.control_interface_number) == 1) {
-            libusb_detach_kernel_driver(dev_handle_, endpoint_info_.control_interface_number);
-        }
-        libusb_claim_interface(dev_handle_, endpoint_info_.control_interface_number);
-    }
-
-    if (libusb_kernel_driver_active(dev_handle_, endpoint_info_.interface_number) == 1) {
-        LOGI("检测到 Linux 内核 snd-usb-audio 驱动活跃，执行 detach...");
-        r = libusb_detach_kernel_driver(dev_handle_, endpoint_info_.interface_number);
-        if (r != LIBUSB_SUCCESS) {
-            LOGW("libusb_detach_kernel_driver 返回 %d (可能已被系统自动卸载)", r);
-        }
-    }
-
-    // 💡 步骤 2: 声明占用接口 (Claim Interface)
-    r = libusb_claim_interface(dev_handle_, endpoint_info_.interface_number);
-    if (r != LIBUSB_SUCCESS) {
-        LOGE("libusb_claim_interface 失败: %d", r);
-        // 💡 失败退出前尝试重新挂载 Linux 内核驱动，避免电视声卡永久哑音
-        libusb_attach_kernel_driver(dev_handle_, endpoint_info_.interface_number);
-        libusb_close(dev_handle_);
-        dev_handle_ = nullptr;
-        return r;
-    }
-    is_claimed_.store(true);
-
-    // 💡 步骤 3: 激活等时传输 Alternate Setting
-    r = libusb_set_interface_alt_setting(dev_handle_, endpoint_info_.interface_number, endpoint_info_.alt_setting);
-    if (r != LIBUSB_SUCCESS) {
-        LOGE("libusb_set_interface_alt_setting 失败: %d", r);
-        libusb_release_interface(dev_handle_, endpoint_info_.interface_number);
-        // 💡 失败退出前重新绑定 Linux 内核驱动
-        libusb_attach_kernel_driver(dev_handle_, endpoint_info_.interface_number);
-        libusb_close(dev_handle_);
-        dev_handle_ = nullptr;
-        is_claimed_.store(false);
-        return r;
-    }
-
-    // 💡 步骤 4: 锁定硬件时钟采样率与 UAC Feature Unit 音量 (0.0dB Unity Gain)
-    configure_clock(sample_rate);
-    if (endpoint_info_.feature_unit_id != 0) {
-        lock_hardware_volume(endpoint_info_.feature_unit_id);
-    } else {
-        LOGI("未发现 UAC Feature Unit 实体，跳过硬件音量锁定");
-    }
-
-    // 💡 步骤 5: 构建无锁环形缓冲区：根据采样率与位深动态分配容量
-    // 容量 = max(65536, byte_rate * 0.5s)（对齐至 2^N，例如 44.1k/16b 分配 128KB，192k/24b 分配 1MB），兼顾 AirPlay 低延迟与 UPnP 高码率抗抖动
+    // 💡 构建无锁环形缓冲区：容量 = max(65536, byte_rate * 0.5s)（对齐至 2^N）
     const size_t bytes_per_sample = (bit_depth > 0) ? static_cast<size_t>(bit_depth / 8) : 2;
     const size_t byte_rate = static_cast<size_t>(sample_rate) * static_cast<size_t>(channels) * bytes_per_sample;
     const size_t min_capacity = std::max(static_cast<size_t>(65536), static_cast<size_t>(byte_rate * 0.5));
     ring_buffer_ = std::make_unique<SpscRingBuffer>(min_capacity);
+    pre_roll_threshold_bytes_.store(byte_rate / 10, std::memory_order_release);
+
     LOGI("动态构建无锁环形缓冲区: min_capacity=%zu, actual_capacity=%zu (byte_rate=%zu bytes/s, 约 %.2f 秒缓冲)",
          min_capacity, ring_buffer_->capacity(), byte_rate,
          byte_rate > 0 ? (static_cast<double>(ring_buffer_->capacity()) / byte_rate) : 0.0);
 
-    // 💡 步骤 5.2: 配置 50ms DAC Warmup 静音预充 (保护继电器免受切频瞬间物理爆音冲击)
-    // High-Speed (125us 微帧): 每秒 8000 microframes，50ms 对应 400 个微帧
+    // 💡 配置 50ms DAC Warmup 静音预充 (仅首次开流或物理切频重配设置)
     packet_rate_ = 8000;
     const int warmup_packets = static_cast<int>((packet_rate_ * 50) / 1000);
     warmup_packets_remaining_.store(warmup_packets, std::memory_order_release);
     LOGI("配置 DAC Warmup 静音预充: %d 个微帧数据包 (约 50ms)", warmup_packets);
 
-    // 💡 步骤 6: 配置 Bresenham 时钟步进 (解决 44.1kHz 分数包采样率与 USB High-Speed 8000微帧/秒同步)
-    base_samples_per_packet_ = static_cast<uint32_t>(sample_rate / packet_rate_);
-    remainder_samples_ = static_cast<uint32_t>(sample_rate % packet_rate_);
+    // 💡 配置 Bresenham 时钟步进
+    base_samples_per_packet_ = static_cast<uint32_t>(sample_rate / static_cast<int>(packet_rate_));
+    remainder_samples_ = static_cast<uint32_t>(sample_rate % static_cast<int>(packet_rate_));
     bresenham_accum_ = 0;
     phase_accumulator_ = 0;
-    // 💡 预设初始反馈定点数为标称值，开局立即进入精准微帧同步，杜绝初始浪涌
-    const uint32_t nominal_fb = static_cast<uint32_t>(((uint64_t)sample_rate << 16) / packet_rate_);
+    const uint32_t nominal_fb = static_cast<uint32_t>((static_cast<uint64_t>(sample_rate) << 16) / packet_rate_);
     feedback_rate_q16_.store(nominal_fb, std::memory_order_release);
 
-    // 分配单个 URB packet 的最大缓冲区 (base_samples + 2)
     const size_t max_samples_per_pkt = base_samples_per_packet_ + 2;
-    packet_size_ = max_samples_per_pkt * current_channels_ * endpoint_info_.subslot_size;
+    packet_size_ = max_samples_per_pkt * static_cast<size_t>(current_channels_) * endpoint_info_.subslot_size;
     if (packet_size_ > endpoint_info_.max_packet_size && endpoint_info_.max_packet_size > 0) {
         packet_size_ = endpoint_info_.max_packet_size;
     }
@@ -510,19 +431,19 @@ int AudioEngine::open_device(int fd, int sample_rate, int bit_depth, int channel
     LOGI("配置 Bresenham 时钟步进: rate=%d, base_samples=%u, rem=%u, packet_rate=%u, max_pkt_size=%zu",
          sample_rate, base_samples_per_packet_, remainder_samples_, packet_rate_, packet_size_);
 
-    // 💡 步骤 6: 预分配等时 URB 池与传输线程
-    is_running_.store(true);
-    is_paused_.store(false);
-    has_pre_rolled_.store(false);
-    feedback_locked_.store(false);
+    // 💡 重置会话状态并单调推进世代
+    is_explicitly_paused_.store(false, std::memory_order_release);
+    feedback_locked_.store(false, std::memory_order_release);
+    const uint64_t new_epoch = advance_epoch_and_set_flushing(false);
+    consumed_epoch_.store(new_epoch, std::memory_order_release);
+    is_running_.store(true, std::memory_order_seq_cst);
 
-    transfers_.resize(NUM_TRANSFERS, nullptr);
-    transfer_buffers_.resize(NUM_TRANSFERS);
+    transfers_.assign(NUM_TRANSFERS, nullptr);
+    transfer_buffers_.assign(NUM_TRANSFERS, {});
 
     const size_t transfer_buf_size = packet_size_ * PACKETS_PER_TRANSFER;
     for (int i = 0; i < NUM_TRANSFERS; ++i) {
         transfer_buffers_[i].resize(transfer_buf_size, 0);
-        // 💡 锁定等时传输 URB 物理内存页，杜绝换页抖动 (Page Fault)
         if (mlock(transfer_buffers_[i].data(), transfer_buf_size) != 0) {
             LOGW("mlock transfer_buffer[%d] 警告: errno=%d (%s)", i, errno, strerror(errno));
         }
@@ -542,18 +463,16 @@ int AudioEngine::open_device(int fd, int sample_rate, int bit_depth, int channel
             PACKETS_PER_TRANSFER,
             isoc_transfer_cb,
             this,
-            1000 // 超时 1000ms
+            1000
         );
 
         transfers_[i] = xfer;
-        // 💡 预初始化填充静音与紧凑连续数据包长度
         fill_isoc_transfer(xfer);
     }
 
-    // 💡 步骤 6.2: 预分配 UAC 显式时钟反馈 (Explicit Feedback) IN URBs
     if (endpoint_info_.feedback_ep != 0) {
-        feedback_transfers_.resize(NUM_FEEDBACK_TRANSFERS, nullptr);
-        feedback_buffers_.resize(NUM_FEEDBACK_TRANSFERS);
+        feedback_transfers_.assign(NUM_FEEDBACK_TRANSFERS, nullptr);
+        feedback_buffers_.assign(NUM_FEEDBACK_TRANSFERS, {});
         const size_t fb_pkt_size = std::max<size_t>(
             endpoint_info_.feedback_max_packet_size > 0 ? endpoint_info_.feedback_max_packet_size : 4,
             8
@@ -589,15 +508,10 @@ int AudioEngine::open_device(int fd, int sample_rate, int bit_depth, int channel
              endpoint_info_.feedback_ep, NUM_FEEDBACK_TRANSFERS, fb_pkt_size);
     }
 
-    LOGI("RingBuffer 与 URB 物理内存页已执行 mlock 锁定 (RingBuffer: %zu bytes, OUT URB: %zu bytes, FB URB: %zu bytes)",
-         ring_buffer_->capacity(),
-         transfer_buf_size * NUM_TRANSFERS,
-         feedback_buffers_.empty() ? 0 : (feedback_buffers_[0].size() * NUM_FEEDBACK_TRANSFERS));
-
     // 启动 libusb 事件循环线程
     event_thread_ = std::thread(&AudioEngine::event_thread_func, this);
 
-    // 💡 提交首批反馈 URBs 开启时钟闭环监听
+    // 💡 提交反馈 URBs
     if (endpoint_info_.feedback_ep != 0) {
         for (int i = 0; i < NUM_FEEDBACK_TRANSFERS; ++i) {
             if (feedback_transfers_[i]) {
@@ -611,26 +525,388 @@ int AudioEngine::open_device(int fd, int sample_rate, int bit_depth, int channel
         }
     }
 
-    // 💡 提交首批 OUT URBs (预充静音 Warmup 防爆音)
+    // 💡 提交等时 OUT URBs
+    int submitted_out = 0;
     for (int i = 0; i < NUM_TRANSFERS; ++i) {
         if (transfers_[i]) {
             int r = libusb_submit_transfer(transfers_[i]);
             if (r == LIBUSB_SUCCESS) {
                 active_transfers_.fetch_add(1, std::memory_order_acq_rel);
+                ++submitted_out;
             } else {
                 LOGE("提交初始等时 OUT URB[%d] 失败: %d", i, r);
             }
         }
     }
 
-    LOGI("音频引擎启动成功，等时传输流水线正常运转 (Explicit Feedback: %s)",
+    if (submitted_out == 0) {
+        LOGE("所有初始等时 OUT URB 提交均失败，中止传输管线启动");
+        stop_transfer_pipeline_locked();
+        return -5;
+    }
+
+    LOGI("音频引擎启动成功，等时传输流水线正常运转 (epoch=%llu, Explicit Feedback: %s)",
+         static_cast<unsigned long long>(new_epoch),
          endpoint_info_.feedback_ep != 0 ? "ENABLED" : "OPEN-LOOP");
     return 0;
 }
 
+int AudioEngine::stop_transfer_pipeline_locked() {
+    is_running_.store(false, std::memory_order_seq_cst);
+    warmup_packets_remaining_.store(0, std::memory_order_release);
+
+    for (auto* xfer : transfers_) {
+        if (xfer) {
+            libusb_cancel_transfer(xfer);
+        }
+    }
+    for (auto* xfer : feedback_transfers_) {
+        if (xfer) {
+            libusb_cancel_transfer(xfer);
+        }
+    }
+
+    if (event_thread_.joinable()) {
+        event_thread_.join();
+    }
+    LOGI("所有在途等时传输 URB 已完成注销与内核回收 (active=%d)",
+         active_transfers_.load(std::memory_order_relaxed));
+    active_transfers_.store(0, std::memory_order_release);
+
+    // 💡 排空仍在 write_pcm / 只读查询中的外部生产线程，确保后续 ring_buffer_ 销毁或重配绝不产生 UAF
+    while (active_writers_.load(std::memory_order_seq_cst) > 0) {
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+
+    for (auto* xfer : transfers_) {
+        if (xfer) {
+            libusb_free_transfer(xfer);
+        }
+    }
+    for (auto* xfer : feedback_transfers_) {
+        if (xfer) {
+            libusb_free_transfer(xfer);
+        }
+    }
+    transfers_.clear();
+
+    for (auto& buf : transfer_buffers_) {
+        if (!buf.empty()) {
+            munlock(buf.data(), buf.size());
+        }
+    }
+    transfer_buffers_.clear();
+
+    for (auto& buf : feedback_buffers_) {
+        if (!buf.empty()) {
+            munlock(buf.data(), buf.size());
+        }
+    }
+    feedback_transfers_.clear();
+    feedback_buffers_.clear();
+    feedback_rate_q16_.store(0, std::memory_order_release);
+    phase_accumulator_ = 0;
+    bresenham_accum_ = 0;
+    return 0;
+}
+
+void AudioEngine::release_claimed_interfaces_locked() {
+    if (!dev_handle_) return;
+
+    if (is_claimed_.load(std::memory_order_acquire)) {
+        libusb_release_interface(dev_handle_, endpoint_info_.interface_number);
+        is_claimed_.store(false, std::memory_order_release);
+    }
+    if (is_control_claimed_.load(std::memory_order_acquire)) {
+        if (endpoint_info_.control_interface_number >= 0 &&
+            endpoint_info_.control_interface_number != endpoint_info_.interface_number) {
+            libusb_release_interface(dev_handle_, endpoint_info_.control_interface_number);
+        }
+        is_control_claimed_.store(false, std::memory_order_release);
+    }
+
+    LOGI("重新向 Linux 内核挂载 snd-usb-audio 驱动 (USBDEVFS_CONNECT)...");
+    if (endpoint_info_.control_interface_number >= 0 &&
+        endpoint_info_.control_interface_number != endpoint_info_.interface_number) {
+        libusb_attach_kernel_driver(dev_handle_, endpoint_info_.control_interface_number);
+    }
+    int r = libusb_attach_kernel_driver(dev_handle_, endpoint_info_.interface_number);
+    if (r != LIBUSB_SUCCESS) {
+        LOGW("libusb_attach_kernel_driver 结果: %d (声卡可能已处于内核接管态)", r);
+    }
+}
+
+bool AudioEngine::is_valid_audio_format(int sample_rate, int bit_depth, int channels) {
+    return sample_rate > 0 && sample_rate <= 768000 &&
+        (bit_depth == 16 || bit_depth == 24 || bit_depth == 32) &&
+        channels > 0 && channels <= 8;
+}
+
+void AudioEngine::reset_ring_state_for_epoch(uint64_t target_epoch) {
+    if (ring_buffer_) {
+        ring_buffer_->clear();
+    }
+    consecutive_underruns_.store(0, std::memory_order_relaxed);
+    phase_accumulator_ = 0;
+    bresenham_accum_ = 0;
+    // 💡 绝不重置 warmup_packets_remaining_：URB 保活下继电器未断开，切歌无需多静音 50ms
+    consumed_epoch_.store(target_epoch, std::memory_order_release);
+}
+
+bool AudioEngine::try_unlock_preroll(uint64_t target_epoch, bool* cas_unmuted) {
+    if (cas_unmuted) {
+        *cas_unmuted = false;
+    }
+    uint64_t cur = epoch_and_flush_.load(std::memory_order_acquire);
+    if ((cur >> EPOCH_SHIFT) != target_epoch || (cur & FLAG_PREROLLED) != 0ULL) {
+        return false;
+    }
+    const size_t threshold = pre_roll_threshold_bytes_.load(std::memory_order_relaxed);
+    if (!ring_buffer_ || threshold == 0 || ring_buffer_->available_read() < threshold) {
+        return false;
+    }
+    // 💡 仅当 epoch 与未预充位仍匹配时，用单条 CAS 原子置位 FLAG_PREROLLED 并清除 FLAG_FLUSHING，严防过期线程污染新世代
+    const uint64_t desired = (target_epoch << EPOCH_SHIFT) | FLAG_PREROLLED;
+    while (!epoch_and_flush_.compare_exchange_weak(
+        cur, desired, std::memory_order_acq_rel, std::memory_order_acquire
+    )) {
+        if ((cur >> EPOCH_SHIFT) != target_epoch || (cur & FLAG_PREROLLED) != 0ULL) {
+            return false;
+        }
+    }
+    if (cas_unmuted) {
+        *cas_unmuted = ((cur & FLAG_FLUSHING) != 0ULL);
+    }
+    return true;
+}
+
+int AudioEngine::open_device(int fd, int sample_rate, int bit_depth, int channels) {
+    if (!is_valid_audio_format(sample_rate, bit_depth, channels)) {
+        LOGE("open_device 非法音频参数: rate=%d, bit=%d, ch=%d", sample_rate, bit_depth, channels);
+        return -22;
+    }
+
+    std::lock_guard<std::recursive_mutex> lock(op_mutex_);
+    LOGI("接管 USB 硬件设备: fd=%d, rate=%d, bit=%d, ch=%d", fd, sample_rate, bit_depth, channels);
+
+    if (init_context() != 0) {
+        return -1;
+    }
+
+    if (dev_handle_) {
+        release_device();
+    }
+
+    current_fd_ = fd;
+
+    int r = libusb_wrap_sys_device(ctx_, static_cast<intptr_t>(fd), &dev_handle_);
+    if (r != LIBUSB_SUCCESS || !dev_handle_) {
+        LOGE("libusb_wrap_sys_device 失败: %d", r);
+        return r != 0 ? r : -1;
+    }
+
+    libusb_device* dev = libusb_get_device(dev_handle_);
+    if (!parse_audio_descriptors(dev, bit_depth)) {
+        libusb_close(dev_handle_);
+        dev_handle_ = nullptr;
+        return -2;
+    }
+
+    // 💡 步骤 1: 卸载 Linux 内核驱动 snd-usb-audio，实现全链路接口独占
+    if (endpoint_info_.control_interface_number >= 0 &&
+        endpoint_info_.control_interface_number != endpoint_info_.interface_number) {
+        if (libusb_kernel_driver_active(dev_handle_, endpoint_info_.control_interface_number) == 1) {
+            libusb_detach_kernel_driver(dev_handle_, endpoint_info_.control_interface_number);
+        }
+        if (libusb_claim_interface(dev_handle_, endpoint_info_.control_interface_number) == LIBUSB_SUCCESS) {
+            is_control_claimed_.store(true, std::memory_order_release);
+        }
+    }
+
+    if (libusb_kernel_driver_active(dev_handle_, endpoint_info_.interface_number) == 1) {
+        LOGI("检测到 Linux 内核 snd-usb-audio 驱动活跃，执行 detach...");
+        r = libusb_detach_kernel_driver(dev_handle_, endpoint_info_.interface_number);
+        if (r != LIBUSB_SUCCESS) {
+            LOGW("libusb_detach_kernel_driver 返回 %d (可能已被系统自动卸载)", r);
+        }
+    }
+
+    // 💡 步骤 2: 声明占用接口 (Claim Interface)
+    r = libusb_claim_interface(dev_handle_, endpoint_info_.interface_number);
+    if (r != LIBUSB_SUCCESS) {
+        LOGE("libusb_claim_interface 失败: %d", r);
+        release_claimed_interfaces_locked();
+        libusb_close(dev_handle_);
+        dev_handle_ = nullptr;
+        return r;
+    }
+    is_claimed_.store(true, std::memory_order_release);
+
+    // 💡 步骤 3: 激活等时传输 Alternate Setting
+    r = libusb_set_interface_alt_setting(dev_handle_, endpoint_info_.interface_number, endpoint_info_.alt_setting);
+    if (r != LIBUSB_SUCCESS) {
+        LOGE("libusb_set_interface_alt_setting 失败: %d", r);
+        release_claimed_interfaces_locked();
+        libusb_close(dev_handle_);
+        dev_handle_ = nullptr;
+        return r;
+    }
+
+    // 💡 步骤 4: 锁定硬件时钟采样率与 UAC Feature Unit 音量
+    configure_clock(sample_rate);
+    if (endpoint_info_.feature_unit_id != 0) {
+        lock_hardware_volume(endpoint_info_.feature_unit_id);
+    } else {
+        LOGI("未发现 UAC Feature Unit 实体，跳过硬件音量锁定");
+    }
+
+    // 💡 步骤 5: 启动 SPSC 缓冲与等时传输流水线
+    r = start_transfer_pipeline_locked(sample_rate, bit_depth, channels);
+    if (r != 0) {
+        release_device();
+        return r;
+    }
+
+    return 0;
+}
+
+int64_t AudioEngine::reconfigure_audio_format(int sample_rate, int bit_depth, int channels) {
+    if (!is_valid_audio_format(sample_rate, bit_depth, channels)) {
+        LOGE("reconfigure_audio_format 拒绝非法参数: rate=%d, bit=%d, ch=%d",
+             sample_rate, bit_depth, channels);
+        return -22;
+    }
+
+    std::lock_guard<std::recursive_mutex> lock(op_mutex_);
+    if (!dev_handle_ || !is_claimed_.load(std::memory_order_acquire)) {
+        LOGW("reconfigure_audio_format 失败: 硬件设备尚未打开或独占未就绪");
+        return -1;
+    }
+
+    // 💡 同规格快速路径：规格未变化且流水线正常运转时保持 URB 不中断
+    if (is_running_.load(std::memory_order_acquire) &&
+        sample_rate == current_sample_rate_ &&
+        bit_depth == current_bit_depth_ &&
+        channels == current_channels_) {
+        is_explicitly_paused_.store(false, std::memory_order_release);
+        const uint64_t epoch = get_current_buffer_epoch();
+        LOGI("音频规格未变更 (%dHz/%dbit/%dch)，复用现役管线并保留 epoch=%llu",
+             sample_rate, bit_depth, channels, static_cast<unsigned long long>(epoch));
+        return static_cast<int64_t>(epoch);
+    }
+
+    LOGI("开始 UAC 原位三元组切频: %dHz/%dbit/%dch -> %dHz/%dbit/%dch",
+         current_sample_rate_, current_bit_depth_, current_channels_,
+         sample_rate, bit_depth, channels);
+
+    const uac::AudioEndpointInfo prev_endpoint = endpoint_info_;
+    const int prev_sample_rate = current_sample_rate_;
+
+    // 先推进 epoch 并静音，安全收回全部在途 URB
+    advance_epoch_and_set_flushing(true);
+    is_explicitly_paused_.store(false, std::memory_order_release);
+    stop_transfer_pipeline_locked();
+
+    libusb_device* dev = libusb_get_device(dev_handle_);
+    if (!dev || !parse_audio_descriptors(dev, bit_depth)) {
+        LOGE("原位切频解析描述符失败，触发安全回滚释放设备");
+        endpoint_info_ = prev_endpoint;
+        release_device();
+        return -2;
+    }
+
+    // 若新候选位于不同的 AudioStreaming 接口，先释放旧接口再独占新接口
+    if (endpoint_info_.interface_number != prev_endpoint.interface_number) {
+        libusb_release_interface(dev_handle_, prev_endpoint.interface_number);
+        is_claimed_.store(false, std::memory_order_release);
+        if (libusb_kernel_driver_active(dev_handle_, endpoint_info_.interface_number) == 1) {
+            libusb_detach_kernel_driver(dev_handle_, endpoint_info_.interface_number);
+        }
+        int claim_ret = libusb_claim_interface(dev_handle_, endpoint_info_.interface_number);
+        if (claim_ret != LIBUSB_SUCCESS) {
+            LOGE("原位切频切换流接口失败 (%d)，触发安全回滚", claim_ret);
+            endpoint_info_ = prev_endpoint;
+            release_device();
+            return claim_ret < 0 ? claim_ret : -3;
+        }
+        is_claimed_.store(true, std::memory_order_release);
+    }
+
+    int r = libusb_set_interface_alt_setting(
+        dev_handle_,
+        endpoint_info_.interface_number,
+        endpoint_info_.alt_setting
+    );
+    if (r != LIBUSB_SUCCESS) {
+        LOGE("原位切频设置 alt_setting=%d 失败 (%d)，触发安全回滚", endpoint_info_.alt_setting, r);
+        release_device();
+        return r < 0 ? r : -4;
+    }
+
+    int clk_ret = configure_clock(sample_rate);
+    if (clk_ret < 0 && (endpoint_info_.is_uac2 || sample_rate != prev_sample_rate)) {
+        LOGE("原位切频硬件时钟配置失败 (%d)，触发安全回滚", clk_ret);
+        release_device();
+        return clk_ret;
+    }
+
+    if (endpoint_info_.feature_unit_id != 0) {
+        lock_hardware_volume(endpoint_info_.feature_unit_id);
+    }
+
+    r = start_transfer_pipeline_locked(sample_rate, bit_depth, channels);
+    if (r != 0) {
+        LOGE("原位切频重建传输管线失败 (%d)，触发安全回滚", r);
+        release_device();
+        return r < 0 ? r : -5;
+    }
+
+    const uint64_t new_epoch = get_current_buffer_epoch();
+    LOGI("🎉 原位切频成功完成: %dHz/%dbit/%dch (alt=%d, epoch=%llu)",
+         sample_rate, bit_depth, channels, endpoint_info_.alt_setting,
+         static_cast<unsigned long long>(new_epoch));
+    return static_cast<int64_t>(new_epoch);
+}
+
+uint64_t AudioEngine::emergency_mute_and_flush(FlushReason reason) {
+    // 💡 R1/KTD1 无锁硬件快路径铁律：
+    // 1. 严禁获取 op_mutex_
+    // 2. 严禁取消或停止 URB (保持 8 个等时 URB + 4 个反馈 URB 泵送全 0 静音锁相)
+    // 3. 严禁跨线程调用 ring_buffer_->clear() 修改 tail_
+    switch (reason) {
+        case FlushReason::EXPLICIT_PAUSE: {
+            is_explicitly_paused_.store(true, std::memory_order_release);
+            const uint64_t epoch = get_current_buffer_epoch();
+            LOGI("快路径 EXPLICIT_PAUSE: 切入全0保活，保留缓冲与 epoch=%llu",
+                 static_cast<unsigned long long>(epoch));
+            return epoch;
+        }
+        case FlushReason::FLUSH_SWITCH: {
+            const uint64_t next_epoch = advance_epoch_and_set_flushing(true);
+            LOGI("快路径 FLUSH_SWITCH: 推进至 epoch=%llu 并挂起预充自动解锁",
+                 static_cast<unsigned long long>(next_epoch));
+            return next_epoch;
+        }
+        case FlushReason::STOP_OR_TEARDOWN: {
+            is_explicitly_paused_.store(true, std::memory_order_release);
+            const uint64_t next_epoch = advance_epoch_and_set_flushing(false);
+            LOGI("快路径 STOP_OR_TEARDOWN: 置显式静音并推进 epoch=%llu 排空旧流",
+                 static_cast<unsigned long long>(next_epoch));
+            return next_epoch;
+        }
+        case FlushReason::PREEMPT: {
+            is_explicitly_paused_.store(false, std::memory_order_release);
+            const uint64_t next_epoch = advance_epoch_and_set_flushing(true);
+            LOGI("快路径 PREEMPT: 解除旧暂停，推进 epoch=%llu 等待新流预充",
+                 static_cast<unsigned long long>(next_epoch));
+            return next_epoch;
+        }
+    }
+    return get_current_buffer_epoch();
+}
+
 void AudioEngine::event_thread_func() {
     LOGI("启动 Native URB 调度线程，提升至实时调度等级...");
-    // 💡 提升当前线程优先级至最高 (-19) 规避丢包
     errno = 0;
     int prio_res = setpriority(PRIO_PROCESS, 0, -19);
     if (prio_res == 0) {
@@ -640,14 +916,13 @@ void AudioEngine::event_thread_func() {
     }
 
     struct timeval tv { 0, 10000 }; // 10ms 超时
-    // 💡 保持事件泵运行直到主动停止且所有在途 URB 的取消/完成回调均已被内核投递完成
-    while ((is_running_.load(std::memory_order_relaxed) || active_transfers_.load(std::memory_order_relaxed) > 0) && ctx_) {
+    while ((is_running_.load(std::memory_order_acquire) || active_transfers_.load(std::memory_order_acquire) > 0) && ctx_) {
         int r = libusb_handle_events_timeout_completed(ctx_, &tv, nullptr);
         if (r < 0 && r != LIBUSB_ERROR_INTERRUPTED) {
             LOGW("libusb_handle_events 警告: %d", r);
         }
     }
-    LOGI("Native URB 调度线程退出 (剩余在途 URB: %d)", active_transfers_.load(std::memory_order_relaxed));
+    LOGI("Native URB 调度线程退出 (剩余在途 URB: %d)", active_transfers_.load(std::memory_order_acquire));
 }
 
 void LIBUSB_CALL AudioEngine::isoc_transfer_cb(struct libusb_transfer* transfer) {
@@ -659,41 +934,41 @@ void LIBUSB_CALL AudioEngine::isoc_transfer_cb(struct libusb_transfer* transfer)
 }
 
 void AudioEngine::fill_isoc_transfer(struct libusb_transfer* transfer) {
-    const bool paused = is_paused_.load(std::memory_order_relaxed);
+    // 💡 R2/KTD2：仅由消费线程检查世代并安全排空 SPSC tail_
+    const uint64_t packed_entry = epoch_and_flush_.load(std::memory_order_acquire);
+    const uint64_t target_epoch = packed_entry >> EPOCH_SHIFT;
+    if (consumed_epoch_.load(std::memory_order_relaxed) != target_epoch) {
+        reset_ring_state_for_epoch(target_epoch);
+        LOGI("消费线程已安全清空旧代残余并追平 epoch=%llu", static_cast<unsigned long long>(target_epoch));
+    }
+
     uint8_t* pkt_buf = transfer->buffer;
     size_t total_transfer_len = 0;
 
-    // 💡 动态根据输入位深确定单采样字节数 (16-bit: 2 bytes, 24-bit: 3 bytes)
     const size_t input_bytes_per_sample = (current_bit_depth_ > 0) ? static_cast<size_t>(current_bit_depth_ / 8) : 2;
 
-    // 💡 预留预充缓冲区门限 (100ms) 彻底避免网络抖动微下溢
-    const size_t pre_roll_threshold = (current_sample_rate_ * current_channels_ * input_bytes_per_sample) / 10;
-    if (!has_pre_rolled_.load(std::memory_order_relaxed)) {
-        if (ring_buffer_ && ring_buffer_->available_read() >= pre_roll_threshold) {
-            has_pre_rolled_.store(true, std::memory_order_release);
-            LOGI("环形缓冲区预充就绪 (已缓冲 >= 100ms PCM: %zu 字节)，开启平滑输出", ring_buffer_->available_read());
-        }
+    if (try_unlock_preroll(target_epoch)) {
+        LOGI("环形缓冲区预充就绪 (已缓冲 >= 100ms PCM: %zu 字节)，开启平滑输出",
+             ring_buffer_->available_read());
     }
-    const bool ready_to_play = has_pre_rolled_.load(std::memory_order_relaxed);
+    const uint64_t packed_after_unlock = epoch_and_flush_.load(std::memory_order_acquire);
+    const bool ready_to_play =
+        ((packed_after_unlock >> EPOCH_SHIFT) == target_epoch) &&
+        ((packed_after_unlock & FLAG_PREROLLED) != 0ULL);
 
-    // 临时输入缓冲区 (存放从 RingBuffer 提取的原始输入 PCM)
     static thread_local std::vector<uint8_t> temp_pcm_in;
 
     for (int i = 0; i < transfer->num_iso_packets; ++i) {
         struct libusb_iso_packet_descriptor* pkt = &transfer->iso_packet_desc[i];
 
-        // 💡 步进计算：优先采用 UAC2 显式时钟反馈闭环伺服，后备开环 Bresenham
         size_t samples_this_pkt = 0;
-        const uint32_t fb_rate = feedback_rate_q16_.load(std::memory_order_relaxed);
+        const uint32_t fb_rate = feedback_rate_q16_.load(std::memory_order_acquire);
 
         if (fb_rate > 0) {
-            // 💡 闭环模式：Q16.16 瞬时微帧采样率相位累加
-            // fb_rate 为 DAC 硬件晶振汇报的 Q16.16 定点数 (例如 44.1kHz 下标称 0x00058333 = 5.5125 采样/微帧)
             phase_accumulator_ += fb_rate;
             samples_this_pkt = phase_accumulator_ >> 16;
-            phase_accumulator_ &= 0xFFFF; // 保留小数余量
+            phase_accumulator_ &= 0xFFFF;
         } else {
-            // 💡 开环模式：Bresenham 时钟步进计算当前微帧所需采样点数 (如 44.1kHz 时交替 5 与 6 采样点)
             samples_this_pkt = base_samples_per_packet_;
             bresenham_accum_ += remainder_samples_;
             if (bresenham_accum_ >= packet_rate_) {
@@ -702,45 +977,56 @@ void AudioEngine::fill_isoc_transfer(struct libusb_transfer* transfer) {
             }
         }
 
-        // 边界防护：限制在单微帧最大安全容量内
         const size_t max_allowed_samples = (endpoint_info_.subslot_size > 0 && current_channels_ > 0) ?
-            (packet_size_ / (current_channels_ * endpoint_info_.subslot_size)) : 8;
+            (packet_size_ / (static_cast<size_t>(current_channels_) * endpoint_info_.subslot_size)) : 8;
         if (samples_this_pkt > max_allowed_samples && max_allowed_samples > 0) {
             samples_this_pkt = max_allowed_samples;
         }
 
-        const size_t target_pkt_bytes = samples_this_pkt * current_channels_ * endpoint_info_.subslot_size;
-        const size_t raw_input_bytes = samples_this_pkt * current_channels_ * input_bytes_per_sample;
+        const size_t target_pkt_bytes = samples_this_pkt * static_cast<size_t>(current_channels_) * endpoint_info_.subslot_size;
+        const size_t raw_input_bytes = samples_this_pkt * static_cast<size_t>(current_channels_) * input_bytes_per_sample;
         pkt->length = static_cast<unsigned int>(target_pkt_bytes);
 
-        // 💡 优先判断 DAC Warmup 静音预充：开流或切频首 50ms 注入全零，保护继电器免受爆音冲击
+        // 💡 每微帧实时采样原子静音标记，确保快路径哪怕在 URB 填充中途触发也能立刻切全 0
+        const uint64_t packed_now = epoch_and_flush_.load(std::memory_order_acquire);
+        const bool epoch_changed = (packed_now >> EPOCH_SHIFT) != target_epoch;
+        const bool flushing_now = (packed_now & FLAG_FLUSHING) != 0ULL;
+        const bool paused_now = is_explicitly_paused_.load(std::memory_order_acquire);
+        const bool muted = paused_now || flushing_now || epoch_changed;
+
         const int remaining_warmup = warmup_packets_remaining_.load(std::memory_order_relaxed);
         if (remaining_warmup > 0) {
             if (warmup_packets_remaining_.fetch_sub(1, std::memory_order_relaxed) == 1) {
                 LOGI("DAC Warmup 50ms 静音预充完成，开始正常音频调度");
             }
             std::memset(pkt_buf, 0, target_pkt_bytes);
-        } else if (paused || !ready_to_play || !ring_buffer_ || ring_buffer_->available_read() < raw_input_bytes) {
-            // 💡 暂停、预充中或下溢时填充静音帧，保持等时时钟锁相不丢步
+        } else if (muted || !ready_to_play || !ring_buffer_ || ring_buffer_->available_read() < raw_input_bytes) {
             std::memset(pkt_buf, 0, target_pkt_bytes);
-            if (ready_to_play && ring_buffer_ && ring_buffer_->available_read() < raw_input_bytes) {
+            if (!muted && ready_to_play && ring_buffer_ && ring_buffer_->available_read() < raw_input_bytes) {
                 int underruns = consecutive_underruns_.fetch_add(1, std::memory_order_relaxed) + 1;
-                // 💡 软抗抖策略：偶发微下溢仅填补单微帧静音垫步保活，避免人为制造 100ms 停顿跳跃；
-                // 仅当连续 50 个微帧 (~50ms) 持续读空时，才判定为网络断流并重新触发 100ms 蓄水保护
                 if (underruns >= 50) {
-                    has_pre_rolled_.store(false, std::memory_order_release);
+                    uint64_t cur_state = epoch_and_flush_.load(std::memory_order_acquire);
+                    while ((cur_state >> EPOCH_SHIFT) == target_epoch &&
+                           (cur_state & FLAG_PREROLLED) != 0ULL) {
+                        if (epoch_and_flush_.compare_exchange_weak(
+                                cur_state,
+                                cur_state & ~FLAG_PREROLLED,
+                                std::memory_order_acq_rel,
+                                std::memory_order_acquire
+                            )) {
+                            LOGW("环形缓冲区持续下溢超 50ms，重新进入 100ms 预充保护");
+                            break;
+                        }
+                    }
                     consecutive_underruns_.store(0, std::memory_order_relaxed);
-                    LOGW("环形缓冲区持续下溢超 50ms，重新进入 100ms 预充保护");
                 }
             } else {
                 consecutive_underruns_.store(0, std::memory_order_relaxed);
             }
         } else {
             temp_pcm_in.resize(raw_input_bytes);
-            // 从无锁环形缓冲区读取纯 PCM 数据
             size_t bytes_read = ring_buffer_->read(temp_pcm_in.data(), raw_input_bytes);
             if (bytes_read == raw_input_bytes) {
-                // 💡 根据当前输入位深动态分流 (16-bit vs 24-bit)，并执行高位对齐与低位补零 (Bit-Perfect LSB Zero-Padding)
                 if (current_bit_depth_ == 24) {
                     PcmFormatter::format_24bit_to_target(
                         temp_pcm_in.data(),
@@ -761,7 +1047,6 @@ void AudioEngine::fill_isoc_transfer(struct libusb_transfer* transfer) {
             }
         }
 
-        // 💡 严格遵循 Linux usbfs / libusb 规范：数据包在 transfer->buffer 内紧凑无缝连续排布
         pkt_buf += target_pkt_bytes;
         total_transfer_len += target_pkt_bytes;
     }
@@ -770,7 +1055,7 @@ void AudioEngine::fill_isoc_transfer(struct libusb_transfer* transfer) {
 }
 
 void AudioEngine::process_isoc_transfer(struct libusb_transfer* transfer) {
-    if (!is_running_.load(std::memory_order_relaxed) ||
+    if (!is_running_.load(std::memory_order_acquire) ||
         transfer->status == LIBUSB_TRANSFER_CANCELLED ||
         transfer->status == LIBUSB_TRANSFER_NO_DEVICE) {
         active_transfers_.fetch_sub(1, std::memory_order_acq_rel);
@@ -778,18 +1063,16 @@ void AudioEngine::process_isoc_transfer(struct libusb_transfer* transfer) {
     }
 
     if (transfer->status != LIBUSB_TRANSFER_COMPLETED) {
-        static int transfer_err_count = 0;
-        if (transfer_err_count++ % 100 == 0) {
+        if (transfer_err_count_.fetch_add(1, std::memory_order_relaxed) % 100 == 0) {
             LOGW("等时传输 URB 状态异常: status=%d", transfer->status);
         }
     }
 
     fill_isoc_transfer(transfer);
 
-    // 重新提交该 URB
     int r = libusb_submit_transfer(transfer);
     if (r != LIBUSB_SUCCESS) {
-        if (is_running_.load(std::memory_order_relaxed)) {
+        if (is_running_.load(std::memory_order_acquire)) {
             LOGW("重新提交等时 URB 失败: %d", r);
         }
         active_transfers_.fetch_sub(1, std::memory_order_acq_rel);
@@ -805,7 +1088,7 @@ void LIBUSB_CALL AudioEngine::feedback_transfer_cb(struct libusb_transfer* trans
 }
 
 void AudioEngine::process_feedback_transfer(struct libusb_transfer* transfer) {
-    if (!is_running_.load(std::memory_order_relaxed) ||
+    if (!is_running_.load(std::memory_order_acquire) ||
         transfer->status == LIBUSB_TRANSFER_CANCELLED ||
         transfer->status == LIBUSB_TRANSFER_NO_DEVICE) {
         active_transfers_.fetch_sub(1, std::memory_order_acq_rel);
@@ -823,20 +1106,17 @@ void AudioEngine::process_feedback_transfer(struct libusb_transfer* transfer) {
                 }
                 uint32_t raw_val = 0;
                 if (pkt->actual_length == 3) {
-                    // UAC1 10.14 格式 (Full Speed, 1ms 帧)
                     const uint32_t val10_14 = static_cast<uint32_t>(buf[0]) |
                                               (static_cast<uint32_t>(buf[1]) << 8) |
                                               (static_cast<uint32_t>(buf[2]) << 16);
                     raw_val = val10_14 << 2;
                 } else {
-                    // UAC2 16.16 格式 (High Speed Q16.16 125us 微帧)
                     raw_val = static_cast<uint32_t>(buf[0]) |
                               (static_cast<uint32_t>(buf[1]) << 8) |
                               (static_cast<uint32_t>(buf[2]) << 16) |
                               (static_cast<uint32_t>(buf[3]) << 24);
                 }
 
-                // 💡 验证合法范围 (允许标称频率 ±10% 物理晶振范围，过滤非法干扰包)
                 const uint64_t nominal_q16 = (static_cast<uint64_t>(current_sample_rate_) << 16) / packet_rate_;
                 const uint64_t min_q16 = nominal_q16 * 90 / 100;
                 const uint64_t max_q16 = nominal_q16 * 110 / 100;
@@ -847,11 +1127,9 @@ void AudioEngine::process_feedback_transfer(struct libusb_transfer* transfer) {
                         LOGI("🎉 成功锁定 UAC2 Explicit Feedback 物理时钟: raw=0x%08X (%.4f 采样/微帧, 目标基准: 0x%08llX)",
                              raw_val, static_cast<double>(raw_val) / 65536.0, static_cast<unsigned long long>(nominal_q16));
                     }
-                    // 💡 实时精准跟随外部 DAC 晶振反馈伺服步进，杜绝相位滞后引发的 Overrun 溢出
                     feedback_rate_q16_.store(raw_val, std::memory_order_release);
                 } else {
-                    static int err_count = 0;
-                    if (err_count++ % 1000 == 0) {
+                    if (feedback_err_count_.fetch_add(1, std::memory_order_relaxed) % 1000 == 0) {
                         LOGW("FB 越界异常: raw=0x%08X, nominal=0x%08llX, range=[0x%08llX, 0x%08llX], act_len=%u",
                              raw_val, static_cast<unsigned long long>(nominal_q16),
                              static_cast<unsigned long long>(min_q16),
@@ -863,7 +1141,6 @@ void AudioEngine::process_feedback_transfer(struct libusb_transfer* transfer) {
         }
     }
 
-    // 重置接收包长并重新提交
     const size_t fb_pkt_size = std::max<size_t>(
         endpoint_info_.feedback_max_packet_size > 0 ? endpoint_info_.feedback_max_packet_size : 4,
         8
@@ -873,145 +1150,123 @@ void AudioEngine::process_feedback_transfer(struct libusb_transfer* transfer) {
 
     int r = libusb_submit_transfer(transfer);
     if (r != LIBUSB_SUCCESS) {
-        if (is_running_.load(std::memory_order_relaxed)) {
+        if (is_running_.load(std::memory_order_acquire)) {
             LOGW("重新提交反馈 URB 失败: %d", r);
         }
         active_transfers_.fetch_sub(1, std::memory_order_acq_rel);
     }
 }
 
-int AudioEngine::write_pcm(const uint8_t* data, size_t size) {
-    if (!ring_buffer_ || !is_running_.load(std::memory_order_relaxed) || !data || size == 0) {
+int AudioEngine::write_pcm(const uint8_t* data, size_t size, uint64_t expected_epoch) {
+    // 💡 P0 #3 并发防御：先登记 active_writers_，再以 seq_cst 检查 is_running_，
+    // 配合 stop_transfer_pipeline_locked() 先设 is_running_=false (seq_cst) 再排空 active_writers_，
+    // 确保 ring_buffer_ 在整个写入期间存活且不被 release_device()/reconfigure() 并发销毁。
+    ScopedActiveWriter writer_guard(active_writers_);
+    if (!is_running_.load(std::memory_order_seq_cst) || !ring_buffer_) {
         return -1;
     }
+    if (!data || size == 0) {
+        return 0;
+    }
+    if (expected_epoch == 0 || expected_epoch != get_current_buffer_epoch()) {
+        return -2;
+    }
+
+    // 💡 R2/KTD2 “写先于清 (Write-Before-Clear)” 同步门闩：
+    // 若快路径刚把 buffer_epoch_ 推到 expected_epoch，但消费线程尚在 <=1ms 回调窗口内未追平，
+    // 生产线程必须让出等待消费线程先清完旧代残余再写首包，严禁跨线程清缓冲或提前写导致吞首音。
+    if (consumed_epoch_.load(std::memory_order_acquire) != expected_epoch) {
+        const auto wait_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+        while (consumed_epoch_.load(std::memory_order_acquire) != expected_epoch) {
+            if (!is_running_.load(std::memory_order_seq_cst)) {
+                return -1;
+            }
+            if (get_current_buffer_epoch() != expected_epoch) {
+                return -2;
+            }
+            // 💡 严禁误用 is_streaming() (静音期间恒 false)！仅以 is_running_ && active_transfers_ > 0 判定消费线程存活
+            if (active_transfers_.load(std::memory_order_acquire) == 0) {
+                // 💡 必须使用 try_to_lock：若控制线程正持 op_mutex_ 执行 stop_transfer_pipeline_locked() 等待 active_writers_==0，
+                // 阻塞等待 op_mutex_ 会引发互相等待的锁序死锁！
+                std::unique_lock<std::recursive_mutex> lock(op_mutex_, std::try_to_lock);
+                if (!lock.owns_lock()) {
+                    if (!is_running_.load(std::memory_order_seq_cst)) {
+                        return -1;
+                    }
+                    if (std::chrono::steady_clock::now() >= wait_deadline) {
+                        return -3;
+                    }
+                    std::this_thread::sleep_for(std::chrono::microseconds(100));
+                    continue;
+                }
+                if (!is_running_.load(std::memory_order_seq_cst)) {
+                    return -1;
+                }
+                if (get_current_buffer_epoch() != expected_epoch) {
+                    return -2;
+                }
+                if (active_transfers_.load(std::memory_order_acquire) == 0 &&
+                    consumed_epoch_.load(std::memory_order_acquire) != expected_epoch) {
+                    reset_ring_state_for_epoch(expected_epoch);
+                    break;
+                }
+            } else {
+                if (std::chrono::steady_clock::now() >= wait_deadline) {
+                    LOGW("write_pcm 等待消费线程追平 epoch=%llu 超时 (consumed=%llu)",
+                         static_cast<unsigned long long>(expected_epoch),
+                         static_cast<unsigned long long>(consumed_epoch_.load(std::memory_order_acquire)));
+                    return -3;
+                }
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+            }
+        }
+    }
+
+    // 追平唤醒后再次校验世代，防止等待期间已发生新的切歌 Flush
+    if (!is_running_.load(std::memory_order_seq_cst)) {
+        return -1;
+    }
+    if (get_current_buffer_epoch() != expected_epoch) {
+        return -2;
+    }
+
     const size_t available = ring_buffer_->available_write();
-    // 💡 保护原则：剩余空间不足以写入整包时执行整包丢弃 (Drop Whole Packet)，绝不截断半帧拼接破坏连续声波
+    // 💡 整包丢弃原则 (Drop Whole Packet)：严禁半包截断破坏采样声道对齐
     if (available < size) {
-        static int overrun_log = 0;
-        if (overrun_log++ % 100 == 0) {
+        if (overrun_log_count_.fetch_add(1, std::memory_order_relaxed) % 100 == 0) {
             LOGW("环形缓冲区高水位饱和 (可用: %zu < 需求: %zu)，整包丢弃以消除波形断裂爆音", available, size);
         }
         return 0;
     }
-    return static_cast<int>(ring_buffer_->write(data, size));
-}
 
-int AudioEngine::pause_stream() {
-    is_paused_.store(true, std::memory_order_release);
-    LOGI("音频流等时传输已暂停 (持续推送静音保活帧)");
-    return 0;
+    const size_t written = ring_buffer_->write(data, size);
+
+    // 💡 写入后达到 100ms 预充阈值且仍在同一 epoch 时，原位原子解除 FLUSH 静音
+    if (written > 0) {
+        bool cas_unmuted = false;
+        if (try_unlock_preroll(expected_epoch, &cas_unmuted) && cas_unmuted) {
+            LOGI("新流达到 100ms 预充水位，Native 原位自动解除 FLUSH 静音 (epoch=%llu)",
+                 static_cast<unsigned long long>(expected_epoch));
+        }
+    }
+
+    return static_cast<int>(written);
 }
 
 int AudioEngine::resume_stream() {
-    is_paused_.store(false, std::memory_order_release);
-    LOGI("音频流等时传输已恢复");
+    is_explicitly_paused_.store(false, std::memory_order_release);
+    LOGI("音频流显式暂停标记已清除，恢复等时输出");
     return 0;
-}
-
-int AudioEngine::stop_stream() {
-    LOGI("停止音频流...");
-    has_pre_rolled_.store(false, std::memory_order_release);
-    feedback_locked_.store(false, std::memory_order_release);
-    warmup_packets_remaining_.store(0, std::memory_order_release);
-    if (ring_buffer_) {
-        ring_buffer_->clear();
-    }
-    is_paused_.store(true, std::memory_order_release);
-    return 0;
-}
-
-void AudioEngine::flush_buffer() {
-    std::lock_guard<std::recursive_mutex> lock(op_mutex_);
-    LOGI("AudioEngine 刷新环形缓冲区并重置预充门限 (FLUSH/Seek)");
-    if (ring_buffer_) {
-        ring_buffer_->clear();
-    }
-    has_pre_rolled_.store(false, std::memory_order_release);
-    consecutive_underruns_.store(0, std::memory_order_relaxed);
-    phase_accumulator_ = 0;
-    bresenham_accum_ = 0;
 }
 
 int AudioEngine::release_device() {
     std::lock_guard<std::recursive_mutex> lock(op_mutex_);
     LOGI("开始执行声卡归还与内核驱动重绑时序...");
 
-    // 💡 严格遵循时序规范：
-    // (1) 终止 URB 传输并回收 URB
-    is_running_.store(false, std::memory_order_release);
-    warmup_packets_remaining_.store(0, std::memory_order_release);
-
-    for (auto* xfer : transfers_) {
-        if (xfer) {
-            libusb_cancel_transfer(xfer);
-        }
-    }
-    for (auto* xfer : feedback_transfers_) {
-        if (xfer) {
-            libusb_cancel_transfer(xfer);
-        }
-    }
-
-    if (event_thread_.joinable()) {
-        event_thread_.join();
-    }
-    LOGI("所有在途等时传输 URB 已完成注销与内核回收 (active=%d)，执行物理内存安全释放...",
-         active_transfers_.load(std::memory_order_relaxed));
-    active_transfers_.store(0, std::memory_order_release);
-
-    for (auto* xfer : transfers_) {
-        if (xfer) {
-            libusb_free_transfer(xfer);
-        }
-    }
-    for (auto* xfer : feedback_transfers_) {
-        if (xfer) {
-            libusb_free_transfer(xfer);
-        }
-    }
-    transfers_.clear();
-
-    // 💡 解锁并清空 URB 物理内存
-    for (auto& buf : transfer_buffers_) {
-        if (!buf.empty()) {
-            munlock(buf.data(), buf.size());
-        }
-    }
-    transfer_buffers_.clear();
-
-    for (auto& buf : feedback_buffers_) {
-        if (!buf.empty()) {
-            munlock(buf.data(), buf.size());
-        }
-    }
-    feedback_transfers_.clear();
-    feedback_buffers_.clear();
-    feedback_rate_q16_.store(0, std::memory_order_release);
-    phase_accumulator_ = 0;
+    stop_transfer_pipeline_locked();
 
     if (dev_handle_) {
-        // (2) 释放接口独占
-        if (is_claimed_.load()) {
-            libusb_release_interface(dev_handle_, endpoint_info_.interface_number);
-            if (endpoint_info_.control_interface_number >= 0 &&
-                endpoint_info_.control_interface_number != endpoint_info_.interface_number) {
-                libusb_release_interface(dev_handle_, endpoint_info_.control_interface_number);
-            }
-            is_claimed_.store(false);
-        }
-
-        // (3) 💡 重新绑定 Linux 内核驱动 snd-usb-audio (触发底层 USBDEVFS_CONNECT ioctl)
-        LOGI("重新向 Linux 内核挂载 snd-usb-audio 驱动 (USBDEVFS_CONNECT)...");
-        if (endpoint_info_.control_interface_number >= 0 &&
-            endpoint_info_.control_interface_number != endpoint_info_.interface_number) {
-            libusb_attach_kernel_driver(dev_handle_, endpoint_info_.control_interface_number);
-        }
-        int r = libusb_attach_kernel_driver(dev_handle_, endpoint_info_.interface_number);
-        if (r != LIBUSB_SUCCESS) {
-            LOGW("libusb_attach_kernel_driver 结果: %d (声卡可能已处于内核接管态)", r);
-        }
-
-        // (4) 关闭 libusb 句柄 (关闭后 Java 层的 UsbDeviceConnection 才能安全 close)
+        release_claimed_interfaces_locked();
         libusb_close(dev_handle_);
         dev_handle_ = nullptr;
     }
@@ -1023,19 +1278,22 @@ int AudioEngine::release_device() {
 }
 
 bool AudioEngine::is_streaming() const {
-    return is_running_.load(std::memory_order_relaxed) && !is_paused_.load(std::memory_order_relaxed);
+    return is_running_.load(std::memory_order_acquire) && !is_muted();
 }
 
 size_t AudioEngine::get_buffer_available() const {
-    return ring_buffer_ ? ring_buffer_->available_write() : 0;
+    ScopedActiveWriter writer_guard(active_writers_);
+    return (is_running_.load(std::memory_order_seq_cst) && ring_buffer_) ? ring_buffer_->available_write() : 0;
 }
 
 size_t AudioEngine::get_buffer_capacity() const {
-    return ring_buffer_ ? ring_buffer_->capacity() : 0;
+    ScopedActiveWriter writer_guard(active_writers_);
+    return (is_running_.load(std::memory_order_seq_cst) && ring_buffer_) ? ring_buffer_->capacity() : 0;
 }
 
 size_t AudioEngine::get_available_read() const {
-    return ring_buffer_ ? ring_buffer_->available_read() : 0;
+    ScopedActiveWriter writer_guard(active_writers_);
+    return (is_running_.load(std::memory_order_seq_cst) && ring_buffer_) ? ring_buffer_->available_read() : 0;
 }
 
 } // namespace purecast

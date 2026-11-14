@@ -11,7 +11,8 @@ public:
     static bool decode_stream(
         JNIEnv* env,
         jobject input_stream,
-        void (*on_format_ready)(int sample_rate, int bit_depth, int channels, int64_t total_pcm_frames, void* user_data),
+        int64_t (*on_format_ready)(int sample_rate, int bit_depth, int channels, int64_t total_pcm_frames, void* user_data),
+        void (*on_first_pcm_written)(void* user_data),
         void* user_data
     );
 

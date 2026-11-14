@@ -2,6 +2,7 @@ plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
+    jacoco
 }
 
 android {
@@ -75,7 +76,18 @@ android {
 
     testOptions {
         unitTests.isReturnDefaultValues = true
+        unitTests.isIncludeAndroidResources = true
+        unitTests.all {
+            it.extensions.configure(JacocoTaskExtension::class.java) {
+                isIncludeNoLocationClasses = true
+                excludes = listOf("jdk.internal.*")
+            }
+        }
     }
+}
+
+jacoco {
+    toolVersion = "0.8.12"
 }
 
 dependencies {
@@ -104,4 +116,89 @@ dependencies {
     // Testing
     testImplementation(libs.junit)
     testImplementation(libs.kotlinx.coroutines.test)
+    testImplementation(libs.robolectric)
+    testImplementation(libs.androidx.test.core)
+    androidTestImplementation(libs.junit)
+    androidTestImplementation(libs.androidx.test.core)
+    androidTestImplementation(libs.androidx.test.runner)
+    androidTestImplementation(libs.androidx.test.ext.junit)
+    androidTestImplementation(libs.androidx.compose.ui.test.junit4)
+    debugImplementation(libs.androidx.compose.ui.test.manifest)
+}
+
+// 💡 焦点与状态转换核心单元覆盖率强校验门禁
+val sessionClassesTree = fileTree(layout.buildDirectory.dir("tmp/kotlin-classes/debug")) {
+    include(
+        "com/solo/purecast/core/session/PlaybackSessionCoordinator*.class",
+        "com/solo/purecast/core/session/TrackTransactionManager*.class",
+        "com/solo/purecast/core/session/TriStateTransitionMatrix*.class"
+    )
+}
+
+val jacocoTestReport by tasks.registering(JacocoReport::class) {
+    dependsOn("testDebugUnitTest")
+    reports {
+        xml.required.set(true)
+        html.required.set(true)
+    }
+    sourceDirectories.setFrom(files("${project.projectDir}/src/main/java"))
+    classDirectories.setFrom(files(sessionClassesTree))
+    executionData.setFrom(files(layout.buildDirectory.file("jacoco/testDebugUnitTest.exec")))
+}
+
+val jacocoTestCoverageVerification by tasks.registering(JacocoCoverageVerification::class) {
+    dependsOn(jacocoTestReport)
+    sourceDirectories.setFrom(files("${project.projectDir}/src/main/java"))
+    classDirectories.setFrom(files(sessionClassesTree))
+    executionData.setFrom(files(layout.buildDirectory.file("jacoco/testDebugUnitTest.exec")))
+
+    violationRules {
+        rule {
+            element = "BUNDLE"
+            limit {
+                counter = "INSTRUCTION"
+                value = "COVEREDRATIO"
+                minimum = "0.90".toBigDecimal()
+            }
+            limit {
+                counter = "LINE"
+                value = "COVEREDRATIO"
+                minimum = "0.90".toBigDecimal()
+            }
+        }
+        rule {
+            element = "CLASS"
+            includes = listOf(
+                "com.solo.purecast.core.session.TrackTransactionManager",
+                "com.solo.purecast.core.session.TriStateTransitionMatrix"
+            )
+            limit {
+                counter = "BRANCH"
+                value = "COVEREDRATIO"
+                minimum = "1.00".toBigDecimal()
+            }
+        }
+    }
+}
+
+// 💡 Native C++ ASan / UBSan / TSan 宿主机状态机与 RAOP 协议栈测试门禁 (#7)
+val runNativeSanitizerTests by tasks.registering(Exec::class) {
+    group = "verification"
+    description = "Configure, build, and run C++ ASan/UBSan/TSan host tests via CTest"
+    workingDir = projectDir
+    commandLine(
+        "sh",
+        "-c",
+        """
+        export PATH="/opt/homebrew/bin:/usr/local/bin:${'$'}PATH"
+        cmake -S src/main/cpp/tests -B src/main/cpp/tests/build &&
+        cmake --build src/main/cpp/tests/build -j8 &&
+        ctest --test-dir src/main/cpp/tests/build --output-on-failure --timeout 20 --repeat until-fail:2
+        """.trimIndent()
+    )
+}
+
+tasks.named("check") {
+    dependsOn(jacocoTestCoverageVerification)
+    dependsOn(runNativeSanitizerTests)
 }

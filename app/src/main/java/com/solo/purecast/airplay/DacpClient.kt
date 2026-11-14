@@ -1,9 +1,11 @@
 package com.solo.purecast.airplay
 
+import com.solo.purecast.core.session.RemoteCommandType
 import com.solo.purecast.util.Logger
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.net.HttpURLConnection
 import java.net.URL
 
@@ -86,44 +88,89 @@ class DacpClient(
     fun previous() = sendCommand("previtem")
     fun stop() = sendCommand("stop")
 
+    /**
+     * 💡 设置当前播放时间戳 (ms)，用于 AirPlay 远端精准寻道
+     */
+    suspend fun setPlayingTime(positionMs: Long): Result<Unit> =
+        sendCommandAndAwait("setproperty?dacp.playingtime=$positionMs")
+
+    /**
+     * 💡 串行执行挂起式 DACP 控制指令（供 [com.solo.purecast.core.session.PlaybackSessionCoordinator] 使用），
+     * 返回真实网络响应成功/失败回执，确保连按切歌指令不并发交错且支持 5000ms 超时判定。
+     */
+    suspend fun executeRemoteCommand(commandType: RemoteCommandType): Result<Unit> {
+        val command = when (commandType) {
+            RemoteCommandType.PLAY -> "play"
+            RemoteCommandType.PAUSE -> "pause"
+            RemoteCommandType.PLAY_PAUSE -> "playpause"
+            RemoteCommandType.NEXT -> "nextitem"
+            RemoteCommandType.PREVIOUS -> "previtem"
+        }
+        return sendCommandAndAwait(command)
+    }
+
+    suspend fun sendCommandAndAwait(command: String): Result<Unit> {
+        val params = prepareCommandParams(command)
+            ?: return Result.failure(IllegalStateException("DACP 会话未连接，无法发送指令 [$command]"))
+        return withContext(Dispatchers.IO) {
+            executeHttpCommand(params.first, params.second, params.third, command)
+        }
+    }
+
     private fun sendCommand(command: String) {
+        val params = prepareCommandParams(command) ?: return
+        scope.launch(Dispatchers.IO) {
+            executeHttpCommand(params.first, params.second, params.third, command)
+        }
+    }
+
+    private fun prepareCommandParams(command: String): Triple<String, Int, String?>? {
         val ip = clientIp
         if (ip.isNullOrEmpty()) {
             Logger.airplay.w(TAG, "未连接 AirPlay 发送端，忽略 DACP 指令 [$command]")
-            return
+            return null
         }
-
         val port = if (dacpPort > 0) dacpPort else 3689
         val token = activeRemoteToken
-
-        // 💡 如果尚未从 mDNS 解析出真实端口，暂存指令以备端口就绪后补发，但同时先尝试向当前端口 (或默认 3689) 发送一次
         if (dacpPort <= 0) {
             pendingCommand = command
             Logger.airplay.i(TAG, "DACP 动态端口未就绪，暂存 [$command] 并先向 3689 端口试探")
         }
+        return Triple(ip, port, token)
+    }
 
-        scope.launch(Dispatchers.IO) {
-            var conn: HttpURLConnection? = null
-            try {
-                val urlString = buildUrl(ip, port, command)
-                val url = URL(urlString)
-                conn = (url.openConnection() as HttpURLConnection).apply {
-                    requestMethod = "GET"
-                    connectTimeout = 1500
-                    readTimeout = 1500
-                    if (!token.isNullOrEmpty()) {
-                        setRequestProperty("Active-Remote", token)
-                    }
-                    setRequestProperty("User-Agent", "iTunes/12.11 (Windows; N)")
+    private fun executeHttpCommand(
+        ip: String,
+        port: Int,
+        token: String?,
+        command: String
+    ): Result<Unit> {
+        var conn: HttpURLConnection? = null
+        return try {
+            val urlString = buildUrl(ip, port, command)
+            val url = URL(urlString)
+            conn = (url.openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 1500
+                readTimeout = 1500
+                if (!token.isNullOrEmpty()) {
+                    setRequestProperty("Active-Remote", token)
                 }
-
-                val responseCode = conn.responseCode
-                Logger.airplay.i(TAG, "发送 DACP 指令 [$command] 至 $ip:$port 响应码: $responseCode")
-            } catch (e: Exception) {
-                Logger.airplay.w(TAG, "发送 DACP 指令 [$command] 异常: ${e.message}")
-            } finally {
-                conn?.disconnect()
+                setRequestProperty("User-Agent", "iTunes/12.11 (Windows; N)")
             }
+
+            val responseCode = conn.responseCode
+            Logger.airplay.i(TAG, "发送 DACP 指令 [$command] 至 $ip:$port 响应码: $responseCode")
+            if (responseCode in 200..299) {
+                Result.success(Unit)
+            } else {
+                Result.failure(IllegalStateException("DACP 指令 [$command] HTTP 响应失败: $responseCode"))
+            }
+        } catch (e: Exception) {
+            Logger.airplay.w(TAG, "发送 DACP 指令 [$command] 异常: ${e.message}")
+            Result.failure(e)
+        } finally {
+            conn?.disconnect()
         }
     }
 }

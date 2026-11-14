@@ -1,5 +1,6 @@
 package com.solo.purecast.service
 
+import android.app.Activity
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -7,6 +8,7 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.hardware.usb.UsbDevice
 import android.media.MediaMetadata
 import android.media.session.MediaSession
 import android.media.session.PlaybackState
@@ -16,80 +18,96 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.net.wifi.WifiManager
-import android.os.Build
 import android.os.PowerManager
+import android.os.SystemClock
 import androidx.core.app.ServiceCompat
+import androidx.core.content.IntentCompat
 import androidx.lifecycle.LifecycleService
 import androidx.lifecycle.lifecycleScope
 import com.solo.purecast.R
+import com.solo.purecast.airplay.AirPlayServerManager
 import com.solo.purecast.core.audio.AudioFocusManager
-import com.solo.purecast.core.nativebridge.NativeAudioEngine
+import com.solo.purecast.core.session.HardwareFastPathController
+import com.solo.purecast.core.session.PlaybackSessionCoordinator
+import com.solo.purecast.core.session.ProtocolResumeReopenResult
 import com.solo.purecast.core.usb.UsbDeviceManager
 import com.solo.purecast.data.SettingsRepository
-import com.solo.purecast.model.AudioPathState
+import com.solo.purecast.model.ErrorCode
 import com.solo.purecast.model.PlaybackStatus
+import com.solo.purecast.model.PlayerSessionSnapshot
+import com.solo.purecast.model.SeekCapability
+import com.solo.purecast.model.StreamProtocol
 import com.solo.purecast.model.TrackMetadata
 import com.solo.purecast.ui.MainActivity
+import com.solo.purecast.upnp.UpnpRendererServer
 import com.solo.purecast.util.Logger
+import java.lang.ref.WeakReference
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /**
- * 💡 PureCast 核心播放前台服务
+ * 💡 PureCast 核心播放前台服务（薄宿主容器）
  * 深度集成：
- * 1. UsbDeviceManager: 冷启动设备识别、Linux usbfs fd 穿透与 10 秒空闲自动让渡
- * 2. AudioFocusManager: Android 11+ 标准音频焦点抢占与被动释放时序
- * 3. 动态 Wi-Fi 锁管理: PLAYING 时激活 WIFI_MODE_FULL_LOW_LATENCY，空闲时释放以节能
- * 4. 突破 BAL 限制: 收到推流主动唤醒 MainActivity 大屏，并提供 fullScreenIntent 通知保底
- * 5. MediaSession 深度集成: 响应遥控器媒体全局按键，同步播放状态机与元数据，绑定 Notification MediaStyle
- * 6. UPnP / DLNA MediaRenderer 协议栈托管与广播友好名称持久化
+ * 1. UsbDeviceManager: 冷启动设备识别、Linux usbfs fd 穿透、Serial HardwareExecutor 与空闲让渡
+ * 2. PlaybackSessionCoordinator & PlaybackServiceSessionHost: 三状态正交会话协调与系统副作用桥接
+ * 3. AudioFocusManager: Android 11+ 标准音频焦点抢占与外部丢失即时归还声卡
+ * 4. 动态 Wi-Fi 锁管理 & 突破 BAL 限制的大屏唤醒 + fullScreenIntent 保底
+ * 5. MediaSession & 前台 MediaStyle 通知同步
+ * 6. UPnP / DLNA 与 AirPlay 1 (RAOP) 无状态协议服务端托管
  */
 class PlaybackService : LifecycleService() {
 
     lateinit var usbDeviceManager: UsbDeviceManager
+        private set
     private lateinit var audioFocusManager: AudioFocusManager
     private lateinit var settingsRepository: SettingsRepository
-    private var upnpServer: com.solo.purecast.upnp.UpnpRendererServer? = null
-    var airPlayServer: com.solo.purecast.airplay.AirPlayServerManager? = null
+    private lateinit var coordinator: PlaybackSessionCoordinator
+    private lateinit var sessionHost: PlaybackServiceSessionHost
+
+    private val fastPath = HardwareFastPathController.default
+
+    // 💡 协调器事件循环独立运行在受限单线程后台调度器，避免 sync 硬件操作阻塞 Android UI 主线程
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    private val coordinatorScope = CoroutineScope(SupervisorJob() + Dispatchers.Default.limitedParallelism(1))
+
+    private var upnpServer: UpnpRendererServer? = null
+    var airPlayServer: AirPlayServerManager? = null
         private set
-
-    enum class StreamSource {
-        IDLE,
-        UPNP,
-        AIRPLAY
-    }
-
-    private var currentStreamSource = StreamSource.IDLE
 
     private var multicastLock: WifiManager.MulticastLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
     private var wakeLock: PowerManager.WakeLock? = null
-
-    // 💡 系统级 MediaSession 会话管理器
     private var mediaSession: MediaSession? = null
-
-    // 💡 AirPlay 进度平滑推进器 (基于单调时钟推算，补偿 iOS 连续播放时不发 RTSP progress 的特性)
-    private val airPlayStateManager = com.solo.purecast.airplay.AirPlayStateManager()
-    private var airPlayProgressJob: kotlinx.coroutines.Job? = null
-    private var airPlaySuspendJob: kotlinx.coroutines.Job? = null
-    private var airPlayResumeWatchdogJob: kotlinx.coroutines.Job? = null
-    private var airPlayAnchorRealtimeMs: Long = 0L
-    private var airPlayBasePositionMs: Long = 0L
-
-    // 💡 动态网络状态监听器 (解决开机自启时 Wi-Fi 尚未就绪导致服务瘫痪的问题)
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var pendingPermissionActivityRef: WeakReference<Activity>? = null
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        super.onStartCommand(intent, flags, startId)
+        if (intent != null) {
+            val attachedDevice = IntentCompat.getParcelableExtra(
+                intent,
+                EXTRA_ATTACHED_USB_DEVICE,
+                UsbDevice::class.java
+            )
+            if (attachedDevice != null) {
+                Logger.service.i(TAG, "从 onStartCommand 捕获到待处理 USB 设备: ${attachedDevice.productName ?: attachedDevice.deviceName}")
+                handleUsbDeviceAttachedFromIntent(attachedDevice)
+            }
+        }
+        return START_STICKY
+    }
 
     override fun onCreate() {
         super.onCreate()
-        instance = this
-        Logger.service.i(TAG, "PlaybackService onCreate: 启动核心服务...")
+        Logger.service.i(TAG, "PlaybackService onCreate: 启动核心服务 (三状态协调器架构)...")
 
         settingsRepository = SettingsRepository(this)
         createNotificationChannel()
@@ -107,67 +125,182 @@ class PlaybackService : LifecycleService() {
         }
 
         val idleTimeout = settingsRepository.getIdleTimeoutSeconds()
-        usbDeviceManager = UsbDeviceManager(this) { connected, name ->
-            Logger.service.i(TAG, "USB DAC 硬件状态通知: connected=$connected, name=$name")
-            _audioPathState.value = _audioPathState.value.copy(
-                isDacConnected = connected,
-                dacName = name ?: if (connected) "Sony DAC" else "未检测到 USB DAC",
-                isExclusive = usbDeviceManager.isExclusive()
-            )
-            updateNotification()
-        }.apply {
+        usbDeviceManager = UsbDeviceManager(
+            context = this,
+            dispatchEvent = { envelope ->
+                if (::coordinator.isInitialized) {
+                    coordinator.dispatch(envelope)
+                }
+            }
+        )
+
+        coordinator = PlaybackSessionCoordinator(
+            scope = coordinatorScope,
+            hardwareBridge = usbDeviceManager,
+            dacpCommandSender = { commandType, _ ->
+                val client = airPlayServer?.dacpClient
+                    ?: return@PlaybackSessionCoordinator Result.failure(
+                        IllegalStateException("AirPlay 服务未就绪，无法发送 DACP 指令")
+                    )
+                client.executeRemoteCommand(commandType)
+            },
+            onSessionTerminated = { protocol, sessionId ->
+                preemptProtocolSession(protocol, sessionId)
+            },
+            onProtocolResumeAfterReopen = { protocol, sessionId, newEpoch ->
+                resumeProtocolAfterDeviceReopen(protocol, sessionId, newEpoch)
+            },
+            clockMs = { SystemClock.elapsedRealtime() }
+        ).apply {
             setIdleTimeoutSeconds(idleTimeout)
         }
 
-        // 冷启动扫描已连接的 USB DAC
-        usbDeviceManager.scanAndAttachDevice()
+        val systemEffects = object : ServiceSystemEffects {
+            override fun syncMediaSessionState(
+                status: PlaybackStatus,
+                positionMs: Long,
+                seekCapability: SeekCapability
+            ) {
+                updateMediaSessionState(status, positionMs, seekCapability)
+            }
 
-        // 💡 启动 UPnP / DLNA MediaRenderer 服务端 (友好名称末尾追加 [UPnP] 协议后缀)
+            override fun syncMediaSessionMetadata(metadata: TrackMetadata) {
+                updateMediaSessionMetadata(metadata)
+            }
+
+            override fun syncNotification(snapshot: PlayerSessionSnapshot) {
+                updateNotification(snapshot)
+            }
+
+            override fun acquireWifiLowLatencyLock() {
+                this@PlaybackService.acquireWifiLowLatencyLock()
+            }
+
+            override fun releaseWifiLowLatencyLock() {
+                this@PlaybackService.releaseWifiLowLatencyLock()
+            }
+
+            override fun requestAudioFocus(): Boolean = audioFocusManager.requestFocus()
+
+            override fun abandonAudioFocus() {
+                audioFocusManager.abandonFocus()
+            }
+
+            override fun wakeUpUiIfInBackground() {
+                this@PlaybackService.wakeUpUiIfInBackground()
+            }
+
+            override fun notifyUpnpTransportState(state: String) {
+                upnpServer?.genaNotifier?.notifyTransportState(state)
+            }
+
+            override fun preemptProtocol(protocol: StreamProtocol, sessionId: Long) {
+                preemptProtocolSession(protocol, sessionId)
+            }
+
+            override fun seekProtocolStream(protocol: StreamProtocol, positionMs: Long) {
+                Logger.service.i(TAG, "执行协议寻道: protocol=$protocol, positionMs=$positionMs")
+                when (protocol) {
+                    StreamProtocol.UPNP_DLNA -> {
+                        val ok = upnpServer?.seekToPositionMs(positionMs) ?: false
+                        if (!ok) {
+                            Logger.service.w(TAG, "UPnP seekToPositionMs 失败: $positionMs")
+                        }
+                    }
+                    StreamProtocol.AIRPLAY_1 -> {
+                        lifecycleScope.launch {
+                            val dacp = airPlayServer?.dacpClient
+                            val result = dacp?.setPlayingTime(positionMs)
+                            if (result?.isFailure == true) {
+                                Logger.service.w(TAG, "AirPlay DACP setPlayingTime 失败: ${result.exceptionOrNull()?.message}")
+                            }
+                        }
+                    }
+                    StreamProtocol.NONE -> Unit
+                }
+            }
+
+            override fun resumeProtocolAfterDeviceReopen(
+                protocol: StreamProtocol,
+                sessionId: Long,
+                newEpoch: Long
+            ): ProtocolResumeReopenResult {
+                return this@PlaybackService.resumeProtocolAfterDeviceReopen(protocol, sessionId, newEpoch)
+            }
+        }
+
+        sessionHost = PlaybackServiceSessionHost(
+            scope = lifecycleScope,
+            coordinator = coordinator,
+            hardwareBridge = usbDeviceManager,
+            systemEffects = systemEffects,
+            clockMs = { SystemClock.elapsedRealtime() }
+        )
+
+        // 💡 单向发布不可变全局快照，必须在发起硬件扫描前启动观察
+        lifecycleScope.launch {
+            coordinator.snapshot.collect { snap ->
+                _sessionSnapshot.value = snap
+            }
+        }
+        sessionHost.startObserving()
+
+        // 冷启动异步扫描已连接的 USB DAC，避免阻塞 Service.onCreate 主线程
+        usbDeviceManager.scanAndAttachDeviceAsync()
+
         val friendlyName = settingsRepository.getFriendlyName()
         if (settingsRepository.isUpnpEnabled()) {
-            upnpServer = com.solo.purecast.upnp.UpnpRendererServer(
-                scope = lifecycleScope,
-                playbackService = this,
-                friendlyName = formatUpnpName(friendlyName)
-            ).apply {
+            upnpServer = createUpnpServer(formatUpnpName(friendlyName)).apply {
                 start()
             }
         }
 
-        // 💡 启动原生 AirPlay 1 (RAOP) 接收服务端 (友好名称末尾追加 [AirPlay] 协议后缀)
-        airPlayServer = com.solo.purecast.airplay.AirPlayServerManager(
-            context = this,
-            scope = lifecycleScope,
-            onStreamRequestedListener = { sampleRate, bitDepth, channels, codec, clientIp, dacpPort, token ->
-                onAirPlayStreamRequested(sampleRate, bitDepth, channels, codec, clientIp, dacpPort, token)
-            },
-            onStreamStoppedListener = {
-                onAirPlayStreamStopped()
-            },
-            onMetadataReceivedListener = { title, artist, album, durationMs, coverArt ->
-                onAirPlayMetadataReceived(title, artist, album, durationMs, coverArt)
-            },
-            onProgressUpdatedListener = { positionMs, durationMs ->
-                onAirPlayProgressUpdated(positionMs, durationMs)
-            },
-            onStreamPausedListener = {
-                onAirPlayStreamPaused()
-            },
-            onStreamResumedListener = {
-                onAirPlayStreamResumed()
-            }
-        )
-
+        airPlayServer = createAirPlayServer()
         if (settingsRepository.isAirPlayEnabled()) {
             airPlayServer?.start(formatAirPlayName(friendlyName))
         }
 
+        // 💡 必须在所有 lateinit 核心协作者（sessionHost、usbDeviceManager、coordinator 等）就绪后再对外发布单实例引用
+        instance = this
+        pendingPermissionActivityRef?.get()?.let { act ->
+            registerUsbPermissionActivity(act)
+        }
         startBootNetworkWatchdog()
     }
 
+    private fun preemptProtocolSession(protocol: StreamProtocol, sessionId: Long) {
+        Logger.service.i(TAG, "终止/抢占协议底层会话: protocol=$protocol, sessionId=$sessionId")
+        when (protocol) {
+            StreamProtocol.UPNP_DLNA -> upnpServer?.stopPlayback(isPreempted = true, targetSessionId = sessionId)
+            StreamProtocol.AIRPLAY_1 -> airPlayServer?.preemptActiveSession(targetGlobalSessionId = sessionId)
+            StreamProtocol.NONE -> Unit
+        }
+    }
+
+    private fun resumeProtocolAfterDeviceReopen(
+        protocol: StreamProtocol,
+        sessionId: Long,
+        newEpoch: Long
+    ): ProtocolResumeReopenResult = when (protocol) {
+        StreamProtocol.AIRPLAY_1 ->
+            airPlayServer?.resumeAfterDeviceReopen(sessionId, newEpoch)
+                ?: ProtocolResumeReopenResult.PRODUCER_DEAD
+
+        StreamProtocol.UPNP_DLNA ->
+            upnpServer?.resumeStreamAfterDeviceReopen(sessionId)
+                ?: ProtocolResumeReopenResult.PRODUCER_DEAD
+
+        StreamProtocol.NONE -> ProtocolResumeReopenResult.PRODUCER_DEAD
+    }
+
+    fun clearError(code: ErrorCode) {
+        if (::sessionHost.isInitialized) {
+            sessionHost.clearError(code)
+        }
+    }
+
     /**
-     * 💡 开机冷启动阶段 Wi-Fi 就绪兜底守护：前 60 秒每隔 2~5 秒自检并尝试刷新一次网络广播
-     * 防止 Android TV 固件在开机瞬间 Wi-Fi 建立连通时漏发或延迟派发 NetworkCallback
+     * 💡 开机冷启动阶段 Wi-Fi 就绪兜底守护：前 60 秒定期自检并刷新网络广播
      */
     private fun startBootNetworkWatchdog() {
         lifecycleScope.launch(Dispatchers.IO) {
@@ -178,14 +311,17 @@ class PlaybackService : LifecycleService() {
                 val upnpBound = upnpServer?.getActiveIpAddress()
 
                 val isAirplayOk = airplayBound != null &&
-                        airplayBound.hostAddress?.startsWith("192.168.48.") != true &&
-                        airplayBound.hostAddress?.startsWith("127.") != true
+                    airplayBound.hostAddress?.startsWith("192.168.48.") != true &&
+                    airplayBound.hostAddress?.startsWith("127.") != true
                 val isUpnpOk = upnpBound != null &&
-                        !upnpBound.startsWith("192.168.48.") &&
-                        upnpBound != "127.0.0.1"
+                    !upnpBound.startsWith("192.168.48.") &&
+                    upnpBound != "127.0.0.1"
 
                 if (!isAirplayOk || !isUpnpOk) {
-                    Logger.service.i(TAG, "开机广播网络巡检守护：检测到未绑定至有效局域网 IP (AirPlay=${airplayBound?.hostAddress}, UPnP=$upnpBound)，触发自愈刷新...")
+                    Logger.service.i(
+                        TAG,
+                        "开机广播网络巡检守护：检测到未绑定至有效局域网 IP (AirPlay=${airplayBound?.hostAddress}, UPnP=$upnpBound)，触发自愈刷新..."
+                    )
                     withContext(Dispatchers.Main) {
                         refreshNetworkServices()
                     }
@@ -194,115 +330,76 @@ class PlaybackService : LifecycleService() {
         }
     }
 
-    /**
-     * 💡 初始化系统级 MediaSession
-     */
     private fun setupMediaSession() {
         try {
             mediaSession = MediaSession(this, "PureCastMediaSession").apply {
                 setCallback(object : MediaSession.Callback() {
                     override fun onPlay() {
                         Logger.service.i(TAG, "MediaSession 收到 onPlay 回调")
-                        if (currentStreamSource == StreamSource.AIRPLAY) {
-                            airPlayServer?.dacpClient?.play()
-                        }
                         resumePlayback()
-                        upnpServer?.genaNotifier?.notifyTransportState("PLAYING")
                     }
 
                     override fun onPause() {
                         Logger.service.i(TAG, "MediaSession 收到 onPause 回调")
-                        if (currentStreamSource == StreamSource.AIRPLAY) {
-                            airPlayServer?.dacpClient?.pause()
-                        }
                         pausePlayback()
-                        upnpServer?.genaNotifier?.notifyTransportState("PAUSED_PLAYBACK")
                     }
 
                     override fun onStop() {
                         Logger.service.i(TAG, "MediaSession 收到 onStop 回调")
-                        if (currentStreamSource == StreamSource.AIRPLAY) {
-                            airPlayServer?.dacpClient?.stop()
-                        }
                         stopPlayback()
-                        upnpServer?.genaNotifier?.notifyTransportState("STOPPED")
                     }
 
                     override fun onSkipToNext() {
                         Logger.service.i(TAG, "MediaSession 收到 onSkipToNext 回调")
-                        if (currentStreamSource == StreamSource.AIRPLAY) {
-                            airPlayServer?.dacpClient?.next()
-                        } else {
-                            handleNextTrack()
-                        }
+                        handleNextTrack()
                     }
 
                     override fun onSkipToPrevious() {
                         Logger.service.i(TAG, "MediaSession 收到 onSkipToPrevious 回调")
-                        if (currentStreamSource == StreamSource.AIRPLAY) {
-                            airPlayServer?.dacpClient?.previous()
-                        } else {
-                            handlePreviousTrack()
-                        }
+                        handlePreviousTrack()
                     }
 
                     override fun onSeekTo(pos: Long) {
                         Logger.service.i(TAG, "MediaSession 收到 onSeekTo: $pos ms")
+                        seekTo(pos)
                     }
                 })
                 isActive = true
             }
-            updateMediaSessionState()
-            updateMediaSessionMetadata(_currentMetadata.value)
+            val initial = _sessionSnapshot.value
+            updateMediaSessionState(
+                status = initial.playbackStatus,
+                positionMs = initial.progressPositionMs,
+                seekCapability = initial.metadata.seekCapability
+            )
+            updateMediaSessionMetadata(initial.metadata)
             Logger.service.i(TAG, "MediaSession 初始化完成并已激活")
         } catch (e: Exception) {
             Logger.service.e(TAG, "初始化 MediaSession 异常", e)
         }
     }
 
-    /**
-     * 💡 同步更新 MediaSession 播放状态与可用动作
-     */
-    private fun updateMediaSessionState() {
+    private fun updateMediaSessionState(
+        status: PlaybackStatus,
+        positionMs: Long,
+        seekCapability: SeekCapability
+    ) {
         val session = mediaSession ?: return
-        val status = _playbackStatus.value
         val state = when (status) {
             PlaybackStatus.PLAYING -> PlaybackState.STATE_PLAYING
             PlaybackStatus.PAUSED -> PlaybackState.STATE_PAUSED
             PlaybackStatus.STOPPED -> PlaybackState.STATE_STOPPED
             PlaybackStatus.IDLE -> PlaybackState.STATE_NONE
         }
-
-        val baseActions = PlaybackState.ACTION_PLAY or
-                PlaybackState.ACTION_PAUSE or
-                PlaybackState.ACTION_PLAY_PAUSE or
-                PlaybackState.ACTION_STOP or
-                PlaybackState.ACTION_SKIP_TO_NEXT or
-                PlaybackState.ACTION_SKIP_TO_PREVIOUS
-
-        val actions = if (_currentMetadata.value.isLiveStream) {
-            baseActions
-        } else {
-            baseActions or PlaybackState.ACTION_SEEK_TO
-        }
-
-        val currentPosMs = when (currentStreamSource) {
-            StreamSource.AIRPLAY -> _playbackPositionMs.value
-            else -> (upnpServer?.getCurrentPlayPositionSeconds() ?: 0L) * 1000L
-        }
+        val actions = computeMediaSessionActions(seekCapability)
         val playbackSpeed = if (status == PlaybackStatus.PLAYING) 1.0f else 0.0f
-
         val playbackState = PlaybackState.Builder()
             .setActions(actions)
-            .setState(state, currentPosMs, playbackSpeed)
+            .setState(state, positionMs, playbackSpeed)
             .build()
-
         session.setPlaybackState(playbackState)
     }
 
-    /**
-     * 💡 同步更新 MediaSession 歌曲元数据
-     */
     private fun updateMediaSessionMetadata(metadata: TrackMetadata) {
         val session = mediaSession ?: return
         try {
@@ -318,24 +415,19 @@ class PlaybackService : LifecycleService() {
         }
     }
 
-    /**
-     * 获取基础常驻锁 (组播锁与 CPU WakeLock 保证局域网保活)
-     */
     private fun acquireStandingLocks() {
         try {
             val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-
-            // 💡 必须获取 MulticastLock，否则电视机休眠或息屏时无法响应 SSDP M-SEARCH 广播
+            // 💡 必须获取 MulticastLock，否则电视机休眠或息屏时无法响应 SSDP/mDNS 广播
             multicastLock = wifiManager.createMulticastLock("PureCast:MulticastLock").apply {
                 setReferenceCounted(true)
                 acquire()
             }
             Logger.service.i(TAG, "成功获取 Wi-Fi 组播锁 (MulticastLock)")
 
-            // 获取 CPU WakeLock
             val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
             wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "PureCast:WakeLock").apply {
-                acquire(12 * 60 * 60 * 1000L) // 最长保护 12 小时
+                acquire(12 * 60 * 60 * 1000L)
             }
             Logger.service.i(TAG, "成功获取 CPU WakeLock")
         } catch (e: Exception) {
@@ -343,9 +435,6 @@ class PlaybackService : LifecycleService() {
         }
     }
 
-    /**
-     * 💡 动态按需激活 Wi-Fi 低延迟锁 (仅在推流播放中持有)
-     */
     private fun acquireWifiLowLatencyLock() {
         try {
             if (wifiLock == null) {
@@ -369,9 +458,6 @@ class PlaybackService : LifecycleService() {
         }
     }
 
-    /**
-     * 💡 释放 Wi-Fi 低延迟锁进入节能待机
-     */
     private fun releaseWifiLowLatencyLock() {
         try {
             wifiLock?.let {
@@ -404,8 +490,8 @@ class PlaybackService : LifecycleService() {
             val intent = Intent(this, MainActivity::class.java).apply {
                 addFlags(
                     Intent.FLAG_ACTIVITY_NEW_TASK or
-                            Intent.FLAG_ACTIVITY_SINGLE_TOP or
-                            Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
+                        Intent.FLAG_ACTIVITY_SINGLE_TOP or
+                        Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
                 )
             }
             startActivity(intent)
@@ -415,448 +501,60 @@ class PlaybackService : LifecycleService() {
         }
     }
 
-    /**
-     * 收到推流开始指令
-     */
-    fun startStreaming(
-        sampleRate: Int,
-        bitDepth: Int,
-        channels: Int = 2,
-        source: StreamSource = StreamSource.UPNP,
-        codec: String = "PCM"
-    ): Boolean {
-        Logger.service.i(TAG, "收到流式播放请求 (source=$source, codec=$codec): $sampleRate Hz, $bitDepth bit, $channels ch")
-
-        // 💡 跨协议后发抢占保护：若 UPnP 推流启动而 AirPlay 正在播放，优雅中止 AirPlay
-        if (source == StreamSource.UPNP && currentStreamSource == StreamSource.AIRPLAY) {
-            Logger.service.i(TAG, "UPnP 新流到达，执行后发抢占中止正在运行的 AirPlay 流")
-            airPlayServer?.stop()
-        }
-        currentStreamSource = source
-
-        // 1. 动态获取低延迟锁，突破 BAL 拉起界面
-        acquireWifiLowLatencyLock()
-        wakeUpUiIfInBackground()
-
-        // 2. 请求系统音频焦点
-        if (!audioFocusManager.requestFocus()) {
-            Logger.service.w(TAG, "申请音频焦点被系统拒绝，放弃推流")
-            releaseWifiLowLatencyLock()
-            return false
-        }
-
-        // 3. 接管声卡开启独占
-        val claimed = usbDeviceManager.claimUsbExclusive(sampleRate, bitDepth, channels)
-        if (!claimed) {
-            Logger.service.w(TAG, "接管 USB 声卡独占失败，释放音频焦点与低延迟锁")
-            audioFocusManager.abandonFocus()
-            releaseWifiLowLatencyLock()
-            return false
-        }
-
-        // 💡 确保新流开始时唤醒 Native 传输管道并重置 is_paused 状态
-        NativeAudioEngine.resumeStream()
-
-        _playbackStatus.value = PlaybackStatus.PLAYING
-        val currentProto = if (currentStreamSource == StreamSource.AIRPLAY) {
-            com.solo.purecast.model.StreamProtocol.AIRPLAY_1
-        } else {
-            com.solo.purecast.model.StreamProtocol.UPNP_DLNA
-        }
-        val resolvedCodec = when (source) {
-            StreamSource.AIRPLAY -> if (codec.isNotBlank()) codec else "ALAC"
-            StreamSource.UPNP -> if (codec.isNotBlank()) codec else "PCM"
-            else -> codec
-        }
-        _audioPathState.value = _audioPathState.value.copy(
-            isExclusive = true,
-            sampleRate = sampleRate,
-            bitDepth = bitDepth,
-            channels = channels,
-            protocol = currentProto,
-            codec = resolvedCodec
-        )
-
-        // 💡 若为 AirPlay 会话，启动单调时钟平滑进度推进器
-        if (currentStreamSource == StreamSource.AIRPLAY) {
-            airPlayResumeWatchdogJob?.cancel()
-            airPlayResumeWatchdogJob = null
-            airPlaySuspendJob?.cancel()
-            airPlaySuspendJob = null
-            if (_playbackPositionMs.value > 0L) {
-                airPlayBasePositionMs = _playbackPositionMs.value
-            } else {
-                airPlayBasePositionMs = 0L
-            }
-            airPlayAnchorRealtimeMs = android.os.SystemClock.elapsedRealtime()
-            launchAirPlayProgressTicker()
-        }
-
-        updateMediaSessionState()
-        updateNotification()
-        return true
-    }
-
-    /**
-     * 💡 原生 AirPlay 1 推流请求事件 (SETUP 触发)
-     */
-    private fun onAirPlayStreamRequested(
-        sampleRate: Int,
-        bitDepth: Int,
-        channels: Int,
-        codec: String,
-        clientIp: String,
-        dacpPort: Int,
-        token: String
-    ): Boolean {
-        Logger.service.i(TAG, "处理 AirPlay 推流请求 (后发抢占): client=$clientIp, codec=$codec")
-        airPlaySuspendJob?.cancel()
-        airPlaySuspendJob = null
-
-        // 💡 后发抢占：若当前正在运行 UPnP 流，立即优雅中止旧流
-        if (currentStreamSource == StreamSource.UPNP) {
-            Logger.service.i(TAG, "AirPlay 新流到达，执行后发抢占中止旧 UPnP 流")
-            upnpServer?.stopPlayback()
-            upnpServer?.notifyTransportState("STOPPED")
-        }
-
-        currentStreamSource = StreamSource.AIRPLAY
-        val started = startStreaming(sampleRate, bitDepth, channels, StreamSource.AIRPLAY, codec = codec)
-        if (!started) {
-            currentStreamSource = StreamSource.IDLE
-        }
-        return started
-    }
-
-    /**
-     * 💡 启动 10 分钟软挂起超时守护：若长时间未恢复，彻底释放 DACP 会话与声卡独占
-     */
-    private fun scheduleAirPlaySuspendTimeout() {
-        airPlaySuspendJob?.cancel()
-        airPlaySuspendJob = lifecycleScope.launch(Dispatchers.Default) {
-            delay(10 * 60 * 1000L)
-            if (currentStreamSource == StreamSource.AIRPLAY && _playbackStatus.value == PlaybackStatus.PAUSED) {
-                Logger.service.i(TAG, "AirPlay 挂起待机超时 (10分钟)，彻底释放会话与声卡")
-                stopPlayback(StreamSource.AIRPLAY)
-                airPlayServer?.clearDacpSession()
-                _audioPathState.value = _audioPathState.value.copy(
-                    protocol = com.solo.purecast.model.StreamProtocol.NONE
-                )
-            }
-        }
-    }
-
-    /**
-     * 💡 原生 AirPlay 1 推流停止事件 (TEARDOWN 触发)
-     */
-    private fun onAirPlayStreamStopped() {
-        if (currentStreamSource == StreamSource.AIRPLAY) {
-            Logger.service.i(TAG, "AirPlay 音频传输通道断开 (TEARDOWN)，进入挂起暂停状态并保持 DACP 会话与元数据")
-            airPlayProgressJob?.cancel()
-            airPlayProgressJob = null
-            airPlayBasePositionMs = _playbackPositionMs.value
-
-            NativeAudioEngine.pauseStream()
-            _playbackStatus.value = PlaybackStatus.PAUSED
-            releaseWifiLowLatencyLock()
-            updateMediaSessionState()
-            updateNotification()
-
-            scheduleAirPlaySuspendTimeout()
-        }
-    }
-
-    /**
-     * 💡 原生 AirPlay 1 推流暂停事件 (iPhone 点击暂停或断流触发)
-     */
-    private fun onAirPlayStreamPaused() {
-        if (currentStreamSource == StreamSource.AIRPLAY && _playbackStatus.value == PlaybackStatus.PLAYING) {
-            Logger.service.i(TAG, "AirPlay 数据流暂停 (iPhone 暂停推流)，同步 TV 端播放状态机为 PAUSED")
-            airPlayProgressJob?.cancel()
-            airPlayProgressJob = null
-            airPlayBasePositionMs = _playbackPositionMs.value
-
-            NativeAudioEngine.pauseStream()
-            _playbackStatus.value = PlaybackStatus.PAUSED
-            releaseWifiLowLatencyLock()
-            updateMediaSessionState()
-            updateNotification()
-
-            scheduleAirPlaySuspendTimeout()
-        }
-    }
-
-    /**
-     * 💡 原生 AirPlay 1 推流恢复事件 (iPhone 恢复播放触发)
-     */
-    private fun onAirPlayStreamResumed() {
-        if (currentStreamSource == StreamSource.AIRPLAY && _playbackStatus.value == PlaybackStatus.PAUSED) {
-            Logger.service.i(TAG, "AirPlay 数据流恢复 (iPhone 恢复推流)，同步 TV 端播放状态机为 PLAYING")
-            airPlaySuspendJob?.cancel()
-            airPlaySuspendJob = null
-            acquireWifiLowLatencyLock()
-            usbDeviceManager.cancelIdleRelease()
-            if (!usbDeviceManager.isExclusive()) {
-                val state = _audioPathState.value
-                usbDeviceManager.claimUsbExclusive(state.sampleRate, state.bitDepth, state.channels)
-            }
-            NativeAudioEngine.resumeStream()
-            _playbackStatus.value = PlaybackStatus.PLAYING
-            airPlayAnchorRealtimeMs = android.os.SystemClock.elapsedRealtime()
-            launchAirPlayProgressTicker()
-            updateMediaSessionState()
-            updateNotification()
-        }
-    }
-
-    /**
-     * 💡 原生 AirPlay 1 DMAP 元数据更新事件 (SET_PARAMETER 触发)
-     * 支持多包增量合并 (Smart Merge)，杜绝后序元数据包将封面或歌名相互覆盖冲刷
-     */
-    private fun onAirPlayMetadataReceived(
-        title: String,
-        artist: String,
-        album: String,
-        durationMs: Long,
-        coverArt: ByteArray?
-    ) {
-        val current = _currentMetadata.value
-        val isNewTrack = (title.isNotEmpty() && title != current.title) ||
-                (artist.isNotEmpty() && artist != current.artist)
-
-        val mergedTitle = when {
-            title.isNotEmpty() -> title
-            current.title.isNotEmpty() && current.title != "AirPlay 音频直通" -> current.title
-            else -> "AirPlay 音频直通"
-        }
-        val mergedArtist = when {
-            artist.isNotEmpty() -> artist
-            current.artist.isNotEmpty() && current.artist != "AirPlay 设备" -> current.artist
-            else -> "AirPlay 设备"
-        }
-        val mergedAlbum = if (album.isNotEmpty()) album else current.album
-        // 💡 模型真实性保证：换歌时若新曲目暂无封面（如无封面的网络电台/播客），模型层置 null，
-        // 视觉平滑过渡与旧封面暂留由 UI 层的 persistentCover 负责兜底并设置 1.2s 超时优雅清除。
-        val mergedCover = when {
-            coverArt != null && coverArt.isNotEmpty() -> coverArt
-            isNewTrack -> null
-            else -> current.coverBytes
-        }
-        // 💡 换歌进入直播流/无时长电台保护：若为新曲目且 durationMs 未指定或 <= 0，
-        // 必须置 0 并判定为直播流 (isLiveStream = true)，绝不沿用上一曲固定时长导致状态误判
-        val mergedDuration = if (durationMs > 0) durationMs else if (isNewTrack) 0L else current.durationMs
-        val isLive = mergedDuration <= 0
-
-        if (isNewTrack) {
-            // 💡 换歌时重置在途进度并取消旧 Ticker，避免上一曲尾部时间戳引发进度条跳动
-            airPlayProgressJob?.cancel()
-            airPlayProgressJob = null
-            airPlayBasePositionMs = 0L
-            _playbackPositionMs.value = 0L
-        }
-
-        val meta = TrackMetadata(
-            title = mergedTitle,
-            artist = mergedArtist,
-            album = mergedAlbum,
-            coverBytes = mergedCover,
-            durationMs = mergedDuration,
-            isLiveStream = isLive
-        )
-        updateMetadata(meta)
-    }
-
-    /**
-     * 💡 原生 AirPlay 1 播放进度与总时长更新 (SET_PARAMETER progress: start/curr/end 触发)
-     */
-    private fun onAirPlayProgressUpdated(positionMs: Long, durationMs: Long) {
-        // 💡 委托 AirPlayStateManager 过滤全零无效时间戳 (如 progress: 0/0/0)，杜绝暂停或缓冲时将当前进度冲刷归零
-        if (!airPlayStateManager.handleProgressUpdate(positionMs, durationMs)) {
-            return
-        }
-        val current = _currentMetadata.value
-        val resolvedDuration = if (durationMs > 0) durationMs else current.durationMs
-        if (resolvedDuration > 0 && current.durationMs != resolvedDuration) {
-            val updated = current.copy(durationMs = resolvedDuration, isLiveStream = false)
-            updateMetadata(updated)
-        }
-        val clampedPos = if (resolvedDuration > 0) positionMs.coerceIn(0L, resolvedDuration) else positionMs
-        startOrUpdateAirPlayProgress(clampedPos, resolvedDuration)
-        updateMediaSessionState()
-    }
-
-    private fun startOrUpdateAirPlayProgress(positionMs: Long, durationMs: Long) {
-        airPlayBasePositionMs = positionMs
-        airPlayAnchorRealtimeMs = android.os.SystemClock.elapsedRealtime()
-        _playbackPositionMs.value = positionMs
-
-        if (_playbackStatus.value == PlaybackStatus.PLAYING && currentStreamSource == StreamSource.AIRPLAY) {
-            launchAirPlayProgressTicker()
-        }
-    }
-
-    private fun launchAirPlayProgressTicker() {
-        airPlayProgressJob?.cancel()
-        airPlayProgressJob = lifecycleScope.launch(Dispatchers.Default) {
-            while (isActive && _playbackStatus.value == PlaybackStatus.PLAYING && currentStreamSource == StreamSource.AIRPLAY) {
-                delay(500)
-                val elapsed = android.os.SystemClock.elapsedRealtime() - airPlayAnchorRealtimeMs
-                val duration = _currentMetadata.value.durationMs
-                var calculatedPos = airPlayBasePositionMs + elapsed
-                if (duration > 0 && calculatedPos > duration) {
-                    calculatedPos = duration
-                }
-                _playbackPositionMs.value = calculatedPos
-            }
-        }
-    }
-
     fun pausePlayback() {
-        Logger.service.i(TAG, "暂停音频播放 (流源: $currentStreamSource)...")
-        airPlayResumeWatchdogJob?.cancel()
-        airPlayResumeWatchdogJob = null
-        airPlayProgressJob?.cancel()
-        airPlayProgressJob = null
-        airPlayBasePositionMs = _playbackPositionMs.value
+        if (!::sessionHost.isInitialized) return
+        sessionHost.pausePlayback()
+    }
 
-        if (currentStreamSource == StreamSource.AIRPLAY) {
-            airPlayServer?.dacpClient?.pause()
-            scheduleAirPlaySuspendTimeout()
-        } else if (currentStreamSource == StreamSource.UPNP) {
-            // 💡 UPnP 暂停：挂起 10 分钟闲置让渡任务，防止无限占用 USB 声卡
-            usbDeviceManager.scheduleIdleRelease(10 * 60 * 1000L)
-        }
-
-        NativeAudioEngine.pauseStream()
-        _playbackStatus.value = PlaybackStatus.PAUSED
-        releaseWifiLowLatencyLock()
-        // 💡 暂停期间不触发 10 秒激进让渡，保持 USB DAC 独占与时钟锁相
-        upnpServer?.notifyTransportState("PAUSED_PLAYBACK")
-        updateMediaSessionState()
-        updateNotification()
+    fun seekTo(positionMs: Long) {
+        if (!::sessionHost.isInitialized) return
+        sessionHost.seekTo(positionMs)
     }
 
     fun resumePlayback() {
-        Logger.service.i(TAG, "恢复音频播放 (流源: $currentStreamSource)...")
-        airPlayResumeWatchdogJob?.cancel()
-        airPlayResumeWatchdogJob = null
-        airPlaySuspendJob?.cancel()
-        airPlaySuspendJob = null
-        acquireWifiLowLatencyLock()
-        usbDeviceManager.cancelIdleRelease()
-        if (!usbDeviceManager.isExclusive()) {
-            val state = _audioPathState.value
-            usbDeviceManager.claimUsbExclusive(state.sampleRate, state.bitDepth, state.channels)
-        }
-
-        if (currentStreamSource == StreamSource.AIRPLAY) {
-            val rtpActive = airPlayServer?.isRtpActive == true
-            airPlayServer?.dacpClient?.play()
-            if (!rtpActive) {
-                Logger.service.i(TAG, "AirPlay RTP 通道已挂起断开 (处于 TEARDOWN 状态)，已通过 DACP 发送 play，等待客户端重连建流...")
-                // 启动 5 秒重连看门狗，若超时未收到 SETUP/RECORD 建流则维持 PAUSED 并告警
-                airPlayResumeWatchdogJob = lifecycleScope.launch(Dispatchers.Default) {
-                    delay(5000L)
-                    if (currentStreamSource == StreamSource.AIRPLAY && _playbackStatus.value == PlaybackStatus.PAUSED) {
-                        Logger.service.w(TAG, "AirPlay 恢复播放超时 (5秒内未收到客户端重连 RTP)，维持 PAUSED 状态")
-                        releaseWifiLowLatencyLock()
-                        scheduleAirPlaySuspendTimeout()
-                    }
-                }
-                return
-            }
-            airPlayAnchorRealtimeMs = android.os.SystemClock.elapsedRealtime()
-            launchAirPlayProgressTicker()
-        }
-
-        NativeAudioEngine.resumeStream()
-        _playbackStatus.value = PlaybackStatus.PLAYING
-
-        upnpServer?.notifyTransportState("PLAYING")
-        updateMediaSessionState()
-        updateNotification()
+        if (!::sessionHost.isInitialized) return
+        sessionHost.resumePlayback()
     }
 
-    fun stopPlayback(source: StreamSource? = null) {
-        if (source != null && currentStreamSource != source && currentStreamSource != StreamSource.IDLE) {
-            Logger.service.w(TAG, "忽略非当前流源 ($source) 的 stopPlayback 请求，当前源为: $currentStreamSource")
-            return
-        }
-        Logger.service.i(TAG, "停止音频播放 (流源: $currentStreamSource)...")
-        airPlayResumeWatchdogJob?.cancel()
-        airPlayResumeWatchdogJob = null
-        airPlaySuspendJob?.cancel()
-        airPlaySuspendJob = null
-        airPlayProgressJob?.cancel()
-        airPlayProgressJob = null
-        airPlayBasePositionMs = 0L
-        airPlayAnchorRealtimeMs = 0L
+    fun stopPlayback() {
+        if (!::sessionHost.isInitialized) return
+        sessionHost.stopPlayback()
+    }
 
-        if (currentStreamSource == StreamSource.AIRPLAY) {
-            airPlayServer?.dacpClient?.stop()
-            airPlayServer?.clearDacpSession()
-        }
-
-        currentStreamSource = StreamSource.IDLE
-        _audioPathState.value = _audioPathState.value.copy(
-            protocol = com.solo.purecast.model.StreamProtocol.NONE
-        )
-
-        NativeAudioEngine.stopStream()
-        _playbackStatus.value = PlaybackStatus.STOPPED
-        _playbackPositionMs.value = 0L
-        releaseWifiLowLatencyLock()
-        usbDeviceManager.scheduleIdleRelease() // 启动 10 秒空闲让渡
-        audioFocusManager.abandonFocus()
-        upnpServer?.notifyTransportState("STOPPED")
-        updateMediaSessionState()
-        updateNotification()
+    fun togglePlayPause() {
+        if (!::sessionHost.isInitialized) return
+        sessionHost.togglePlayPause()
     }
 
     fun handleNextTrack() {
-        Logger.service.i(TAG, "用户触发切下一曲 (流源: $currentStreamSource)")
-        if (currentStreamSource == StreamSource.AIRPLAY) {
-            airPlayServer?.dacpClient?.next()
-        } else {
-            upnpServer?.notifyNextTrack()
-        }
+        if (!::sessionHost.isInitialized) return
+        sessionHost.handleNextTrack()
     }
 
     fun handlePreviousTrack() {
-        Logger.service.i(TAG, "用户触发切上一曲 (流源: $currentStreamSource)")
-        if (currentStreamSource == StreamSource.AIRPLAY) {
-            airPlayServer?.dacpClient?.previous()
-        } else {
-            upnpServer?.notifyPreviousTrack()
-        }
-    }
-
-    fun updatePlaybackPosition(posMs: Long) {
-        _playbackPositionMs.value = posMs
-    }
-
-    fun updateServerError(error: String?) {
-        _serverError.value = error
-    }
-
-    fun updateMetadata(metadata: TrackMetadata) {
-        _currentMetadata.value = metadata
-        updateMediaSessionMetadata(metadata)
-        updateNotification()
+        if (!::sessionHost.isInitialized) return
+        sessionHost.handlePreviousTrack()
     }
 
     /**
-     * 💡 更新 UPnP 与 AirPlay 局域网广播名称并即时通知服务更新 (自动追加 [UPnP] / [AirPlay] 协议后缀)
+     * 💡 外部音频焦点彻底丢失（AUDIOFOCUS_LOSS）时的统一协调收口：
+     * 先暂停并快路径静音，再在硬件串行线程立即归还 USB DAC 给系统。
      */
+    fun handleAudioFocusLost() {
+        if (::sessionHost.isInitialized) {
+            sessionHost.pausePlayback()
+        }
+        if (::usbDeviceManager.isInitialized) {
+            usbDeviceManager.releaseForExternalFocusLoss()
+        }
+    }
+
     fun updateFriendlyName(newName: String) {
         settingsRepository.setFriendlyName(newName)
         upnpServer?.updateFriendlyName(formatUpnpName(newName))
         airPlayServer?.updateDeviceName(formatAirPlayName(newName))
     }
 
-    /**
-     * 💡 动态开启或关闭原生 AirPlay 1 服务
-     */
     fun setAirPlayEnabled(enabled: Boolean) {
         settingsRepository.setAirPlayEnabled(enabled)
         if (enabled) {
@@ -867,19 +565,12 @@ class PlaybackService : LifecycleService() {
         }
     }
 
-    /**
-     * 💡 动态开启或关闭 UPnP / DLNA 服务
-     */
     fun setUpnpEnabled(enabled: Boolean) {
         settingsRepository.setUpnpEnabled(enabled)
         if (enabled) {
             val name = settingsRepository.getFriendlyName()
             if (upnpServer == null) {
-                upnpServer = com.solo.purecast.upnp.UpnpRendererServer(
-                    scope = lifecycleScope,
-                    playbackService = this,
-                    friendlyName = formatUpnpName(name)
-                )
+                upnpServer = createUpnpServer(formatUpnpName(name))
             } else {
                 upnpServer?.updateFriendlyName(formatUpnpName(name))
             }
@@ -891,19 +582,94 @@ class PlaybackService : LifecycleService() {
 
     fun setIdleTimeoutSeconds(seconds: Int) {
         settingsRepository.setIdleTimeoutSeconds(seconds)
-        usbDeviceManager.setIdleTimeoutSeconds(seconds)
+        coordinator.setIdleTimeoutSeconds(seconds)
     }
 
-    fun requestUsbPermission(activity: android.app.Activity) {
+    fun registerUsbPermissionActivity(activity: Activity?) {
+        if (activity != null) {
+            pendingPermissionActivityRef = WeakReference(activity)
+            if (::usbDeviceManager.isInitialized) {
+                usbDeviceManager.bindPermissionActivity(activity)
+                usbDeviceManager.scanAndRequestPermissionAsync(activity)
+            }
+        } else {
+            pendingPermissionActivityRef = null
+            if (::usbDeviceManager.isInitialized) {
+                usbDeviceManager.bindPermissionActivity(null)
+            }
+        }
+    }
+
+    /**
+     * 💡 供设置界面手动让渡声卡：暂停播放并立即调用 releaseForExternalFocusLoss 归还系统驱动
+     */
+    fun releaseUsbExclusiveManually() {
+        if (::sessionHost.isInitialized) {
+            sessionHost.pausePlayback()
+        }
+        if (::usbDeviceManager.isInitialized) {
+            usbDeviceManager.releaseForExternalFocusLoss()
+        }
+        Logger.service.i(TAG, "用户手动触发声卡让渡")
+    }
+
+    /**
+     * 💡 供设置界面手动独占接管声卡：枚举设备、校验权限并尝试直通打开
+     */
+    fun claimUsbExclusiveManually(activity: Activity, onResult: (Boolean, String) -> Unit) {
+        if (!::usbDeviceManager.isInitialized) {
+            onResult(false, "USB 管理模块尚未初始化")
+            return
+        }
+        usbDeviceManager.bindPermissionActivity(activity)
+        val attached = usbDeviceManager.scanAndAttachDevice()
+        val snap = sessionSnapshot.value
+        if (!attached && !snap.audioPath.isDacConnected) {
+            usbDeviceManager.scanAndRequestPermissionAsync(activity)
+            onResult(false, "未连接可用 USB DAC 或正在请求授权")
+            return
+        }
+        val rate = snap.audioPath.sampleRate.takeIf { it > 0 } ?: 44100
+        val bits = snap.audioPath.bitDepth.takeIf { it > 0 } ?: 16
+        val ch = snap.audioPath.channels.takeIf { it > 0 } ?: 2
+        val openRes = usbDeviceManager.openDeviceWithCurrentFd(rate, bits, ch, forceNewEpoch = true)
+        openRes.fold(
+            onSuccess = { success ->
+                onResult(true, "已成功独占接管: ${success.dacName}")
+            },
+            onFailure = { err ->
+                onResult(false, "独占接管失败: ${err.message}")
+            }
+        )
+    }
+
+    fun bindUsbPermissionActivity(activity: Activity?) {
+        if (!::usbDeviceManager.isInitialized) return
+        usbDeviceManager.bindPermissionActivity(activity)
+    }
+
+    fun requestUsbPermission(activity: Activity) {
+        if (!::usbDeviceManager.isInitialized) return
         usbDeviceManager.requestPermissionWithActivity(activity)
     }
 
-    fun scanUsbDevice(): Boolean {
-        return usbDeviceManager.scanAndAttachDevice()
+    fun scanAndRequestUsbPermission(activity: Activity) {
+        if (!::usbDeviceManager.isInitialized) return
+        usbDeviceManager.scanAndRequestPermissionAsync(activity)
+    }
+
+    fun handleUsbDeviceAttachedFromIntent(device: UsbDevice) {
+        if (!::usbDeviceManager.isInitialized) return
+        usbDeviceManager.onDeviceAttachedAsync(device)
+    }
+
+    fun handleUsbDeviceDetached(device: UsbDevice?) {
+        Logger.service.w(TAG, "收到 USB 设备拔出通知，异步投递给 HardwareExecutor: ${device?.deviceName}")
+        if (!::usbDeviceManager.isInitialized) return
+        usbDeviceManager.handleDeviceDetachedAsync(device)
     }
 
     private fun createNotificationChannel() {
-        // 💡 使用 IMPORTANCE_HIGH 确保全屏通知 fullScreenIntent 能够在后台成功展示
         val channel = NotificationChannel(
             CHANNEL_ID,
             getString(R.string.service_notification_channel_name),
@@ -917,9 +683,9 @@ class PlaybackService : LifecycleService() {
         manager?.createNotificationChannel(channel)
     }
 
-    private fun buildNotification(): Notification {
-        val metadata = _currentMetadata.value
-        val isPlaying = _playbackStatus.value == PlaybackStatus.PLAYING
+    private fun buildNotification(snapshot: PlayerSessionSnapshot): Notification {
+        val metadata = snapshot.metadata
+        val isPlaying = snapshot.playbackStatus == PlaybackStatus.PLAYING
 
         val openAppIntent = Intent(this, MainActivity::class.java).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
@@ -928,7 +694,7 @@ class PlaybackService : LifecycleService() {
             this,
             0,
             openAppIntent,
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) PendingIntent.FLAG_IMMUTABLE else 0
+            PendingIntent.FLAG_IMMUTABLE
         )
 
         val mediaStyle = Notification.MediaStyle()
@@ -939,25 +705,22 @@ class PlaybackService : LifecycleService() {
             .setContentText("${metadata.artist} • ${if (isPlaying) "Bit-Perfect 独占播放中" else "待机"}")
             .setSmallIcon(R.drawable.ic_launcher)
             .setContentIntent(pendingIntent)
-            .setFullScreenIntent(pendingIntent, isPlaying) // 💡 突破 BAL 限制的全屏通知保底
+            .setFullScreenIntent(pendingIntent, isPlaying)
             .setStyle(mediaStyle)
             .setOngoing(isPlaying)
             .build()
     }
 
-    private fun updateNotification() {
-        val notification = buildNotification()
+    private fun updateNotification(snapshot: PlayerSessionSnapshot) {
+        val notification = buildNotification(snapshot)
         val manager = getSystemService(NotificationManager::class.java)
         manager?.notify(NOTIFICATION_ID, notification)
     }
 
     private fun startForegroundWithTypes() {
-        val notification = buildNotification()
-        val foregroundServiceType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK or ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
-        } else {
-            0
-        }
+        val notification = buildNotification(_sessionSnapshot.value)
+        val foregroundServiceType = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK or
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
 
         try {
             ServiceCompat.startForeground(
@@ -969,19 +732,6 @@ class PlaybackService : LifecycleService() {
             Logger.service.i(TAG, "已启动前台服务 (mediaPlayback | connectedDevice)")
         } catch (e: Exception) {
             Logger.service.e(TAG, "startForeground 失败!", e)
-        }
-    }
-
-    fun handleUsbDeviceAttachedFromIntent(device: android.hardware.usb.UsbDevice) {
-        usbDeviceManager.onDeviceAttachedFromIntent(device)
-    }
-
-    fun handleUsbDeviceDetached(device: android.hardware.usb.UsbDevice?) {
-        Logger.service.w(TAG, "收到 USB 设备拔出通知: ${device?.deviceName}")
-        val isCurrentDacDetached = usbDeviceManager.handleDeviceDetached(device)
-        if (isCurrentDacDetached && _playbackStatus.value == PlaybackStatus.PLAYING) {
-            Logger.service.i(TAG, "当前活跃的 USB DAC 已物理拔出，自动暂停当前音频播放")
-            pausePlayback()
         }
     }
 
@@ -1042,11 +792,7 @@ class PlaybackService : LifecycleService() {
         val friendlyName = settingsRepository.getFriendlyName()
         if (settingsRepository.isUpnpEnabled()) {
             if (upnpServer == null) {
-                upnpServer = com.solo.purecast.upnp.UpnpRendererServer(
-                    scope = lifecycleScope,
-                    playbackService = this,
-                    friendlyName = formatUpnpName(friendlyName)
-                ).apply {
+                upnpServer = createUpnpServer(formatUpnpName(friendlyName)).apply {
                     start()
                 }
             } else {
@@ -1055,22 +801,7 @@ class PlaybackService : LifecycleService() {
         }
         if (settingsRepository.isAirPlayEnabled()) {
             if (airPlayServer == null) {
-                airPlayServer = com.solo.purecast.airplay.AirPlayServerManager(
-                    context = this,
-                    scope = lifecycleScope,
-                    onStreamRequestedListener = { sampleRate, bitDepth, channels, codec, clientIp, dacpPort, token ->
-                        onAirPlayStreamRequested(sampleRate, bitDepth, channels, codec, clientIp, dacpPort, token)
-                    },
-                    onStreamStoppedListener = { onAirPlayStreamStopped() },
-                    onMetadataReceivedListener = { title, artist, album, durationMs, coverArt ->
-                        onAirPlayMetadataReceived(title, artist, album, durationMs, coverArt)
-                    },
-                    onProgressUpdatedListener = { positionMs, durationMs ->
-                        onAirPlayProgressUpdated(positionMs, durationMs)
-                    },
-                    onStreamPausedListener = { onAirPlayStreamPaused() },
-                    onStreamResumedListener = { onAirPlayStreamResumed() }
-                ).apply {
+                airPlayServer = createAirPlayServer().apply {
                     start(formatAirPlayName(friendlyName))
                 }
             } else {
@@ -1079,14 +810,34 @@ class PlaybackService : LifecycleService() {
         }
     }
 
+    private fun createUpnpServer(friendlyName: String): UpnpRendererServer {
+        return UpnpRendererServer(
+            scope = lifecycleScope,
+            sessionBridge = sessionHost,
+            snapshotProvider = { coordinator.snapshot.value },
+            fastPath = fastPath,
+            onWakeUpUi = { wakeUpUiIfInBackground() },
+            clockMs = { SystemClock.elapsedRealtime() },
+            friendlyName = friendlyName
+        )
+    }
+
+    private fun createAirPlayServer(): AirPlayServerManager {
+        return AirPlayServerManager(
+            context = this,
+            scope = lifecycleScope,
+            sessionBridge = sessionHost
+        )
+    }
+
     override fun onDestroy() {
         Logger.service.i(TAG, "PlaybackService onDestroy: 彻底清理服务...")
         instance = null
         unregisterNetworkCallback()
-        airPlaySuspendJob?.cancel()
-        airPlaySuspendJob = null
-        airPlayProgressJob?.cancel()
-        airPlayProgressJob = null
+        if (::sessionHost.isInitialized) {
+            sessionHost.stop()
+        }
+        coordinatorScope.cancel()
         mediaSession?.apply {
             isActive = false
             release()
@@ -1098,8 +849,12 @@ class PlaybackService : LifecycleService() {
         airPlayServer = null
         releaseWifiLowLatencyLock()
         releaseSystemLocks()
-        audioFocusManager.abandonFocus()
-        usbDeviceManager.destroy()
+        if (::audioFocusManager.isInitialized) {
+            audioFocusManager.abandonFocus()
+        }
+        if (::usbDeviceManager.isInitialized) {
+            usbDeviceManager.destroy()
+        }
         super.onDestroy()
     }
 
@@ -1107,32 +862,22 @@ class PlaybackService : LifecycleService() {
         private const val TAG = "PlaybackService"
         private const val CHANNEL_ID = "purecast_playback_channel"
         private const val NOTIFICATION_ID = 1001
+        const val EXTRA_ATTACHED_USB_DEVICE = "com.solo.purecast.extra.ATTACHED_USB_DEVICE"
 
+        @Volatile
         var instance: PlaybackService? = null
             private set
 
-        private val _playbackStatus = MutableStateFlow(PlaybackStatus.IDLE)
-        val playbackStatus: StateFlow<PlaybackStatus> = _playbackStatus.asStateFlow()
+        private val _sessionSnapshot = MutableStateFlow(PlayerSessionSnapshot())
+        val sessionSnapshot: StateFlow<PlayerSessionSnapshot> = _sessionSnapshot.asStateFlow()
 
-        private val _currentMetadata = MutableStateFlow(TrackMetadata())
-        val currentMetadata: StateFlow<TrackMetadata> = _currentMetadata.asStateFlow()
-
-        private val _audioPathState = MutableStateFlow(AudioPathState())
-        val audioPathState: StateFlow<AudioPathState> = _audioPathState.asStateFlow()
-
-        private val _playbackPositionMs = MutableStateFlow(0L)
-        val playbackPositionMs: StateFlow<Long> = _playbackPositionMs.asStateFlow()
-
-        private val _serverError = MutableStateFlow<String?>(null)
-        val serverError: StateFlow<String?> = _serverError.asStateFlow()
-
-        fun start(context: Context) {
-            val intent = Intent(context, PlaybackService::class.java)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(intent)
-            } else {
-                context.startService(intent)
+        fun start(context: Context, attachedUsbDevice: UsbDevice? = null) {
+            val intent = Intent(context, PlaybackService::class.java).apply {
+                if (attachedUsbDevice != null) {
+                    putExtra(EXTRA_ATTACHED_USB_DEVICE, attachedUsbDevice)
+                }
             }
+            context.startForegroundService(intent)
         }
 
         /**
