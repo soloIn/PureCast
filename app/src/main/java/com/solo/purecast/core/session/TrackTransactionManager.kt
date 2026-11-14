@@ -31,6 +31,13 @@ class TrackTransactionManager {
     var currentTrackKey: String? = null
         private set
 
+    /**
+     * 💡 记录当前持有的封面元数据所属的曲目代数。
+     * 若切歌后新曲目未上报新封面，此值保持旧代数，直到 1200ms 宽限期超时被自动清理。
+     */
+    var coverTrackGeneration: Long = 0L
+        private set
+
     var currentMetadata: TrackMetadata = TrackMetadata()
         private set
 
@@ -85,17 +92,35 @@ class TrackTransactionManager {
         }
 
         val patchBytes = patch.coverBytes
-        val nextCoverBytes = if (patchBytes != null && patchBytes.isNotEmpty()) {
-            patchBytes
+        val hasNewBytes = patchBytes != null && patchBytes.isNotEmpty()
+        val patchUri = patch.coverUri
+        val hasNewUri = patchUri != null && patchUri.isNotEmpty()
+
+        val nextCoverBytes: ByteArray?
+        val nextCoverUri: String?
+
+        if (hasNewBytes && hasNewUri) {
+            nextCoverBytes = patchBytes
+            nextCoverUri = patchUri
+            coverTrackGeneration = currentTrackGeneration
+        } else if (hasNewBytes) {
+            nextCoverBytes = patchBytes
+            nextCoverUri = null
+            coverTrackGeneration = currentTrackGeneration
+        } else if (hasNewUri) {
+            nextCoverBytes = null
+            nextCoverUri = patchUri
+            coverTrackGeneration = currentTrackGeneration
         } else {
-            currentMetadata.coverBytes
+            nextCoverBytes = currentMetadata.coverBytes
+            nextCoverUri = currentMetadata.coverUri
         }
 
         currentMetadata = currentMetadata.copy(
             title = patch.title ?: currentMetadata.title,
             artist = patch.artist ?: currentMetadata.artist,
             album = patch.album ?: currentMetadata.album,
-            coverUri = patch.coverUri ?: currentMetadata.coverUri,
+            coverUri = nextCoverUri,
             coverBytes = nextCoverBytes,
             durationMs = patch.durationMs ?: currentMetadata.durationMs,
             durationState = patch.durationState ?: currentMetadata.durationState,
@@ -105,11 +130,33 @@ class TrackTransactionManager {
     }
 
     /**
+     * 💡 切歌 1200ms 宽限期超时后，若新曲目仍未认领封面（如无封面曲目），清除上一曲残留的封面字段
+     */
+    fun clearStaleCoverIfUnclaimed(targetGeneration: Long): TrackMetadata? {
+        if (targetGeneration != currentTrackGeneration) return null
+        if (coverTrackGeneration >= currentTrackGeneration) return null
+        val hasBytes = currentMetadata.coverBytes != null
+        val hasUri = currentMetadata.coverUri != null
+        if (hasBytes || hasUri) {
+            Logger.service.i(
+                TAG,
+                "曲目代数 $targetGeneration 在 1200ms 宽限期内未认领新封面，优雅清除上一曲残留封面 (prevGen=$coverTrackGeneration)"
+            )
+            currentMetadata = currentMetadata.copy(coverBytes = null, coverUri = null)
+            return currentMetadata
+        }
+        return null
+    }
+
+    /**
      * 用新流初始元数据原子重建第 1 代曲目事务（例如建流时已解析到完整标签）
      */
     fun resetForNewStream(generation: Long, initialMetadata: TrackMetadata?): TrackMetadata {
         currentTrackGeneration = generation
         currentTrackKey = initialMetadata?.trackUri ?: "stream-$generation"
+        val hasInitialCover = initialMetadata != null &&
+            (initialMetadata.coverBytes != null || initialMetadata.coverUri != null)
+        coverTrackGeneration = if (hasInitialCover) generation else 0L
         currentMetadata = initialMetadata ?: TrackMetadata(
             durationState = DurationState.UNKNOWN,
             seekCapability = SeekCapability.UNKNOWN
@@ -122,6 +169,7 @@ class TrackTransactionManager {
      */
     fun reset() {
         currentTrackGeneration = 0L
+        coverTrackGeneration = 0L
         currentTrackKey = null
         currentMetadata = TrackMetadata()
     }

@@ -94,6 +94,8 @@ class PlaybackSessionCoordinator(
     private var hardwareIdleTimeoutJob: Job? = null
     private var suspendTimeoutJob: Job? = null
     private var remoteCommandTimeoutJob: Job? = null
+    private var coverGraceJob: Job? = null
+    private val transientErrorDismissJobs = HashMap<ErrorCode, Job>()
 
     init {
         startEventLoop()
@@ -112,6 +114,10 @@ class PlaybackSessionCoordinator(
         suspendTimeoutJob = null
         remoteCommandTimeoutJob?.cancel()
         remoteCommandTimeoutJob = null
+        coverGraceJob?.cancel()
+        coverGraceJob = null
+        transientErrorDismissJobs.values.forEach { it.cancel() }
+        transientErrorDismissJobs.clear()
         eventChannel.close()
         dacpCommandChannel.close()
     }
@@ -171,7 +177,9 @@ class PlaybackSessionCoordinator(
             for (item in dacpCommandChannel) {
                 val (command, commandId, capturedSessionId) = item
                 try {
-                    val res = dacpCommandSender(command, commandId)
+                    val res = kotlinx.coroutines.withTimeoutOrNull(5000L) {
+                        dacpCommandSender(command, commandId)
+                    } ?: Result.failure(java.util.concurrent.TimeoutException("DACP 指令等待网络响应超时 (5000ms)"))
                     if (res.isFailure) {
                         val errMsg = res.exceptionOrNull()?.message ?: "DACP 指令执行失败"
                         Logger.service.w(TAG, "DACP 串行指令执行失败: cmd=$command, id=$commandId, err=$errMsg")
@@ -195,6 +203,22 @@ class PlaybackSessionCoordinator(
                 } catch (t: Throwable) {
                     if (t is kotlinx.coroutines.CancellationException) throw t
                     Logger.service.e(TAG, "DACP 串行指令抛出异常: cmd=$command", t)
+                    if (commandId > 0L) {
+                        dispatch(
+                            SessionEventEnvelope(
+                                origin = EventOrigin.AIRPLAY,
+                                sessionId = capturedSessionId,
+                                deviceGeneration = latestDeviceGeneration,
+                                sequence = allocateSequence(),
+                                timestampElapsedMs = clockMs(),
+                                payload = RemoteCommandFailedEvent(
+                                    commandId = commandId,
+                                    errorCode = ErrorCode.REMOTE_COMMAND_TIMEOUT,
+                                    message = t.message ?: "DACP 指令异常"
+                                )
+                            )
+                        )
+                    }
                 }
             }
         }
@@ -484,6 +508,49 @@ class PlaybackSessionCoordinator(
             is TransitionEffect.CancelRemoteCommandTimeout -> {
                 remoteCommandTimeoutJob?.cancel()
                 remoteCommandTimeoutJob = null
+            }
+
+            is TransitionEffect.ScheduleCoverGraceTimeout -> {
+                coverGraceJob?.cancel()
+                coverGraceJob = scope.launch {
+                    delay(1200L)
+                    dispatch(
+                        SessionEventEnvelope(
+                            origin = EventOrigin.SERVICE,
+                            sessionId = context.snapshot.sessionId,
+                            deviceGeneration = latestDeviceGeneration,
+                            sequence = allocateSequence(),
+                            timestampElapsedMs = clockMs(),
+                            payload = CoverGraceTimeoutEvent(effect.trackGeneration)
+                        )
+                    )
+                }
+            }
+
+            is TransitionEffect.CancelCoverGraceTimeout -> {
+                coverGraceJob?.cancel()
+                coverGraceJob = null
+            }
+
+            is TransitionEffect.ScheduleTransientErrorDismiss -> {
+                transientErrorDismissJobs[effect.code]?.cancel()
+                transientErrorDismissJobs[effect.code] = scope.launch {
+                    delay(3500L)
+                    dispatch(
+                        SessionEventEnvelope(
+                            origin = EventOrigin.SERVICE,
+                            sessionId = context.snapshot.sessionId,
+                            deviceGeneration = latestDeviceGeneration,
+                            sequence = allocateSequence(),
+                            timestampElapsedMs = clockMs(),
+                            payload = ErrorClearedEvent(effect.code)
+                        )
+                    )
+                }
+            }
+
+            is TransitionEffect.CancelTransientErrorDismiss -> {
+                transientErrorDismissJobs.remove(effect.code)?.cancel()
             }
         }
     }

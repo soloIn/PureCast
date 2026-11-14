@@ -39,6 +39,10 @@ internal sealed interface TransitionEffect {
     data object CancelSuspendTimeout : TransitionEffect
     data class ScheduleRemoteCommandTimeout(val commandId: Long) : TransitionEffect
     data object CancelRemoteCommandTimeout : TransitionEffect
+    data class ScheduleCoverGraceTimeout(val trackGeneration: Long) : TransitionEffect
+    data object CancelCoverGraceTimeout : TransitionEffect
+    data class ScheduleTransientErrorDismiss(val code: ErrorCode, val timestampMs: Long) : TransitionEffect
+    data class CancelTransientErrorDismiss(val code: ErrorCode) : TransitionEffect
     data class OpenDeviceOnResume(
         val sampleRate: Int,
         val bitDepth: Int,
@@ -128,6 +132,7 @@ internal object TriStateTransitionMatrix {
                 val nextHw = if (isDetachedOrPendingPermission(snap.hardwareState)) {
                     snap.hardwareState
                 } else {
+                    effects += TransitionEffect.ResumeNativeOutput
                     HardwarePipelineState.EXCLUSIVE_ACTIVE
                 }
 
@@ -264,9 +269,10 @@ internal object TriStateTransitionMatrix {
                         recoverable = true,
                         timestampMs = nowMs
                     )
+                    val errEffects = listOf(TransitionEffect.ScheduleTransientErrorDismiss(ErrorCode.REMOTE_COMMAND_UNSUPPORTED, nowMs))
                     return TransitionOutput(
                         ctx.copy(snapshot = snap.copy(errors = snap.errors + (ErrorCode.REMOTE_COMMAND_UNSUPPORTED to err))),
-                        emptyList()
+                        errEffects
                     )
                 }
                 if (snap.activeProtocol != StreamProtocol.AIRPLAY_1) {
@@ -466,8 +472,8 @@ internal object TriStateTransitionMatrix {
             }
 
             is HardwareReconfiguredEvent -> {
-                val nextHw = if (isExclusiveActiveOrReconfiguring(snap.hardwareState)) {
-                    snap.hardwareState
+                val nextHw = if (snap.hardwareState == HardwarePipelineState.EXCLUSIVE_ACTIVE) {
+                    HardwarePipelineState.EXCLUSIVE_ACTIVE
                 } else {
                     HardwarePipelineState.EXCLUSIVE_MUTED
                 }
@@ -477,7 +483,8 @@ internal object TriStateTransitionMatrix {
                     audioPath = snap.audioPath.copy(
                         sampleRate = ev.sampleRate,
                         bitDepth = ev.bitDepth,
-                        channels = ev.channels
+                        channels = ev.channels,
+                        isExclusive = true
                     ),
                     errors = snap.errors - ErrorCode.USB_RECONFIGURE_FAILED - ErrorCode.USB_OPEN_FAILED
                 )
@@ -494,8 +501,7 @@ internal object TriStateTransitionMatrix {
                 val nextSnap = snap.copy(
                     hardwareState = ev.fallbackState,
                     audioPath = snap.audioPath.copy(
-                        isExclusive = ev.fallbackState == HardwarePipelineState.EXCLUSIVE_ACTIVE ||
-                            ev.fallbackState == HardwarePipelineState.EXCLUSIVE_MUTED
+                        isExclusive = isExclusiveActiveOrReconfiguring(ev.fallbackState)
                     ),
                     errors = snap.errors + (ev.errorCode to err)
                 )
@@ -508,8 +514,7 @@ internal object TriStateTransitionMatrix {
                     audioPath = snap.audioPath.copy(
                         dacName = ev.dacName ?: snap.audioPath.dacName,
                         bufferAvailablePercent = ev.bufferAvailablePercent ?: snap.audioPath.bufferAvailablePercent,
-                        isExclusive = ev.newHardwareState == HardwarePipelineState.EXCLUSIVE_ACTIVE ||
-                            ev.newHardwareState == HardwarePipelineState.EXCLUSIVE_MUTED
+                        isExclusive = isExclusiveActiveOrReconfiguring(ev.newHardwareState)
                     )
                 )
                 return TransitionOutput(ctx.copy(snapshot = nextSnap), emptyList())
@@ -523,7 +528,19 @@ internal object TriStateTransitionMatrix {
                     progressPositionMs = if (result.accepted) 0L else snap.progressPositionMs,
                     progressDurationMs = if (result.accepted) 0L else snap.progressDurationMs
                 )
-                return TransitionOutput(ctx.copy(snapshot = nextSnap), emptyList())
+                if (result.accepted) {
+                    effects += TransitionEffect.ScheduleCoverGraceTimeout(ev.trackGeneration)
+                }
+                return TransitionOutput(ctx.copy(snapshot = nextSnap), effects)
+            }
+
+            is CoverGraceTimeoutEvent -> {
+                val cleared = trackManager.clearStaleCoverIfUnclaimed(ev.trackGeneration)
+                if (cleared != null) {
+                    val nextSnap = snap.copy(metadata = cleared)
+                    return TransitionOutput(ctx.copy(snapshot = nextSnap), emptyList())
+                }
+                return TransitionOutput(ctx, emptyList())
             }
 
             is MetadataPatchEvent -> {
@@ -561,9 +578,10 @@ internal object TriStateTransitionMatrix {
             }
 
             is ErrorClearedEvent -> {
+                val clearedEffects = listOf(TransitionEffect.CancelTransientErrorDismiss(ev.code))
                 return TransitionOutput(
                     ctx.copy(snapshot = snap.copy(errors = snap.errors - ev.code)),
-                    emptyList()
+                    clearedEffects
                 )
             }
         }
@@ -578,6 +596,7 @@ internal object TriStateTransitionMatrix {
         effects += TransitionEffect.CancelDebouncePause
         effects += TransitionEffect.CancelSuspendTimeout
         effects += TransitionEffect.CancelRemoteCommandTimeout
+        effects += TransitionEffect.CancelCoverGraceTimeout
         if (scheduleIdleRelease) {
             effects += TransitionEffect.ScheduleHardwareIdleTimeout
         }
@@ -598,6 +617,7 @@ internal object TriStateTransitionMatrix {
         effects: MutableList<TransitionEffect>
     ): TransitionOutput {
         effects += TransitionEffect.ReleaseHardwareDevice
+        effects += TransitionEffect.CancelCoverGraceTimeout
         trackManager.reset()
         val snap = ctx.snapshot
         val nextSnap = snap.copy(
@@ -650,6 +670,7 @@ internal object TriStateTransitionMatrix {
             recoverable = true,
             timestampMs = nowMs
         )
+        effects += TransitionEffect.ScheduleTransientErrorDismiss(errorCode, nowMs)
         val nextSnap = snap.copy(
             businessState = fallbackState,
             hardwareState = nextHw,

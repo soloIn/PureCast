@@ -558,6 +558,7 @@ class UsbDeviceManager internal constructor(
                 val epoch = if (forceNewEpoch) {
                     nativeBridge.emergencyMuteAndFlush(FlushReason.PREEMPT).coerceAtLeast(1L)
                 } else {
+                    nativeBridge.resumeStream()
                     nativeBridge.getCurrentBufferEpoch().coerceAtLeast(1L)
                 }
                 Logger.usb.i(
@@ -566,7 +567,6 @@ class UsbDeviceManager internal constructor(
                 )
                 return Result.success(HardwareOpenSuccess(epoch = epoch, dacName = device.productName))
             }
-
             Logger.usb.i(
                 TAG,
                 "HardwareExecutor 执行三元组原位切频: ${currentSampleRate}Hz/${currentBitDepth}bit -> ${sampleRate}Hz/${bitDepth}bit/${channels}ch"

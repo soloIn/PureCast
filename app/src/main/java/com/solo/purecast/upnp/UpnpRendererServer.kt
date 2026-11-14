@@ -36,7 +36,10 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import java.io.BufferedInputStream
 import java.io.BufferedReader
+import java.io.ByteArrayOutputStream
+import java.io.InputStream
 import java.io.InputStreamReader
 import java.io.OutputStream
 import java.net.DatagramPacket
@@ -426,6 +429,11 @@ class UpnpRendererServer(
                         )
                     }
                 }
+            },
+            onSeekFlush = {
+                val newEpoch = fastPath.emergencyMuteAndFlush(FlushReason.FLUSH_SWITCH)
+                fastPath.resumeStream()
+                newEpoch
             }
         )
     }
@@ -497,8 +505,8 @@ class UpnpRendererServer(
             socket.use { s ->
                 // 💡 针对连接配置 5000ms 超时防护，防止局域网异常客户端挂起连接耗尽 Dispatchers.IO 线程池
                 s.soTimeout = 5000
-                val reader = BufferedReader(InputStreamReader(s.getInputStream()))
-                val firstLine = reader.readLine() ?: return
+                val bis = BufferedInputStream(s.getInputStream(), 8192)
+                val firstLine = readHttpLine(bis) ?: return
                 val parts = firstLine.split(" ")
                 if (parts.size < 2) return
 
@@ -506,7 +514,7 @@ class UpnpRendererServer(
                 val path = parts[1]
 
                 val headers = mutableMapOf<String, String>()
-                var line = reader.readLine()
+                var line = readHttpLine(bis)
                 var contentLength = 0
                 while (!line.isNullOrEmpty()) {
                     val colonIdx = line.indexOf(':')
@@ -518,22 +526,69 @@ class UpnpRendererServer(
                             contentLength = v.toIntOrNull() ?: 0
                         }
                     }
-                    line = reader.readLine()
-                }
-
-                var body = ""
-                if (contentLength > 0) {
-                    val bodyChars = CharArray(contentLength)
-                    var readTotal = 0
-                    while (readTotal < contentLength) {
-                        val r = reader.read(bodyChars, readTotal, contentLength - readTotal)
-                        if (r == -1) break
-                        readTotal += r
-                    }
-                    body = String(bodyChars, 0, readTotal)
+                    line = readHttpLine(bis)
                 }
 
                 val out = s.getOutputStream()
+                val maxBodyBytes = 4 * 1024 * 1024
+                if (contentLength > maxBodyBytes) {
+                    sendResponse(out, 413, "Payload Too Large", "text/plain", "")
+                    return
+                }
+
+                if (headers["expect"]?.equals("100-continue", ignoreCase = true) == true) {
+                    out.write("HTTP/1.1 100 Continue\r\n\r\n".toByteArray(Charsets.US_ASCII))
+                    out.flush()
+                }
+
+                val isChunked = headers["transfer-encoding"]?.contains("chunked", ignoreCase = true) == true
+                val bodyBytes: ByteArray = when {
+                    isChunked -> {
+                        val baos = ByteArrayOutputStream()
+                        while (true) {
+                            val sizeLine = readHttpLine(bis) ?: break
+                            val chunkHeader = sizeLine.trim().split(";")[0]
+                            val chunkSize = chunkHeader.toIntOrNull(16) ?: break
+                            if (chunkSize == 0) {
+                                while (!readHttpLine(bis).isNullOrEmpty()) {}
+                                break
+                            }
+                            if (baos.size() + chunkSize > maxBodyBytes) {
+                                sendResponse(out, 413, "Payload Too Large", "text/plain", "")
+                                return
+                            }
+                            val chunkBuf = ByteArray(chunkSize)
+                            var readTotal = 0
+                            while (readTotal < chunkSize) {
+                                val r = bis.read(chunkBuf, readTotal, chunkSize - readTotal)
+                                if (r == -1) break
+                                readTotal += r
+                            }
+                            baos.write(chunkBuf, 0, readTotal)
+                            readHttpLine(bis) // skip trailing \r\n
+                        }
+                        baos.toByteArray()
+                    }
+                    contentLength > 0 -> {
+                        val buf = ByteArray(contentLength)
+                        var readTotal = 0
+                        while (readTotal < contentLength) {
+                            val r = bis.read(buf, readTotal, contentLength - readTotal)
+                            if (r == -1) break
+                            readTotal += r
+                        }
+                        if (readTotal < contentLength) {
+                            buf.copyOf(readTotal)
+                        } else {
+                            buf
+                        }
+                    }
+                    else -> ByteArray(0)
+                }
+
+                val charset = parseCharsetFromContentType(headers["content-type"]) ?: Charsets.UTF_8
+                val body = if (bodyBytes.isNotEmpty()) String(bodyBytes, charset) else ""
+
                 when (method) {
                     "GET" -> handleHttpGet(path, out)
                     "POST" -> handleHttpPost(path, headers, body, out)
@@ -544,6 +599,32 @@ class UpnpRendererServer(
             }
         } catch (e: Exception) {
             Logger.upnp.w(TAG, "处理 HTTP 请求异常: ${e.message}")
+        }
+    }
+
+    private fun readHttpLine(input: InputStream): String? {
+        val baos = ByteArrayOutputStream(128)
+        var sawAny = false
+        while (true) {
+            val b = input.read()
+            if (b == -1) {
+                if (!sawAny) return null
+                break
+            }
+            sawAny = true
+            if (b == '\n'.code) break
+            if (b != '\r'.code) {
+                baos.write(b)
+            }
+        }
+        return baos.toString(Charsets.US_ASCII.name())
+    }
+
+    private fun parseCharsetFromContentType(contentType: String?): java.nio.charset.Charset? {
+        if (contentType == null) return null
+        val match = Regex("charset\\s*=\\s*\"?([a-zA-Z0-9_-]+)\"?", RegexOption.IGNORE_CASE).find(contentType)
+        return match?.groupValues?.get(1)?.let {
+            try { java.nio.charset.Charset.forName(it) } catch (_: Exception) { null }
         }
     }
 
@@ -664,7 +745,7 @@ class UpnpRendererServer(
                 0L
             }
             val parsedMeta = if (metadataXml.isNotEmpty() || !isSameUriReplay || currentTrackMetadata.title.isEmpty() || currentTrackMetadata.title == TrackMetadata.DEFAULT_TITLE) {
-                parseDidlLiteMetadata(metadataXml, uri)
+                parseDidlLiteMetadata(metadataXml, uri, preserveCoverWhenEmpty = isSameUriReplay)
             } else {
                 currentTrackMetadata.copy(trackUri = uri)
             }
@@ -723,6 +804,7 @@ class UpnpRendererServer(
         onWakeUpUi?.invoke()
 
         if (currentUri.isNotEmpty() && (demuxer?.isRunning() != true || demuxer?.getCurrentUri() != currentUri)) {
+            fastPath.resumeStream()
             ensureDemuxer().start(currentUri)
         } else {
             fastPath.resumeStream()
@@ -782,6 +864,25 @@ class UpnpRendererServer(
         return durationState == DurationState.LIVE || seekCapability == SeekCapability.UNSEEKABLE
     }
 
+    fun seekToPositionMs(positionMs: Long): Boolean {
+        val d = demuxer ?: return false
+        return d.seekTo(positionMs)
+    }
+
+    private fun parseRelTimeToMs(target: String): Long? {
+        val parts = target.trim().split(":")
+        if (parts.size != 3) return null
+        val h = parts[0].toLongOrNull() ?: return null
+        val m = parts[1].toLongOrNull() ?: return null
+        val sParts = parts[2].split(".")
+        val s = sParts[0].toLongOrNull() ?: return null
+        val ms = if (sParts.size > 1) {
+            val fraction = sParts[1].padEnd(3, '0').substring(0, 3)
+            fraction.toLongOrNull() ?: 0L
+        } else 0L
+        return (h * 3600L + m * 60L + s) * 1000L + ms
+    }
+
     /**
      * 💡 SOAP Seek 寻道指令处理
      * 符合 UPnP AVTransport 规范：对于 [DurationState.LIVE] 或 [SeekCapability.UNSEEKABLE] 返回 701 (Transition not available)
@@ -795,6 +896,14 @@ class UpnpRendererServer(
             Logger.upnp.w(TAG, "实时或不可寻道音频流不支持 Seek 操作，按规范返回 SOAP 701 错误")
             buildSoapFault(701, "Transition not available for live stream")
         } else {
+            val targetMs = parseRelTimeToMs(target)
+            if (targetMs != null) {
+                val ok = seekToPositionMs(targetMs)
+                if (!ok) {
+                    Logger.upnp.w(TAG, "Seek 寻道执行失败或底层流不支持: $target")
+                    return buildSoapFault(701, "Seek operation failed or unsupported for current stream")
+                }
+            }
             Logger.upnp.i(TAG, "普通流 Seek 寻道请求已接受: $target")
             buildSoapResponse("SeekResponse", "urn:schemas-upnp-org:service:AVTransport:1", "")
         }
@@ -915,7 +1024,11 @@ class UpnpRendererServer(
         )
     }
 
-    private fun parseDidlLiteMetadata(escapedXml: String, trackUri: String = currentUri): TrackMetadata {
+    private fun parseDidlLiteMetadata(
+        escapedXml: String,
+        trackUri: String = currentUri,
+        preserveCoverWhenEmpty: Boolean = false
+    ): TrackMetadata {
         val unescaped = escapedXml
             .replace("&lt;", "<")
             .replace("&gt;", ">")
@@ -951,7 +1064,7 @@ class UpnpRendererServer(
             .ifEmpty { extractTagValue(unescaped, "albumArtURI") }
             .ifEmpty { extractTagValue(unescaped, "upnp:icon") }
             .ifEmpty { extractTagValue(unescaped, "icon") }
-            .ifEmpty { currentTrackMetadata.coverUri.orEmpty() }
+            .ifEmpty { if (preserveCoverWhenEmpty) currentTrackMetadata.coverUri.orEmpty() else "" }
 
         val hasLiveMarker = unescaped.contains("isLive", ignoreCase = true)
         val durationState = when {

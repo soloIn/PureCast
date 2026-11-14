@@ -120,6 +120,9 @@ internal class MacRenderer(private val context: Context, private val clock: MacC
     private fun source(s: String) = if (highp) s else s.replace("highp", "mediump")
     private fun program(v: String, f: String) = Program(source(v), source(f)).also { programs += it }
 
+    val isTransitioning: Boolean
+        get() = image != 0 && outgoing != 0 && transition < MacScene.TRANSITION_SECONDS
+
     fun setArtwork(bitmap: Bitmap?, now: Long) {
         if (outgoing != 0) GL.glDeleteTextures(1, intArrayOf(outgoing), 0)
         outgoing = image
@@ -128,7 +131,7 @@ internal class MacRenderer(private val context: Context, private val clock: MacC
             image = texture()
             GLUtils.texImage2D(GL.GL_TEXTURE_2D, 0, bitmap, 0)
         }
-        transition = if (outgoing == 0) MacScene.TRANSITION_SECONDS else 0.0
+        transition = if (outgoing == 0 || image == 0) MacScene.TRANSITION_SECONDS else 0.0
         checkGl()
     }
 

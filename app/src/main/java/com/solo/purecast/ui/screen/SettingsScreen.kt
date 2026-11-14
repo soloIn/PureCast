@@ -460,6 +460,7 @@ fun SettingsScreen(
                                                 modifier = Modifier
                                                     .fillMaxWidth()
                                                     .focusRequester(customNameFocusRequester)
+                                                    .focusProperties { left = navFocusRequesters[selectedCategory.ordinal] }
                                                     .onFocusChanged { isTextFieldFocused = it.isFocused }
                                             )
                                         }
@@ -500,10 +501,11 @@ fun SettingsScreen(
                                         FluidQuality.POWER_SAVE to "省电 (30fps)",
                                         FluidQuality.STATIC to "静态磨砂",
                                         FluidQuality.OFF to "关闭"
-                                    ).forEach { (quality, label) ->
+                                    ).forEachIndexed { qIdx, (quality, label) ->
                                         SegmentOptionButton(
                                             label = label,
                                             isSelected = currentFluidQuality == quality,
+                                            leftNavFocusRequester = if (qIdx == 0) navFocusRequesters[selectedCategory.ordinal] else null,
                                             onClick = {
                                                 currentFluidQuality = quality
                                                 settingsRepo.setFluidQuality(quality)
@@ -539,14 +541,14 @@ fun SettingsScreen(
                                         leftNavFocusRequester = navFocusRequesters[selectedCategory.ordinal],
                                         onClick = {
                                             if (audioState.isExclusive) {
-                                                PlaybackService.instance?.pausePlayback()
-                                                Toast.makeText(context, "已触发让渡，声卡归还系统", Toast.LENGTH_SHORT).show()
+                                                PlaybackService.instance?.releaseUsbExclusiveManually()
+                                                Toast.makeText(context, "已释放独占，声卡已归还系统", Toast.LENGTH_SHORT).show()
                                             } else {
                                                 if (context is Activity) {
-                                                    PlaybackService.instance?.requestUsbPermission(context)
+                                                    PlaybackService.instance?.claimUsbExclusiveManually(context) { _, msg ->
+                                                        Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                                                    }
                                                 }
-                                                PlaybackService.instance?.resumePlayback()
-                                                Toast.makeText(context, "正在尝试接管 USB DAC...", Toast.LENGTH_SHORT).show()
                                             }
                                         }
                                     )

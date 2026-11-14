@@ -222,6 +222,13 @@ data class ProgressUpdateEvent(
     val durationMs: Long
 ) : SessionEventPayload
 
+/**
+ * 💡 1200ms 切歌封面宽限期到期事件：若新曲目仍未提供封面，触发清理旧封面
+ */
+data class CoverGraceTimeoutEvent(
+    val trackGeneration: Long
+) : SessionEventPayload
+
 // ==========================================
 // 3. 遥控交互与定时器超时事件
 // ==========================================

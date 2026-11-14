@@ -21,6 +21,7 @@ import android.net.wifi.WifiManager
 import android.os.PowerManager
 import android.os.SystemClock
 import androidx.core.app.ServiceCompat
+import androidx.core.content.IntentCompat
 import androidx.lifecycle.LifecycleService
 import androidx.lifecycle.lifecycleScope
 import com.solo.purecast.R
@@ -40,6 +41,7 @@ import com.solo.purecast.model.TrackMetadata
 import com.solo.purecast.ui.MainActivity
 import com.solo.purecast.upnp.UpnpRendererServer
 import com.solo.purecast.util.Logger
+import java.lang.ref.WeakReference
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -85,6 +87,23 @@ class PlaybackService : LifecycleService() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var mediaSession: MediaSession? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var pendingPermissionActivityRef: WeakReference<Activity>? = null
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        super.onStartCommand(intent, flags, startId)
+        if (intent != null) {
+            val attachedDevice = IntentCompat.getParcelableExtra(
+                intent,
+                EXTRA_ATTACHED_USB_DEVICE,
+                UsbDevice::class.java
+            )
+            if (attachedDevice != null) {
+                Logger.service.i(TAG, "从 onStartCommand 捕获到待处理 USB 设备: ${attachedDevice.productName ?: attachedDevice.deviceName}")
+                handleUsbDeviceAttachedFromIntent(attachedDevice)
+            }
+        }
+        return START_STICKY
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -179,6 +198,28 @@ class PlaybackService : LifecycleService() {
                 preemptProtocolSession(protocol, sessionId)
             }
 
+            override fun seekProtocolStream(protocol: StreamProtocol, positionMs: Long) {
+                Logger.service.i(TAG, "执行协议寻道: protocol=$protocol, positionMs=$positionMs")
+                when (protocol) {
+                    StreamProtocol.UPNP_DLNA -> {
+                        val ok = upnpServer?.seekToPositionMs(positionMs) ?: false
+                        if (!ok) {
+                            Logger.service.w(TAG, "UPnP seekToPositionMs 失败: $positionMs")
+                        }
+                    }
+                    StreamProtocol.AIRPLAY_1 -> {
+                        lifecycleScope.launch {
+                            val dacp = airPlayServer?.dacpClient
+                            val result = dacp?.setPlayingTime(positionMs)
+                            if (result?.isFailure == true) {
+                                Logger.service.w(TAG, "AirPlay DACP setPlayingTime 失败: ${result.exceptionOrNull()?.message}")
+                            }
+                        }
+                    }
+                    StreamProtocol.NONE -> Unit
+                }
+            }
+
             override fun resumeProtocolAfterDeviceReopen(
                 protocol: StreamProtocol,
                 sessionId: Long,
@@ -221,6 +262,9 @@ class PlaybackService : LifecycleService() {
 
         // 💡 必须在所有 lateinit 核心协作者（sessionHost、usbDeviceManager、coordinator 等）就绪后再对外发布单实例引用
         instance = this
+        pendingPermissionActivityRef?.get()?.let { act ->
+            registerUsbPermissionActivity(act)
+        }
         startBootNetworkWatchdog()
     }
 
@@ -317,6 +361,7 @@ class PlaybackService : LifecycleService() {
 
                     override fun onSeekTo(pos: Long) {
                         Logger.service.i(TAG, "MediaSession 收到 onSeekTo: $pos ms")
+                        seekTo(pos)
                     }
                 })
                 isActive = true
@@ -461,6 +506,11 @@ class PlaybackService : LifecycleService() {
         sessionHost.pausePlayback()
     }
 
+    fun seekTo(positionMs: Long) {
+        if (!::sessionHost.isInitialized) return
+        sessionHost.seekTo(positionMs)
+    }
+
     fun resumePlayback() {
         if (!::sessionHost.isInitialized) return
         sessionHost.resumePlayback()
@@ -533,6 +583,64 @@ class PlaybackService : LifecycleService() {
     fun setIdleTimeoutSeconds(seconds: Int) {
         settingsRepository.setIdleTimeoutSeconds(seconds)
         coordinator.setIdleTimeoutSeconds(seconds)
+    }
+
+    fun registerUsbPermissionActivity(activity: Activity?) {
+        if (activity != null) {
+            pendingPermissionActivityRef = WeakReference(activity)
+            if (::usbDeviceManager.isInitialized) {
+                usbDeviceManager.bindPermissionActivity(activity)
+                usbDeviceManager.scanAndRequestPermissionAsync(activity)
+            }
+        } else {
+            pendingPermissionActivityRef = null
+            if (::usbDeviceManager.isInitialized) {
+                usbDeviceManager.bindPermissionActivity(null)
+            }
+        }
+    }
+
+    /**
+     * 💡 供设置界面手动让渡声卡：暂停播放并立即调用 releaseForExternalFocusLoss 归还系统驱动
+     */
+    fun releaseUsbExclusiveManually() {
+        if (::sessionHost.isInitialized) {
+            sessionHost.pausePlayback()
+        }
+        if (::usbDeviceManager.isInitialized) {
+            usbDeviceManager.releaseForExternalFocusLoss()
+        }
+        Logger.service.i(TAG, "用户手动触发声卡让渡")
+    }
+
+    /**
+     * 💡 供设置界面手动独占接管声卡：枚举设备、校验权限并尝试直通打开
+     */
+    fun claimUsbExclusiveManually(activity: Activity, onResult: (Boolean, String) -> Unit) {
+        if (!::usbDeviceManager.isInitialized) {
+            onResult(false, "USB 管理模块尚未初始化")
+            return
+        }
+        usbDeviceManager.bindPermissionActivity(activity)
+        val attached = usbDeviceManager.scanAndAttachDevice()
+        val snap = sessionSnapshot.value
+        if (!attached && !snap.audioPath.isDacConnected) {
+            usbDeviceManager.scanAndRequestPermissionAsync(activity)
+            onResult(false, "未连接可用 USB DAC 或正在请求授权")
+            return
+        }
+        val rate = snap.audioPath.sampleRate.takeIf { it > 0 } ?: 44100
+        val bits = snap.audioPath.bitDepth.takeIf { it > 0 } ?: 16
+        val ch = snap.audioPath.channels.takeIf { it > 0 } ?: 2
+        val openRes = usbDeviceManager.openDeviceWithCurrentFd(rate, bits, ch, forceNewEpoch = true)
+        openRes.fold(
+            onSuccess = { success ->
+                onResult(true, "已成功独占接管: ${success.dacName}")
+            },
+            onFailure = { err ->
+                onResult(false, "独占接管失败: ${err.message}")
+            }
+        )
     }
 
     fun bindUsbPermissionActivity(activity: Activity?) {
@@ -754,6 +862,7 @@ class PlaybackService : LifecycleService() {
         private const val TAG = "PlaybackService"
         private const val CHANNEL_ID = "purecast_playback_channel"
         private const val NOTIFICATION_ID = 1001
+        const val EXTRA_ATTACHED_USB_DEVICE = "com.solo.purecast.extra.ATTACHED_USB_DEVICE"
 
         @Volatile
         var instance: PlaybackService? = null
@@ -762,8 +871,12 @@ class PlaybackService : LifecycleService() {
         private val _sessionSnapshot = MutableStateFlow(PlayerSessionSnapshot())
         val sessionSnapshot: StateFlow<PlayerSessionSnapshot> = _sessionSnapshot.asStateFlow()
 
-        fun start(context: Context) {
-            val intent = Intent(context, PlaybackService::class.java)
+        fun start(context: Context, attachedUsbDevice: UsbDevice? = null) {
+            val intent = Intent(context, PlaybackService::class.java).apply {
+                if (attachedUsbDevice != null) {
+                    putExtra(EXTRA_ATTACHED_USB_DEVICE, attachedUsbDevice)
+                }
+            }
             context.startForegroundService(intent)
         }
 

@@ -64,6 +64,7 @@ interface ServiceSystemEffects {
     fun wakeUpUiIfInBackground()
     fun notifyUpnpTransportState(state: String)
     fun preemptProtocol(protocol: StreamProtocol, sessionId: Long)
+    fun seekProtocolStream(protocol: StreamProtocol, positionMs: Long)
     fun resumeProtocolAfterDeviceReopen(
         protocol: StreamProtocol,
         sessionId: Long,
@@ -281,6 +282,18 @@ class PlaybackServiceSessionHost(
         } else if (status == PlaybackStatus.PAUSED) {
             resumePlayback()
         }
+    }
+
+    /**
+     * 💡 用户触发寻道 (SeekTo)，受当前流媒体寻道能力严格管控
+     */
+    fun seekTo(positionMs: Long) {
+        val snap = coordinator.snapshot.value
+        if (snap.metadata.seekCapability != SeekCapability.SEEKABLE) {
+            Logger.service.w(TAG, "当前媒体不可寻道，忽略 seekTo($positionMs)")
+            return
+        }
+        systemEffects.seekProtocolStream(snap.activeProtocol, positionMs)
     }
 
     private fun dispatchRemoteCommand(commandType: RemoteCommandType) {

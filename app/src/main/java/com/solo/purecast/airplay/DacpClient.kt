@@ -89,6 +89,12 @@ class DacpClient(
     fun stop() = sendCommand("stop")
 
     /**
+     * 💡 设置当前播放时间戳 (ms)，用于 AirPlay 远端精准寻道
+     */
+    suspend fun setPlayingTime(positionMs: Long): Result<Unit> =
+        sendCommandAndAwait("setproperty?dacp.playingtime=$positionMs")
+
+    /**
      * 💡 串行执行挂起式 DACP 控制指令（供 [com.solo.purecast.core.session.PlaybackSessionCoordinator] 使用），
      * 返回真实网络响应成功/失败回执，确保连按切歌指令不并发交错且支持 5000ms 超时判定。
      */

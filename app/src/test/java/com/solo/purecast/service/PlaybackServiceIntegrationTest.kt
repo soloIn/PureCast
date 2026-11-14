@@ -99,6 +99,7 @@ class PlaybackServiceIntegrationTest {
         var wakeUpCount = 0
         val upnpStates = CopyOnWriteArrayList<String>()
         val preempted = CopyOnWriteArrayList<Pair<StreamProtocol, Long>>()
+        val soughtPositions = CopyOnWriteArrayList<Pair<StreamProtocol, Long>>()
         val dacpSent = CopyOnWriteArrayList<String>()
         var reopenResult = ProtocolResumeReopenResult.STREAMING_READY
         var eventLog: MutableList<String>? = null
@@ -144,6 +145,11 @@ class PlaybackServiceIntegrationTest {
         override fun preemptProtocol(protocol: StreamProtocol, sessionId: Long) {
             eventLog?.add("preempt($protocol,$sessionId)")
             preempted += protocol to sessionId
+        }
+
+        override fun seekProtocolStream(protocol: StreamProtocol, positionMs: Long) {
+            eventLog?.add("seek($protocol,$positionMs)")
+            soughtPositions += protocol to positionMs
         }
 
         override fun resumeProtocolAfterDeviceReopen(

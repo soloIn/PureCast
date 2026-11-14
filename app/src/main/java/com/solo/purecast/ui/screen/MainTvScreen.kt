@@ -58,6 +58,7 @@ import com.solo.purecast.model.DurationState
 import com.solo.purecast.model.ErrorCode
 import com.solo.purecast.model.HardwarePipelineState
 import com.solo.purecast.model.PlaybackStatus
+import com.solo.purecast.ui.background.FluidQuality
 import com.solo.purecast.model.PlayerSessionSnapshot
 import com.solo.purecast.model.SeekCapability
 import com.solo.purecast.model.TrackMetadata
@@ -120,6 +121,19 @@ internal fun resolveUiErrorBanner(snapshot: PlayerSessionSnapshot): UiErrorBanne
 }
 
 /**
+ * 💡 计算界面当前是否采用暗场背景渲染策略：
+ * 1. 遵循系统全局深色模式；
+ * 2. 或处于推流活跃状态且流光画质开启且持有有效封面时启用暗场；
+ * 3. 待机、画质关闭或无封面时回退至系统主题底色，杜绝浅色模式文字对比度崩溃。
+ */
+internal fun resolveHasDarkBackground(
+    isSystemDark: Boolean,
+    isIdle: Boolean,
+    fluidQuality: FluidQuality,
+    hasActiveCover: Boolean
+): Boolean = isSystemDark || (!isIdle && fluidQuality != FluidQuality.OFF && hasActiveCover)
+
+/**
  * 💡 剥离高频 progressPositionMs 后的主屏 UI 投影态，避免每 500ms 进度推进触发封面与流光背景整屏重组
  */
 internal data class MainTvUiState(
@@ -173,6 +187,7 @@ fun MainTvScreen(
     onPreviousTrack: () -> Unit,
     onNextTrack: () -> Unit,
     onOpenSettings: () -> Unit,
+    onSeekTo: (Long) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -190,20 +205,7 @@ fun MainTvScreen(
     val metadata = uiState.metadata
     val audioPathState = uiState.audioPath
     val errorBanner = uiState.errorBanner
-    var autoDismissedBannerKey by remember { mutableStateOf<Pair<ErrorCode, Long>?>(null) }
-    LaunchedEffect(errorBanner?.code, errorBanner?.timestampMs) {
-        val current = errorBanner ?: return@LaunchedEffect
-        if (current.code == ErrorCode.REMOTE_COMMAND_UNSUPPORTED ||
-            current.code == ErrorCode.REMOTE_COMMAND_TIMEOUT
-        ) {
-            delay(3_500L)
-            autoDismissedBannerKey = current.code to current.timestampMs
-            PlaybackService.instance?.clearError(current.code)
-        }
-    }
-    val visibleErrorBanner = errorBanner?.takeUnless {
-        autoDismissedBannerKey == (it.code to it.timestampMs)
-    }
+    val visibleErrorBanner = errorBanner
 
     val playPauseFocusRequester = remember { FocusRequester() }
     val settingsFocusRequester = remember { FocusRequester() }
@@ -259,11 +261,36 @@ fun MainTvScreen(
     val coverData: Any? = metadata.coverBytes ?: metadata.coverUri
     val isPlaying = uiState.isPlaying
     val isIdle = uiState.isIdle
-    val hasActiveCover = coverData != null
+    val uri = metadata.coverUri
+    val hasValidCover = metadata.coverBytes != null ||
+            (!uri.isNullOrEmpty() &&
+                    (uri.startsWith("http://", ignoreCase = true) || uri.startsWith("https://", ignoreCase = true)))
+    var persistentCover by remember { mutableStateOf<Any?>(null) }
 
-    // 💡 视觉色彩稳定性：推流活跃期间始终呈现全屏暗场流光，控件与进度条恒定保持纯净高亮白；
-    // 仅在完全待机 (IDLE/STOPPED) 时才跟随系统深浅色切换，彻底杜绝切歌瞬间黑白颜色闪烁颠簸
-    val hasDarkBackground = !isIdle || hasActiveCover || AppPalette.isDark
+    // 💡 封面占位保护：只有在完全空闲 (IDLE/STOPPED) 且无封面时才清空；
+    // 切歌期间若新曲目暂无封面（如无封面电台/播客），保留上一曲封面 1.2s 防抖，若持续无封面则优雅清除过渡到默认占位
+    LaunchedEffect(
+        metadata.title,
+        metadata.artist,
+        metadata.coverHash,
+        hasValidCover,
+        coverData,
+        isIdle
+    ) {
+        if (isIdle) {
+            persistentCover = null
+        } else if (hasValidCover && coverData != null) {
+            persistentCover = coverData
+        } else {
+            delay(1200)
+            if (!hasValidCover && coverData == null) {
+                persistentCover = null
+            }
+        }
+    }
+
+    val hasActiveCover = persistentCover != null
+    val hasDarkBackground = resolveHasDarkBackground(AppPalette.isDark, isIdle, fluidQuality, hasActiveCover)
 
     // 封面放大弹簧动画：TRANSITIONING 切歌过渡期保持 1.0f 放大态，避免闪缩
     val coverScale by animateFloatAsState(
@@ -282,14 +309,14 @@ fun MainTvScreen(
     ) {
         // 1. GLES2 材质网格动态流光背景 (无推流时 MacBackground 优雅呈现自适应纯净背景)
         FluidBackground(
-            coverData = coverData,
+            coverData = persistentCover,
             isPlaying = isPlaying,
             isIdle = isIdle,
             quality = fluidQuality
         )
 
         // 💡 柔和暗化层：仅在推流播放动态流光背景时启用，防止高饱和流光吞没文字；待机时关闭以呈现原汁原味的深/浅主题
-        if (hasActiveCover) {
+        if (!isIdle && fluidQuality != FluidQuality.OFF && hasActiveCover) {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
@@ -332,34 +359,6 @@ fun MainTvScreen(
                         ),
                     contentAlignment = Alignment.Center
                 ) {
-                    val uri = metadata.coverUri
-                    val hasValidCover = metadata.coverBytes != null ||
-                            (!uri.isNullOrEmpty() &&
-                                    (uri.startsWith("http://", ignoreCase = true) || uri.startsWith("https://", ignoreCase = true)))
-                    var persistentCover by remember { mutableStateOf<Any?>(null) }
-
-                    // 💡 封面占位保护：只有在完全空闲 (IDLE/STOPPED) 且无封面时才清空；
-                    // 切歌期间若新曲目暂无封面（如无封面电台/播客），保留上一曲封面 1.2s 防抖，若持续无封面则优雅清除过渡到默认占位
-                    LaunchedEffect(
-                        metadata.title,
-                        metadata.artist,
-                        metadata.coverHash,
-                        hasValidCover,
-                        coverData,
-                        isIdle
-                    ) {
-                        if (isIdle) {
-                            persistentCover = null
-                        } else if (hasValidCover && coverData != null) {
-                            persistentCover = coverData
-                        } else {
-                            delay(1200)
-                            if (!hasValidCover && coverData == null) {
-                                persistentCover = null
-                            }
-                        }
-                    }
-
                     Crossfade(
                         targetState = persistentCover,
                         animationSpec = tween(300),
@@ -494,7 +493,8 @@ fun MainTvScreen(
                     seekCapability = metadata.seekCapability,
                     playbackStatus = playbackStatus,
                     hasDarkBackground = hasDarkBackground,
-                    onPlayPauseClick = onTogglePlayPause
+                    onPlayPauseClick = onTogglePlayPause,
+                    onSeekTo = onSeekTo
                 )
 
                 Spacer(modifier = Modifier.height(16.dp))
@@ -544,7 +544,8 @@ private fun IsolatedProgressBar(
     seekCapability: SeekCapability,
     playbackStatus: PlaybackStatus,
     hasDarkBackground: Boolean = true,
-    onPlayPauseClick: () -> Unit
+    onPlayPauseClick: () -> Unit,
+    onSeekTo: (Long) -> Unit = {}
 ) {
     val servicePositionMs by remember {
         PlaybackService.sessionSnapshot
@@ -577,6 +578,7 @@ private fun IsolatedProgressBar(
             debounceJob?.cancel()
             debounceJob = coroutineScope.launch {
                 delay(300)
+                onSeekTo(newPositionMs)
                 isScrubbing = false
                 Logger.ui.i("MainTvScreen", "D-Pad 寻道防抖完成，提交 Seek: ${newPositionMs / 1000} 秒")
             }

@@ -6,6 +6,7 @@ import com.solo.purecast.model.ErrorCode
 import com.solo.purecast.model.FlushReason
 import com.solo.purecast.model.HardwarePipelineState
 import com.solo.purecast.model.PlaybackStatus
+import com.solo.purecast.model.PlayerSessionSnapshot
 import com.solo.purecast.model.SeekCapability
 import com.solo.purecast.model.StreamProtocol
 import com.solo.purecast.model.TrackMetadata
@@ -20,6 +21,7 @@ import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -1093,5 +1095,116 @@ class PlaybackSessionCoordinatorTest {
         assertEquals(s2, c.snapshot.value.sessionId)
         assertEquals(BusinessSessionState.PLAYING, c.snapshot.value.businessState)
         assertEquals(HardwarePipelineState.EXCLUSIVE_ACTIVE, c.snapshot.value.hardwareState)
+    }
+
+    @Test
+    fun `CoverGraceTimeoutEvent clears stale cover if unclaimed after 1200ms grace period`() = runTest(StandardTestDispatcher()) {
+        val tm = TrackTransactionManager()
+        val initialCover = byteArrayOf(1, 2, 3)
+        tm.resetForNewStream(1L, TrackMetadata(title = "Song 1", coverBytes = initialCover))
+        assertEquals(1L, tm.coverTrackGeneration)
+
+        // Track 2 arrives with no cover
+        val ctx = TransitionContext(
+            snapshot = PlayerSessionSnapshot(
+                sessionId = 1L,
+                businessState = BusinessSessionState.PLAYING,
+                metadata = tm.currentMetadata
+            )
+        )
+        val boundaryEnv = SessionEventEnvelope(
+            origin = EventOrigin.UPNP,
+            sessionId = 1L,
+            deviceGeneration = 1L,
+            sequence = 1L,
+            timestampElapsedMs = 100L,
+            payload = TrackBoundaryEvent("track-2", 2L)
+        )
+        val out1 = TriStateTransitionMatrix.reduce(ctx, boundaryEnv, tm, 100L)
+        assertTrue(out1.effects.any { it is TransitionEffect.ScheduleCoverGraceTimeout })
+        assertNotNull(out1.nextContext.snapshot.metadata.coverBytes)
+
+        // Case A: CoverGraceTimeoutEvent fires when cover is STILL unclaimed (coverTrackGeneration < 2L)
+        val timeoutEnv = SessionEventEnvelope(
+            origin = EventOrigin.SERVICE,
+            sessionId = 1L,
+            deviceGeneration = 1L,
+            sequence = 2L,
+            timestampElapsedMs = 1300L,
+            payload = CoverGraceTimeoutEvent(2L)
+        )
+        val out2 = TriStateTransitionMatrix.reduce(out1.nextContext, timeoutEnv, tm, 1300L)
+        assertNull(out2.nextContext.snapshot.metadata.coverBytes)
+        assertNull(out2.nextContext.snapshot.metadata.coverUri)
+
+        // Case B: CoverGraceTimeoutEvent fires when cover was ALREADY claimed (cleared == null branch)
+        val tm2 = TrackTransactionManager()
+        tm2.resetForNewStream(1L, TrackMetadata(title = "Song 1", coverBytes = initialCover))
+        val outB1 = TriStateTransitionMatrix.reduce(ctx, boundaryEnv, tm2, 100L)
+        tm2.applyMetadataPatch(MetadataPatchEvent(trackGeneration = 2L, coverBytes = byteArrayOf(4, 5, 6)))
+        val outB2 = TriStateTransitionMatrix.reduce(outB1.nextContext, timeoutEnv, tm2, 1300L)
+        assertEquals(outB1.nextContext, outB2.nextContext)
+
+        // Case C: Duplicate TrackBoundaryEvent (result.accepted == false branch)
+        val duplicateBoundary = SessionEventEnvelope(
+            origin = EventOrigin.UPNP,
+            sessionId = 1L,
+            deviceGeneration = 1L,
+            sequence = 3L,
+            timestampElapsedMs = 1400L,
+            payload = TrackBoundaryEvent("track-2", 2L)
+        )
+        val outC = TriStateTransitionMatrix.reduce(outB2.nextContext, duplicateBoundary, tm2, 1400L)
+        assertFalse(outC.effects.any { it is TransitionEffect.ScheduleCoverGraceTimeout })
+
+        // 验证 TrackTransactionManager 全分支覆盖：
+        // 1. resetForNewStream 分支：null、uri-only、cover-less
+        val tm3 = TrackTransactionManager()
+        tm3.resetForNewStream(1L, null)
+        assertEquals(0L, tm3.coverTrackGeneration)
+        assertEquals("stream-1", tm3.currentTrackKey)
+
+        val tm4 = TrackTransactionManager()
+        tm4.resetForNewStream(1L, TrackMetadata(title = "NoCover"))
+        assertEquals(0L, tm4.coverTrackGeneration)
+
+        val tm5 = TrackTransactionManager()
+        tm5.resetForNewStream(1L, TrackMetadata(coverUri = "http://uri-only"))
+        assertEquals(1L, tm5.coverTrackGeneration)
+
+        // 2. applyMetadataPatch 分支：
+        // a. patch with bytes only -> clears uri
+        tm5.onTrackBoundary(TrackBoundaryEvent("k2", 2L))
+        val patchBytesOnly = tm5.applyMetadataPatch(MetadataPatchEvent(trackGeneration = 2L, coverBytes = byteArrayOf(9)))!!
+        assertNotNull(patchBytesOnly.coverBytes)
+        assertNull(patchBytesOnly.coverUri)
+        assertEquals(2L, tm5.coverTrackGeneration)
+
+        // b. patch with uri only -> clears bytes
+        tm5.onTrackBoundary(TrackBoundaryEvent("k3", 3L))
+        val patchUriOnly = tm5.applyMetadataPatch(MetadataPatchEvent(trackGeneration = 3L, coverUri = "http://new-uri"))!!
+        assertNotNull(patchUriOnly.coverUri)
+        assertNull(patchUriOnly.coverBytes)
+        assertEquals(3L, tm5.coverTrackGeneration)
+
+        // c. patch with empty uri string -> hasNewUri == false
+        val patchEmptyUri = tm5.applyMetadataPatch(MetadataPatchEvent(trackGeneration = 3L, coverUri = ""))!!
+        assertEquals("http://new-uri", patchEmptyUri.coverUri)
+
+        // 3. clearStaleCoverIfUnclaimed 分支：
+        // a. targetGeneration != currentTrackGeneration
+        assertNull(tm5.clearStaleCoverIfUnclaimed(99L))
+        // b. coverTrackGeneration >= currentTrackGeneration
+        assertNull(tm5.clearStaleCoverIfUnclaimed(3L))
+
+        // c. hasUri == true && hasBytes == false
+        tm5.onTrackBoundary(TrackBoundaryEvent("k4", 4L))
+        val clearedUri = tm5.clearStaleCoverIfUnclaimed(4L)
+        assertNotNull(clearedUri)
+        assertNull(clearedUri!!.coverUri)
+        assertNull(clearedUri.coverBytes)
+
+        // d. hasUri == false && hasBytes == false
+        assertNull(tm5.clearStaleCoverIfUnclaimed(4L))
     }
 }

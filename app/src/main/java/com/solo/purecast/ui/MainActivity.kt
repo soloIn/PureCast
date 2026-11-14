@@ -47,9 +47,16 @@ class MainActivity : ComponentActivity() {
         // 初始化外观色彩系统
         com.solo.purecast.ui.theme.AppPalette.init(this)
 
-        // 确保后台音频前台服务与 UPnP 监听已就绪
-        PlaybackService.start(this)
-        handleUsbAttachedIntent(intent)
+        val coldAttachedDevice: android.hardware.usb.UsbDevice? = if (intent?.action == android.hardware.usb.UsbManager.ACTION_USB_DEVICE_ATTACHED) {
+            androidx.core.content.IntentCompat.getParcelableExtra(
+                intent,
+                android.hardware.usb.UsbManager.EXTRA_DEVICE,
+                android.hardware.usb.UsbDevice::class.java
+            )
+        } else null
+
+        // 确保后台音频前台服务与 UPnP 监听已就绪，透传冷启动设备
+        PlaybackService.start(this, attachedUsbDevice = coldAttachedDevice)
 
         setContent {
             PureCastTheme {
@@ -91,7 +98,8 @@ class MainActivity : ComponentActivity() {
                                 onTogglePlayPause = { togglePlayPause() },
                                 onPreviousTrack = { handlePreviousTrack() },
                                 onNextTrack = { handleNextTrack() },
-                                onOpenSettings = { currentScreen = TvNavScreen.SETTINGS }
+                                onOpenSettings = { currentScreen = TvNavScreen.SETTINGS },
+                                onSeekTo = { posMs -> PlaybackService.instance?.seekTo(posMs) }
                             )
                         }
                         TvNavScreen.SETTINGS -> {
@@ -109,8 +117,7 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         Logger.ui.i(TAG, "MainActivity onResume: 检查 USB DAC 授权状态与屏保常亮状态...")
-        PlaybackService.instance?.bindUsbPermissionActivity(this)
-        checkAndRequestUsbPermission()
+        PlaybackService.instance?.registerUsbPermissionActivity(this)
         updateKeepScreenOn()
     }
 
@@ -152,7 +159,7 @@ class MainActivity : ComponentActivity() {
     override fun onStop() {
         super.onStop()
         Logger.ui.i(TAG, "MainActivity onStop: 退入后台，清除 FLAG_KEEP_SCREEN_ON 释放屏保控制权")
-        PlaybackService.instance?.bindUsbPermissionActivity(null)
+        PlaybackService.instance?.registerUsbPermissionActivity(null)
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
     }
 

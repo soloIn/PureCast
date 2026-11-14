@@ -386,6 +386,7 @@ class StreamDemuxerTransactionTest {
             assertTrue("Play 后应在限时内发送 FirstDataPacketEvent", events.any { it.payload is FirstDataPacketEvent })
 
             val epochBeforePause = fakeNative.currentEpoch
+            val resumesBeforeSecondPlay = fakeNative.resumeCalls
             server.processSoapActionForTest("Pause", "")
             assertEquals("Pause 不应递增 epoch", epochBeforePause, fakeNative.currentEpoch)
             assertTrue(events.any { it.payload is ExplicitPauseEvent })
@@ -394,7 +395,7 @@ class StreamDemuxerTransactionTest {
             server.processSoapActionForTest("Play", "")
             assertEquals("Pause -> Play 恢复绝不应递增 epoch", epochBeforePause, fakeNative.currentEpoch)
             assertTrue("Pause -> Play 应发出 StreamResumeEvent", events.any { it.payload is StreamResumeEvent })
-            assertEquals(1, fakeNative.resumeCalls)
+            assertEquals(resumesBeforeSecondPlay + 1, fakeNative.resumeCalls)
 
             server.processSoapActionForTest("Stop", "")
             assertTrue(events.any { it.payload is StreamStopEvent })

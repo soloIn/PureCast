@@ -137,6 +137,9 @@ internal class MacTextureView(
         private val vsyncFrame = Choreographer.FrameCallback { onVsync() }
         private var vsyncFrameCount = 0L
 
+        private fun shouldContinueVsync(state: FluidRenderState): Boolean =
+            !stopping.get() && !closed && active && state.quality.animated && (state.playing || renderer?.isTransitioning == true)
+
         private fun onVsync() {
             if (!stopping.get() && !closed && active) {
                 val state = renderState
@@ -144,7 +147,7 @@ internal class MacTextureView(
                 // 💡 帧率节流：当 quality.fps 在 1..30 之间（如 POWER_SAVE 档位的 30fps）时，跳过奇数 VSYNC 信号（60Hz -> 30Hz）
                 vsyncFrameCount++
                 if (state.quality.fps in 1..30 && (vsyncFrameCount % 2L != 0L)) {
-                    if (state.playing && state.quality.animated) {
+                    if (shouldContinueVsync(state)) {
                         choreographer?.postFrameCallback(vsyncFrame)
                     }
                     return
@@ -152,9 +155,9 @@ internal class MacTextureView(
 
                 render()
 
-                // 💡 当 state.playing == false（暂停或停止）时，在完成当前过渡帧渲染后停止 choreographer 回调，GPU 占用直接降至 0%
-                // 待恢复播放或状态变更时，通过外部 wake() 重新唤醒帧循环
-                if (state.playing && state.quality.animated) {
+                // 💡 当 state.playing == false（暂停或停止）且无材质交叉淡入渐变时，停止 choreographer 回调，GPU 占用直接降至 0%
+                // 若正在进行暂停期间的切歌封面淡入渐变 (renderer.isTransitioning == true)，维持帧率直至过渡完毕
+                if (shouldContinueVsync(state)) {
                     choreographer?.postFrameCallback(vsyncFrame)
                 }
             }
@@ -163,7 +166,7 @@ internal class MacTextureView(
         private val frame = Runnable {
             render()
             val state = renderState
-            if (state.playing && state.quality.animated && !stopping.get() && !closed && active) {
+            if (shouldContinueVsync(state)) {
                 choreographer?.postFrameCallback(vsyncFrame)
             }
         }

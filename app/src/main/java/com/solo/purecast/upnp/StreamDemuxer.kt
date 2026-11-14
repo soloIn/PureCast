@@ -78,7 +78,7 @@ internal fun resolveWavDurationSpec(dataSize: Long, bytesPerSecond: Long): Tripl
 internal fun resolveFlacDurationSpec(sampleRate: Int, totalPcmFrames: Long): Triple<Long, DurationState, SeekCapability> {
     return if (sampleRate > 0 && totalPcmFrames > 0L) {
         val durMs = (totalPcmFrames * 1000L) / sampleRate.toLong()
-        Triple(durMs, DurationState.FIXED, SeekCapability.SEEKABLE)
+        Triple(durMs, DurationState.FIXED, SeekCapability.UNSEEKABLE)
     } else {
         Triple(0L, DurationState.UNKNOWN, SeekCapability.UNSEEKABLE)
     }
@@ -96,12 +96,13 @@ internal fun resolveFlacDurationSpec(sampleRate: Int, totalPcmFrames: Long): Tri
 class StreamDemuxer(
     private val scope: CoroutineScope,
     private val audioGateway: DemuxerAudioGateway = NativeDemuxerAudioGateway,
-    private val onAcquireStreamEpoch: (spec: DemuxedStreamSpec) -> Long,
-    private val onFirstDataPacket: (epoch: Long, spec: DemuxedStreamSpec) -> Unit,
-    private val onStreamEnded: (abortedByEpoch: Boolean, finalEpoch: Long) -> Unit,
-    private val onError: (String) -> Unit,
+    private val onAcquireStreamEpoch: (spec: DemuxedStreamSpec) -> Long = { 1L },
+    private val onFirstDataPacket: (epoch: Long, spec: DemuxedStreamSpec) -> Unit = { _, _ -> },
+    private val onStreamEnded: (abortedByEpoch: Boolean, finalEpoch: Long) -> Unit = { _, _ -> },
+    private val onError: (String) -> Unit = {},
     private val onMetadataParsed: ((title: String?, artist: String?, album: String?) -> Unit)? = null,
-    private val onPositionUpdated: ((positionMs: Long) -> Unit)? = null
+    private val onPositionUpdated: ((positionMs: Long) -> Unit)? = null,
+    private val onSeekFlush: (() -> Long)? = null
 ) {
 
     private var streamingJob: Job? = null
@@ -120,6 +121,12 @@ class StreamDemuxer(
     @Volatile
     private var totalBytesStreamed: Long = 0L
     @Volatile
+    private var seekBaseBytes: Long = 0L
+    @Volatile
+    private var wavDataStartOffsetBytes: Long = 0L
+    @Volatile
+    private var wavDataSizeBytes: Long = 0L
+    @Volatile
     private var bytesPerSecond: Long = 0L
     @Volatile
     private var totalDurationSeconds: Long = 0L
@@ -135,14 +142,16 @@ class StreamDemuxer(
     private var currentChannels: Int = 0
     @Volatile
     private var isFlacStream: Boolean = false
+    @Volatile
+    private var acquiredEpoch: Long = 0L
 
     fun isRunning(): Boolean = isDemuxing
     fun getCurrentUri(): String = currentStreamUrl
 
     /**
-     * 💡 获取当前已流式传输/播放的时间戳 (秒)
+     * 💡 获取当前已流式传输/播放的时间戳 (毫秒)，具备亚秒级精度
      */
-    fun getCurrentPlayPositionSeconds(): Long {
+    fun getCurrentPlayPositionMs(): Long {
         val bps = bytesPerSecond
         if (bps > 0L) {
             if (isFlacStream && currentSampleRate > 0) {
@@ -150,22 +159,120 @@ class StreamDemuxer(
                 val bytesPerFrame = currentChannels * (currentBitDepth / 8)
                 val bufferedFrames = if (bytesPerFrame > 0) (audioGateway.getAvailableRead() / bytesPerFrame).toLong() else 0L
                 val playedFrames = (decodedFrames - bufferedFrames).coerceAtLeast(0L)
-                return playedFrames / currentSampleRate.toLong()
-            } else if (totalBytesStreamed > 0L) {
-                val playedBytes = (totalBytesStreamed - audioGateway.getAvailableRead().toLong()).coerceAtLeast(0L)
-                return playedBytes / bps
+                val rate = currentSampleRate.toLong()
+                return (playedFrames / rate) * 1000L + ((playedFrames % rate) * 1000L) / rate
+            } else if (totalBytesStreamed > 0L || seekBaseBytes > 0L) {
+                val playedBytes = (seekBaseBytes + totalBytesStreamed - audioGateway.getAvailableRead().toLong()).coerceAtLeast(0L)
+                return (playedBytes / bps) * 1000L + ((playedBytes % bps) * 1000L) / bps
             }
         }
         if (flacStartTimeMs > 0L && isDemuxing) {
-            return (System.currentTimeMillis() - flacStartTimeMs) / 1000L
+            return (System.currentTimeMillis() - flacStartTimeMs).coerceAtLeast(0L)
         }
         return 0L
     }
 
     /**
+     * 💡 获取当前已流式传输/播放的时间戳 (秒)
+     */
+    fun getCurrentPlayPositionSeconds(): Long = getCurrentPlayPositionMs() / 1000L
+
+    /**
      * 💡 获取当前音轨总时长 (秒)，若流为实时直播流 (AirPlay / 广播) 则返回 0
      */
     fun getTotalDurationSeconds(): Long = totalDurationSeconds
+
+    /**
+     * 💡 HTTP Range 寻道
+     */
+    fun seekTo(targetPositionMs: Long): Boolean {
+        if (!isDemuxing || isFlacStream || bytesPerSecond <= 0L || totalDurationSeconds <= 0L) {
+            return false
+        }
+        val url = currentStreamUrl
+        if (url.isEmpty()) return false
+
+        val bytesPerFrame = currentChannels * (currentBitDepth / 8)
+        if (bytesPerFrame <= 0) return false
+
+        val durMs = totalDurationSeconds * 1000L
+        val clampedMs = targetPositionMs.coerceIn(0L, durMs)
+        val pcmOffset = ((clampedMs * bytesPerSecond) / 1000L)
+        val alignedPcmOffset = (pcmOffset / bytesPerFrame) * bytesPerFrame
+
+        val thisSession = sessionToken.incrementAndGet()
+        val oldConn = activeConnection
+        val oldStream = activeInputStream
+        activeConnection = null
+        activeInputStream = null
+        closeDetachedStreamAsync(oldConn, oldStream)
+
+        streamingJob = scope.launch(Dispatchers.IO) {
+            var connection: HttpURLConnection? = null
+            var inputStream: InputStream? = null
+            var abortedByEpoch = false
+            try {
+                if (thisSession != sessionToken.get()) return@launch
+                val connUrl = URL(url)
+                val rangeHeader = "bytes=${wavDataStartOffsetBytes + alignedPcmOffset}-"
+                Logger.upnp.i(TAG, "执行 HTTP Range Seek: target=${clampedMs}ms, offset=$alignedPcmOffset, header=$rangeHeader")
+                connection = (connUrl.openConnection() as HttpURLConnection).apply {
+                    connectTimeout = 8000
+                    readTimeout = 15000
+                    requestMethod = "GET"
+                    setRequestProperty("User-Agent", "PureCast-UPnP-Renderer/1.0")
+                    setRequestProperty("Connection", "keep-alive")
+                    setRequestProperty("Range", rangeHeader)
+                }
+                activeConnection = connection
+                connection.connect()
+                val responseCode = connection.responseCode
+                if (responseCode == 206) {
+                    inputStream = BufferedInputStream(connection.inputStream, 64 * 1024)
+                    activeInputStream = inputStream
+
+                    val seekEpoch = onSeekFlush?.invoke() ?: acquiredEpoch
+                    seekBaseBytes = alignedPcmOffset
+                    totalBytesStreamed = 0L
+                    onPositionUpdated?.invoke(clampedMs)
+
+                    val pcmBuffer = ByteArray(32768)
+                    while (isActive && isDemuxing && thisSession == sessionToken.get() && !abortedByEpoch) {
+                        val bytesRead = inputStream.read(pcmBuffer, 0, pcmBuffer.size)
+                        if (bytesRead == -1) break
+                        if (bytesRead > 0) {
+                            totalBytesStreamed += bytesRead
+                            var offset = 0
+                            var remaining = bytesRead
+                            while (remaining > 0 && isActive && isDemuxing && thisSession == sessionToken.get()) {
+                                val written = audioGateway.writePcm(pcmBuffer, offset, remaining, seekEpoch)
+                                if (written > 0) {
+                                    offset += written
+                                    remaining -= written
+                                } else if (written == -2 || written == -1) {
+                                    abortedByEpoch = true
+                                    break
+                                } else {
+                                    delay(5L)
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    Logger.upnp.w(TAG, "HTTP Range Seek 返回非 206 状态码: $responseCode")
+                }
+            } catch (e: CancellationException) {
+                abortedByEpoch = true
+            } catch (e: Exception) {
+                Logger.upnp.w(TAG, "HTTP Range Seek 异常", e)
+                abortedByEpoch = true
+            } finally {
+                try { inputStream?.close() } catch (_: Exception) {}
+                try { connection?.disconnect() } catch (_: Exception) {}
+            }
+        }
+        return true
+    }
 
     /**
      * 启动流式拉取与解析任务
@@ -201,7 +308,7 @@ class StreamDemuxer(
         progressJob = scope.launch(Dispatchers.Default) {
             var lastEmittedPosMs = -1L
             while (isActive && isDemuxing && thisSession == sessionToken.get()) {
-                val posMs = getCurrentPlayPositionSeconds() * 1000L
+                val posMs = getCurrentPlayPositionMs()
                 if (posMs != lastEmittedPosMs) {
                     lastEmittedPosMs = posMs
                     onPositionUpdated?.invoke(posMs)
@@ -325,6 +432,8 @@ class StreamDemuxer(
                         abortedByEpoch = true
                         return@launch
                     }
+                    wavDataStartOffsetBytes = format.headerLength.toLong()
+                    wavDataSizeBytes = format.dataSize
                     currentSampleRate = format.sampleRate
                     currentBitDepth = format.bitDepth
                     currentChannels = format.channels
@@ -335,7 +444,7 @@ class StreamDemuxer(
                     totalDurationSeconds = durMs / 1000L
                     Logger.upnp.i(
                         TAG,
-                        "WAV 容器头部解析完毕: ${format.sampleRate}Hz/${format.bitDepth}bit/${format.channels}ch, dataSize=${format.dataSize}, durationState=$durState"
+                        "WAV 容器头部解析完毕: ${format.sampleRate}Hz/${format.bitDepth}bit/${format.channels}ch, dataSize=${format.dataSize}, headerLen=${format.headerLength}, durationState=$durState"
                     )
 
                     val spec = DemuxedStreamSpec(
@@ -348,6 +457,7 @@ class StreamDemuxer(
                         seekCapability = seekCap
                     )
                     acquiredEpoch = onAcquireStreamEpoch(spec)
+                    this@StreamDemuxer.acquiredEpoch = acquiredEpoch
                     if (acquiredEpoch <= 0L) {
                         abortedByEpoch = true
                         Logger.upnp.w(TAG, "WAV 获取硬件世代失败 ($acquiredEpoch)，中止推流 (session=$thisSession)")
@@ -461,15 +571,27 @@ class StreamDemuxer(
         val sampleRate: Int,
         val bitDepth: Int,
         val channels: Int,
-        val dataSize: Long = 0L
+        val dataSize: Long = 0L,
+        val headerLength: Int = 44
     )
 
     /**
      * 流式状态机解析 WAV 头部多 Chunk，并提取 LIST INFO 内嵌元数据
      */
-    private fun parseHeader(input: InputStream): AudioStreamFormat {
+    internal fun parseHeader(input: InputStream): AudioStreamFormat {
+        var totalBytesRead = 0
+        fun readFullyTracked(target: ByteArray, offset: Int, length: Int): Boolean {
+            val ok = readFully(input, target, offset, length)
+            if (ok) totalBytesRead += length
+            return ok
+        }
+        fun skipFullyTracked(length: Long) {
+            skipFully(input, length)
+            totalBytesRead += length.toInt()
+        }
+
         val magic = ByteArray(12)
-        if (!readFully(input, magic, 0, 12)) throw IllegalStateException("流提前结束 (EOF in readFully)")
+        if (!readFullyTracked(magic, 0, 12)) throw IllegalStateException("流提前结束 (EOF in readFully)")
 
         val riff = String(magic, 0, 4)
         val wave = String(magic, 8, 4)
@@ -487,15 +609,16 @@ class StreamDemuxer(
 
         val chunkHeader = ByteArray(8)
         while (!dataFound) {
-            if (!readFully(input, chunkHeader, 0, 8)) throw IllegalStateException("流提前结束 (EOF in readFully)")
+            if (!readFullyTracked(chunkHeader, 0, 8)) throw IllegalStateException("流提前结束 (EOF in readFully)")
             val chunkId = String(chunkHeader, 0, 4)
             val chunkSize = ByteBuffer.wrap(chunkHeader, 4, 4).order(ByteOrder.LITTLE_ENDIAN).int.toLong() and 0xFFFFFFFFL
 
             when (chunkId) {
                 "fmt " -> {
                     val fmtLen = chunkSize.toInt()
-                    val fmtData = ByteArray(fmtLen)
-                    if (!readFully(input, fmtData, 0, fmtLen)) throw IllegalStateException("流提前结束 (EOF in readFully)")
+                    if (fmtLen < 16) throw IllegalStateException("fmt Chunk 长度不足 16 字节: $fmtLen")
+                    val fmtData = ByteArray(16)
+                    if (!readFullyTracked(fmtData, 0, 16)) throw IllegalStateException("流提前结束 (EOF in readFully)")
                     val fmtBuf = ByteBuffer.wrap(fmtData).order(ByteOrder.LITTLE_ENDIAN)
                     fmtBuf.short // audioFormat (1=PCM)
                     channels = fmtBuf.short.toInt()
@@ -504,14 +627,26 @@ class StreamDemuxer(
                     fmtBuf.short // blockAlign
                     bitDepth = fmtBuf.short.toInt()
                     Logger.upnp.d(TAG, "解析 fmt Chunk 成功: $sampleRate Hz, $bitDepth bit, $channels ch")
+                    val extraFmt = fmtLen - 16
+                    if (extraFmt > 0) {
+                        skipFullyTracked(extraFmt.toLong())
+                    }
+                    if (chunkSize % 2L != 0L) {
+                        skipFullyTracked(1L)
+                    }
                 }
 
                 "LIST" -> {
                     // 💡 深度流式解析 WAV LIST INFO 内嵌元数据
                     Logger.upnp.d(TAG, "检测到 LIST 扩展 Chunk: $chunkSize 字节，准备提取内嵌文本标签...")
-                    if (chunkSize >= 4L) {
+                    if (chunkSize < 4L) {
+                        skipFullyTracked(chunkSize)
+                        if (chunkSize % 2L != 0L) {
+                            skipFullyTracked(1L)
+                        }
+                    } else {
                         val listTypeBytes = ByteArray(4)
-                        if (readFully(input, listTypeBytes, 0, 4)) {
+                        if (readFullyTracked(listTypeBytes, 0, 4)) {
                             val listType = String(listTypeBytes, 0, 4)
                             var bytesRemaining = chunkSize - 4L
 
@@ -523,21 +658,21 @@ class StreamDemuxer(
 
                                 while (bytesRemaining >= 8L) {
                                     val subHeader = ByteArray(8)
-                                    if (!readFully(input, subHeader, 0, 8)) break
+                                    if (!readFullyTracked(subHeader, 0, 8)) break
                                     val subId = String(subHeader, 0, 4)
                                     val subSize = ByteBuffer.wrap(subHeader, 4, 4).order(ByteOrder.LITTLE_ENDIAN).int.toLong() and 0xFFFFFFFFL
                                     bytesRemaining -= 8L
 
                                     if (subSize < 0L || subSize > bytesRemaining) {
                                         Logger.upnp.w(TAG, "异常 subChunk 尺寸: subId=$subId, subSize=$subSize, 剩余=$bytesRemaining")
-                                        skipBytes(input, bytesRemaining)
+                                        skipFullyTracked(bytesRemaining)
                                         bytesRemaining = 0L
                                         break
                                     }
 
                                     val subLen = subSize.toInt()
                                     val subData = ByteArray(subLen)
-                                    if (!readFully(input, subData, 0, subLen)) {
+                                    if (!readFullyTracked(subData, 0, subLen)) {
                                         bytesRemaining = 0L
                                         break
                                     }
@@ -545,24 +680,15 @@ class StreamDemuxer(
 
                                     // RIFF 规范：若 subSize 为奇数，后附 1 字节对齐填充
                                     if (subSize % 2L != 0L && bytesRemaining > 0L) {
-                                        input.read()
+                                        skipFullyTracked(1L)
                                         bytesRemaining -= 1L
                                     }
 
                                     val text = String(subData, Charsets.UTF_8).trimEnd { it == '\u0000' || it.isWhitespace() }
                                     when (subId) {
-                                        "INAM" -> {
-                                            Logger.upnp.i(TAG, "提取到内嵌歌曲标题 INAM: $text")
-                                            parsedTitle = text
-                                        }
-                                        "IART" -> {
-                                            Logger.upnp.i(TAG, "提取到内嵌艺术家 IART: $text")
-                                            parsedArtist = text
-                                        }
-                                        "IPRD" -> {
-                                            Logger.upnp.i(TAG, "提取到内嵌专辑 IPRD: $text")
-                                            parsedAlbum = text
-                                        }
+                                        "INAM" -> parsedTitle = text
+                                        "IART" -> parsedArtist = text
+                                        "IPRD" -> parsedAlbum = text
                                         else -> {
                                             Logger.upnp.d(TAG, "跳过 LIST INFO 子项: $subId, 内容=$text")
                                         }
@@ -572,8 +698,14 @@ class StreamDemuxer(
                                 if (!parsedTitle.isNullOrEmpty() || !parsedArtist.isNullOrEmpty() || !parsedAlbum.isNullOrEmpty()) {
                                     onMetadataParsed?.invoke(parsedTitle, parsedArtist, parsedAlbum)
                                 }
+                                if (bytesRemaining > 0L) {
+                                    skipFullyTracked(bytesRemaining)
+                                }
                             } else {
-                                skipBytes(input, bytesRemaining)
+                                skipFullyTracked(bytesRemaining)
+                            }
+                            if (chunkSize % 2L != 0L) {
+                                skipFullyTracked(1L)
                             }
                         }
                     }
@@ -582,26 +714,29 @@ class StreamDemuxer(
                 "data" -> {
                     dataFound = true
                     dataSize = chunkSize
-                    Logger.upnp.d(TAG, "精准定位到 data Chunk 边界，准备直通 Raw PCM 载荷 (chunkSize=$chunkSize)")
+                    Logger.upnp.d(TAG, "精准定位到 data Chunk 边界，准备直通 Raw PCM 载荷 (chunkSize=$chunkSize, headerLen=$totalBytesRead)")
                 }
 
                 else -> {
-                    // 💡 跳过 JUNK, bext 等扩展 Chunk
+                    // 💡 跳过 JUNK, bext 等扩展 Chunk，若为奇数则跳过对齐填充
                     Logger.upnp.d(TAG, "跳过非 data 扩展 Chunk: $chunkId, 长度: $chunkSize 字节")
-                    skipBytes(input, chunkSize)
+                    skipFullyTracked(chunkSize)
+                    if (chunkSize % 2L != 0L) {
+                        skipFullyTracked(1L)
+                    }
                 }
             }
         }
 
-        return AudioStreamFormat(sampleRate, bitDepth, channels, dataSize)
+        return AudioStreamFormat(sampleRate, bitDepth, channels, dataSize, totalBytesRead)
     }
 
-    private fun skipBytes(input: InputStream, length: Long) {
+    private fun skipFully(input: InputStream, length: Long) {
         var toSkip = length
         val skipBuf = ByteArray(minOf(toSkip, 4096L).toInt())
         while (toSkip > 0L) {
             val n = input.read(skipBuf, 0, minOf(toSkip, skipBuf.size.toLong()).toInt())
-            if (n == -1) break
+            if (n == -1) throw IllegalStateException("流提前结束 (EOF in skipFully: 仍需跳过 $toSkip 字节)")
             toSkip -= n.toLong()
         }
     }

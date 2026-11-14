@@ -1,7 +1,11 @@
 package com.solo.purecast
 
+import com.solo.purecast.upnp.StreamDemuxer
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertThrows
 import org.junit.Test
 import java.io.ByteArrayInputStream
 import java.io.InputStream
@@ -155,5 +159,157 @@ class WavHeaderParserTest {
         assertEquals(24, info.bitDepth)
         assertEquals(2, info.channels)
         assertEquals(totalSize, info.headerLength)
+    }
+
+    @Test
+    fun testDemuxerDirectStandard44ByteWavHeader() {
+        val bb = ByteBuffer.allocate(44).order(ByteOrder.LITTLE_ENDIAN)
+        bb.put("RIFF".toByteArray())
+        bb.putInt(10044)
+        bb.put("WAVE".toByteArray())
+
+        // fmt chunk (16 bytes)
+        bb.put("fmt ".toByteArray())
+        bb.putInt(16)
+        bb.putShort(1.toShort()) // PCM
+        bb.putShort(2.toShort()) // 2 channels
+        bb.putInt(44100)
+        bb.putInt(44100 * 4)
+        bb.putShort(4.toShort())
+        bb.putShort(16.toShort())
+
+        // data chunk
+        bb.put("data".toByteArray())
+        bb.putInt(10000)
+
+        val demuxer = StreamDemuxer(CoroutineScope(Dispatchers.Unconfined))
+        val fmt = demuxer.parseHeader(ByteArrayInputStream(bb.array()))
+
+        assertEquals(44100, fmt.sampleRate)
+        assertEquals(16, fmt.bitDepth)
+        assertEquals(2, fmt.channels)
+        assertEquals(10000L, fmt.dataSize)
+        assertEquals(44, fmt.headerLength)
+    }
+
+    @Test
+    fun testDemuxerDirectOddSizedJunkAndListChunksWithPadding() {
+        // JUNK chunk with odd size 5 -> followed by 1 pad byte
+        val junkPayload = "HELLO".toByteArray()
+        // LIST INFO chunk with odd subchunk
+        val subPayload = "TrackTitle".toByteArray() // 10 bytes (even)
+        val listPayload = ByteBuffer.allocate(4 + 8 + subPayload.size).order(ByteOrder.LITTLE_ENDIAN)
+        listPayload.put("INFO".toByteArray())
+        listPayload.put("INAM".toByteArray())
+        listPayload.putInt(subPayload.size)
+        listPayload.put(subPayload)
+
+        // LIST payload total = 4 + 8 + 10 = 22 (even), let's make it odd: add odd comment subchunk
+        val oddComment = "Odd".toByteArray() // 3 bytes -> 1 pad byte
+        val fullList = ByteBuffer.allocate(4 + 8 + subPayload.size + 8 + oddComment.size + 1).order(ByteOrder.LITTLE_ENDIAN)
+        fullList.put("INFO".toByteArray())
+        fullList.put("INAM".toByteArray())
+        fullList.putInt(subPayload.size)
+        fullList.put(subPayload)
+        fullList.put("ICMT".toByteArray())
+        fullList.putInt(oddComment.size)
+        fullList.put(oddComment)
+        fullList.put(0.toByte()) // pad byte for odd ICMT
+
+        val listBytes = fullList.array()
+        val listSize = listBytes.size // 4 + 8 + 10 + 8 + 3 + 1 = 34 (even)
+
+        // Total header = 12 (RIFF WAVE) + 8 + 16 (fmt) + 8 + 5 (JUNK) + 1 (pad) + 8 + 34 (LIST) + 8 (data header) = 100
+        val totalAlloc = 12 + 24 + 8 + 5 + 1 + 8 + listSize + 8
+        val bb = ByteBuffer.allocate(totalAlloc).order(ByteOrder.LITTLE_ENDIAN)
+        bb.put("RIFF".toByteArray())
+        bb.putInt(10000 + totalAlloc)
+        bb.put("WAVE".toByteArray())
+
+        // fmt
+        bb.put("fmt ".toByteArray())
+        bb.putInt(16)
+        bb.putShort(1.toShort())
+        bb.putShort(2.toShort())
+        bb.putInt(48000)
+        bb.putInt(48000 * 4)
+        bb.putShort(4.toShort())
+        bb.putShort(16.toShort())
+
+        // odd JUNK chunk
+        bb.put("JUNK".toByteArray())
+        bb.putInt(5)
+        bb.put(junkPayload)
+        bb.put(0.toByte()) // pad byte
+
+        // LIST chunk
+        bb.put("LIST".toByteArray())
+        bb.putInt(listSize)
+        bb.put(listBytes)
+
+        // data chunk
+        bb.put("data".toByteArray())
+        bb.putInt(10000)
+
+        var titleParsed: String? = null
+        val demuxer = StreamDemuxer(
+            scope = CoroutineScope(Dispatchers.Unconfined),
+            onMetadataParsed = { title, _, _ -> titleParsed = title }
+        )
+        val fmt = demuxer.parseHeader(ByteArrayInputStream(bb.array()))
+
+        assertEquals(48000, fmt.sampleRate)
+        assertEquals(16, fmt.bitDepth)
+        assertEquals(2, fmt.channels)
+        assertEquals(totalAlloc, fmt.headerLength)
+        assertEquals("TrackTitle", titleParsed)
+    }
+
+    @Test
+    fun testDemuxerDirectOddSizedFmtChunk() {
+        // fmt chunk with 17 bytes (16 standard + 1 extra byte) -> requires 1 pad byte
+        val fmtSize = 17
+        val totalAlloc = 12 + 8 + fmtSize + 1 + 8 // 12 + 26 + 8 = 46
+        val bb = ByteBuffer.allocate(totalAlloc).order(ByteOrder.LITTLE_ENDIAN)
+        bb.put("RIFF".toByteArray())
+        bb.putInt(10000 + totalAlloc)
+        bb.put("WAVE".toByteArray())
+
+        bb.put("fmt ".toByteArray())
+        bb.putInt(fmtSize)
+        bb.putShort(1.toShort())
+        bb.putShort(2.toShort())
+        bb.putInt(44100)
+        bb.putInt(44100 * 4)
+        bb.putShort(4.toShort())
+        bb.putShort(16.toShort())
+        bb.put(0x00.toByte()) // extra byte
+        bb.put(0x00.toByte()) // pad byte
+
+        bb.put("data".toByteArray())
+        bb.putInt(10000)
+
+        val demuxer = StreamDemuxer(CoroutineScope(Dispatchers.Unconfined))
+        val fmt = demuxer.parseHeader(ByteArrayInputStream(bb.array()))
+
+        assertEquals(44100, fmt.sampleRate)
+        assertEquals(16, fmt.bitDepth)
+        assertEquals(2, fmt.channels)
+        assertEquals(totalAlloc, fmt.headerLength)
+    }
+
+    @Test
+    fun testDemuxerDirectPrematureEofThrowsException() {
+        // Truncated stream
+        val bb = ByteBuffer.allocate(20).order(ByteOrder.LITTLE_ENDIAN)
+        bb.put("RIFF".toByteArray())
+        bb.putInt(10000)
+        bb.put("WAVE".toByteArray())
+        bb.put("fmt ".toByteArray())
+
+        val demuxer = StreamDemuxer(CoroutineScope(Dispatchers.Unconfined))
+        assertThrows(IllegalStateException::class.java) {
+            demuxer.parseHeader(ByteArrayInputStream(bb.array()))
+        }
     }
 }
