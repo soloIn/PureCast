@@ -95,6 +95,7 @@ class PlaybackSessionCoordinator(
     private var suspendTimeoutJob: Job? = null
     private var remoteCommandTimeoutJob: Job? = null
     private var coverGraceJob: Job? = null
+    private var transitionTimeoutJob: Job? = null
     private val transientErrorDismissJobs = HashMap<ErrorCode, Job>()
 
     init {
@@ -116,6 +117,8 @@ class PlaybackSessionCoordinator(
         remoteCommandTimeoutJob = null
         coverGraceJob?.cancel()
         coverGraceJob = null
+        transitionTimeoutJob?.cancel()
+        transitionTimeoutJob = null
         transientErrorDismissJobs.values.forEach { it.cancel() }
         transientErrorDismissJobs.clear()
         eventChannel.close()
@@ -376,6 +379,13 @@ class PlaybackSessionCoordinator(
                             }
 
                             ProtocolResumeReopenResult.RESTARTING -> {
+                                // 💡 P1-4 修复：UPnP 重新拉流进入 TRANSITIONING，挂载 5s 过渡态看门狗防止无数据卡死
+                                transitionTimeoutJob = rescheduleServiceTimer(
+                                    previous = transitionTimeoutJob,
+                                    delayMs = TRANSITION_TIMEOUT_MS,
+                                    sessionId = snap.sessionId,
+                                    payload = TransitionTimeoutEvent(snap.sessionId)
+                                )
                                 snap.copy(
                                     transportState = TransportPipeState.PREPARING,
                                     businessState = BusinessSessionState.TRANSITIONING,
@@ -413,6 +423,13 @@ class PlaybackSessionCoordinator(
                         }
                     },
                     onFailure = { snap, err ->
+                        // 💡 P1-4 修复：恢复打开硬件失败回退 PAUSED，重新挂载 10 分钟挂起超时定时器
+                        suspendTimeoutJob = rescheduleServiceTimer(
+                            previous = suspendTimeoutJob,
+                            delayMs = SUSPEND_TIMEOUT_MS,
+                            sessionId = snap.sessionId,
+                            payload = SuspendTimeoutEvent
+                        )
                         snap.copy(
                             businessState = BusinessSessionState.PAUSED,
                             hardwareState = HardwarePipelineState.RELEASED,
@@ -552,6 +569,20 @@ class PlaybackSessionCoordinator(
             is TransitionEffect.CancelTransientErrorDismiss -> {
                 transientErrorDismissJobs.remove(effect.code)?.cancel()
             }
+
+            is TransitionEffect.ScheduleTransitionTimeout -> {
+                transitionTimeoutJob = rescheduleServiceTimer(
+                    previous = transitionTimeoutJob,
+                    delayMs = TRANSITION_TIMEOUT_MS,
+                    sessionId = effect.sessionId,
+                    payload = TransitionTimeoutEvent(effect.sessionId)
+                )
+            }
+
+            is TransitionEffect.CancelTransitionTimeout -> {
+                transitionTimeoutJob?.cancel()
+                transitionTimeoutJob = null
+            }
         }
     }
 
@@ -612,6 +643,9 @@ class PlaybackSessionCoordinator(
 
         /** 💡 DACP 单项请求超时期限：防止发端无响应导致 UI 卡死于 TRANSITIONING */
         const val REMOTE_COMMAND_TIMEOUT_MS = 5_000L
+
+        /** 💡 过渡态看门狗超时期限：防止 SETUP/FLUSH 后无数据流入导致 UI 卡死于 TRANSITIONING (R4) */
+        const val TRANSITION_TIMEOUT_MS = 5_000L
 
         /** 💡 停止后硬件让渡延迟：释放独占声卡重绑内核驱动 */
         const val HARDWARE_IDLE_RELEASE_MS = 10_000L

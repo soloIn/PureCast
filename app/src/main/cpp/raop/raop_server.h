@@ -73,6 +73,10 @@ public:
         rtp_.set_crypto_key(key, iv);
     }
 
+    void update_track_progress(int64_t position_ms, int64_t duration_ms) {
+        rtp_.update_track_progress(position_ms, duration_ms);
+    }
+
     RaopRtp& rtp() { return rtp_; }
     const RaopStreamParams& current_params() const { return current_params_; }
 

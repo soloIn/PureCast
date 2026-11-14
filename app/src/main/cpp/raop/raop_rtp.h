@@ -171,6 +171,40 @@ public:
         return current_volume_db_.load(std::memory_order_relaxed);
     }
 
+    /**
+     * 💡 状态只读探测接口 (供协议测试与状态审计使用)
+     */
+    bool is_stream_paused() const {
+        return is_stream_paused_.load(std::memory_order_acquire);
+    }
+    bool is_manually_paused() const {
+        return is_manually_paused_.load(std::memory_order_acquire);
+    }
+    bool has_crypto() const {
+        return has_crypto_.load(std::memory_order_acquire);
+    }
+
+    /**
+     * 💡 更新当前曲目播放进度与总时长，用于曲目尾部静音免疫窗口计算
+     */
+    void update_track_progress(int64_t position_ms, int64_t duration_ms) {
+        if (duration_ms > 0) {
+            track_duration_ms_.store(duration_ms, std::memory_order_release);
+            track_position_ms_.store(std::max<int64_t>(0, position_ms), std::memory_order_release);
+        } else if (duration_ms < 0) {
+            track_duration_ms_.store(0, std::memory_order_release);
+            track_position_ms_.store(0, std::memory_order_release);
+        }
+    }
+
+    int64_t get_track_duration_ms() const {
+        return track_duration_ms_.load(std::memory_order_acquire);
+    }
+
+    int64_t get_track_position_ms() const {
+        return track_position_ms_.load(std::memory_order_acquire);
+    }
+
 private:
     void data_loop();
     void ctrl_loop();
@@ -209,6 +243,7 @@ private:
     RaopJitterBuffer jitter_buffer_;
 
     // 💡 客户端控制端点与重传状态维护
+    mutable std::mutex ctrl_addr_mutex_;
     struct sockaddr_in client_ctrl_addr_{};
     std::atomic<bool> has_client_ctrl_{false};
     std::atomic<uint16_t> resend_req_seq_{0};
@@ -233,6 +268,8 @@ private:
     std::atomic<uint32_t> continuous_silence_count_{0};
     std::atomic<uint64_t> track_transition_deadline_ms_{0};
     std::atomic<bool> skipped_silence_in_transition_{false};
+    std::atomic<int64_t> track_duration_ms_{0};
+    std::atomic<int64_t> track_position_ms_{0};
 };
 
 } // namespace purecast::raop

@@ -43,6 +43,7 @@ internal class AirPlayNativeEventDispatcher(
     private val lastStateSequenceByNative = ConcurrentHashMap<Long, Long>()
     private val latestNativeSessionId = AtomicLong(0L)
     private val trackGenerationGenerator = AtomicLong(0L)
+    private val lastSeekTimestampMs = AtomicLong(0L)
     private val eventDispatchLock = Any()
 
     @Volatile
@@ -60,10 +61,35 @@ internal class AirPlayNativeEventDispatcher(
     @Volatile
     private var currentTrackMarkedLive: Boolean = false
 
+    @Volatile
+    private var postFlushProgressDurationMs: Long = 0L
+
+    @Volatile
+    private var lastTrackSwitchFlushedTimestampMs: Long = 0L
+
+    @Volatile
+    private var pendingOrphanCoverBytes: ByteArray? = null
+
+    @Volatile
+    private var pendingOrphanCoverTimestampMs: Long = 0L
+
     fun resetSessions() {
         nativeToGlobalSessionMap.clear()
         lastStateSequenceByNative.clear()
+        lastSeekTimestampMs.set(0L)
+        postFlushProgressDurationMs = 0L
+        lastTrackSwitchFlushedTimestampMs = 0L
+        pendingOrphanCoverBytes = null
+        pendingOrphanCoverTimestampMs = 0L
         onRtpActiveChanged(false)
+    }
+
+    /**
+     * 💡 标记 TV 本机触发了寻道请求，在 4000ms 窗口期内将紧随其后的 FLUSH 标记为 isSeekFlush = true，
+     * 确保协调器保留用户拖动进度条设定的目标播放位置，彻底解决 AirPlay 1 寻道后进度条瞬间归零的问题。
+     */
+    fun markPendingSeek() {
+        lastSeekTimestampMs.set(clockMs())
     }
 
     /**
@@ -120,7 +146,7 @@ internal class AirPlayNativeEventDispatcher(
                 album = "",
                 durationMs = 0L,
                 durationState = DurationState.UNKNOWN,
-                seekCapability = SeekCapability.UNSEEKABLE
+                seekCapability = SeekCapability.UNKNOWN
             )
             emitLocked(
                 sessionId = globalSessionId,
@@ -144,6 +170,10 @@ internal class AirPlayNativeEventDispatcher(
         onRtpActiveChanged(false)
         synchronized(eventDispatchLock) {
             val globalSid = acceptActiveStateEventLocked(nativeSessionId, sequence) ?: return
+            nativeToGlobalSessionMap.remove(nativeSessionId)
+            lastStateSequenceByNative.remove(nativeSessionId)
+            // 💡 契约修复：RTSP TEARDOWN 属于传输通道挂起，由状态机转入 10 分钟 PAUSED 挂起 (hardStop = false)，
+            // 严禁作为 hardStop 硬停止导致大屏闪烁跳回等待投屏与 10s 误释放声卡。
             emitLocked(
                 sessionId = globalSid,
                 payload = StreamTeardownEvent(hardStop = false)
@@ -180,9 +210,18 @@ internal class AirPlayNativeEventDispatcher(
     override fun onTrackSwitchFlushed(nativeSessionId: Long, sequence: Long, newEpoch: Long) {
         synchronized(eventDispatchLock) {
             val globalSid = acceptActiveStateEventLocked(nativeSessionId, sequence) ?: return
+            val seekTs = lastSeekTimestampMs.get()
+            val isSeek = seekTs > 0L && (clockMs() - seekTs) < 4000L
+            if (isSeek) {
+                lastSeekTimestampMs.set(0L) // 💡 消费单次寻道标记
+                Logger.airplay.i(TAG, "AirPlay 寻道触发 FLUSH 响应: sid=$globalSid, newEpoch=$newEpoch, isSeekFlush=true")
+            } else {
+                lastTrackSwitchFlushedTimestampMs = clockMs()
+                postFlushProgressDurationMs = 0L // 💡 切歌换代重置已知时长缓存，防止旧曲目时长泄漏
+            }
             emitLocked(
                 sessionId = globalSid,
-                payload = TrackSwitchEvent(newEpoch = newEpoch)
+                payload = TrackSwitchEvent(newEpoch = newEpoch, isSeekFlush = isSeek)
             )
         }
     }
@@ -234,25 +273,55 @@ internal class AirPlayNativeEventDispatcher(
             val trimmedArtist = artist.trim()
             val trimmedAlbum = album.trim()
 
+            // 💡 孤立封面先于文本到达场景 (image/jpeg 报文没有 title/artist)
+            if (trimmedTitle.isEmpty() && trimmedArtist.isEmpty() && coverArt != null && coverArt.isNotEmpty()) {
+                pendingOrphanCoverBytes = coverArt.copyOf()
+                pendingOrphanCoverTimestampMs = clockMs()
+            }
+
+            val now = clockMs()
+            val orphanCoverValid = (now - pendingOrphanCoverTimestampMs) <= 2500L
+            val effectiveCover = if (coverArt != null && coverArt.isNotEmpty()) {
+                coverArt
+            } else if (orphanCoverValid) {
+                pendingOrphanCoverBytes
+            } else {
+                null
+            }
+
             val isBoundarySwitch = trimmedTitle.isNotEmpty() &&
                 currentTrackTitle.isNotEmpty() &&
                 (trimmedTitle != currentTrackTitle ||
                     (trimmedArtist.isNotEmpty() && currentTrackArtist.isNotEmpty() && trimmedArtist != currentTrackArtist))
 
+            // 💡 P0-3: 若切歌 FLUSH 后收到了 progress 报文，继承该时长防止新歌时长被抹零；使用后立即清空避免污染后续曲目
+            val effectiveDurationMs = if (durationMs > 0L) {
+                durationMs
+            } else if (postFlushProgressDurationMs > 0L) {
+                postFlushProgressDurationMs
+            } else {
+                0L
+            }
+
             if (isBoundarySwitch) {
                 val nextTxGen = trackGenerationGenerator.incrementAndGet()
                 currentTrackGeneration = nextTxGen
-                currentTrackDurationFixed = false
+                currentTrackDurationFixed = effectiveDurationMs > 0L
                 currentTrackMarkedLive = false
                 emitLocked(
                     sessionId = globalSid,
                     payload = TrackBoundaryEvent(
                         trackGeneration = nextTxGen,
                         trackKey = "$trimmedTitle|$trimmedArtist",
-                        initialDurationState = if (durationMs > 0L) DurationState.FIXED else DurationState.UNKNOWN,
-                        seekCapability = if (durationMs > 0L) SeekCapability.SEEKABLE else SeekCapability.UNSEEKABLE
+                        initialDurationState = if (effectiveDurationMs > 0L) DurationState.FIXED else DurationState.UNKNOWN,
+                        seekCapability = if (effectiveDurationMs > 0L) SeekCapability.SEEKABLE else SeekCapability.UNKNOWN
                     )
                 )
+                postFlushProgressDurationMs = 0L // 💡 消费后清空
+                lastTrackSwitchFlushedTimestampMs = 0L
+                if (effectiveCover != null && effectiveCover === pendingOrphanCoverBytes) {
+                    pendingOrphanCoverBytes = null
+                }
             }
 
             if (trimmedTitle.isNotEmpty()) {
@@ -261,19 +330,24 @@ internal class AirPlayNativeEventDispatcher(
             if (trimmedArtist.isNotEmpty()) {
                 currentTrackArtist = trimmedArtist
             }
-            if (durationMs > 0L) {
+            if (effectiveDurationMs > 0L) {
                 currentTrackDurationFixed = true
                 currentTrackMarkedLive = false
+                try {
+                    com.solo.purecast.core.nativebridge.NativeAudioEngine.updateAirPlayTrackProgress(0L, effectiveDurationMs)
+                } catch (t: Throwable) {
+                    Logger.airplay.w(TAG, "同步 Native 曲目时长异常: ${t.message}")
+                }
             }
 
             val patchedDurationState = when {
-                durationMs > 0L -> DurationState.FIXED
+                effectiveDurationMs > 0L -> DurationState.FIXED
                 !currentTrackDurationFixed && !currentTrackMarkedLive -> DurationState.UNKNOWN
                 else -> null
             }
             val patchedSeek = when {
-                durationMs > 0L -> SeekCapability.SEEKABLE
-                !currentTrackDurationFixed && !currentTrackMarkedLive -> SeekCapability.UNSEEKABLE
+                effectiveDurationMs > 0L -> SeekCapability.SEEKABLE
+                !currentTrackDurationFixed && !currentTrackMarkedLive -> SeekCapability.UNKNOWN
                 else -> null
             }
 
@@ -284,8 +358,8 @@ internal class AirPlayNativeEventDispatcher(
                     title = trimmedTitle.ifEmpty { null },
                     artist = trimmedArtist.ifEmpty { null },
                     album = trimmedAlbum.ifEmpty { null },
-                    coverBytes = coverArt?.takeIf { it.isNotEmpty() },
-                    durationMs = durationMs.takeIf { it > 0L },
+                    coverBytes = effectiveCover?.takeIf { it.isNotEmpty() },
+                    durationMs = effectiveDurationMs.takeIf { it > 0L },
                     durationState = patchedDurationState,
                     seekCapability = patchedSeek
                 )
@@ -301,6 +375,15 @@ internal class AirPlayNativeEventDispatcher(
             if (nativeSessionId != latestNativeSessionId.get()) return
             val globalSid = nativeToGlobalSessionMap[nativeSessionId] ?: return
 
+            val timeSinceFlush = if (lastTrackSwitchFlushedTimestampMs > 0L) {
+                clockMs() - lastTrackSwitchFlushedTimestampMs
+            } else {
+                -1L
+            }
+            if (timeSinceFlush in 0L..4000L && durationMs > 0L) {
+                postFlushProgressDurationMs = durationMs
+            }
+
             if (durationMs > 0L && !currentTrackDurationFixed) {
                 currentTrackDurationFixed = true
                 currentTrackMarkedLive = false
@@ -313,24 +396,23 @@ internal class AirPlayNativeEventDispatcher(
                         seekCapability = SeekCapability.SEEKABLE
                     )
                 )
-            } else if (durationMs == 0L && positionMs > 0L && !currentTrackDurationFixed && !currentTrackMarkedLive) {
-                currentTrackMarkedLive = true
-                emitLocked(
-                    sessionId = globalSid,
-                    payload = MetadataPatchEvent(
-                        trackGeneration = currentTrackGeneration,
-                        durationMs = 0L,
-                        durationState = DurationState.LIVE,
-                        seekCapability = SeekCapability.UNSEEKABLE
-                    )
-                )
             }
+            if (durationMs > 0L) {
+                try {
+                    com.solo.purecast.core.nativebridge.NativeAudioEngine.updateAirPlayTrackProgress(positionMs, durationMs)
+                } catch (t: Throwable) {
+                    Logger.airplay.w(TAG, "同步 Native 曲目进度异常: ${t.message}")
+                }
+            }
+            // 💡 R7 契约：当 durationMs == 0 时保持 UNKNOWN，绝不能因 positionMs > 0 而武断标记为 LIVE，
+            // 避免切歌或首播进度先于元数据到达时 UI 误报 LIVE 红点并永久锁定不可寻道。
 
             emitLocked(
                 sessionId = globalSid,
                 payload = ProgressUpdateEvent(
                     positionMs = positionMs.coerceAtLeast(0L),
-                    durationMs = durationMs.coerceAtLeast(0L)
+                    durationMs = durationMs.coerceAtLeast(0L),
+                    trackGeneration = currentTrackGeneration
                 )
             )
         }

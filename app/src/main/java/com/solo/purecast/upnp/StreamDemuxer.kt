@@ -32,6 +32,7 @@ interface DemuxerAudioGateway {
         inputStream: InputStream,
         callback: NativeAudioEngine.FlacFormatCallback
     ): Boolean
+    fun isStreaming(): Boolean = true
 }
 
 /**
@@ -49,6 +50,8 @@ object NativeDemuxerAudioGateway : DemuxerAudioGateway {
         inputStream: InputStream,
         callback: NativeAudioEngine.FlacFormatCallback
     ): Boolean = NativeAudioEngine.decodeFlacStream(inputStream, callback)
+
+    override fun isStreaming(): Boolean = NativeAudioEngine.isStreaming()
 }
 
 /**
@@ -198,8 +201,21 @@ class StreamDemuxer(
         val durMs = totalDurationSeconds * 1000L
         val clampedMs = targetPositionMs.coerceIn(0L, durMs)
         val pcmOffset = ((clampedMs * bytesPerSecond) / 1000L)
-        val alignedPcmOffset = (pcmOffset / bytesPerFrame) * bytesPerFrame
+        var alignedPcmOffset = (pcmOffset / bytesPerFrame) * bytesPerFrame
 
+        // 💡 防御 HTTP 416: 若寻道目标接近或超出曲目尾部 (EOF)，进行安全边界钳位，保留至少安全帧缓冲，杜绝 Range 越界触发 416
+        val maxSafePcmOffset = if (wavDataSizeBytes > 0L) {
+            (wavDataSizeBytes - bytesPerFrame * 32L).coerceAtLeast(0L)
+        } else {
+            (((durMs - 500L).coerceAtLeast(0L) * bytesPerSecond) / 1000L)
+        }
+        if (alignedPcmOffset > maxSafePcmOffset) {
+            alignedPcmOffset = (maxSafePcmOffset / bytesPerFrame) * bytesPerFrame
+        }
+
+        // 💡 防御协程竞争：先取消先前的 streamingJob，并递增会话 token 隔离旧连接
+        val prevJob = streamingJob
+        prevJob?.cancel()
         val thisSession = sessionToken.incrementAndGet()
         val oldConn = activeConnection
         val oldStream = activeInputStream
@@ -211,6 +227,7 @@ class StreamDemuxer(
             var connection: HttpURLConnection? = null
             var inputStream: InputStream? = null
             var abortedByEpoch = false
+            var seekEpoch = acquiredEpoch
             try {
                 if (thisSession != sessionToken.get()) return@launch
                 val connUrl = URL(url)
@@ -228,48 +245,99 @@ class StreamDemuxer(
                 connection.connect()
                 val responseCode = connection.responseCode
                 if (responseCode == 206) {
-                    inputStream = BufferedInputStream(connection.inputStream, 64 * 1024)
-                    activeInputStream = inputStream
+                        inputStream = BufferedInputStream(connection.inputStream, 64 * 1024)
+                        activeInputStream = inputStream
 
-                    val seekEpoch = onSeekFlush?.invoke() ?: acquiredEpoch
-                    seekBaseBytes = alignedPcmOffset
-                    totalBytesStreamed = 0L
-                    onPositionUpdated?.invoke(clampedMs)
+                        seekEpoch = onSeekFlush?.invoke() ?: acquiredEpoch
+                        this@StreamDemuxer.acquiredEpoch = seekEpoch
+                        seekBaseBytes = alignedPcmOffset
+                        totalBytesStreamed = 0L
+                        onPositionUpdated?.invoke(clampedMs)
 
-                    val pcmBuffer = ByteArray(32768)
-                    while (isActive && isDemuxing && thisSession == sessionToken.get() && !abortedByEpoch) {
-                        val bytesRead = inputStream.read(pcmBuffer, 0, pcmBuffer.size)
-                        if (bytesRead == -1) break
-                        if (bytesRead > 0) {
-                            totalBytesStreamed += bytesRead
-                            var offset = 0
-                            var remaining = bytesRead
-                            while (remaining > 0 && isActive && isDemuxing && thisSession == sessionToken.get()) {
-                                val written = audioGateway.writePcm(pcmBuffer, offset, remaining, seekEpoch)
-                                if (written > 0) {
-                                    offset += written
-                                    remaining -= written
-                                } else if (written == -2 || written == -1) {
-                                    abortedByEpoch = true
-                                    break
-                                } else {
-                                    delay(5L)
+                        val pcmBuffer = ByteArray(32768)
+                        var seekFirstPacketEmitted = false
+                        val currentSpec = DemuxedStreamSpec(
+                            sampleRate = currentSampleRate,
+                            bitDepth = currentBitDepth,
+                            channels = currentChannels,
+                            codec = "WAV",
+                            durationMs = durMs,
+                            durationState = DurationState.FIXED,
+                            seekCapability = SeekCapability.SEEKABLE
+                        )
+                        while (isActive && isDemuxing && thisSession == sessionToken.get() && !abortedByEpoch) {
+                            val bytesRead = inputStream.read(pcmBuffer, 0, pcmBuffer.size)
+                            if (bytesRead == -1) break
+                            if (bytesRead > 0) {
+                                totalBytesStreamed += bytesRead
+                                var offset = 0
+                                var remaining = bytesRead
+                                while (remaining > 0 && isActive && isDemuxing && thisSession == sessionToken.get()) {
+                                    val written = audioGateway.writePcm(pcmBuffer, offset, remaining, seekEpoch)
+                                    if (written > 0) {
+                                        if (!seekFirstPacketEmitted) {
+                                            seekFirstPacketEmitted = true
+                                            onFirstDataPacket(seekEpoch, currentSpec) // 💡 P0-2 修复：寻道后首帧通知解除 TRANSITIONING 并取消 5s 看门狗
+                                        }
+                                        offset += written
+                                        remaining -= written
+                                    } else if (written == -2 || written == -1) {
+                                        abortedByEpoch = true
+                                        break
+                                    } else {
+                                        delay(5L)
+                                    }
                                 }
                             }
                         }
+
+                        if (!abortedByEpoch && thisSession == sessionToken.get()) {
+                            Logger.upnp.i(TAG, "Seek 音频流拉取完毕，等待排空 (session=$thisSession)...")
+                            var waitCount = 0
+                            var pausedWaitCount = 0
+                            while (isActive && isDemuxing && thisSession == sessionToken.get() && audioGateway.getAvailableRead() > 0 && waitCount < 120) {
+                                if (!audioGateway.isStreaming()) {
+                                    delay(50)
+                                    if (++pausedWaitCount > 12000) { // 💡 P1-3 修复：暂停态等待上限 10 分钟 (600s)，对齐协调器挂起回收契约
+                                        abortedByEpoch = true
+                                        break
+                                    }
+                                    continue
+                                }
+                                delay(50)
+                                waitCount++
+                            }
+                            delay(25)
+                        }
+                    } else {
+                        Logger.upnp.w(TAG, "HTTP Range Seek 返回非 206 状态码: $responseCode")
+                        abortedByEpoch = true
+                        if (thisSession == sessionToken.get()) {
+                            onError("HTTP Range Seek 失败: 响应码 $responseCode")
+                        }
                     }
-                } else {
-                    Logger.upnp.w(TAG, "HTTP Range Seek 返回非 206 状态码: $responseCode")
+                } catch (e: CancellationException) {
+                    abortedByEpoch = true
+                } catch (e: Exception) {
+                    Logger.upnp.w(TAG, "HTTP Range Seek 异常", e)
+                    abortedByEpoch = true
+                    if (thisSession == sessionToken.get()) {
+                        onError("HTTP Range Seek 传输异常: ${e.message}")
+                    }
+                } finally {
+                    if (activeConnection === connection) activeConnection = null
+                    if (activeInputStream === inputStream) activeInputStream = null
+                    try { inputStream?.close() } catch (_: Exception) {}
+                    try { connection?.disconnect() } catch (_: Exception) {}
+                    // 💡 完整收尾：同步重置 isDemuxing 并触发 onStreamEnded，防止 Seek 后自然播完进度冻结 (B-1)
+                    if (thisSession == sessionToken.get()) {
+                        progressJob?.cancel()
+                        progressJob = null
+                        isDemuxing = false
+                        onStreamEnded(abortedByEpoch, seekEpoch)
+                        Logger.upnp.i(TAG, "Seek 活跃会话 (session=$thisSession) 结束 (abortedByEpoch=$abortedByEpoch)")
+                    }
                 }
-            } catch (e: CancellationException) {
-                abortedByEpoch = true
-            } catch (e: Exception) {
-                Logger.upnp.w(TAG, "HTTP Range Seek 异常", e)
-                abortedByEpoch = true
-            } finally {
-                try { inputStream?.close() } catch (_: Exception) {}
-                try { connection?.disconnect() } catch (_: Exception) {}
-            }
         }
         return true
     }
@@ -513,7 +581,18 @@ class StreamDemuxer(
                 if (!abortedByEpoch && thisSession == sessionToken.get()) {
                     Logger.upnp.i(TAG, "音频流数据拉取完毕，等待环形缓冲排空播放 (session=$thisSession)...")
                     var waitCount = 0
+                    var pausedWaitCount = 0
                     while (isActive && isDemuxing && thisSession == sessionToken.get() && audioGateway.getAvailableRead() > 0 && waitCount < 120) {
+                        // 💡 暂停态下底层 fill_isoc_transfer 填零静音，环形缓冲被冻结不会被消费。
+                        // 此时若累计 waitCount 会导致 6 秒超时误判 EOF 强停。暂停期间挂起循环等待，不计入排空超时。
+                        if (!audioGateway.isStreaming()) {
+                            delay(50)
+                            if (++pausedWaitCount > 12000) { // 💡 P1-3: 暂停态等待上限 10 分钟 (600s)，对齐协调器挂起回收契约
+                                abortedByEpoch = true
+                                break
+                            }
+                            continue
+                        }
                         delay(50)
                         waitCount++
                     }

@@ -266,25 +266,38 @@ fun MainTvScreen(
             (!uri.isNullOrEmpty() &&
                     (uri.startsWith("http://", ignoreCase = true) || uri.startsWith("https://", ignoreCase = true)))
     var persistentCover by remember { mutableStateOf<Any?>(null) }
+    var persistentCoverHash by remember { mutableStateOf(0) }
 
-    // 💡 封面占位保护：只有在完全空闲 (IDLE/STOPPED) 且无封面时才清空；
-    // 切歌期间若新曲目暂无封面（如无封面电台/播客），保留上一曲封面 1.2s 防抖，若持续无封面则优雅清除过渡到默认占位
+    // 💡 封面占位保护与内容指纹防抖：
+    // 1. 严格使用 contentHash / coverUri 内容指纹对比，彻底消除 ByteArray 对象引用变动引发的 Crossfade 整体闪烁；
+    // 2. 只有在完全空闲 (IDLE/STOPPED) 且无封面时才清空；
+    // 3. 切歌期间若新曲目暂无封面，保留上一曲封面 1.2s 防抖，若持续无封面则优雅过渡到默认占位。
     LaunchedEffect(
         metadata.title,
         metadata.artist,
         metadata.coverHash,
+        metadata.coverUri,
         hasValidCover,
-        coverData,
         isIdle
     ) {
         if (isIdle) {
             persistentCover = null
+            persistentCoverHash = 0
         } else if (hasValidCover && coverData != null) {
-            persistentCover = coverData
+            val incomingHash = if (metadata.coverHash != 0) {
+                metadata.coverHash
+            } else {
+                metadata.coverUri.hashCode()
+            }
+            if (incomingHash != persistentCoverHash || persistentCover == null) {
+                persistentCover = coverData
+                persistentCoverHash = incomingHash
+            }
         } else {
-            delay(1200)
-            if (!hasValidCover && coverData == null) {
+            // 💡 P2-3 修复：TrackTransactionManager 已经执行了 1200ms 封面宽限期；此处收到 null 立即清空，杜绝 2.4 秒双重延迟
+            if (!hasValidCover && metadata.coverBytes == null && metadata.coverUri.isNullOrEmpty()) {
                 persistentCover = null
+                persistentCoverHash = 0
             }
         }
     }
@@ -547,15 +560,21 @@ private fun IsolatedProgressBar(
     onPlayPauseClick: () -> Unit,
     onSeekTo: (Long) -> Unit = {}
 ) {
-    val servicePositionMs by remember {
-        PlaybackService.sessionSnapshot
-            .map { it.progressPositionMs }
-            .distinctUntilChanged()
-    }.collectAsState(initial = remember { PlaybackService.sessionSnapshot.value.progressPositionMs })
+    val currentSnapshot by remember { PlaybackService.sessionSnapshot }.collectAsState()
+    val servicePositionMs = currentSnapshot.progressPositionMs
+    val trackGeneration = currentSnapshot.trackGeneration
+
     var seekPositionMs by remember { mutableLongStateOf(0L) }
     var isScrubbing by remember { mutableStateOf(false) }
     val coroutineScope = rememberCoroutineScope()
     var debounceJob by remember { mutableStateOf<Job?>(null) }
+
+    // 💡 P2-2: 切歌换代时立即取消正在防抖的寻道任务，防止旧歌寻道覆盖新歌
+    LaunchedEffect(trackGeneration) {
+        debounceJob?.cancel()
+        debounceJob = null
+        isScrubbing = false
+    }
 
     // 💡 只有在非用户拖拽寻道防抖期间，才接受 servicePositionMs 的覆盖，并结合总时长安全钳位
     LaunchedEffect(servicePositionMs, totalDurationMs) {
@@ -582,6 +601,15 @@ private fun IsolatedProgressBar(
                 isScrubbing = false
                 Logger.ui.i("MainTvScreen", "D-Pad 寻道防抖完成，提交 Seek: ${newPositionMs / 1000} 秒")
             }
+        },
+        onSeekImmediate = { newPositionMs ->
+            // 💡 P2-2: 确认键立即提交寻道，取消 300ms 延时
+            debounceJob?.cancel()
+            debounceJob = null
+            seekPositionMs = newPositionMs
+            isScrubbing = false
+            onSeekTo(newPositionMs)
+            Logger.ui.i("MainTvScreen", "D-Pad 确认键立即提交 Seek: ${newPositionMs / 1000} 秒")
         },
         onPlayPauseClick = onPlayPauseClick
     )

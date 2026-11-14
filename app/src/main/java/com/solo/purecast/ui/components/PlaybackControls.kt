@@ -67,20 +67,21 @@ fun PlaybackControls(
         TransportIconButton(
             iconResId = R.drawable.ic_backward_end_fill,
             contentDescription = "上一曲",
-            buttonSize = 46.dp,
-            iconSize = 22.dp,
+            buttonSize = 48.dp,
+            iconSize = 24.dp,
             enabled = transportButtonsEnabled,
             hasDarkBackground = hasDarkBackground,
             onClick = onPreviousClick
         )
 
         // 2. 播放 / 暂停主按钮 (▶ / ❚❚) - 待机状态下半透明禁用，非待机绑定 playPauseFocusRequester
+        // 💡 视觉规格统一：基础尺寸统一为 48.dp (icon 24.dp)，仅在获焦时通过 Surface 放大 1.12x，彻底根除“播放按钮一直处于放大状态”
         TransportIconButton(
             iconResId = if (isPlaying) R.drawable.ic_pause_fill else R.drawable.ic_play_fill,
             contentDescription = if (isPlaying) "暂停" else "播放",
-            buttonSize = 56.dp,
-            iconSize = 28.dp,
-            isCircle = true,
+            buttonSize = 48.dp,
+            iconSize = 24.dp,
+            isCircle = false,
             enabled = transportButtonsEnabled,
             hasDarkBackground = hasDarkBackground,
             focusRequester = if (transportButtonsEnabled) playPauseFocusRequester else null,
@@ -91,8 +92,8 @@ fun PlaybackControls(
         TransportIconButton(
             iconResId = R.drawable.ic_forward_end_fill,
             contentDescription = "下一曲",
-            buttonSize = 46.dp,
-            iconSize = 22.dp,
+            buttonSize = 48.dp,
+            iconSize = 24.dp,
             enabled = transportButtonsEnabled,
             hasDarkBackground = hasDarkBackground,
             onClick = onNextClick
@@ -102,8 +103,8 @@ fun PlaybackControls(
         TransportIconButton(
             iconResId = R.drawable.ic_gear,
             contentDescription = "设置",
-            buttonSize = 46.dp,
-            iconSize = 22.dp,
+            buttonSize = 48.dp,
+            iconSize = 24.dp,
             enabled = true,
             hasDarkBackground = hasDarkBackground,
             focusRequester = settingsFocusRequester,
@@ -134,7 +135,7 @@ private fun TransportIconButton(
     onClick: () -> Unit
 ) {
     var isFocused by remember { mutableStateOf(false) }
-    val shape = if (isCircle) CircleShape else RoundedCornerShape(12.dp)
+    val shape = if (isCircle) CircleShape else RoundedCornerShape(14.dp)
     val noBorder = Border(BorderStroke(0.dp, Color.Transparent))
 
     val focusedContainerColor = if (hasDarkBackground) Color(0x22FFFFFF) else Color(0x18000000)

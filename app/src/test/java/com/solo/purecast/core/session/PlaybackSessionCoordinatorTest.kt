@@ -1207,4 +1207,152 @@ class PlaybackSessionCoordinatorTest {
         // d. hasUri == false && hasBytes == false
         assertNull(tm5.clearStaleCoverIfUnclaimed(4L))
     }
+
+    @Test
+    fun `StreamSetupEvent times out to STOPPED after 5000ms transition timeout (R4 and B-3)`() = runTest(StandardTestDispatcher()) {
+        val hw = FakeSessionHardwareBridge()
+        val c = createCoordinator(this, hw)
+
+        c.dispatch(env(c, EventOrigin.USB_HARDWARE, 0L, HardwareAttachedEvent("Sony WALKMAN", hasPermission = true), deviceGen = 1L))
+        runCurrent()
+
+        val s1 = c.allocateSessionId()
+        c.dispatch(
+            env(
+                c, EventOrigin.AIRPLAY, s1,
+                StreamSetupEvent(StreamProtocol.AIRPLAY_1, 44100, 16, 2, "ALAC", 10L)
+            )
+        )
+        runCurrent()
+        assertEquals(BusinessSessionState.TRANSITIONING, c.snapshot.value.businessState)
+
+        // 4999ms 未超时
+        advanceTimeBy(4999L)
+        runCurrent()
+        assertEquals(BusinessSessionState.TRANSITIONING, c.snapshot.value.businessState)
+
+        // 5000ms 超时看门狗触发: 初始建流超时安全降级至 STOPPED，杜绝伪暂停占住声卡 10 分钟 (B-3)
+        advanceTimeBy(2L)
+        runCurrent()
+        assertEquals(BusinessSessionState.STOPPED, c.snapshot.value.businessState)
+    }
+
+    @Test
+    fun `TrackSwitchEvent times out to PAUSED after 5000ms transition timeout (R4)`() = runTest(StandardTestDispatcher()) {
+        val hw = FakeSessionHardwareBridge()
+        val c = createCoordinator(this, hw)
+
+        c.dispatch(env(c, EventOrigin.USB_HARDWARE, 0L, HardwareAttachedEvent("Sony WALKMAN", hasPermission = true), deviceGen = 1L))
+        runCurrent()
+
+        val s1 = c.allocateSessionId()
+        c.dispatch(env(c, EventOrigin.AIRPLAY, s1, StreamSetupEvent(StreamProtocol.AIRPLAY_1, 44100, 16, 2, "ALAC", 10L)))
+        c.dispatch(env(c, EventOrigin.AIRPLAY, s1, FirstDataPacketEvent(StreamProtocol.AIRPLAY_1, 10L, 44100, 16, 2, "ALAC")))
+        runCurrent()
+        assertEquals(BusinessSessionState.PLAYING, c.snapshot.value.businessState)
+
+        // 切歌 / FLUSH 进入 TRANSITIONING
+        c.dispatch(env(c, EventOrigin.AIRPLAY, s1, TrackSwitchEvent(FlushReason.FLUSH_SWITCH, 11L, null)))
+        runCurrent()
+        assertEquals(BusinessSessionState.TRANSITIONING, c.snapshot.value.businessState)
+
+        // 5000ms 内无音频包或恢复事件，超时回退至 PAUSED
+        advanceTimeBy(5001L)
+        runCurrent()
+        assertEquals(BusinessSessionState.PAUSED, c.snapshot.value.businessState)
+    }
+
+    @Test
+    fun `TrackSwitchEvent preserves progress position when isSeekFlush true and clears on song switch (R11 and B-3)`() = runTest(StandardTestDispatcher()) {
+        val hw = FakeSessionHardwareBridge()
+        val c = createCoordinator(this, hw)
+
+        c.dispatch(env(c, EventOrigin.USB_HARDWARE, 0L, HardwareAttachedEvent("Sony WALKMAN", hasPermission = true), deviceGen = 1L))
+        runCurrent()
+
+        val s1 = c.allocateSessionId()
+        c.dispatch(env(c, EventOrigin.AIRPLAY, s1, StreamSetupEvent(StreamProtocol.AIRPLAY_1, 44100, 16, 2, "ALAC", 10L)))
+        c.dispatch(env(c, EventOrigin.AIRPLAY, s1, FirstDataPacketEvent(StreamProtocol.AIRPLAY_1, 10L, 44100, 16, 2, "ALAC")))
+        // 推进进度至 45000ms
+        c.dispatch(env(c, EventOrigin.AIRPLAY, s1, ProgressUpdateEvent(45000L, 180000L)))
+        runCurrent()
+        assertEquals(45000L, c.snapshot.value.progressPositionMs)
+
+        // 💡 寻道引起的 FLUSH (isSeekFlush = true)，保留进度避免闪烁回弹 (R11)
+        c.dispatch(env(c, EventOrigin.AIRPLAY, s1, TrackSwitchEvent(FlushReason.FLUSH_SWITCH, 11L, null, isSeekFlush = true)))
+        runCurrent()
+        assertEquals("Seek 触发的 FLUSH 必须保留 progressPositionMs (R11)", 45000L, c.snapshot.value.progressPositionMs)
+
+        // 💡 常规切歌引起的 FLUSH (isSeekFlush = false)，进度必须归零杜绝残留上一首位置 (B-3)
+        c.dispatch(env(c, EventOrigin.AIRPLAY, s1, TrackSwitchEvent(FlushReason.FLUSH_SWITCH, 12L, null, isSeekFlush = false)))
+        runCurrent()
+        assertEquals("常规切歌触发的 FLUSH 必须立即归零 progressPositionMs (B-3)", 0L, c.snapshot.value.progressPositionMs)
+    }
+
+    @Test
+    fun `TrackSwitchEvent in PAUSED state keeps PAUSED and does not jump to TRANSITIONING (P0-4)`() = runTest(StandardTestDispatcher()) {
+        val hw = FakeSessionHardwareBridge()
+        val c = createCoordinator(this, hw)
+
+        c.dispatch(env(c, EventOrigin.USB_HARDWARE, 0L, HardwareAttachedEvent("Sony WALKMAN", hasPermission = true), deviceGen = 1L))
+        runCurrent()
+
+        val s1 = c.allocateSessionId()
+        c.dispatch(env(c, EventOrigin.AIRPLAY, s1, StreamSetupEvent(StreamProtocol.AIRPLAY_1, 44100, 16, 2, "ALAC", 10L)))
+        c.dispatch(env(c, EventOrigin.AIRPLAY, s1, FirstDataPacketEvent(StreamProtocol.AIRPLAY_1, 10L, 44100, 16, 2, "ALAC")))
+        runCurrent()
+        assertEquals(BusinessSessionState.PLAYING, c.snapshot.value.businessState)
+
+        // 显式暂停（本机操作，立即进入 PAUSED）
+        c.dispatch(env(c, EventOrigin.USER_ACTION, s1, ExplicitPauseEvent(epoch = 11L)))
+        runCurrent()
+        assertEquals(BusinessSessionState.PAUSED, c.snapshot.value.businessState)
+
+        // 💡 暂停态下收到 RTSP FLUSH（例如暂停态拖动进度条或手机暂停时附带发 FLUSH）
+        c.dispatch(env(c, EventOrigin.AIRPLAY, s1, TrackSwitchEvent(FlushReason.FLUSH_SWITCH, 12L, null, isSeekFlush = false)))
+        runCurrent()
+
+        // 验证：P0-4 契约生效，必须保持 PAUSED，严禁误跳回 TRANSITIONING / PLAYING
+        assertEquals(BusinessSessionState.PAUSED, c.snapshot.value.businessState)
+        assertEquals(12L, c.snapshot.value.currentEpoch)
+    }
+
+    @Test
+    fun `StreamTeardownEvent in PAUSED state preserves PAUSED businessState and keeps 10m SuspendTimeout`() = runTest(StandardTestDispatcher()) {
+        val hw = FakeSessionHardwareBridge()
+        val c = createCoordinator(this, hw)
+
+        c.dispatch(env(c, EventOrigin.USB_HARDWARE, 0L, HardwareAttachedEvent("DAC", hasPermission = true), deviceGen = 1L))
+        runCurrent()
+
+        val s1 = c.allocateSessionId()
+        c.dispatch(env(c, EventOrigin.AIRPLAY, s1, StreamSetupEvent(StreamProtocol.AIRPLAY_1, 44100, 16, 2, "ALAC", 10L)))
+        c.dispatch(env(c, EventOrigin.AIRPLAY, s1, FirstDataPacketEvent(StreamProtocol.AIRPLAY_1, 10L, 44100, 16, 2, "ALAC")))
+        runCurrent()
+        assertEquals(BusinessSessionState.PLAYING, c.snapshot.value.businessState)
+
+        // 1. 用户主动暂停 -> PAUSED
+        c.dispatch(env(c, EventOrigin.USER_ACTION, s1, ExplicitPauseEvent(epoch = 11L)))
+        runCurrent()
+        assertEquals(BusinessSessionState.PAUSED, c.snapshot.value.businessState)
+
+        // 2. iOS 暂停 2 秒后下发 TEARDOWN 拆除音频通道 (即使携带 hardStop = true，业务层也绝不退化为 STOPPED)
+        c.dispatch(env(c, EventOrigin.AIRPLAY, s1, StreamTeardownEvent(hardStop = true)))
+        runCurrent()
+
+        // 验证：契约保护生效，业务态依然为 PAUSED，管道变为 DISCONNECTED，不进 STOPPED，大屏不闪回待机！
+        assertEquals(BusinessSessionState.PAUSED, c.snapshot.value.businessState)
+        assertEquals(TransportPipeState.DISCONNECTED, c.snapshot.value.transportState)
+        assertEquals(PlaybackStatus.PAUSED, c.snapshot.value.playbackStatus)
+
+        // 推进 9 分钟 (540s)：未到 10 分钟挂起超时，依然保持 PAUSED
+        advanceTimeBy(540_000L)
+        runCurrent()
+        assertEquals(BusinessSessionState.PAUSED, c.snapshot.value.businessState)
+
+        // 推进至 10 分钟超时：触发 SuspendTimeoutEvent 优雅回归 IDLE
+        advanceTimeBy(60_000L)
+        runCurrent()
+        assertEquals(BusinessSessionState.IDLE, c.snapshot.value.businessState)
+    }
 }

@@ -128,10 +128,10 @@ fun SignalPathPill(
                     StreamProtocol.NONE -> "Direct"
                 }
 
-                // 2. 音频编码格式与指标
+                // 2. 音频编码格式与指标 (💡 P2-1: 优先展示协商确立的真实编码格式)
                 val codecName = when {
-                    audioState.protocol == StreamProtocol.AIRPLAY_1 -> "ALAC"
                     audioState.codec.isNotBlank() -> audioState.codec
+                    audioState.protocol == StreamProtocol.AIRPLAY_1 -> "ALAC"
                     audioState.protocol == StreamProtocol.UPNP_DLNA -> if (audioState.bitDepth > 16 || audioState.sampleRate > 48000) "PCM Hi-Res" else "PCM"
                     else -> "PCM"
                 }

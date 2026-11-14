@@ -4,6 +4,8 @@ import com.solo.purecast.util.Logger
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.UUID
@@ -15,26 +17,41 @@ import java.util.concurrent.atomic.AtomicLong
  * 负责维护 DLNA 控制端 (如 iPhone, airupnp, BubbleUPnP) 的订阅生命周期，
  * 并在电视端遥控器触发播放/暂停/切歌时，向所有订阅端毫秒级广播状态变更。
  */
-class GenaEventNotifier(private val scope: CoroutineScope) {
+class GenaEventNotifier(
+    private val scope: CoroutineScope,
+    private val currentStateProvider: () -> String = { "STOPPED" }
+) {
 
     data class Subscriber(
         val sid: String,
         val callbackUrl: String,
         var expirationEpochMs: Long,
-        val sequenceNumber: AtomicLong = AtomicLong(0)
+        val sequenceNumber: AtomicLong = AtomicLong(0),
+        val sendMutex: Mutex = Mutex()
     )
 
     private val subscribers = ConcurrentHashMap<String, Subscriber>()
 
     /**
      * 注册新的 GENA 订阅者
+     * 💡 P1-2 修复：严格遵循 UPnP 规范，在 200 OK 后立即向订阅端推送 SEQ: 0 的初始 LastChange 状态
      */
     fun subscribe(callbackUrl: String, timeoutSeconds: Int = 1800): String {
         val sid = "uuid:" + UUID.randomUUID().toString()
         val expiration = System.currentTimeMillis() + (timeoutSeconds * 1000L)
         val cleanCallback = callbackUrl.trim().removeSurrounding("<", ">")
-        subscribers[sid] = Subscriber(sid, cleanCallback, expiration)
+        val sub = Subscriber(sid, cleanCallback, expiration)
+        subscribers[sid] = sub
         Logger.upnp.i(TAG, "新增 GENA 订阅者: sid=$sid, callback=$cleanCallback, 超时=${timeoutSeconds}s")
+
+        val initialState = currentStateProvider()
+        val xmlEvent = buildLastChangeEventXml(initialState)
+        val seq = sub.sequenceNumber.getAndIncrement()
+        scope.launch(Dispatchers.IO) {
+            sub.sendMutex.withLock {
+                sendNotify(sub.callbackUrl, sub.sid, seq, xmlEvent)
+            }
+        }
         return sid
     }
 
@@ -59,6 +76,7 @@ class GenaEventNotifier(private val scope: CoroutineScope) {
 
     /**
      * 广播播放状态变化 (PLAYING, PAUSED_PLAYBACK, STOPPED)
+     * 💡 P1-2 修复：通过每个订阅者独占的 sendMutex 串行化 HTTP NOTIFY 请求，杜绝 SEQ 并发乱序到达
      */
     fun notifyTransportState(state: String) {
         val xmlEvent = buildLastChangeEventXml(state)
@@ -70,7 +88,9 @@ class GenaEventNotifier(private val scope: CoroutineScope) {
         for (sub in subscribers.values) {
             val seq = sub.sequenceNumber.getAndIncrement()
             scope.launch(Dispatchers.IO) {
-                sendNotify(sub.callbackUrl, sub.sid, seq, xmlEvent)
+                sub.sendMutex.withLock {
+                    sendNotify(sub.callbackUrl, sub.sid, seq, xmlEvent)
+                }
             }
         }
     }

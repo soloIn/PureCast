@@ -169,4 +169,9 @@ object NativeAudioEngine {
      * 💡 注入经由 RSA-2048 私钥解密出的原始 AES-128 密钥与 IV
      */
     external fun setAirPlayCryptoKey(aesKey: ByteArray, aesIv: ByteArray)
+
+    /**
+     * 💡 向底层 Native RAOP 同步当前播放进度与曲目总时长，用于曲目尾部静音免疫窗口判定
+     */
+    external fun updateAirPlayTrackProgress(positionMs: Long, durationMs: Long): Boolean
 }

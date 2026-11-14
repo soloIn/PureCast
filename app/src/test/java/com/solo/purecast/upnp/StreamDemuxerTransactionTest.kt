@@ -53,6 +53,9 @@ class StreamDemuxerTransactionTest {
         val writeCallCount = AtomicInteger(0)
         var simulatedAvailableRead = 0
         var flacFrames = 0L
+        var simulatedIsStreaming = true
+
+        override fun isStreaming(): Boolean = simulatedIsStreaming
 
         override fun writePcm(data: ByteArray, offset: Int, length: Int, expectedEpoch: Long): Int {
             throwOnWrite?.let { throw it }
@@ -539,6 +542,47 @@ class StreamDemuxerTransactionTest {
             }
             assertEquals("流读取/写入抛出异常必须将 abortedByEpoch 标为 true (#17)", true, endedAborted)
             assertTrue(recordedError != null)
+        } finally {
+            serverSocket.close()
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun `StreamDemuxer pauses buffer drain without completing stream when audio is paused`() = runBlocking {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val gateway = FakeAudioGateway()
+        gateway.simulatedAvailableRead = 4096
+        gateway.simulatedIsStreaming = false // 💡 模拟暂停/静音态，底层填零保活不消费有效 PCM
+
+        var endedAborted: Boolean? = null
+        val wavBytes = buildWavStreamBytes(44100, 16, 2, 4096)
+        val (url, serverSocket) = serveOnceOverHttp(scope, wavBytes)
+
+        try {
+            val demuxer = StreamDemuxer(
+                scope = scope,
+                audioGateway = gateway,
+                onAcquireStreamEpoch = { 88L },
+                onFirstDataPacket = { _, _ -> },
+                onStreamEnded = { aborted, _ -> endedAborted = aborted },
+                onError = { }
+            )
+            demuxer.start(url)
+            // 等待数据拉取完毕进入排空循环并挂起等待
+            delay(300)
+            // 💡 验证：在暂停态下，排空循环绝不能因为 waitCount 超时而误判 EOF
+            assertEquals("暂停态排空循环中绝不能提前派发 onStreamEnded", null, endedAborted)
+
+            // 模拟恢复播放，且环形缓冲区排空
+            gateway.simulatedIsStreaming = true
+            gateway.simulatedAvailableRead = 0
+
+            val deadline = System.currentTimeMillis() + 3000L
+            while (endedAborted == null && System.currentTimeMillis() < deadline) {
+                delay(20)
+            }
+            assertEquals("恢复流式消费且环形缓冲排空后正常自然结束", false, endedAborted)
         } finally {
             serverSocket.close()
             scope.cancel()

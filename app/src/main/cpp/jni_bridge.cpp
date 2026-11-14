@@ -705,7 +705,18 @@ Java_com_solo_purecast_core_nativebridge_NativeAudioEngine_setAirPlayCryptoKey(
 
     jsize key_len = env->GetArrayLength(aes_key);
     jsize iv_len = env->GetArrayLength(aes_iv);
-    if (key_len <= 0 || iv_len <= 0) return;
+    if (key_len <= 0 || iv_len <= 0) {
+        // 💡 修复 R1 密钥残留漏洞：当传入空数组时重置底层 AES 解密上下文，支持加密流切换至明文流
+        std::shared_ptr<purecast::raop::RaopServer> server;
+        {
+            std::lock_guard<std::recursive_mutex> slock(g_server_mutex);
+            server = g_raop_server;
+        }
+        if (server) {
+            server->set_decrypted_aes_key({}, {});
+        }
+        return;
+    }
 
     std::vector<uint8_t> key(key_len);
     std::vector<uint8_t> iv(iv_len);
@@ -722,6 +733,23 @@ Java_com_solo_purecast_core_nativebridge_NativeAudioEngine_setAirPlayCryptoKey(
     if (server) {
         server->set_decrypted_aes_key(key, iv);
     }
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_solo_purecast_core_nativebridge_NativeAudioEngine_updateAirPlayTrackProgress(
+    JNIEnv* /* env */,
+    jobject /* thiz */,
+    jlong position_ms,
+    jlong duration_ms
+) {
+    std::shared_ptr<purecast::raop::RaopServer> server;
+    {
+        std::lock_guard<std::recursive_mutex> slock(g_server_mutex);
+        server = g_raop_server;
+    }
+    if (!server) return JNI_FALSE;
+    server->update_track_progress(static_cast<int64_t>(position_ms), static_cast<int64_t>(duration_ms));
+    return JNI_TRUE;
 }
 
 } // extern "C"

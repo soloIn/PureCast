@@ -1,5 +1,6 @@
 package com.solo.purecast.ui
 
+import android.content.res.Configuration
 import android.os.Bundle
 import android.view.KeyEvent
 import android.view.WindowManager
@@ -232,6 +233,12 @@ class MainActivity : ComponentActivity() {
             }
         }
         return super.onKeyDown(keyCode, event)
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        Logger.ui.i(TAG, "系统配置发生变更，同步更新 AUTO 主题模式 (B-5)")
+        com.solo.purecast.ui.theme.AppPalette.updateSystemNightMode(this)
     }
 
     companion object {

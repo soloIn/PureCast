@@ -208,6 +208,7 @@ class PlaybackService : LifecycleService() {
                         }
                     }
                     StreamProtocol.AIRPLAY_1 -> {
+                        airPlayServer?.notifySeekTriggered()
                         lifecycleScope.launch {
                             val dacp = airPlayServer?.dacpClient
                             val result = dacp?.setPlayingTime(positionMs)
@@ -403,13 +404,26 @@ class PlaybackService : LifecycleService() {
     private fun updateMediaSessionMetadata(metadata: TrackMetadata) {
         val session = mediaSession ?: return
         try {
-            val mediaMetadata = MediaMetadata.Builder()
+            val builder = MediaMetadata.Builder()
                 .putString(MediaMetadata.METADATA_KEY_TITLE, metadata.title)
                 .putString(MediaMetadata.METADATA_KEY_ARTIST, metadata.artist)
                 .putString(MediaMetadata.METADATA_KEY_ALBUM, metadata.album)
                 .putLong(MediaMetadata.METADATA_KEY_DURATION, metadata.durationMs)
-                .build()
-            session.setMetadata(mediaMetadata)
+
+            // 💡 P2-4: 同步封面至系统全局 MediaSession 卡片
+            val coverBytes = metadata.coverBytes
+            if (coverBytes != null && coverBytes.isNotEmpty()) {
+                try {
+                    val bitmap = android.graphics.BitmapFactory.decodeByteArray(coverBytes, 0, coverBytes.size)
+                    if (bitmap != null) {
+                        builder.putBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART, bitmap)
+                        builder.putBitmap(MediaMetadata.METADATA_KEY_ART, bitmap)
+                    }
+                } catch (t: Throwable) {
+                    Logger.service.w(TAG, "解码 MediaSession 封面 Bitmap 异常: ${t.message}")
+                }
+            }
+            session.setMetadata(builder.build())
         } catch (e: Exception) {
             Logger.service.w(TAG, "更新 MediaMetadata 异常", e)
         }

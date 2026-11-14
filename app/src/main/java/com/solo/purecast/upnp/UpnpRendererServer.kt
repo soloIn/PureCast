@@ -19,6 +19,7 @@ import com.solo.purecast.core.session.StreamStopEvent
 import com.solo.purecast.core.session.TrackBoundaryEvent
 import com.solo.purecast.core.session.TrackCompleteEvent
 import com.solo.purecast.core.session.TrackSwitchEvent
+import com.solo.purecast.model.BusinessSessionState
 import com.solo.purecast.model.DurationState
 import com.solo.purecast.model.ErrorCode
 import com.solo.purecast.model.FlushReason
@@ -85,7 +86,21 @@ class UpnpRendererServer(
     private var ssdpJob: Job? = null
     private var httpJob: Job? = null
 
-    val genaNotifier = GenaEventNotifier(scope)
+    val genaNotifier = GenaEventNotifier(
+        scope = scope,
+        currentStateProvider = {
+            val snap = snapshotProvider()
+            if (snap.activeProtocol == StreamProtocol.UPNP_DLNA) {
+                when (snap.playbackStatus) {
+                    PlaybackStatus.PLAYING -> "PLAYING"
+                    PlaybackStatus.PAUSED -> "PAUSED_PLAYBACK"
+                    PlaybackStatus.STOPPED, PlaybackStatus.IDLE -> "STOPPED"
+                }
+            } else {
+                "STOPPED"
+            }
+        }
+    )
     private var demuxer: StreamDemuxer? = null
 
     private val sessionStateLock = Any()
@@ -273,12 +288,12 @@ class UpnpRendererServer(
                         resolvedDurMs > 0L -> DurationState.FIXED
                         else -> spec.durationState
                     }
-                    val resolvedSeekCap = if (resolvedDurState == DurationState.LIVE) {
-                        SeekCapability.UNSEEKABLE
-                    } else if (resolvedDurState == DurationState.FIXED) {
-                        SeekCapability.SEEKABLE
-                    } else {
-                        spec.seekCapability
+                    val resolvedSeekCap = when {
+                        resolvedDurState == DurationState.LIVE -> SeekCapability.UNSEEKABLE
+                        // 💡 尊重解复用器真实寻道能力：对于 FLAC 等当前不支持 Range 寻道的流，严格保持 UNSEEKABLE，杜绝 UI 拖动回弹 (B-2)
+                        spec.seekCapability == SeekCapability.UNSEEKABLE -> SeekCapability.UNSEEKABLE
+                        resolvedDurState == DurationState.FIXED -> SeekCapability.SEEKABLE
+                        else -> spec.seekCapability
                     }
                     currentTrackMetadata = currentTrackMetadata.copy(
                         durationMs = resolvedDurMs,
@@ -424,15 +439,22 @@ class UpnpRendererServer(
                         emitEventLocked(
                             ProgressUpdateEvent(
                                 positionMs = posMs,
-                                durationMs = currentTrackMetadata.durationMs
+                                durationMs = currentTrackMetadata.durationMs,
+                                trackGeneration = trackGenerationCounter
                             )
                         )
                     }
                 }
             },
             onSeekFlush = {
+                val isPaused = snapshotProvider().businessState == BusinessSessionState.PAUSED
                 val newEpoch = fastPath.emergencyMuteAndFlush(FlushReason.FLUSH_SWITCH)
-                fastPath.resumeStream()
+                // 💡 防御暂停偷跑与进度回弹: 暂停态下 Seek 换代必须维持暂停静音，严禁提前 resumeStream
+                if (!isPaused) {
+                    fastPath.resumeStream()
+                } else {
+                    Logger.upnp.i(TAG, "Seek 换代时流处于暂停态，维持底层静音保活，防止底层提前恢复消费引发声音偷跑")
+                }
                 newEpoch
             }
         )
@@ -777,7 +799,8 @@ class UpnpRendererServer(
                     emitEventLocked(
                         ProgressUpdateEvent(
                             positionMs = 0L,
-                            durationMs = parsedMeta.durationMs
+                            durationMs = parsedMeta.durationMs,
+                            trackGeneration = trackGenerationCounter
                         )
                     )
                 }
@@ -1243,19 +1266,27 @@ class UpnpRendererServer(
     }
 
     private fun sendSsdpByebye() {
-        try {
-            val group = InetAddress.getByName("239.255.255.250")
-            val notify = "NOTIFY * HTTP/1.1\r\n" +
-                    "HOST: 239.255.255.250:1900\r\n" +
-                    "NT: urn:schemas-upnp-org:device:MediaRenderer:1\r\n" +
-                    "NTS: ssdp:byebye\r\n" +
-                    "USN: $deviceUuid::urn:schemas-upnp-org:device:MediaRenderer:1\r\n\r\n"
-            val bytes = notify.toByteArray(Charsets.UTF_8)
-            val packet = DatagramPacket(bytes, bytes.size, group, 1900)
-            multicastSocket?.send(packet)
-        } catch (e: Exception) {
-            // ignore
+        val uuid = deviceUuid
+        // 💡 防御 B-5: 采用独立后台线程发送下线通知，彻底杜绝主线程调用 (如 Service.onDestroy) 触发 NetworkOnMainThreadException
+        val thread = Thread {
+            try {
+                val group = InetAddress.getByName("239.255.255.250")
+                val notify = "NOTIFY * HTTP/1.1\r\n" +
+                        "HOST: 239.255.255.250:1900\r\n" +
+                        "NT: urn:schemas-upnp-org:device:MediaRenderer:1\r\n" +
+                        "NTS: ssdp:byebye\r\n" +
+                        "USN: $uuid::urn:schemas-upnp-org:device:MediaRenderer:1\r\n\r\n"
+                val bytes = notify.toByteArray(Charsets.UTF_8)
+                val packet = DatagramPacket(bytes, bytes.size, group, 1900)
+                val sock = MulticastSocket()
+                sock.send(packet)
+                sock.close()
+            } catch (e: Exception) {
+                // ignore
+            }
         }
+        thread.name = "SSDP-ByeBye"
+        thread.start()
     }
 
     private fun getActiveNetworkInterface(): NetworkInterface? {
