@@ -87,6 +87,10 @@ class AirPlayServerManager(
         },
         onRtpActiveChanged = { active ->
             isRtpActive = active
+            // 💡 契约修复：推流 RTP/RTSP 挂起时严禁清除 DACP 会话与凭据！
+            // 在 iOS AirPlay 1 中，暂停推流时发送端会主动下发 TEARDOWN 拆除音频通道进入休眠；
+            // 必须保留 DACP 凭据，使 TV 遥控器与大屏能在 10 分钟挂起期间随时发送 PLAY 指令唤醒发送端恢复推流。
+            // DACP 凭据仅在会话彻底超时 (SuspendTimeoutEvent)、新流抢占或用户显式 Stop 时由协调器统一回收。
         },
         clockMs = clockMs
     )
@@ -245,4 +249,11 @@ class AirPlayServerManager(
     }
 
     fun isRunning(): Boolean = isRunning
+
+    /**
+     * 💡 通知 AirPlay 会话即将触发 TV 端寻道指令，标记 4000ms 响应窗口，防止 FLUSH 冲刷归零进度
+     */
+    fun notifySeekTriggered() {
+        nativeDispatcher.markPendingSeek()
+    }
 }

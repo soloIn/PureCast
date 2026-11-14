@@ -57,6 +57,9 @@ void DmapParser::parse_recursive(const uint8_t* data, size_t size, DmapMetadata&
         } else if (std::strcmp(tag, "asal") == 0) { // 专辑名
             out_metadata.album.assign(reinterpret_cast<const char*>(val_ptr), len);
             LOGI("DMAP 提取专辑: %s", out_metadata.album.c_str());
+        } else if (std::strcmp(tag, "astm") == 0 && len == 4) { // 💡 曲目时长 (毫秒, 4 字节大端整数)
+            out_metadata.duration_ms = static_cast<long>(read_uint32_be(val_ptr));
+            LOGI("DMAP 提取曲目时长: %ld ms", out_metadata.duration_ms);
         } else if (std::strcmp(tag, "PICT") == 0) { // 专辑封面图片数据
             out_metadata.cover_art.assign(val_ptr, val_ptr + len);
             LOGI("DMAP 提取封面图片: %u 字节", len);

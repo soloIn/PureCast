@@ -25,11 +25,16 @@ void RaopJitterBuffer::reset() {
     first_packet_ = true;
     is_buffering_.store(true, std::memory_order_release);
     lost_packets_.store(0, std::memory_order_relaxed);
+    frame_bytes_ = FRAME_BYTES;
     LOGI("RaopJitterBuffer 重置完成");
 }
 
 void RaopJitterBuffer::push(uint16_t seq, uint32_t timestamp, std::vector<uint8_t> pcm) {
     std::lock_guard<std::mutex> lock(mutex_);
+
+    if (!pcm.empty()) {
+        frame_bytes_ = pcm.size();
+    }
 
     if (first_packet_) {
         head_seq_ = seq;
@@ -107,7 +112,7 @@ bool RaopJitterBuffer::pop(std::vector<uint8_t>& out_pcm) {
     int16_t diff = static_cast<int16_t>(max_seq_seen_ - head_seq_);
     if (diff > MAX_REORDER_TOLERANCE) {
         // 丢包确认，生成全 0 静音补偿帧保持物理晶振时钟对齐
-        out_pcm.assign(FRAME_BYTES, 0);
+        out_pcm.assign(frame_bytes_, 0);
         lost_packets_.fetch_add(1, std::memory_order_relaxed);
         LOGW("RTP 丢包补偿: 丢失帧 seq=%u (最新已收 seq=%u, 超差 %d 帧)，插入 8ms 静音保真帧",
              head_seq_, max_seq_seen_, diff);

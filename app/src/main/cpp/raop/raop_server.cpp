@@ -193,8 +193,13 @@ void RaopServer::server_loop() {
         socklen_t client_len = sizeof(client_addr);
         int client_fd = accept(server_fd_, (struct sockaddr*)&client_addr, &client_len);
         if (client_fd < 0) {
-            if (is_running_.load()) {
-                LOGW("accept RTSP client 失败: %d", errno);
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK || errno == ECONNABORTED) {
+                continue;
+            }
+            if (is_running_.load(std::memory_order_acquire)) {
+                LOGW("accept RTSP client 异常 (errno=%d)，继续保持监听循环", errno);
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                continue;
             }
             break;
         }
@@ -223,23 +228,33 @@ void RaopServer::server_loop() {
             active_client_fd_.store(-1, std::memory_order_release);
             close(client_fd);
         }
+        // 💡 修复 R1: 客户端断开连接后彻底清空会话参数与密钥上下文，防止下个会话串扰
+        current_params_ = RaopStreamParams{};
+        rtp_.set_crypto_key({}, {});
     }
 }
 
 void RaopServer::handle_client(int client_fd) {
     std::vector<char> buffer(8192);
     std::string accumulated_data;
+    int idle_timeout_count = 0;
 
     try {
         while (is_running_.load()) {
             ssize_t bytes_read = recv(client_fd, buffer.data(), buffer.size() - 1, 0);
             if (bytes_read < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+                    // 💡 防御 B-4: 若连续超时且无在途数据，判定为空闲探测僵尸连接，主动退出避免卡死单线程 accept 循环
+                    if (accumulated_data.empty() && ++idle_timeout_count >= 3) {
+                        LOGI("RTSP 客户端无数据空闲超时 (%d 秒)，主动关闭空闲连接让出 accept 循环 (B-4)", idle_timeout_count * 2);
+                        break;
+                    }
                     continue;
                 }
                 LOGI("RTSP 客户端读取异常断开 (errno=%d)", errno);
                 break;
             }
+            idle_timeout_count = 0;
             if (bytes_read == 0) {
                 LOGI("RTSP 客户端连接已关闭或断开");
                 break;
@@ -351,8 +366,7 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
                      << "Server: AirTunes/105.1\r\n\r\n";
         }
     } else if (method == "FLUSH") {
-        // 💡 收到 FLUSH 立即无锁静音递增 epoch 并重置 JitterBuffer，杜绝残音爆音并隔离旧包
-        has_paused_without_flush_.store(false, std::memory_order_release);
+        // 💡 收到 FLUSH 立即无锁静音递增 epoch 并重置 JitterBuffer，杜绝残音爆音并隔离旧包 (R-2 防御：绝不在 FLUSH 强制解除手动暂停)
         rtp_.reset_buffer();
         rtp_.notify_track_transition(2500);
         const uint64_t new_epoch = AudioEngine::instance().emergency_mute_and_flush(FlushReason::FLUSH_SWITCH);
@@ -559,17 +573,14 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
                      << "CSeq: " << cseq << "\r\n\r\n";
         }
     } else if (method == "RECORD") {
-        const bool resuming_from_pause = has_paused_without_flush_.exchange(false, std::memory_order_acq_rel);
-        if (resuming_from_pause) {
-            // 💡 同流恢复 (PAUSE -> RECORD 无 FLUSH)：保留原有 epoch 与环形缓冲，仅取消显式静音标记并上报恢复
-            AudioEngine::instance().resume_stream();
+        const bool was_manually_paused = rtp_.is_manually_paused();
+        AudioEngine::instance().resume_stream();
+        if (was_manually_paused) {
+            // 💡 从显式暂停态恢复推流：取消显式静音标记并向协调器发射恢复状态
             rtp_.mark_paused_manually(false, true);
         } else {
-            // 💡 初次建流 RECORD 或 FLUSH 后 RECORD：切换世代排空潜在旧残留，等待 FirstDataPacketEvent 解锁 PLAYING
+            // 💡 初次建流 RECORD：重置缓冲并就绪，绝不发射恢复回调，严格等待首帧 25 包预充门禁 (R-2 防御)
             rtp_.reset_buffer();
-            const uint64_t switched_ep = AudioEngine::instance().emergency_mute_and_flush(FlushReason::FLUSH_SWITCH);
-            rtp_.set_active_epoch(switched_ep);
-            AudioEngine::instance().resume_stream();
             rtp_.mark_paused_manually(false, false);
         }
         response << "RTSP/1.0 200 OK\r\n"
@@ -679,6 +690,7 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
                                     : 0;
                                 LOGD("AirPlay %s进度实时校准: pos=%ld ms, duration=%ld ms (RTP: %s)",
                                      has_valid_duration ? "" : "直播流", pos_ms, dur_ms, prog_val.c_str());
+                                rtp_.update_track_progress(pos_ms, dur_ms);
                                 if (progress_cb_) {
                                     progress_cb_(active_session_id_.load(std::memory_order_acquire), next_seq(), pos_ms, dur_ms);
                                 }
@@ -693,6 +705,11 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
                  << "CSeq: " << cseq << "\r\n\r\n";
     } else if (method == "TEARDOWN") {
         has_paused_without_flush_.store(false, std::memory_order_release);
+        // 💡 修复 R1: 彻底清空当前会话的 AES 密钥与 IV，防止下个会话残留白噪声
+        current_params_.aes_key_base64.clear();
+        current_params_.aes_iv_base64.clear();
+        rtp_.set_crypto_key({}, {});
+        rtp_.update_track_progress(0, -1);
         rtp_.stop();
         const uint64_t teardown_ep = AudioEngine::instance().emergency_mute_and_flush(FlushReason::STOP_OR_TEARDOWN);
         rtp_.set_active_epoch(teardown_ep);

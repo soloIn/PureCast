@@ -70,6 +70,7 @@ fun ProgressBarComponent(
     durationState: DurationState,
     seekCapability: SeekCapability,
     onSeek: (newPositionMs: Long) -> Unit,
+    onSeekImmediate: ((newPositionMs: Long) -> Unit)? = null,
     modifier: Modifier = Modifier,
     hasDarkBackground: Boolean = true,
     focusRequester: FocusRequester? = null,
@@ -134,7 +135,12 @@ fun ProgressBarComponent(
                             return@onPreviewKeyEvent true
                         }
                         KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> {
-                            onPlayPauseClick?.invoke()
+                            // 💡 进度条聚焦时按下确认键，意图是确认/立即提交当前位置寻道，绝不得误触发暂停
+                            if (onSeekImmediate != null) {
+                                onSeekImmediate(currentPositionMs)
+                            } else {
+                                onSeek(currentPositionMs)
+                            }
                             return@onPreviewKeyEvent true
                         }
                     }

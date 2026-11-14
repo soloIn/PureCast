@@ -91,7 +91,8 @@ class AirPlayServerEventDispatchTest {
         assertEquals(12L, (events.last().payload as TrackSwitchEvent).newEpoch)
 
         dispatcher.onStreamStopped(1L, 7L, 13L)
-        assertTrue(events.last().payload is StreamTeardownEvent)
+        val teardown = events.last().payload as StreamTeardownEvent
+        assertFalse("TEARDOWN 事件严禁作为 hardStop 硬停止", teardown.hardStop)
     }
 
     @Test
@@ -123,18 +124,53 @@ class AirPlayServerEventDispatchTest {
         assertEquals(patch2.trackGeneration, boundary.trackGeneration)
         assertNull(patch2.coverBytes)
 
-        // 真实电台直播 (pos > 0, dur == 0) 才标为 LIVE
+        // 💡 R7 契约验收：无时长进度 (pos > 0, dur == 0) 不得误标为 LIVE，必须保持 UNKNOWN，杜绝切歌误切 LIVE 与红点闪烁
+        val countBeforeUnknownProgress = events.size
         dispatcher.onProgressUpdated(1L, 6L, 5000L, 0L)
-        assertTrue(events.dropLast(1).last().payload is MetadataPatchEvent)
-        val livePatch = events.firstOrNull { it.payload is MetadataPatchEvent && (it.payload as MetadataPatchEvent).durationState == DurationState.LIVE }
-        assertTrue(livePatch != null)
+        val newEvents = events.drop(countBeforeUnknownProgress)
+        assertTrue(newEvents.any { it.payload is ProgressUpdateEvent && (it.payload as ProgressUpdateEvent).positionMs == 5000L })
+        assertFalse("无时长流切歌时绝不得发射 LIVE 补丁", newEvents.any { it.payload is MetadataPatchEvent && (it.payload as MetadataPatchEvent).durationState == DurationState.LIVE })
+    }
 
-        // 曲目已被标记为 LIVE 后，同曲目迟到且 durationMs == 0 的 DMAP 元数据绝不能将状态退回 UNKNOWN (#29)
-        val beforeDelayedMeta = events.size
-        dispatcher.onMetadataReceived(1L, 7L, "稻香", "周杰伦", "魔杰座专辑", 0L, null)
-        val delayedPatch = events.drop(beforeDelayedMeta).first { it.payload is MetadataPatchEvent }.payload as MetadataPatchEvent
-        assertNull("LIVE 状态确立后 duration=0 补丁不得覆写为 UNKNOWN", delayedPatch.durationState)
-        assertNull("LIVE 状态确立后 duration=0 补丁不得覆写 SeekCapability", delayedPatch.seekCapability)
+    @Test
+    fun trackSwitchFlushThenProgressThenDmapInheritsDurationCorrectly() {
+        var mockClock = 1000L
+        val events = mutableListOf<SessionEventEnvelope<SessionEventPayload>>()
+        val globalSessionGen = AtomicLong(100L)
+        val seqGen = AtomicLong(0L)
+        val dispatcher = AirPlayNativeEventDispatcher(
+            dispatchEvent = { events += it },
+            allocateSessionId = { globalSessionGen.incrementAndGet() },
+            allocateSequence = { seqGen.incrementAndGet() },
+            onAcquireHardwareForStream = { _, _, _, _ -> 11L },
+            onDecryptAndInjectCryptoKey = { _, _ -> },
+            onUpdateDacpTarget = { _, _, _, _ -> },
+            onSolveChallenge = { "mock-resp" },
+            clockMs = { mockClock }
+        )
+
+        dispatcher.onStreamRequested(1L, 1L, 44100, 16, 2, "ALAC", "10.0.0.2", "", "", "", "", 0)
+        dispatcher.onMetadataReceived(1L, 2L, "晴天", "周杰伦", "叶惠美", 260_000L, null)
+
+        // 💡 模拟 iOS 切歌分包乱序时序：FLUSH -> progress: -> dmap:
+        mockClock = 2000L
+        dispatcher.onTrackSwitchFlushed(1L, 3L, 15L)
+
+        mockClock = 2100L
+        dispatcher.onProgressUpdated(1L, 4L, 0L, 240_000L)
+
+        mockClock = 2200L
+        dispatcher.onMetadataReceived(1L, 5L, "夜曲", "周杰伦", "十一月的萧邦", 0L, null)
+
+        val boundary = events[events.size - 2].payload as TrackBoundaryEvent
+        val patch = events.last().payload as MetadataPatchEvent
+
+        // 验证：新歌成功继承换代后先到达的 240 秒时长，状态为 FIXED + SEEKABLE
+        assertEquals(DurationState.FIXED, boundary.initialDurationState)
+        assertEquals(SeekCapability.SEEKABLE, boundary.seekCapability)
+        assertEquals(240_000L, patch.durationMs)
+        assertEquals(DurationState.FIXED, patch.durationState)
+        assertEquals(SeekCapability.SEEKABLE, patch.seekCapability)
     }
 
     @Test
@@ -167,5 +203,30 @@ class AirPlayServerEventDispatchTest {
         dispatcher.onStreamPaused(1L, 99L, 11L, isImplicit = true)
         dispatcher.onStreamStopped(1L, 100L, 12L)
         assertEquals(countAfterSecondSetup, events.size)
+    }
+
+    @Test
+    fun markPendingSeekSetsIsSeekFlushOnTrackSwitchFlushed() {
+        val (dispatcher, events) = createDispatcher()
+        dispatcher.onStreamRequested(1L, 1L, 44100, 16, 2, "ALAC", "10.0.0.1", "", "", "", "", 0)
+
+        // 默认情况下切歌 FLUSH 的 isSeekFlush 为 false (重置进度)
+        dispatcher.onTrackSwitchFlushed(1L, 2L, 12L)
+        val normalSwitch = events.last().payload as TrackSwitchEvent
+        assertEquals(12L, normalSwitch.newEpoch)
+        assertFalse(normalSwitch.isSeekFlush)
+
+        // 标记触发 TV 端寻道后，4000ms 窗口内的 FLUSH 被标记为 isSeekFlush = true (保留进度)
+        dispatcher.markPendingSeek()
+        dispatcher.onTrackSwitchFlushed(1L, 3L, 13L)
+        val seekSwitch = events.last().payload as TrackSwitchEvent
+        assertEquals(13L, seekSwitch.newEpoch)
+        assertTrue(seekSwitch.isSeekFlush)
+
+        // 再次到达的 FLUSH 标记已被消费，恢复为 isSeekFlush = false
+        dispatcher.onTrackSwitchFlushed(1L, 4L, 14L)
+        val subsequentSwitch = events.last().payload as TrackSwitchEvent
+        assertEquals(14L, subsequentSwitch.newEpoch)
+        assertFalse(subsequentSwitch.isSeekFlush)
     }
 }

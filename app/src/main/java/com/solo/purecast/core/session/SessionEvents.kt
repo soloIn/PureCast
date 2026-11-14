@@ -89,7 +89,8 @@ data class FirstDataPacketEvent(
 data class TrackSwitchEvent(
     val flushReason: FlushReason = FlushReason.FLUSH_SWITCH,
     val newEpoch: Long,
-    val trackUri: String? = null
+    val trackUri: String? = null,
+    val isSeekFlush: Boolean = false
 ) : SessionEventPayload
 
 /**
@@ -216,10 +217,12 @@ class MetadataPatchEvent(
 
 /**
  * 播放进度与时长更新事件
+ * 💡 P1-1 契约：携带 [trackGeneration] 曲目代数，拒绝旧曲目切歌在途进度包覆盖新歌进度与时长
  */
 data class ProgressUpdateEvent(
     val positionMs: Long,
-    val durationMs: Long
+    val durationMs: Long,
+    val trackGeneration: Long = 0L
 ) : SessionEventPayload
 
 /**
@@ -255,6 +258,13 @@ data class RemoteCommandFailedEvent(
  */
 data class RemoteCommandTimeoutEvent(
     val commandId: Long
+) : SessionEventPayload
+
+/**
+ * 💡 5000ms 过渡态 (TRANSITIONING) 看门狗超时事件，防止切歌或建连异常导致 UI 永久卡死
+ */
+data class TransitionTimeoutEvent(
+    val sessionId: Long
 ) : SessionEventPayload
 
 /**

@@ -187,7 +187,6 @@ class PlaybackServiceSessionHost(
             return
         }
 
-        val origin = originForProtocol(snap.activeProtocol)
         if (snap.activeProtocol == StreamProtocol.AIRPLAY_1) {
             coordinator.sendDacpFireAndForget(RemoteCommandType.PAUSE)
         } else if (snap.activeProtocol == StreamProtocol.UPNP_DLNA) {
@@ -195,7 +194,7 @@ class PlaybackServiceSessionHost(
         }
 
         dispatchEnvelope(
-            origin = origin,
+            origin = EventOrigin.USER_ACTION,
             sessionId = snap.sessionId,
             deviceGeneration = snap.deviceGeneration,
             payload = ExplicitPauseEvent(
@@ -227,7 +226,7 @@ class PlaybackServiceSessionHost(
         }
 
         dispatchEnvelope(
-            origin = originForProtocol(snap.activeProtocol),
+            origin = EventOrigin.USER_ACTION,
             sessionId = snap.sessionId,
             deviceGeneration = snap.deviceGeneration,
             payload = StreamResumeEvent(
@@ -254,7 +253,7 @@ class PlaybackServiceSessionHost(
         if (snap.sessionId != 0L && snap.activeProtocol != StreamProtocol.NONE) {
             systemEffects.preemptProtocol(snap.activeProtocol, snap.sessionId)
             dispatchEnvelope(
-                origin = originForProtocol(snap.activeProtocol),
+                origin = EventOrigin.USER_ACTION, // 💡 P0-1: 本机用户/系统主动停止，严禁伪造远端协议 origin
                 sessionId = snap.sessionId,
                 deviceGeneration = snap.deviceGeneration,
                 payload = StreamStopEvent(
@@ -293,7 +292,22 @@ class PlaybackServiceSessionHost(
             Logger.service.w(TAG, "当前媒体不可寻道，忽略 seekTo($positionMs)")
             return
         }
-        systemEffects.seekProtocolStream(snap.activeProtocol, positionMs)
+        // 💡 R11 契约：乐观更新本地时钟锚点并立即发射乐观进度，彻底消除 500ms 进度条回弹
+        val targetPos = positionMs.coerceAtLeast(0L)
+        lastAnchorPosMs = targetPos
+        lastAnchorClockMs = clockMs()
+        lastTickerEmittedPosMs = targetPos
+        dispatchEnvelope(
+            origin = EventOrigin.USER_ACTION,
+            sessionId = snap.sessionId,
+            deviceGeneration = snap.deviceGeneration,
+            payload = ProgressUpdateEvent(
+                positionMs = targetPos,
+                durationMs = snap.progressDurationMs,
+                trackGeneration = snap.trackGeneration
+            )
+        )
+        systemEffects.seekProtocolStream(snap.activeProtocol, targetPos)
     }
 
     private fun dispatchRemoteCommand(commandType: RemoteCommandType) {
@@ -435,12 +449,13 @@ class PlaybackServiceSessionHost(
                 if (pos != snap.progressPositionMs) {
                     lastTickerEmittedPosMs = pos
                     dispatchEnvelope(
-                        origin = EventOrigin.AIRPLAY,
+                        origin = EventOrigin.SERVICE, // 💡 P0-1: 内部进度平滑轮询使用 SERVICE，避免与协议事件竞争导致乱序丢包
                         sessionId = sessionId,
                         deviceGeneration = deviceGen,
                         payload = ProgressUpdateEvent(
                             positionMs = pos,
-                            durationMs = dur
+                            durationMs = dur,
+                            trackGeneration = snap.trackGeneration
                         )
                     )
                 }

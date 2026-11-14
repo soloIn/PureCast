@@ -83,6 +83,7 @@ private:
 
     std::atomic<bool> is_buffering_{true};
     std::atomic<uint32_t> lost_packets_{0};
+    size_t frame_bytes_{FRAME_BYTES};
 };
 
 } // namespace purecast::raop

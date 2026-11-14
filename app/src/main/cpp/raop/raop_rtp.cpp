@@ -163,6 +163,8 @@ void RaopRtp::stop() {
     is_stream_paused_.store(false, std::memory_order_relaxed);
     is_manually_paused_.store(false, std::memory_order_relaxed);
     emitted_first_epoch_.store(0ULL, std::memory_order_release);
+    track_duration_ms_.store(0, std::memory_order_release);
+    track_position_ms_.store(0, std::memory_order_release);
     {
         std::lock_guard<std::mutex> lock(crypto_mutex_);
         aes_key_.clear();
@@ -174,10 +176,15 @@ void RaopRtp::stop() {
 
 void RaopRtp::set_client_control_endpoint(const std::string& client_ip, int client_ctrl_port) {
     if (client_ip.empty() || client_ctrl_port <= 0) return;
-    std::memset(&client_ctrl_addr_, 0, sizeof(client_ctrl_addr_));
-    client_ctrl_addr_.sin_family = AF_INET;
-    client_ctrl_addr_.sin_port = htons(client_ctrl_port);
-    if (inet_pton(AF_INET, client_ip.c_str(), &client_ctrl_addr_.sin_addr) > 0) {
+    struct sockaddr_in addr{};
+    std::memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(client_ctrl_port);
+    if (inet_pton(AF_INET, client_ip.c_str(), &addr.sin_addr) > 0) {
+        {
+            std::lock_guard<std::mutex> lock(ctrl_addr_mutex_);
+            client_ctrl_addr_ = addr;
+        }
         has_client_ctrl_.store(true, std::memory_order_release);
         LOGI("显式配置客户端控制端点: %s:%d (用于 RAOP 丢包重传)", client_ip.c_str(), client_ctrl_port);
     }
@@ -186,6 +193,12 @@ void RaopRtp::set_client_control_endpoint(const std::string& client_ip, int clie
 void RaopRtp::send_resend_request(uint16_t first_seq, uint16_t count) {
     if (!has_client_ctrl_.load(std::memory_order_acquire) || ctrl_fd_ < 0 || count == 0) {
         return;
+    }
+
+    struct sockaddr_in target_addr{};
+    {
+        std::lock_guard<std::mutex> lock(ctrl_addr_mutex_);
+        target_addr = client_ctrl_addr_;
     }
 
     // 💡 遵循 Apple RAOP 8 字节重传请求报文规范 (0x80, 0xd5, req_seq, first_seq, count)
@@ -201,8 +214,8 @@ void RaopRtp::send_resend_request(uint16_t first_seq, uint16_t count) {
     req[7] = static_cast<uint8_t>(count & 0xFF);
 
     ssize_t ret = sendto(ctrl_fd_, req, sizeof(req), 0,
-                         reinterpret_cast<const struct sockaddr*>(&client_ctrl_addr_),
-                         sizeof(client_ctrl_addr_));
+                         reinterpret_cast<const struct sockaddr*>(&target_addr),
+                         sizeof(target_addr));
     if (ret < 0) {
         LOGW("发送 RAOP 丢包重传请求失败: errno=%d", errno);
     } else {
@@ -255,8 +268,9 @@ void RaopRtp::watchdog_loop() {
                         if (recheck_time == last_time &&
                             is_stream_paused_.load(std::memory_order_acquire) &&
                             !is_manually_paused_.load(std::memory_order_acquire)) {
-                            LOGI("⚠️ 检测到 RTP 音频流停顿超 600ms (iPhone 暂停推流)，C++ 立即无锁静音并通知隐式暂停");
-                            pause_epoch = AudioEngine::instance().emergency_mute_and_flush(FlushReason::EXPLICIT_PAUSE);
+                            LOGI("⚠️ 检测到 RTP 音频流停顿超 600ms (iPhone 暂停推流)，C++ 执行快路径换代静音 (FLUSH_SWITCH) 并通知隐式暂停");
+                            pause_epoch = AudioEngine::instance().emergency_mute_and_flush(FlushReason::FLUSH_SWITCH);
+                            active_epoch_.store(pause_epoch, std::memory_order_release);
                             cb_copy = state_cb_;
                             should_notify = true;
                         } else if (recheck_time != last_time) {
@@ -377,8 +391,8 @@ void RaopRtp::data_loop() {
                       (static_cast<uint32_t>(pktp[6]) << 8)  |
                       pktp[7];
 
-        // 💡 实时丢包空洞检测: 发现主干音频包序列号跳跃时，立即向 iPhone 发送重传请求
-        if (payload_type == 96) {
+        // 💡 实时丢包空洞检测: 发现主干音频包序列号跳跃时，立即向 iPhone 发送重传请求 (B-4 防御：动态匹配 payload_type，解除硬编码 96)
+        if (payload_type == expected_pt || payload_type == 96) {
             if (first_data_seq_) {
                 last_data_seq_ = seq;
                 first_data_seq_ = false;
@@ -434,20 +448,43 @@ void RaopRtp::data_loop() {
         AudioCodec current_codec = audio_codec_.load(std::memory_order_acquire);
 
         if (current_codec == AudioCodec::PCM || payload_type == 10) {
-            // 💡 L16 未压缩线性 PCM 处理:
-            // 遵循 RFC 3551 规范，L16 采样为 16-bit 有符号大端网络字节序 (Big-Endian)
-            // 需逐采样转换为本地架构 Little-Endian (S16_LE) 以便 AudioEngine 直通播放
-            size_t valid_bytes = payload_len & ~1;
-            if (valid_bytes > pcm_frame.size()) {
-                pcm_frame.resize(valid_bytes);
+            int bit_depth = 16;
+            {
+                std::lock_guard<std::mutex> f_lock(format_mutex_);
+                if (format_bit_depth_ > 0) bit_depth = format_bit_depth_;
             }
-            const uint8_t* src = decrypted_payload.data();
-            uint8_t* dst = pcm_frame.data();
-            for (size_t i = 0; i < valid_bytes; i += 2) {
-                dst[i] = src[i + 1];     // 低位
-                dst[i + 1] = src[i];     // 高位
+            if (bit_depth == 24) {
+                // 💡 L24 未压缩线性 PCM 处理 (RFC 3190):
+                // L24 采样为 24-bit 有符号大端网络字节序 (MSB, MID, LSB)
+                // 需逐采样转换为本地架构 Little-Endian (LSB, MID, MSB) 以便 AudioEngine 直通播放
+                size_t valid_bytes = payload_len - (payload_len % 3);
+                if (valid_bytes > pcm_frame.size()) {
+                    pcm_frame.resize(valid_bytes);
+                }
+                const uint8_t* src = decrypted_payload.data();
+                uint8_t* dst = pcm_frame.data();
+                for (size_t i = 0; i < valid_bytes; i += 3) {
+                    dst[i] = src[i + 2];     // LSB (低位)
+                    dst[i + 1] = src[i + 1]; // MID (中位)
+                    dst[i + 2] = src[i];     // MSB (高位)
+                }
+                out_bytes = valid_bytes;
+            } else {
+                // 💡 L16 未压缩线性 PCM 处理:
+                // 遵循 RFC 3551 规范，L16 采样为 16-bit 有符号大端网络字节序 (Big-Endian)
+                // 需逐采样转换为本地架构 Little-Endian (S16_LE) 以便 AudioEngine 直通播放
+                size_t valid_bytes = payload_len & ~1;
+                if (valid_bytes > pcm_frame.size()) {
+                    pcm_frame.resize(valid_bytes);
+                }
+                const uint8_t* src = decrypted_payload.data();
+                uint8_t* dst = pcm_frame.data();
+                for (size_t i = 0; i < valid_bytes; i += 2) {
+                    dst[i] = src[i + 1];     // 低位
+                    dst[i + 1] = src[i];     // 高位
+                }
+                out_bytes = valid_bytes;
             }
-            out_bytes = valid_bytes;
         } else {
             // 💡 ALAC 实时无损解码为 16-bit 44.1kHz PCM (S16_LE)
             if (!alac_decoder_.decode_frame(decrypted_payload.data(), payload_len, pcm_frame.data(), out_bytes)) {
@@ -489,7 +526,36 @@ void RaopRtp::data_loop() {
                 }
             }
 
+            // 💡 自适应曲目播放位置推进 (用于曲目尾部静音免疫窗口)
+            const int64_t dur_ms = track_duration_ms_.load(std::memory_order_relaxed);
+            if (dur_ms > 0) {
+                int sample_rate = 44100;
+                int channels = 2;
+                int bit_depth = 16;
+                {
+                    std::lock_guard<std::mutex> f_lock(format_mutex_);
+                    if (format_sample_rate_ > 0) sample_rate = format_sample_rate_;
+                    if (format_channels_ > 0) channels = format_channels_;
+                    if (format_bit_depth_ > 0) bit_depth = format_bit_depth_;
+                }
+                const size_t bytes_per_sample = static_cast<size_t>(channels * (bit_depth / 8));
+                if (bytes_per_sample > 0 && sample_rate > 0) {
+                    const size_t frame_samples = out_bytes / bytes_per_sample;
+                    const int64_t frame_dur_ms = static_cast<int64_t>(frame_samples * 1000ULL / sample_rate);
+                    track_position_ms_.fetch_add(std::max<int64_t>(1, frame_dur_ms), std::memory_order_relaxed);
+                }
+            }
+
+            // 💡 显式暂停包含两层：远端 RTSP 显式暂停 (is_manually_paused_) 与 TV 本机/系统焦点显式暂停 (AudioEngine::is_paused())
+            const bool is_explicitly_user_paused = is_manually_paused_.load(std::memory_order_acquire) ||
+                                                   AudioEngine::instance().is_paused();
+
             if (is_silence) {
+                // 💡 显式暂停保护：若用户已在 TV 本机或远端触发显式暂停，静音保活帧仅供自然丢弃保活，绝不能再次触发隐式暂停覆盖
+                if (is_explicitly_user_paused) {
+                    continue;
+                }
+
                 // 💡 关键双向同步防抖: 在切歌豁免期内忽略静音判定并重置计数，防止切歌期间累计的静音帧在豁免期结束后立即突发误判为 PAUSED
                 bool in_transition = get_monotonic_time_ms() < track_transition_deadline_ms_.load(std::memory_order_acquire);
                 if (in_transition) {
@@ -497,21 +563,32 @@ void RaopRtp::data_loop() {
                     skipped_silence_in_transition_.store(true, std::memory_order_relaxed);
                     continue;
                 }
+
+                // 💡 曲目尾部静音免疫窗口 (End-of-Track Immunity Window):
+                // 当曲目已知有效时长 (duration > 0) 且剩余时长在 6000ms 以内时，到达的静音帧属于曲目尾部自然淡出留白。
+                // 此时绝对不上报隐式暂停 (emit_state_callback)，UI 保持 PLAYING 直至下一首，杜绝大屏闪烁切到暂停。
+                const int64_t pos_ms = track_position_ms_.load(std::memory_order_relaxed);
+                const bool in_end_of_track_zone = (dur_ms > 0 && (dur_ms - pos_ms) <= 6000);
+
                 uint32_t sil_cnt = continuous_silence_count_.fetch_add(1, std::memory_order_relaxed) + 1;
-                // 门限由 25 帧提高至 180 帧 (~1.44 秒)
-                // 彻底杜绝音乐中的自然休止符、前奏淡入、网络瞬间微抖动误触发 PAUSED 导致的大屏闪烁与焦点抢占
-                if (sil_cnt >= 180 && !is_stream_paused_.load(std::memory_order_relaxed)) {
+                // 门限由 180 帧提高至 375 帧 (~3.0 秒) 以吸收交响乐/流行乐常规艺术休止符；
+                // 尾部保护区提高至 1250 帧 (~10 秒整张专辑放完彻底停顿)，严防曲目尾部自然留白误判为暂停
+                const uint32_t pause_threshold = in_end_of_track_zone ? 1250 : 375;
+
+                if (sil_cnt >= pause_threshold && !is_stream_paused_.load(std::memory_order_relaxed)) {
                     bool expected = false;
                     if (is_stream_paused_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-                        uint64_t pause_ep = AudioEngine::instance().emergency_mute_and_flush(FlushReason::EXPLICIT_PAUSE);
-                        LOGI("⏸️ 检测到连续静音保活帧 (持续 %u 帧 ~1.44s，iPhone 暂停推流)，C++ 立即静音并上报隐式暂停", sil_cnt);
+                        uint64_t pause_ep = AudioEngine::instance().emergency_mute_and_flush(FlushReason::FLUSH_SWITCH);
+                        active_epoch_.store(pause_ep, std::memory_order_release);
+                        LOGI("⏸️ 检测到连续静音保活帧 (持续 %u 帧, 尾部保护区=%d)，C++ 执行快路径 FLUSH_SWITCH 换代静音 (epoch=%llu) 并上报隐式暂停",
+                             sil_cnt, in_end_of_track_zone, static_cast<unsigned long long>(pause_ep));
                         emit_state_callback(true, true, pause_ep);
                     }
                 }
                 if (sil_cnt == 200 || sil_cnt % 1000 == 0) {
                     float vol = current_volume_db_.load(std::memory_order_relaxed);
-                    LOGW("⚠️ ALAC/PCM 连续解码产出全静音帧 (已持续 %u 帧, 当前包长=%zd, 客户端音量=%.2f dB)",
-                         sil_cnt, n, vol);
+                    LOGW("⚠️ ALAC/PCM 连续解码产出全静音帧 (已持续 %u 帧, 当前包长=%zd, 客户端音量=%.2f dB, 尾部保护=%d)",
+                         sil_cnt, n, vol, in_end_of_track_zone);
                 }
                 // 💡 关键保护：静音保活帧绝不推入 JitterBuffer 和 AudioEngine 环形缓冲区！
                 // 避免在暂停期间以 125fps 持续将静音包塞满 RingBuffer 导致高水位丢包与恢复时的吞音延迟
@@ -522,13 +599,23 @@ void RaopRtp::data_loop() {
                     LOGI("🔊 检测到有效音频信号恢复 (结束了连续 %u 帧静音)", prev_sil_cnt);
                 }
 
-                // 💡 关键时钟基准重置与状态同步：
-                // 1. 仅当 TV 端与远端均未主动暂停时，才允许有效音频解除隐式静默暂停并唤醒；
-                // 2. 非暂停状态下若此前有隐式暂停或切歌过渡静音断层，重置 JitterBuffer 并更新 epoch。
-                const bool tv_or_manual_paused =
-                    is_manually_paused_.load(std::memory_order_acquire) || AudioEngine::instance().is_paused();
-                bool was_paused = !tv_or_manual_paused && is_stream_paused_.load(std::memory_order_relaxed);
-                bool had_transition_silence = !tv_or_manual_paused &&
+                // 💡 检查是否属于“FLUSH 后省略 RECORD 直接推流”的流氓场景：
+                // 只有在切歌过渡豁免期内 (in_transition) 收到真实非静音音频帧时，才允许代行解除手动暂停并唤醒引擎；
+                // 若处于暂停态 Seek，客户端只推静音帧或不推流，绝不会进入此分支，完美杜绝 FLUSH 破坏暂停态 (R-2)
+                bool in_transition = get_monotonic_time_ms() < track_transition_deadline_ms_.load(std::memory_order_acquire);
+                if (in_transition && is_manually_paused_.load(std::memory_order_acquire)) {
+                    LOGI("🔄 检测到切歌过渡期非静音音频帧到达 (客户端省略 RECORD)，自动解除手动暂停");
+                    is_manually_paused_.store(false, std::memory_order_release);
+                    AudioEngine::instance().resume_stream();
+                }
+
+                // 💡 关键时钟基准重置与状态同步 (R-1 防御)：
+                // 显式暂停包含两层：远端 RTSP 显式暂停 (is_manually_paused_) 与 TV 本机/系统焦点显式暂停 (AudioEngine::is_paused())
+                // 只有两者均为 false 时，有效音频包方可解除隐式静默并恢复推流，杜绝 TV 暂停期间被在途包反向冲开
+                const bool is_explicitly_user_paused = is_manually_paused_.load(std::memory_order_acquire) ||
+                                                       AudioEngine::instance().is_paused();
+                bool was_paused = !is_explicitly_user_paused && is_stream_paused_.load(std::memory_order_relaxed);
+                bool had_transition_silence = !is_explicitly_user_paused &&
                     skipped_silence_in_transition_.exchange(false, std::memory_order_acq_rel);
 
                 if (was_paused || had_transition_silence) {
@@ -543,16 +630,14 @@ void RaopRtp::data_loop() {
                     uint64_t next_ep = AudioEngine::instance().emergency_mute_and_flush(FlushReason::FLUSH_SWITCH);
                     active_epoch_.store(next_ep, std::memory_order_release);
                     if (was_paused) {
-                        AudioEngine::instance().resume_stream();
                         emit_state_callback(false, false, next_ep);
                     }
                 }
             }
 
-            // 💡 若处于隐式/手动暂停或 TV 端 / 音频焦点显式暂停态，严禁越权调用 resume_stream 并在暂停期间丢弃音频帧防止灌满 RingBuffer
+            // 💡 若处于显式手动暂停态（RTSP PAUSE / TV 本机暂停 / AudioFocus 丢失）或未恢复的流静音态，丢弃音频帧防止灌满 RingBuffer
             if (is_stream_paused_.load(std::memory_order_acquire) ||
-                is_manually_paused_.load(std::memory_order_acquire) ||
-                AudioEngine::instance().is_paused()) {
+                is_explicitly_user_paused) {
                 continue;
             }
 
