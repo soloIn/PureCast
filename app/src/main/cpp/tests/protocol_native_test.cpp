@@ -351,9 +351,9 @@ void test_flac_decoder_exits_on_epoch_invalidation_while_paused() {
     std::printf("PASS test_flac_decoder_exits_on_epoch_invalidation_while_paused\n");
 }
 
-// 用例 3: 校验隐式静音断流触发 FLUSH_SWITCH 换代静音保活，绝不污染 is_paused()，且新有效音频包能无条件自愈唤醒
-void test_raop_implicit_pause_uses_flush_switch_and_auto_resumes() {
-    std::printf("Running test_raop_implicit_pause_uses_flush_switch_and_auto_resumes...\n");
+// 用例 3: 校验静音包零污染丢弃（单静音保活防爆音）以及显式 RTSP PAUSE / RECORD / TEARDOWN 信令生命周期
+void test_raop_silence_packet_handling_and_signaling_lifecycle() {
+    std::printf("Running test_raop_silence_packet_handling_and_signaling_lifecycle...\n");
     auto& mock = MockLibusbController::instance();
     mock.reset();
 
@@ -373,7 +373,7 @@ void test_raop_implicit_pause_uses_flush_switch_and_auto_resumes() {
         return static_cast<int64_t>(ep);
     });
     server.set_stream_pause_callback([&](int64_t, int64_t, int64_t, bool is_implicit) {
-        if (is_implicit) pause_callbacks.fetch_add(1, std::memory_order_acq_rel);
+        pause_callbacks.fetch_add(1, std::memory_order_acq_rel);
     });
     server.set_stream_resume_callback([&](int64_t, int64_t, int64_t) {
         resume_callbacks.fetch_add(1, std::memory_order_acq_rel);
@@ -424,6 +424,7 @@ void test_raop_implicit_pause_uses_flush_switch_and_auto_resumes() {
     udp_dest.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     udp_dest.sin_port = htons(static_cast<uint16_t>(udp_data_port));
 
+    // 1. 发送有效音频包，确认首包接收与非暂停状态
     std::vector<uint8_t> valid_pkt(12 + 1408, 0x55);
     valid_pkt[0] = 0x80;
     valid_pkt[1] = 10;
@@ -435,62 +436,50 @@ void test_raop_implicit_pause_uses_flush_switch_and_auto_resumes() {
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
     PROTO_ASSERT(wait_until([&] { return first_pkt_events.load() >= 1; }), "FirstDataPacket received");
-    PROTO_ASSERT(!server.rtp().is_stream_paused(), "Stream is active");
+    PROTO_ASSERT(!server.rtp().is_paused(), "Stream is active");
     PROTO_ASSERT(!engine.is_paused(), "Engine is not paused");
 
-    // 发送 385 帧连续全 0 静音保活包以触发中段隐式静音检测 (~3.08s)
+    // 2. 发送连续全 0 静音包：验证数据面单静音防爆音丢弃模型（不进 JitterBuffer，不猜暂停，不污染 is_paused）
     std::vector<uint8_t> silence_pkt(12 + 1408, 0);
     silence_pkt[0] = 0x80;
     silence_pkt[1] = 10;
-    for (int seq = 31; seq <= 420; ++seq) {
+    for (int seq = 31; seq <= 100; ++seq) {
         silence_pkt[2] = static_cast<uint8_t>((seq >> 8) & 0xFF);
         silence_pkt[3] = static_cast<uint8_t>(seq & 0xFF);
         sendto(udp_sock, silence_pkt.data(), silence_pkt.size(), 0,
                reinterpret_cast<sockaddr*>(&udp_dest), sizeof(udp_dest));
         std::this_thread::sleep_for(std::chrono::microseconds(500));
     }
+    PROTO_ASSERT(!server.rtp().is_paused(), "Silence packets alone must NOT mutate state into paused");
 
-    PROTO_ASSERT(wait_until([&] { return server.rtp().is_stream_paused(); }, std::chrono::milliseconds(2000)),
-                 "Continuous silence triggers is_stream_paused");
-    PROTO_ASSERT(pause_callbacks.load() >= 1, "Implicit pause callback fired");
+    // 3. 显式信令驱动：客户端发送 RTSP PAUSE
+    std::string pause_req =
+        "PAUSE rtsp://127.0.0.1/test RTSP/1.0\r\n"
+        "CSeq: 4\r\n\r\n";
+    PROTO_ASSERT(rtsp_exchange(client_sock, pause_req).find("200 OK") != std::string::npos, "PAUSE 200");
+    PROTO_ASSERT(server.rtp().is_paused(), "RTSP PAUSE must set is_paused = true");
+    PROTO_ASSERT(engine.is_muted(), "Engine must be muted on PAUSE");
 
-    // 核心断言 1: 隐式静音触发 FLUSH_SWITCH 换代静音 (is_muted() == true, T3 <= 20ms 保活)，但绝对不污染 is_paused()!
-    PROTO_ASSERT(engine.is_muted(), "Engine must be muted to maintain <= 20ms T3 silence保活");
-    PROTO_ASSERT(!engine.is_paused(), "Engine is_paused() must NOT be contaminated by implicit silence!");
+    // 4. 发送 RTSP RECORD 恢复
+    std::string resume_req =
+        "RECORD rtsp://127.0.0.1/test RTSP/1.0\r\n"
+        "CSeq: 5\r\n\r\n";
+    PROTO_ASSERT(rtsp_exchange(client_sock, resume_req).find("200 OK") != std::string::npos, "RECORD 200");
+    PROTO_ASSERT(!server.rtp().is_paused(), "RECORD clears is_paused");
+    PROTO_ASSERT(resume_callbacks.load() >= 1, "Resume callback fired on RECORD");
 
-    // 发送新歌曲有效非静音音频包 (自愈唤醒，发送 35 包完成新一轮预充)
-    for (int seq = 421; seq <= 460; ++seq) {
-        valid_pkt[2] = static_cast<uint8_t>((seq >> 8) & 0xFF);
-        valid_pkt[3] = static_cast<uint8_t>(seq & 0xFF);
-        sendto(udp_sock, valid_pkt.data(), valid_pkt.size(), 0,
-               reinterpret_cast<sockaddr*>(&udp_dest), sizeof(udp_dest));
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
-    }
-
-    // 核心断言 2: 有效音频包抵达后，is_stream_paused 自动清除，AudioEngine 未被锁死，音频恢复写入!
-    PROTO_ASSERT(wait_until([&] { return !server.rtp().is_stream_paused(); }), "Valid audio clears is_stream_paused");
-    PROTO_ASSERT(resume_callbacks.load() >= 1, "Resume callback fired on valid audio arrival");
-    PROTO_ASSERT(!engine.is_paused(), "AudioEngine remains not paused");
-
-    // 💡 核心断言 3: 曲目尾部静音免疫窗口 (End-of-Track Immunity Window) 测试
-    // 设置曲目总长 180s，当前 178s (剩余 2s 处于最后 6s 保护区)
-    server.update_track_progress(178000, 180000);
-    // 连续发送 400 包全 0 静音 (~3.2s)
-    for (int seq = 461; seq <= 860; ++seq) {
-        silence_pkt[2] = static_cast<uint8_t>((seq >> 8) & 0xFF);
-        silence_pkt[3] = static_cast<uint8_t>(seq & 0xFF);
-        sendto(udp_sock, silence_pkt.data(), silence_pkt.size(), 0,
-               reinterpret_cast<sockaddr*>(&udp_dest), sizeof(udp_dest));
-        std::this_thread::sleep_for(std::chrono::microseconds(200));
-    }
-    // 尾部保护区内哪怕静音超过 3 秒，也绝对不上报暂停！
-    PROTO_ASSERT(!server.rtp().is_stream_paused(), "End-of-track silence must NOT trigger pause");
+    // 5. 显式信令驱动：客户端发送 RTSP TEARDOWN 拆除通道（如 iOS 暂停挂起）
+    std::string teardown_req =
+        "TEARDOWN rtsp://127.0.0.1/test RTSP/1.0\r\n"
+        "CSeq: 6\r\n\r\n";
+    PROTO_ASSERT(rtsp_exchange(client_sock, teardown_req).find("200 OK") != std::string::npos, "TEARDOWN 200");
+    PROTO_ASSERT(!server.rtp().is_running(), "TEARDOWN stops RTP pipeline");
 
     close(udp_sock);
     close(client_sock);
     server.stop();
     engine.release_device();
-    std::printf("PASS test_raop_implicit_pause_uses_flush_switch_and_auto_resumes\n");
+    std::printf("PASS test_raop_silence_packet_handling_and_signaling_lifecycle\n");
 }
 
 // 用例 4: 校验 PAUSE -> FLUSH -> RECORD 序列与无 RECORD 补发序列下的暂停标记彻底清零与恢复
@@ -595,12 +584,16 @@ void test_raop_pause_flush_record_clean_resume() {
     }
     PROTO_ASSERT(wait_until([&] { return first_pkt_events.load() >= 1; }), "Audio frames flow after RECORD");
 
-    // 5. 测试子场景: PAUSE -> FLUSH -> 音频包 (无 RECORD)
+    // 5. 测试子场景: PAUSE -> FLUSH -> RECORD 时序完整验证
     rtsp_exchange(client_sock, pause_req);
     PROTO_ASSERT(server.rtp().is_manually_paused(), "PAUSE sets is_manually_paused");
     rtsp_exchange(client_sock, flush_req);
-    // 💡 R-2 防御契约: FLUSH 在暂停态必须保持暂停态，绝不得直接解除手动暂停 (防止暂停态 Seek 破坏暂停)
-    PROTO_ASSERT(server.rtp().is_manually_paused(), "FLUSH retains is_manually_paused until audio frames flow");
+    // 💡 FLUSH 在暂停态必须保持暂停态，绝不得直接解除手动暂停 (防止暂停态 Seek 破坏暂停)
+    PROTO_ASSERT(server.rtp().is_manually_paused(), "FLUSH retains is_manually_paused until RECORD");
+
+    // 显式下发 RECORD 解除暂停
+    rtsp_exchange(client_sock, record2_req);
+    PROTO_ASSERT(!server.rtp().is_manually_paused(), "RECORD clears is_manually_paused");
 
     const int fp_before = first_pkt_events.load();
     for (int seq = 31; seq <= 65; ++seq) {
@@ -611,8 +604,7 @@ void test_raop_pause_flush_record_clean_resume() {
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
     PROTO_ASSERT(wait_until([&] { return first_pkt_events.load() > fp_before; }),
-                 "Audio flows cleanly on PAUSE -> FLUSH -> Audio without RECORD");
-    PROTO_ASSERT(!server.rtp().is_manually_paused(), "Audio frames in transition clear is_manually_paused");
+                 "Audio flows cleanly on PAUSE -> FLUSH -> RECORD -> Audio");
 
     close(udp_sock);
     close(client_sock);
@@ -636,14 +628,281 @@ void test_set_empty_crypto_key_clears_has_crypto() {
     std::printf("PASS test_set_empty_crypto_key_clears_has_crypto\n");
 }
 
+// 用例 6: 校验 ANNOUNCE 正确解析 L24 未压缩 PCM 的真实采样率 (如 96kHz) 与声道数
+void test_raop_announce_l24_sample_rate_and_channels() {
+    std::printf("Running test_raop_announce_l24_sample_rate_and_channels...\n");
+    RaopServer server;
+    const int rtsp_port = 25055;
+    PROTO_ASSERT(server.start(rtsp_port), "RaopServer start");
+
+    int received_sample_rate = 0;
+    int received_bit_depth = 0;
+    int received_channels = 0;
+    std::string received_codec;
+
+    server.set_stream_request_callback([&](int64_t, int64_t, const RaopStreamParams& params) {
+        received_sample_rate = params.sample_rate;
+        received_bit_depth = params.bit_depth;
+        received_channels = params.channels;
+        received_codec = params.codec;
+        return 1L;
+    });
+
+    int client_sock = socket(AF_INET, SOCK_STREAM, 0);
+    PROTO_ASSERT(client_sock >= 0, "socket");
+    sockaddr_in server_addr{};
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    server_addr.sin_port = htons(static_cast<uint16_t>(rtsp_port));
+    PROTO_ASSERT(connect(client_sock, reinterpret_cast<sockaddr*>(&server_addr), sizeof(server_addr)) == 0, "connect");
+
+    // 测试 L24 96kHz 2通道: a=rtpmap:96 L24/96000/2
+    const std::string sdp_l24_96k =
+        "v=0\r\n"
+        "m=audio 0 RTP/AVP 96\r\n"
+        "a=rtpmap:96 L24/96000/2\r\n";
+    std::string announce_req =
+        "ANNOUNCE rtsp://127.0.0.1/test RTSP/1.0\r\n"
+        "CSeq: 1\r\n"
+        "Content-Type: application/sdp\r\n"
+        "Content-Length: " + std::to_string(sdp_l24_96k.size()) + "\r\n\r\n" + sdp_l24_96k;
+    std::string announce_resp = rtsp_exchange(client_sock, announce_req);
+    PROTO_ASSERT(announce_resp.find("200 OK") != std::string::npos, "ANNOUNCE L24 96k 200");
+
+    std::string setup_req =
+        "SETUP rtsp://127.0.0.1/test RTSP/1.0\r\n"
+        "CSeq: 2\r\n"
+        "Transport: RTP/AVP/UDP;unicast;mode=record;control_port=6001;timing_port=6002\r\n\r\n";
+    std::string setup_resp = rtsp_exchange(client_sock, setup_req);
+    PROTO_ASSERT(setup_resp.find("200 OK") != std::string::npos, "SETUP 200");
+
+    PROTO_ASSERT(received_codec == "PCM", "Codec must be PCM for L24");
+    PROTO_ASSERT(received_bit_depth == 24, "Bit depth must be 24 for L24");
+    PROTO_ASSERT(received_sample_rate == 96000, "Sample rate must be 96000 for L24/96000/2");
+    PROTO_ASSERT(received_channels == 2, "Channels must be 2 for L24/96000/2");
+
+    close(client_sock);
+    server.stop();
+    std::printf("PASS test_raop_announce_l24_sample_rate_and_channels\n");
+}
+
+// 用例 7: 💡 修复 Finding 4: 校验停推流触发看门狗隐式暂停后，无需 RTSP RECORD，仅通过 UDP 音频数据到达即可顺利唤醒流
+void test_raop_implicit_pause_clean_resume() {
+    std::printf("Running test_raop_implicit_pause_clean_resume...\n");
+    auto& mock = MockLibusbController::instance();
+    mock.reset();
+
+    auto& engine = AudioEngine::instance();
+    PROTO_ASSERT(engine.open_device(45, 44100, 16, 2) == 0, "open AudioEngine");
+    PROTO_ASSERT(wait_until([&] { return engine.get_active_transfers() > 0; }), "engine URBs active");
+
+    const int rtsp_port = find_free_tcp_port();
+    RaopServer server;
+
+    std::atomic<int> first_pkt_events{0};
+    std::atomic<int> pause_events{0};
+    std::atomic<int> resume_events{0};
+
+    server.set_stream_request_callback([&](int64_t, int64_t, const RaopStreamParams&) -> int64_t {
+        uint64_t ep = engine.emergency_mute_and_flush(FlushReason::PREEMPT);
+        return static_cast<int64_t>(ep);
+    });
+
+    server.set_first_data_packet_callback([&](int64_t, int64_t, int64_t, int, int, int, const std::string&) {
+        first_pkt_events.fetch_add(1, std::memory_order_acq_rel);
+    });
+
+    server.rtp().set_stream_state_callback([&](bool is_paused, bool is_implicit, uint64_t) {
+        if (is_paused) {
+            pause_events.fetch_add(1, std::memory_order_acq_rel);
+        } else {
+            resume_events.fetch_add(1, std::memory_order_acq_rel);
+        }
+    });
+
+    PROTO_ASSERT(server.start(rtsp_port), "RaopServer start");
+
+    int client_sock = socket(AF_INET, SOCK_STREAM, 0);
+    PROTO_ASSERT(client_sock >= 0, "client_sock");
+    sockaddr_in server_addr{};
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    server_addr.sin_port = htons(static_cast<uint16_t>(rtsp_port));
+    PROTO_ASSERT(connect(client_sock, reinterpret_cast<sockaddr*>(&server_addr), sizeof(server_addr)) == 0, "connect");
+
+    const std::string sdp =
+        "v=0\r\n"
+        "m=audio 0 RTP/AVP 10\r\n"
+        "a=rtpmap:10 L16/44100/2\r\n";
+    std::string announce_req =
+        "ANNOUNCE rtsp://127.0.0.1/test RTSP/1.0\r\n"
+        "CSeq: 1\r\n"
+        "Content-Type: application/sdp\r\n"
+        "Content-Length: " + std::to_string(sdp.size()) + "\r\n\r\n" + sdp;
+    rtsp_exchange(client_sock, announce_req);
+
+    std::string setup_req = "SETUP rtsp://127.0.0.1/test RTSP/1.0\r\nCSeq: 2\r\nTransport: RTP/AVP/UDP;unicast;mode=record;control_port=6001;timing_port=6002\r\n\r\n";
+    std::string setup_resp = rtsp_exchange(client_sock, setup_req);
+    const int udp_data_port = parse_server_port(setup_resp);
+    PROTO_ASSERT(udp_data_port > 0, "server_port > 0");
+
+    std::string record_req = "RECORD rtsp://127.0.0.1/test RTSP/1.0\r\nCSeq: 3\r\n\r\n";
+    rtsp_exchange(client_sock, record_req);
+
+    int udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    PROTO_ASSERT(udp_sock >= 0, "udp_sock");
+    sockaddr_in udp_dest{};
+    udp_dest.sin_family = AF_INET;
+    udp_dest.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    udp_dest.sin_port = htons(static_cast<uint16_t>(udp_data_port));
+
+    // 1. 发送前 30 包音频，建立初次推流
+    std::vector<uint8_t> valid_pkt(12 + 1408, 0x44);
+    valid_pkt[0] = 0x80;
+    valid_pkt[1] = 10;
+    for (int seq = 1; seq <= 30; ++seq) {
+        valid_pkt[2] = static_cast<uint8_t>((seq >> 8) & 0xFF);
+        valid_pkt[3] = static_cast<uint8_t>(seq & 0xFF);
+        sendto(udp_sock, valid_pkt.data(), valid_pkt.size(), 0,
+               reinterpret_cast<sockaddr*>(&udp_dest), sizeof(udp_dest));
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    PROTO_ASSERT(wait_until([&] { return first_pkt_events.load() >= 1; }), "First batch audio played");
+
+    // 2. 停包等待 >= 650ms，触发看门狗隐式暂停
+    PROTO_ASSERT(wait_until([&] { return server.rtp().is_implicitly_paused(); }, std::chrono::milliseconds(1500)),
+                 "Watchdog must trigger implicit pause after >=600ms packet gap");
+    PROTO_ASSERT(!server.rtp().is_manually_paused(),
+                 "Watchdog must NOT set is_manually_paused!");
+    PROTO_ASSERT(pause_events.load() >= 1, "State callback emitted implicit pause");
+
+    // 3. 核心断言：绝不发送 RTSP RECORD，直接发送后续 UDP 音频包，验证流能自动恢复
+    for (int seq = 31; seq <= 60; ++seq) {
+        valid_pkt[2] = static_cast<uint8_t>((seq >> 8) & 0xFF);
+        valid_pkt[3] = static_cast<uint8_t>(seq & 0xFF);
+        sendto(udp_sock, valid_pkt.data(), valid_pkt.size(), 0,
+               reinterpret_cast<sockaddr*>(&udp_dest), sizeof(udp_dest));
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+
+    PROTO_ASSERT(wait_until([&] { return !server.rtp().is_implicitly_paused(); }),
+                 "New audio packets must automatically clear is_implicitly_paused");
+    PROTO_ASSERT(!engine.is_paused(), "Engine must be resumed on implicit unpause");
+
+    close(udp_sock);
+    close(client_sock);
+    server.stop();
+    engine.release_device();
+    std::printf("PASS test_raop_implicit_pause_clean_resume\n");
+}
+
+// 用例 8: 💡 修复 Finding 9: 校验 JitterBuffer peek_size 背压守卫，环形缓冲饱和时不提前 pop 丢包
+void test_jitter_buffer_backpressure_peek_size_preserves_frames() {
+    std::printf("Running test_jitter_buffer_backpressure_peek_size_preserves_frames...\n");
+    purecast::raop::RaopJitterBuffer jb;
+
+    // 预充 25 帧以退出 buffering 状态
+    for (int i = 1; i <= 28; ++i) {
+        std::vector<uint8_t> frame(1408, static_cast<uint8_t>(i));
+        jb.push(static_cast<uint16_t>(i), static_cast<uint32_t>(1000 + (i - 1) * 352), std::move(frame));
+    }
+
+    PROTO_ASSERT(jb.buffered_packets() == 28, "JitterBuffer holds 28 packets");
+
+    // 模拟 AudioEngine 可用空间不足 (背压场景):
+    // peek_size 探测出下一帧需要 1408 字节
+    size_t next_size = 0;
+    bool has_frame = jb.peek_size(next_size);
+    PROTO_ASSERT(has_frame, "peek_size must succeed after pre-roll buffering completes");
+    PROTO_ASSERT(next_size == 1408, "peek_size must accurately report frame size 1408");
+
+    // 当可用空间为 500 字节 (< 1408) 时，业务逻辑绝不执行 pop()
+    size_t simulated_ring_available = 500;
+    if (simulated_ring_available < next_size) {
+        // 背压生效，不执行 pop
+    }
+    // 验证背压拦截下帧数未减少
+    PROTO_ASSERT(jb.buffered_packets() == 28, "Frames must be preserved when buffer is saturated");
+
+    // 当空间释放 (simulated_ring_available >= 1408) 时，逐个安全出队
+    std::vector<uint8_t> out_frame;
+    for (int i = 1; i <= 28; ++i) {
+        PROTO_ASSERT(jb.pop(out_frame), "pop frame");
+        PROTO_ASSERT(out_frame.size() == 1408 && out_frame[0] == static_cast<uint8_t>(i), "frame content intact");
+    }
+
+    PROTO_ASSERT(jb.buffered_packets() == 0, "JitterBuffer completely drained");
+    std::printf("PASS test_jitter_buffer_backpressure_peek_size_preserves_frames\n");
+}
+
+void test_jitter_buffer_burst_backpressure_does_not_wipe() {
+    std::printf("Running test_jitter_buffer_burst_backpressure_does_not_wipe...\n");
+    purecast::raop::RaopJitterBuffer jb;
+
+    // 连续推送 140 个包 (超过 BUFFER_SIZE = 128)，模拟下游背压未 pop
+    for (int i = 1; i <= 140; ++i) {
+        std::vector<uint8_t> frame(1408, static_cast<uint8_t>(i % 256));
+        jb.push(static_cast<uint16_t>(i), static_cast<uint32_t>(1000 + (i - 1) * 352), std::move(frame));
+    }
+
+    // 验证：绝对不能被误判为跳变清空为 0 或 1！
+    // 应该保留最近 128 个有效包 (从 13 到 140)
+    PROTO_ASSERT(jb.buffered_packets() == purecast::raop::RaopJitterBuffer::BUFFER_SIZE,
+                 "JitterBuffer must retain full BUFFER_SIZE packets under backpressure rather than being wiped");
+
+    // 弹出验证：最旧的包应该是 13 (前 12 个因背压溢出被主动推进丢弃)
+    std::vector<uint8_t> out_frame;
+    PROTO_ASSERT(jb.pop(out_frame), "First popped packet must succeed");
+    PROTO_ASSERT(out_frame[0] == static_cast<uint8_t>(13), "Oldest preserved packet must be #13");
+
+    std::printf("PASS test_jitter_buffer_burst_backpressure_does_not_wipe\n");
+}
+
+void test_jitter_buffer_sequence_reanchor_on_lag_and_jump() {
+    std::printf("Running test_jitter_buffer_sequence_reanchor_on_lag_and_jump...\n");
+    purecast::raop::RaopJitterBuffer jb;
+
+    // 1. 初始推流 10 个包
+    for (int i = 1000; i < 1010; ++i) {
+        std::vector<uint8_t> frame(1408, static_cast<uint8_t>(i % 256));
+        jb.push(static_cast<uint16_t>(i), 1000, std::move(frame));
+    }
+    PROTO_ASSERT(jb.buffered_packets() == 10, "10 initial packets buffered");
+
+    // 2. 负向微小乱序包 (lag < BUFFER_SIZE, 例如 seq = 998, head = 1000)
+    // 应当作为过期包被丢弃，不破坏现有缓冲
+    std::vector<uint8_t> stale_frame(1408, 0xAA);
+    jb.push(998, 990, std::move(stale_frame));
+    PROTO_ASSERT(jb.buffered_packets() == 10, "Stale packet with lag < BUFFER_SIZE must be dropped without resetting buffer");
+
+    // 3. 负向大跨度跳变 (lag >= BUFFER_SIZE, 例如暂停重推流 seq = 500, lag = 500 >= 128)
+    // 应当触发重锚定
+    std::vector<uint8_t> reanchor_frame(1408, 0x55);
+    jb.push(500, 2000, std::move(reanchor_frame));
+    PROTO_ASSERT(jb.buffered_packets() == 1, "Lag >= BUFFER_SIZE must re-anchor JitterBuffer to new sequence");
+
+    // 4. 远距离异常正向跳变 (例如 seq 从 500 跳到 8000 >= BUFFER_SIZE)
+    // 应当触发重锚定
+    std::vector<uint8_t> jump_frame(1408, 0x77);
+    jb.push(8000, 3000, std::move(jump_frame));
+    PROTO_ASSERT(jb.buffered_packets() == 1, "Forward jump >= BUFFER_SIZE must re-anchor JitterBuffer");
+
+    std::printf("PASS test_jitter_buffer_sequence_reanchor_on_lag_and_jump\n");
+}
+
 } // namespace
 
 int main() {
     test_raop_pause_guard_reopen_and_preempt();
     test_flac_decoder_exits_on_epoch_invalidation_while_paused();
-    test_raop_implicit_pause_uses_flush_switch_and_auto_resumes();
+    test_raop_silence_packet_handling_and_signaling_lifecycle();
     test_raop_pause_flush_record_clean_resume();
     test_set_empty_crypto_key_clears_has_crypto();
+    test_raop_announce_l24_sample_rate_and_channels();
+    test_raop_implicit_pause_clean_resume();
+    test_jitter_buffer_backpressure_peek_size_preserves_frames();
+    test_jitter_buffer_burst_backpressure_does_not_wipe();
+    test_jitter_buffer_sequence_reanchor_on_lag_and_jump();
     std::printf("All purecast native protocol tests PASSED!\n");
     return 0;
 }

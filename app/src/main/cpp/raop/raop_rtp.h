@@ -155,13 +155,6 @@ public:
     void mark_paused_manually(bool paused, bool emit_callback = true);
 
     /**
-     * 💡 标记切歌或元数据过渡期（在若干毫秒内豁免静音暂停判定，防止切歌过渡期状态机颠簸）
-     */
-    void notify_track_transition(uint32_t grace_period_ms = 2500) {
-        track_transition_deadline_ms_.store(get_monotonic_time_ms() + grace_period_ms, std::memory_order_release);
-    }
-
-    /**
      * 💡 设置实时音量分贝 (单位 dB, -144.0 为静音, 0.0 为最大)
      */
     void set_volume(float vol_db) {
@@ -174,23 +167,40 @@ public:
     /**
      * 💡 状态只读探测接口 (供协议测试与状态审计使用)
      */
+    bool is_paused() const {
+        return is_manually_paused_.load(std::memory_order_acquire) ||
+               is_implicitly_paused_.load(std::memory_order_acquire);
+    }
     bool is_stream_paused() const {
-        return is_stream_paused_.load(std::memory_order_acquire);
+        return is_paused();
     }
     bool is_manually_paused() const {
         return is_manually_paused_.load(std::memory_order_acquire);
     }
+    bool is_implicitly_paused() const {
+        return is_implicitly_paused_.load(std::memory_order_acquire);
+    }
     bool has_crypto() const {
         return has_crypto_.load(std::memory_order_acquire);
     }
+    size_t buffered_jitter_packets() const {
+        return jitter_buffer_.buffered_packets();
+    }
 
     /**
-     * 💡 更新当前曲目播放进度与总时长，用于曲目尾部静音免疫窗口计算
+     * 💡 尝试排空 JitterBuffer 中堆积的就绪音频帧至 AudioEngine (防突发推流填满后暂停导致的卡滞欠载)
+     */
+    void drain_jitter_buffer();
+
+    /**
+     * 💡 更新当前曲目播放进度与总时长
      */
     void update_track_progress(int64_t position_ms, int64_t duration_ms) {
         if (duration_ms > 0) {
             track_duration_ms_.store(duration_ms, std::memory_order_release);
-            track_position_ms_.store(std::max<int64_t>(0, position_ms), std::memory_order_release);
+            if (position_ms >= 0) {
+                track_position_ms_.store(position_ms, std::memory_order_release);
+            }
         } else if (duration_ms < 0) {
             track_duration_ms_.store(0, std::memory_order_release);
             track_position_ms_.store(0, std::memory_order_release);
@@ -210,7 +220,9 @@ private:
     void ctrl_loop();
     void timing_loop();
     void watchdog_loop();
+    void drain_jitter_buffer_locked();
     void emit_state_callback(bool is_paused, bool is_implicit, uint64_t epoch);
+    void process_audio_packet(const uint8_t* data, ssize_t len, uint8_t payload_type);
 
     int bind_udp_socket(int preferred_port, int& bound_port);
     static uint64_t get_ntp_timestamp();
@@ -241,6 +253,9 @@ private:
     std::atomic<uint8_t> audio_payload_type_{96};
     alac::AlacDecoder alac_decoder_;
     RaopJitterBuffer jitter_buffer_;
+    std::mutex audio_packet_mutex_;
+    // 💡 修复 Finding 13: 预分配解码 PCM 缓冲区，杜绝热路径每音频包 16KB 堆分配
+    std::vector<uint8_t> decode_pcm_buf_;
 
     // 💡 客户端控制端点与重传状态维护
     mutable std::mutex ctrl_addr_mutex_;
@@ -250,7 +265,7 @@ private:
     uint16_t last_data_seq_{0};
     bool first_data_seq_{true};
 
-    // 💡 音频推流无数据看门狗与首包状态监测
+    // 💡 音频推流状态与首包状态监测 (单静音保活防爆音，控制面由显式信令 100% 驱动)
     std::mutex state_mutex_;
     StreamStateCallback state_cb_{nullptr};
     FirstDataPacketCallback first_packet_cb_{nullptr};
@@ -262,12 +277,10 @@ private:
     std::atomic<uint64_t> active_epoch_{1ULL};
     std::atomic<uint64_t> emitted_first_epoch_{0ULL};
     std::atomic<uint64_t> last_audio_packet_time_ms_{0};
-    std::atomic<bool> is_stream_paused_{false};
     std::atomic<bool> is_manually_paused_{false};
+    // 💡 修复 Finding 2: 解耦隐式无数据饥饿暂停与显式手动暂停
+    std::atomic<bool> is_implicitly_paused_{false};
     std::atomic<float> current_volume_db_{0.0f};
-    std::atomic<uint32_t> continuous_silence_count_{0};
-    std::atomic<uint64_t> track_transition_deadline_ms_{0};
-    std::atomic<bool> skipped_silence_in_transition_{false};
     std::atomic<int64_t> track_duration_ms_{0};
     std::atomic<int64_t> track_position_ms_{0};
 };

@@ -70,6 +70,9 @@ public:
     void set_flush_callback(FlushCallback cb) { flush_cb_ = std::move(cb); }
 
     void set_decrypted_aes_key(const std::vector<uint8_t>& key, const std::vector<uint8_t>& iv) {
+        std::lock_guard<std::mutex> lock(crypto_cache_mutex_);
+        cached_aes_key_ = key;
+        cached_aes_iv_ = iv;
         rtp_.set_crypto_key(key, iv);
     }
 
@@ -101,11 +104,13 @@ private:
 
     RaopRtp rtp_;
     RaopStreamParams current_params_{};
+    std::mutex crypto_cache_mutex_;
+    std::vector<uint8_t> cached_aes_key_;
+    std::vector<uint8_t> cached_aes_iv_;
     std::atomic<float> current_volume_db_{0.0f};
     std::atomic<int64_t> active_session_id_{0};
     std::atomic<int64_t> next_session_id_{0};
     std::atomic<int64_t> event_sequence_{0};
-    std::atomic<bool> has_paused_without_flush_{false};
 
     StreamRequestCallback stream_request_cb_{nullptr};
     StreamStopCallback stream_stop_cb_{nullptr};

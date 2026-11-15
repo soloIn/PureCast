@@ -74,18 +74,20 @@ internal fun resolveHardwarePillHint(hardwareState: HardwarePipelineState): Hard
 fun SignalPathPill(
     audioState: AudioPathState,
     modifier: Modifier = Modifier,
-    hardwareState: HardwarePipelineState = HardwarePipelineState.DISCONNECTED
+    hardwareState: HardwarePipelineState = HardwarePipelineState.DISCONNECTED,
+    isIdle: Boolean = false,
+    hasDarkBackground: Boolean = true
 ) {
     val isExclusive = audioState.isDacConnected && audioState.isExclusive
-    val isPlayingStream = audioState.protocol != StreamProtocol.NONE && audioState.sampleRate > 0
+    // 💡 必须在非空闲且处于活跃推流时才展示音轨规格，空闲待机期间统一展示待机就绪状态，防止 10s 待机窗口期状态割裂
+    val isPlayingStream = !isIdle && audioState.protocol != StreamProtocol.NONE && audioState.sampleRate > 0
     val hardwareHint = resolveHardwarePillHint(hardwareState)
-    val isDark = AppPalette.isDark
 
     // 设备名着色：独占为亮绿，未独占为亮红，过渡提示为琥珀黄，待机为自适应次级灰
     val deviceNameColor = when {
         hardwareHint?.kind == HardwarePillHintKind.RECONFIGURING -> Color(0xFFFFD60A)
         hardwareHint?.kind == HardwarePillHintKind.PERMISSION_PENDING -> Color(0xFFFF9F0A)
-        !isPlayingStream -> if (isDark) Color(0xFF8E8E93) else Color(0xFF6E6E73)
+        !isPlayingStream -> if (hasDarkBackground) Color(0xFF8E8E93) else Color(0xFF6E6E73)
         isExclusive -> Color(0xFF30D158) // Apple Green
         else -> Color(0xFFFF453A) // Apple Red
     }
@@ -94,17 +96,17 @@ fun SignalPathPill(
     val dotColor = when {
         hardwareHint?.kind == HardwarePillHintKind.RECONFIGURING -> Color(0xFFFFD60A)
         hardwareHint?.kind == HardwarePillHintKind.PERMISSION_PENDING -> Color(0xFFFF9F0A)
-        !isPlayingStream -> if (isDark) Color(0xFF636366) else Color(0xFF8E8E93)
+        !isPlayingStream -> if (hasDarkBackground) Color(0xFF636366) else Color(0xFF8E8E93)
         isExclusive -> Color(0xFF30D158)
         else -> Color(0xFFFF453A)
     }
 
     // 格式化文本：协议 · 音频格式 | 设备名称 (附温和硬件过渡提示)
-    val pillAnnotatedText = remember(audioState, hardwareHint, isPlayingStream, isDark) {
+    val pillAnnotatedText = remember(audioState, hardwareHint, isPlayingStream, hasDarkBackground) {
         buildAnnotatedString {
             if (!isPlayingStream) {
-                val statusTextColor = if (isDark) Color(0xFFD1D1D6) else Color(0xFF3C3C43)
-                val dividerColor = if (isDark) Color(0xFF636366) else Color(0xFFAEB0B5)
+                val statusTextColor = if (hasDarkBackground) Color(0xFFD1D1D6) else Color(0xFF3C3C43)
+                val dividerColor = if (hasDarkBackground) Color(0xFF636366) else Color(0xFFAEB0B5)
 
                 withStyle(SpanStyle(color = statusTextColor, fontWeight = FontWeight.Normal)) {
                     append("就绪 · 等待推流")
@@ -138,11 +140,14 @@ fun SignalPathPill(
                 val sampleRateText = formatSampleRate(audioState.sampleRate)
                 val formatSpec = "$sampleRateText/${audioState.bitDepth}bit"
 
-                withStyle(SpanStyle(color = Color(0xFFE5E5EA), fontWeight = FontWeight.Medium)) {
+                val specColor = if (hasDarkBackground) Color(0xFFE5E5EA) else Color(0xFF1C1C1E)
+                val dividerColor = if (hasDarkBackground) Color(0xFF636366) else Color(0xFFAEB0B5)
+
+                withStyle(SpanStyle(color = specColor, fontWeight = FontWeight.Medium)) {
                     append("$protocolName · $codecName · $formatSpec")
                 }
 
-                withStyle(SpanStyle(color = Color(0xFF636366))) {
+                withStyle(SpanStyle(color = dividerColor)) {
                     append("  |  ")
                 }
 
@@ -159,16 +164,14 @@ fun SignalPathPill(
         }
     }
 
-    // 胶囊背景与边框色彩（推流时为半透黑底，待机时自适应深浅）
+    // 胶囊背景与边框色彩（随主屏幕深浅背景动态自适应，杜绝浅色模式下突兀黑底割裂）
     val pillBg = when {
-        isPlayingStream -> Color(0xFF161823).copy(alpha = 0.85f)
-        isDark -> Color(0xFF161823).copy(alpha = 0.85f)
-        else -> Color.White
+        hasDarkBackground -> Color(0xFF161823).copy(alpha = 0.85f)
+        else -> Color.White.copy(alpha = 0.92f)
     }
     val pillBorderColor = when {
-        isPlayingStream -> Color(0xFF2C2F3E)
-        isDark -> Color(0xFF2C2F3E)
-        else -> Color(0xFFE5E5EA)
+        hasDarkBackground -> Color(0xFF2C2F3E)
+        else -> Color(0xFFD1D1D6)
     }
 
     Row(

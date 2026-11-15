@@ -63,8 +63,12 @@ A reverse-control workflow over Apple Digital Audio Control Protocol where a TV 
 *Aliases: DACP 反控唤醒, 遥控反向建流*
 
 ### Silence Keep-Alive Frame
-A continuous stream of fixed 44-byte ALAC packets (32-byte payload, decoding to 1408 bytes of zeros) transmitted at 125 fps by iOS CoreAudio during AirPlay 1 pause states or un-focused audio sessions to preserve UDP port NAT bindings and RTP clock synchronization without breaking the session. Receivers must discard these frames rather than queuing them into playback ring buffers to prevent buffer overrun and resume latency.
+A continuous stream of fixed 44-byte ALAC packets (32-byte payload, decoding to 1408 bytes of zeros) transmitted at 125 fps by iOS CoreAudio during AirPlay 1 pause states or un-focused audio sessions to preserve UDP port NAT bindings and RTP clock synchronization without breaking the session. Receivers queue these frames normally into the jitter buffer to preserve strictly monotonic RTP sequence numbers and UAC2 clock pacing, while the playback state machine is decoupled and driven by explicit RTSP signaling (FLUSH, TEARDOWN soft-suspend, and RECORD resume).
 *Aliases: 静音保活帧, 协议心跳帧*
+
+### Jitter Buffer Backpressure Sliding
+A flow control degradation pattern in network audio jitter buffers where, under downstream buffer backpressure, the buffer discards the oldest audio packets to advance `head_seq_` and retain the newest contiguous audio window, preventing sudden buffer purges, USB DAC underruns, and physical audio pops.
+*Aliases: 抖动缓冲背压滑动, 最旧帧平滑淘汰*
 
 ### Sequence Number Re-anchoring
 A resynchronization procedure in real-time UDP audio receivers where, following an extended pause exceeding the 16-bit sequence difference boundary ($2^{15} = 32768$ packets), the jitter buffer is explicitly reset upon the arrival of the first non-silent audio packet to establish a new monotonic sequence baseline (`first_packet_ = true`), preventing signed integer overflow (`int16_t` wrapping negative) from discarding valid incoming stream packets as out-of-order drops.

@@ -17,6 +17,7 @@ import com.solo.purecast.core.session.TrackSwitchEvent
 import com.solo.purecast.model.DurationState
 import com.solo.purecast.model.SeekCapability
 import com.solo.purecast.model.StreamProtocol
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -228,5 +229,58 @@ class AirPlayServerEventDispatchTest {
         val subsequentSwitch = events.last().payload as TrackSwitchEvent
         assertEquals(14L, subsequentSwitch.newEpoch)
         assertFalse(subsequentSwitch.isSeekFlush)
+    }
+
+    @Test
+    fun orphanCoverArrivingBeforeDmapIsInheritedByNewTrackWithoutDisappearing() {
+        var mockClock = 1000L
+        val events = mutableListOf<SessionEventEnvelope<SessionEventPayload>>()
+        val globalSessionGen = AtomicLong(100L)
+        val seqGen = AtomicLong(0L)
+        val dispatcher = AirPlayNativeEventDispatcher(
+            dispatchEvent = { events += it },
+            allocateSessionId = { globalSessionGen.incrementAndGet() },
+            allocateSequence = { seqGen.incrementAndGet() },
+            onAcquireHardwareForStream = { _, _, _, _ -> 11L },
+            onDecryptAndInjectCryptoKey = { _, _ -> },
+            onUpdateDacpTarget = { _, _, _, _ -> },
+            onSolveChallenge = { "mock-resp" },
+            clockMs = { mockClock }
+        )
+
+        // 1. 初始化建连，生成初始代数
+        dispatcher.onStreamRequested(1L, 1L, 44100, 16, 2, "ALAC", "10.0.0.2", "", "", "", "", 0)
+        val setupEvent = events.last().payload as StreamSetupEvent
+        val initialGen = setupEvent.trackGeneration ?: 1L
+
+        // 2. 模拟 iOS CSeq 11: 孤立封面先于文本报文到达 (image/jpeg 报文无 title/artist)
+        val testCover = byteArrayOf(11, 22, 33, 44)
+        mockClock = 1010L
+        dispatcher.onMetadataReceived(1L, 2L, "", "", "", 0L, testCover)
+
+        val patchOrphan = events.last().payload as MetadataPatchEvent
+        assertEquals(initialGen, patchOrphan.trackGeneration)
+        assertArrayEquals(testCover, patchOrphan.coverBytes)
+
+        // 3. 模拟 25ms 后 iOS CSeq 13: DMAP 文本元数据到达，无封面
+        mockClock = 1035L
+        dispatcher.onMetadataReceived(1L, 3L, "离别的车站", "赵薇", "z", 357_253L, null)
+
+        val boundary = events[events.size - 2].payload as TrackBoundaryEvent
+        val patchTrack = events.last().payload as MetadataPatchEvent
+
+        // 验证：新一代曲目必须完整继承前序 25ms 到达的孤立封面，绝不能为 null
+        assertTrue(boundary.trackGeneration > initialGen)
+        assertEquals(boundary.trackGeneration, patchTrack.trackGeneration)
+        assertEquals("离别的车站", patchTrack.title)
+        assertEquals("赵薇", patchTrack.artist)
+        assertArrayEquals(testCover, patchTrack.coverBytes)
+
+        // 4. 验证后续切歌到真正无封面歌曲时，孤立封面已在消费后被清空，新歌不会误继承
+        mockClock = 5000L
+        dispatcher.onMetadataReceived(1L, 4L, "无封面新歌", "佚名", "", 120_000L, null)
+        val patchNoCover = events.last().payload as MetadataPatchEvent
+        assertEquals("无封面新歌", patchNoCover.title)
+        assertNull("孤立封面消费后必须清空，后续无封面歌曲严禁误继承旧封面", patchNoCover.coverBytes)
     }
 }

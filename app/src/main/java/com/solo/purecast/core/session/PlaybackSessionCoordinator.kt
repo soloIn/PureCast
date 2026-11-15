@@ -304,14 +304,12 @@ class PlaybackSessionCoordinator(
 
             EventOrigin.SERVICE, EventOrigin.USER_ACTION -> {
                 val activeSid = context.snapshot.sessionId
-                val isSessionBoundControl = envelope.payload is RemoteSkipNextEvent ||
-                    envelope.payload is RemoteCommandTimeoutEvent ||
-                    envelope.payload is DebouncePauseTimeoutEvent ||
-                    envelope.payload is SuspendTimeoutEvent
-                if (isSessionBoundControl && envelope.sessionId != 0L && envelope.sessionId != activeSid) {
+                // 💡 修复 Finding 2: SERVICE 与 USER_ACTION 事件携带具体会话 ID 时必须严格绑定当前活跃会话，
+                // 若 sessionId != 0L 且不等于当前 activeSid，说明属于已抢占、已销毁或前序旧会话，坚决丢弃，杜绝跨会话状态污染！
+                if (envelope.sessionId != 0L && envelope.sessionId != activeSid) {
                     Logger.service.d(
                         TAG,
-                        "丢弃失效会话的定时/交互事件: sid=${envelope.sessionId}, active=$activeSid"
+                        "丢弃非活跃/已过期会话的系统与交互事件: origin=${envelope.origin}, sid=${envelope.sessionId}, active=$activeSid, payload=${envelope.payload::class.simpleName}"
                     )
                     false
                 } else {

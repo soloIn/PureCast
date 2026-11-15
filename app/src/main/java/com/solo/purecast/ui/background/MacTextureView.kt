@@ -234,6 +234,8 @@ internal class MacTextureView(
                             Logger.ui.w("MacTextureView", "EGL 上下文丢失，重建中...")
                             destroyEgl()
                             createEgl()
+                            // 💡 修复：重建 EGL 上下文后立即 post 渲染一帧，消除在暂停态下因缺乏 VSYNC 驱动而黑屏
+                            handler.post(frame)
                         } else {
                             error("EGL 交换缓冲失败: 0x${eglError.toString(16)}")
                         }
@@ -265,8 +267,12 @@ internal class MacTextureView(
                 intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE), 0
             )
             check(eglContext != EGL14.EGL_NO_CONTEXT) { "EGLContext 创建失败" }
+            // 💡 修复 Finding 2: setDefaultBufferSize 必须严格在 Surface(texture) 创建之前调用，
+            // 确保底层 BufferQueue 原生图层在首次与 Surface 绑定时即持有准确分辨率，杜绝首帧黑闪与拉伸错位
+            val initialSize = backgroundOutputSize(surfaceWidth, surfaceHeight, renderState.quality)
+            texture.setDefaultBufferSize(initialSize.width, initialSize.height)
             window = Surface(texture)
-            ensureOutputSurface(backgroundOutputSize(surfaceWidth, surfaceHeight, renderState.quality))
+            ensureOutputSurface(initialSize)
             renderer = MacRenderer(context, clock)
             renderer!!.initialize()
             uploaded = null

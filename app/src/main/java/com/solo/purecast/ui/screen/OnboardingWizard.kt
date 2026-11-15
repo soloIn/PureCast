@@ -19,6 +19,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -26,6 +27,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusProperties
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
@@ -34,11 +38,13 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.tv.material3.Button
+import com.solo.purecast.util.Logger
 import androidx.tv.material3.ButtonDefaults
 import androidx.tv.material3.ExperimentalTvMaterial3Api
 import androidx.tv.material3.MaterialTheme
 import androidx.tv.material3.Text
 import com.solo.purecast.util.PermissionHelper
+import kotlinx.coroutines.delay
 
 /**
  * 💡 PureCast 电视专属开机权限与自检引导向导 (OnboardingWizard)
@@ -49,7 +55,7 @@ import com.solo.purecast.util.PermissionHelper
  * 3. 支持生命周期感知：当用户通过遥控器跳转系统设置页并返回时，自动重新自检并更新四项状态。
  * 4. 健壮的容错机制：针对部分电视盒子阉割系统设置界面的情况，由 PermissionHelper 施加 try-catch 保护。
  */
-@OptIn(ExperimentalTvMaterial3Api::class)
+@OptIn(ExperimentalTvMaterial3Api::class, androidx.compose.ui.ExperimentalComposeUiApi::class)
 @Composable
 fun OnboardingWizard(
     onDismiss: () -> Unit,
@@ -79,10 +85,23 @@ fun OnboardingWizard(
         }
     }
 
+    // 💡 弹窗默认获焦 Requester，进入时自动夺取焦点，避免底层 MainTvScreen 抢焦或失焦
+    val primaryButtonFocusRequester = remember { FocusRequester() }
+
+    LaunchedEffect(Unit) {
+        delay(120)
+        try {
+            primaryButtonFocusRequester.requestFocus()
+        } catch (e: Exception) {
+            Logger.ui.w("OnboardingWizard", "引导层请求主操作按钮焦点异常", e)
+        }
+    }
+
     Box(
         modifier = modifier
             .fillMaxSize()
             .background(Color.Black.copy(alpha = 0.82f))
+            .focusProperties { exit = { FocusRequester.Cancel } }
             .padding(horizontal = 48.dp, vertical = 24.dp),
         contentAlignment = Alignment.Center
     ) {
@@ -198,7 +217,9 @@ fun OnboardingWizard(
                 // 主操作按钮：完成并进入
                 Button(
                     onClick = onDismiss,
-                    modifier = Modifier.weight(1f),
+                    modifier = Modifier
+                        .weight(1f)
+                        .focusRequester(primaryButtonFocusRequester),
                     scale = ButtonDefaults.scale(scale = 1.0f, focusedScale = 1.05f),
                     colors = ButtonDefaults.colors(
                         containerColor = Color(0xFF0A84FF),
@@ -236,7 +257,7 @@ fun OnboardingWizard(
 /**
  * 单项权限自检卡片组件
  */
-@OptIn(ExperimentalTvMaterial3Api::class)
+@OptIn(ExperimentalTvMaterial3Api::class, androidx.compose.ui.ExperimentalComposeUiApi::class)
 @Composable
 private fun PermissionItemCard(
     title: String,

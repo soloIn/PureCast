@@ -130,6 +130,16 @@ int libusb_set_option(libusb_context* ctx, int option, ...);
 int libusb_init(libusb_context** ctx);
 void libusb_exit(libusb_context* ctx);
 
+enum libusb_speed {
+    LIBUSB_SPEED_UNKNOWN = 0,
+    LIBUSB_SPEED_LOW = 1,
+    LIBUSB_SPEED_FULL = 2,
+    LIBUSB_SPEED_HIGH = 3,
+    LIBUSB_SPEED_SUPER = 4,
+    LIBUSB_SPEED_SUPER_PLUS = 5,
+};
+
+int libusb_get_device_speed(libusb_device* dev);
 int libusb_wrap_sys_device(libusb_context* ctx, intptr_t sys_dev, libusb_device_handle** dev_handle);
 libusb_device* libusb_get_device(libusb_device_handle* dev_handle);
 void libusb_close(libusb_device_handle* dev_handle);

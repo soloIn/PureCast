@@ -291,11 +291,16 @@ data class PlayerSessionSnapshot(
     val progressDurationMs: Long = 0L,
     val errors: Map<ErrorCode, PlaybackError> = emptyMap(),
     val uiProtectionActive: Boolean = false,
-    val volumePercent: Int = 100
+    val volumePercent: Int = 100,
+    val transitionOriginState: BusinessSessionState? = null
 ) {
-    /** 💡 唯一派生的 UI/MediaSession 状态，严格杜绝外部覆写 */
+    /** 💡 唯一派生的 UI/MediaSession 状态，严格杜绝外部覆写；若从 PAUSED 切歌进入 TRANSITIONING 则对外保持 PAUSED 避免跳变 */
     val playbackStatus: PlaybackStatus
-        get() = businessState.toPlaybackStatus()
+        get() = if (businessState == BusinessSessionState.TRANSITIONING && transitionOriginState == BusinessSessionState.PAUSED) {
+            PlaybackStatus.PAUSED
+        } else {
+            businessState.toPlaybackStatus()
+        }
 
     /** 💡 按固定优先级提取当前最高优先级错误（与 ErrorCode 枚举声明序一致） */
     val highestPriorityError: PlaybackError?

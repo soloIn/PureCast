@@ -107,6 +107,8 @@ class UpnpRendererServer(
     private var activeUpnpSessionId: Long = 0L
     private var trackGenerationCounter: Long = 0L
     private var sessionSetupDispatched: Boolean = false
+    @Volatile
+    private var isLocallyPaused: Boolean = false
 
     @Volatile
     private var currentUri: String = ""
@@ -198,6 +200,7 @@ class UpnpRendererServer(
         val reason = if (isPreempted) FlushReason.PREEMPT else FlushReason.STOP_OR_TEARDOWN
         val stoppedEpoch = fastPath.emergencyMuteAndFlush(reason)
         synchronized(sessionStateLock) {
+            isLocallyPaused = false
             val activeSnap = snapshotProvider()
             val canEmitStop = activeUpnpSessionId != 0L && sessionSetupDispatched &&
                 (activeSnap.sessionId == activeUpnpSessionId || (!isPreempted && (activeSnap.sessionId == 0L || activeSnap.activeProtocol == StreamProtocol.UPNP_DLNA)))
@@ -345,7 +348,7 @@ class UpnpRendererServer(
                 acquiredEpoch
             },
             onFirstDataPacket = { epoch, spec ->
-                synchronized(sessionStateLock) {
+                val shouldNotifyPlaying = synchronized(sessionStateLock) {
                     if (activeUpnpSessionId != 0L) {
                         emitEventLocked(
                             FirstDataPacketEvent(
@@ -358,8 +361,19 @@ class UpnpRendererServer(
                             )
                         )
                     }
+                    // 💡 防御暂停/停止/抢占态寻道误报: 仅当该会话仍属于当前活跃 UPnP 会话，且处于有效播放态时，方可向 GENA 广播 PLAYING
+                    val snap = snapshotProvider()
+                    // 💡 修复 Finding 20: 若协调器已处于 PLAYING，同步复位 isLocallyPaused，解除电视端恢复播放后的本地暂停死锁
+                    if (snap.playbackStatus == PlaybackStatus.PLAYING || snap.businessState == BusinessSessionState.PLAYING) {
+                        isLocallyPaused = false
+                    }
+                    val isCurrentSessionActive = activeUpnpSessionId != 0L && snap.sessionId == activeUpnpSessionId
+                    val isPlaybackActive = !isLocallyPaused && snap.playbackStatus == PlaybackStatus.PLAYING
+                    isCurrentSessionActive && isPlaybackActive
                 }
-                genaNotifier.notifyTransportState("PLAYING")
+                if (shouldNotifyPlaying) {
+                    genaNotifier.notifyTransportState("PLAYING")
+                }
             },
             onStreamEnded = { abortedByEpoch, _ ->
                 Logger.upnp.i(TAG, "StreamDemuxer 回调流结束 (abortedByEpoch=$abortedByEpoch)")
@@ -447,13 +461,32 @@ class UpnpRendererServer(
                 }
             },
             onSeekFlush = {
-                val isPaused = snapshotProvider().businessState == BusinessSessionState.PAUSED
+                val isPaused = synchronized(sessionStateLock) {
+                    val snap = snapshotProvider()
+                    // 💡 修复 Finding 20: 若协调器处于 PLAYING，同步复位 isLocallyPaused
+                    if (snap.playbackStatus == PlaybackStatus.PLAYING || snap.businessState == BusinessSessionState.PLAYING) {
+                        isLocallyPaused = false
+                    }
+                    isLocallyPaused || snap.businessState == BusinessSessionState.PAUSED
+                }
                 val newEpoch = fastPath.emergencyMuteAndFlush(FlushReason.FLUSH_SWITCH)
                 // 💡 防御暂停偷跑与进度回弹: 暂停态下 Seek 换代必须维持暂停静音，严禁提前 resumeStream
                 if (!isPaused) {
                     fastPath.resumeStream()
                 } else {
                     Logger.upnp.i(TAG, "Seek 换代时流处于暂停态，维持底层静音保活，防止底层提前恢复消费引发声音偷跑")
+                }
+                synchronized(sessionStateLock) {
+                    if (activeUpnpSessionId != 0L) {
+                        emitEventLocked(
+                            TrackSwitchEvent(
+                                flushReason = FlushReason.FLUSH_SWITCH,
+                                newEpoch = newEpoch,
+                                isSeekFlush = true,
+                                trackUri = currentUri
+                            )
+                        )
+                    }
                 }
                 newEpoch
             }
@@ -681,6 +714,9 @@ class UpnpRendererServer(
         sendResponse(out, statusCode, statusMsg, "text/xml; charset=\"utf-8\"", responseXml)
     }
 
+    @androidx.annotation.VisibleForTesting
+    internal fun getCurrentTrackMetadataForTest(): TrackMetadata = synchronized(sessionStateLock) { currentTrackMetadata }
+
     internal fun processSoapActionForTest(soapAction: String, body: String): String {
         return when {
             soapAction.contains("SetNextAVTransportURI") -> handleSetNextAvTransportUri(body)
@@ -825,6 +861,9 @@ class UpnpRendererServer(
         Logger.upnp.i(TAG, "SOAP Play 指令触发, 当前 uri: $currentUri")
         // 💡 收到推流，突破 BAL 尝试自动唤醒大屏播放界面
         onWakeUpUi?.invoke()
+        synchronized(sessionStateLock) {
+            isLocallyPaused = false
+        }
 
         if (currentUri.isNotEmpty() && (demuxer?.isRunning() != true || demuxer?.getCurrentUri() != currentUri)) {
             fastPath.resumeStream()
@@ -852,6 +891,7 @@ class UpnpRendererServer(
         // 💡 硬件快路径优先静音，保持 epoch 与环形缓冲不被刷新
         val pausedEpoch = fastPath.emergencyMuteAndFlush(FlushReason.EXPLICIT_PAUSE)
         synchronized(sessionStateLock) {
+            isLocallyPaused = true
             if (activeUpnpSessionId != 0L) {
                 emitEventLocked(
                     ExplicitPauseEvent(
@@ -998,8 +1038,25 @@ class UpnpRendererServer(
             "00:00:00"
         }
 
-        val inner = "<Track>1</Track><TrackDuration>$durStr</TrackDuration><TrackMetaData></TrackMetaData><TrackURI>$currentUri</TrackURI><RelTime>$relTime</RelTime><AbsTime>$relTime</AbsTime><RelCount>0</RelCount><AbsCount>0</AbsCount>"
+        val escapedTrackUri = escapeXml(currentUri)
+        val inner = "<Track>1</Track><TrackDuration>$durStr</TrackDuration><TrackMetaData></TrackMetaData><TrackURI>$escapedTrackUri</TrackURI><RelTime>$relTime</RelTime><AbsTime>$relTime</AbsTime><RelCount>0</RelCount><AbsCount>0</AbsCount>"
         return buildSoapResponse("GetPositionInfoResponse", "urn:schemas-upnp-org:service:AVTransport:1", inner)
+    }
+
+    private fun unescapeXmlRecursive(text: String): String {
+        var current = text
+        var iterations = 0
+        while (current.contains("&amp;") || current.contains("&lt;") || current.contains("&gt;") || current.contains("&quot;") || current.contains("&apos;")) {
+            val next = current
+                .replace("&amp;", "&")
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&quot;", "\"")
+                .replace("&apos;", "'")
+            if (next == current || ++iterations >= 5) break
+            current = next
+        }
+        return current
     }
 
     private fun handleGetProtocolInfo(): String {
@@ -1083,11 +1140,12 @@ class UpnpRendererServer(
         val album = extractTagValue(unescaped, "upnp:album")
             .ifEmpty { extractTagValue(unescaped, "album") }
 
-        val coverUri = extractTagValue(unescaped, "upnp:albumArtURI")
+        val rawCover = extractTagValue(unescaped, "upnp:albumArtURI")
             .ifEmpty { extractTagValue(unescaped, "albumArtURI") }
             .ifEmpty { extractTagValue(unescaped, "upnp:icon") }
             .ifEmpty { extractTagValue(unescaped, "icon") }
             .ifEmpty { if (preserveCoverWhenEmpty) currentTrackMetadata.coverUri.orEmpty() else "" }
+        val coverUri = unescapeXmlRecursive(rawCover).trim()
 
         val hasLiveMarker = unescaped.contains("isLive", ignoreCase = true)
         val durationState = when {

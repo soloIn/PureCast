@@ -602,6 +602,10 @@ int libusb_cancel_transfer(struct libusb_transfer* transfer) {
     return LIBUSB_SUCCESS;
 }
 
+int libusb_get_device_speed(libusb_device* /*dev*/) {
+    return LIBUSB_SPEED_HIGH;
+}
+
 int libusb_handle_events_timeout_completed(libusb_context* /*ctx*/, struct timeval* /*tv*/, int* /*completed*/) {
     purecast::test::MockLibusbController::instance().pump_events();
     return LIBUSB_SUCCESS;

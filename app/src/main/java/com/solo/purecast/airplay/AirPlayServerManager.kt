@@ -11,6 +11,7 @@ import com.solo.purecast.model.StreamProtocol
 import com.solo.purecast.util.Logger
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import java.util.Base64
 
@@ -61,6 +62,8 @@ class AirPlayServerManager(
     private var isRunning = false
     private var currentPort = DEFAULT_RTSP_PORT
     private var currentDeviceName = "PureCast"
+    private val serverLock = Any()
+    private var broadcastJob: Job? = null
 
     @Volatile
     var isRtpActive: Boolean = false
@@ -95,7 +98,7 @@ class AirPlayServerManager(
         clockMs = clockMs
     )
 
-    fun start(deviceName: String, port: Int = DEFAULT_RTSP_PORT): Boolean {
+    fun start(deviceName: String, port: Int = DEFAULT_RTSP_PORT): Boolean = synchronized(serverLock) {
         if (isRunning) {
             Logger.airplay.w(TAG, "AirPlay 服务已处于运行状态，无需重复启动")
             return true
@@ -112,8 +115,9 @@ class AirPlayServerManager(
             return false
         }
 
-        // 启动 JmDns Bonjour 广播
-        scope.launch(Dispatchers.IO) {
+        // 💡 修复 Finding 1: 启动 JmDns Bonjour 广播前取消未完成任务，杜绝并发竞争与实例泄漏
+        broadcastJob?.cancel()
+        broadcastJob = scope.launch(Dispatchers.IO) {
             jmdnsDiscoveryService.startBroadcast(deviceName, 7000, port)
         }
         isRunning = true
@@ -121,11 +125,12 @@ class AirPlayServerManager(
         return true
     }
 
-    fun stop() {
+    fun stop() = synchronized(serverLock) {
         if (!isRunning) return
         Logger.airplay.i(TAG, "正在停止 AirPlay 1 服务...")
         nativeDispatcher.resetSessions()
-        scope.launch(Dispatchers.IO) {
+        broadcastJob?.cancel()
+        broadcastJob = scope.launch(Dispatchers.IO) {
             jmdnsDiscoveryService.stopBroadcast()
         }
         NativeAudioEngine.stopAirPlayServer()
@@ -169,10 +174,11 @@ class AirPlayServerManager(
         return response
     }
 
-    fun updateDeviceName(newName: String) {
+    fun updateDeviceName(newName: String) = synchronized(serverLock) {
         currentDeviceName = newName
         if (isRunning) {
-            scope.launch(Dispatchers.IO) {
+            broadcastJob?.cancel()
+            broadcastJob = scope.launch(Dispatchers.IO) {
                 jmdnsDiscoveryService.stopBroadcast()
                 jmdnsDiscoveryService.startBroadcast(newName, 7000, currentPort)
             }
@@ -187,20 +193,25 @@ class AirPlayServerManager(
     /**
      * 💡 动态检测并响应网络 IP 变更 (如开机冷启动后 Wi-Fi 建立连接)
      */
-    fun restartIfIpChanged(deviceName: String) {
+    fun restartIfIpChanged(deviceName: String) = synchronized(serverLock) {
+        if (!isRunning) {
+            Logger.airplay.i(TAG, "AirPlay 服务尚未启动，直接执行冷启动流程")
+            start(deviceName, currentPort)
+            return
+        }
+
         val currentBoundIp = jmdnsDiscoveryService.getCurrentBoundIp()
         val newIp = jmdnsDiscoveryService.getLocalIpv4Address()
 
         val needRestart = newIp != null && (newIp != currentBoundIp || !jmdnsDiscoveryService.isRunning())
         if (needRestart) {
             Logger.airplay.i(TAG, "检测到有效局域网 IP 变动 (${currentBoundIp?.hostAddress} -> ${newIp?.hostAddress})，重新启动 AirPlay 广播...")
-            scope.launch(Dispatchers.IO) {
+            broadcastJob?.cancel()
+            broadcastJob = scope.launch(Dispatchers.IO) {
                 jmdnsDiscoveryService.stopBroadcast()
-                kotlinx.coroutines.delay(500)
+                kotlinx.coroutines.delay(300)
                 jmdnsDiscoveryService.startBroadcast(deviceName, 7000, currentPort)
             }
-        } else if (!isRunning) {
-            start(deviceName)
         }
     }
 

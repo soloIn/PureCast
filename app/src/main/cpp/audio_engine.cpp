@@ -396,10 +396,10 @@ int AudioEngine::start_transfer_pipeline_locked(int sample_rate, int bit_depth, 
         LOGI("确定声卡输出物理子帧格式: S16_LE (2 bytes per sample)");
     }
 
-    // 💡 构建无锁环形缓冲区：容量 = max(65536, byte_rate * 0.5s)（对齐至 2^N）
+    // 💡 构建无锁环形缓冲区：容量 = max(65536, byte_rate * 2.5s)（对齐至 2^N，约 2.97 秒缓冲，完全容纳 AirPlay 2 秒突发且绝不丢包）
     const size_t bytes_per_sample = (bit_depth > 0) ? static_cast<size_t>(bit_depth / 8) : 2;
     const size_t byte_rate = static_cast<size_t>(sample_rate) * static_cast<size_t>(channels) * bytes_per_sample;
-    const size_t min_capacity = std::max(static_cast<size_t>(65536), static_cast<size_t>(byte_rate * 0.5));
+    const size_t min_capacity = std::max(static_cast<size_t>(65536), static_cast<size_t>(byte_rate * 2.5));
     ring_buffer_ = std::make_unique<SpscRingBuffer>(min_capacity);
     pre_roll_threshold_bytes_.store(byte_rate / 10, std::memory_order_release);
 
@@ -407,8 +407,24 @@ int AudioEngine::start_transfer_pipeline_locked(int sample_rate, int bit_depth, 
          min_capacity, ring_buffer_->capacity(), byte_rate,
          byte_rate > 0 ? (static_cast<double>(ring_buffer_->capacity()) / byte_rate) : 0.0);
 
-    // 💡 配置 50ms DAC Warmup 静音预充 (仅首次开流或物理切频重配设置)
-    packet_rate_ = 8000;
+    // 💡 修复 Finding 10: 动态检测全速 (Full-Speed 1000 pkt/s) vs 高速 (High-Speed 8000 pkt/s) 帧率
+    // UAC1 全速设备以 1ms 帧为调度基准 (1000 fps)；UAC2 高速设备以 125us 微帧为调度基准 (8000 fps)
+    int dev_speed = LIBUSB_SPEED_UNKNOWN;
+    if (dev_handle_) {
+        libusb_device* dev = libusb_get_device(dev_handle_);
+        if (dev) {
+            dev_speed = libusb_get_device_speed(dev);
+        }
+    }
+    if (dev_speed == LIBUSB_SPEED_FULL || dev_speed == LIBUSB_SPEED_LOW ||
+        (!endpoint_info_.is_uac2 && dev_speed != LIBUSB_SPEED_HIGH && dev_speed != LIBUSB_SPEED_SUPER)) {
+        packet_rate_ = 1000;
+        LOGI("检测到 USB 全速 (Full-Speed / UAC1) 设备，基准帧率设为 1000 帧/秒");
+    } else {
+        packet_rate_ = 8000;
+        LOGI("检测到 USB 高速 (High-Speed / UAC2) 设备，基准帧率设为 8000 微帧/秒");
+    }
+
     const int warmup_packets = static_cast<int>((packet_rate_ * 50) / 1000);
     warmup_packets_remaining_.store(warmup_packets, std::memory_order_release);
     LOGI("配置 DAC Warmup 静音预充: %d 个微帧数据包 (约 50ms)", warmup_packets);
@@ -1004,6 +1020,27 @@ void AudioEngine::fill_isoc_transfer(struct libusb_transfer* transfer) {
             std::memset(pkt_buf, 0, target_pkt_bytes);
             if (!muted && ready_to_play && ring_buffer_ && ring_buffer_->available_read() < raw_input_bytes) {
                 int underruns = consecutive_underruns_.fetch_add(1, std::memory_order_relaxed) + 1;
+                // 💡 修复 Finding 3: 曲目尾部残留不足单微帧的零散字节排空 (Drain Tail Residual Samples)
+                // 当连续下溢 >= 5 (约 5ms 无新写入，说明生产者已读到 EOF) 且缓冲区中仍有残留字节时，
+                // 主动读取剩余的完整声道采样并以 0 填充微帧剩余部分，彻底排空 ring_buffer_ 避免 Java 端 6 秒阻塞！
+                size_t leftover = ring_buffer_->available_read();
+                const size_t bytes_per_sample_frame = static_cast<size_t>(current_channels_) * input_bytes_per_sample;
+                if (underruns >= 5 && leftover > 0 && bytes_per_sample_frame > 0) {
+                    size_t samples_bytes_to_read = (leftover / bytes_per_sample_frame) * bytes_per_sample_frame;
+                    if (samples_bytes_to_read > 0) {
+                        temp_pcm_in.resize(raw_input_bytes);
+                        std::memset(temp_pcm_in.data(), 0, raw_input_bytes);
+                        ring_buffer_->read(temp_pcm_in.data(), samples_bytes_to_read);
+                        if (current_bit_depth_ == 24) {
+                            PcmFormatter::format_24bit_to_target(temp_pcm_in.data(), raw_input_bytes, pkt_buf, current_output_format_);
+                        } else {
+                            PcmFormatter::format_16bit_to_target(temp_pcm_in.data(), raw_input_bytes, pkt_buf, current_output_format_);
+                        }
+                    } else {
+                        std::vector<uint8_t> discard(leftover);
+                        ring_buffer_->read(discard.data(), leftover);
+                    }
+                }
                 if (underruns >= 50) {
                     uint64_t cur_state = epoch_and_flush_.load(std::memory_order_acquire);
                     while ((cur_state >> EPOCH_SHIFT) == target_epoch &&

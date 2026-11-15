@@ -356,6 +356,14 @@ class UsbDeviceManager internal constructor(
         onDeviceAttachedAsync(device)
     }
 
+    /**
+     * 💡 检查当前活动设备或已扫描音频设备是否已获得 USB 主机访问权限
+     */
+    fun hasPermission(): Boolean {
+        val dev = activeDevice ?: systemBridge.scanAudioDevice() ?: return false
+        return systemBridge.hasPermission(dev)
+    }
+
     private fun handleAttachedDescriptorInternal(descriptor: UsbDeviceDescriptor): Boolean {
         val current = activeDevice
         val isSameActive = current != null && current.deviceId == descriptor.deviceId &&
@@ -482,6 +490,11 @@ class UsbDeviceManager internal constructor(
             return
         }
 
+        if (isExclusiveTaken.get()) {
+            Logger.usb.d(TAG, "设备当前已处于独占接管状态 (${device.productName})，跳过重复权限请求与事件发射")
+            return
+        }
+
         if (systemBridge.hasPermission(device)) {
             Logger.usb.i(TAG, "设备已拥有访问授权 (${device.productName})，同步回执入 RELEASED")
             isPermissionRequesting.set(false)
@@ -556,7 +569,17 @@ class UsbDeviceManager internal constructor(
         if (currentlyExclusive) {
             if (currentSampleRate == sampleRate && currentBitDepth == bitDepth && currentChannels == channels) {
                 val epoch = if (forceNewEpoch) {
-                    nativeBridge.emergencyMuteAndFlush(FlushReason.PREEMPT).coerceAtLeast(1L)
+                    val newEpoch = nativeBridge.emergencyMuteAndFlush(FlushReason.PREEMPT).coerceAtLeast(1L)
+                    // 💡 修复 Finding 10: forceNewEpoch 产生新 epoch 时，必须同步发射 HardwareReconfiguredEvent 通知协调器
+                    emitHardwareEventLocked(
+                        HardwareReconfiguredEvent(
+                            sampleRate = sampleRate,
+                            bitDepth = bitDepth,
+                            channels = channels,
+                            epoch = newEpoch
+                        )
+                    )
+                    newEpoch
                 } else {
                     nativeBridge.resumeStream()
                     nativeBridge.getCurrentBufferEpoch().coerceAtLeast(1L)

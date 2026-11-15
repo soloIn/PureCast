@@ -5,6 +5,7 @@ import com.solo.purecast.core.session.EventOrigin
 import com.solo.purecast.core.session.ExplicitPauseEvent
 import com.solo.purecast.core.session.FastPathNativeBridge
 import com.solo.purecast.core.session.HardwareFastPathController
+import com.solo.purecast.core.session.MetadataPatchEvent
 import com.solo.purecast.core.session.SessionEventEnvelope
 import com.solo.purecast.core.session.SessionEventPayload
 import com.solo.purecast.core.session.StreamResumeEvent
@@ -28,9 +29,12 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
+import java.io.DataOutputStream
 import java.io.File
 import java.net.ServerSocket
 import java.nio.ByteBuffer
@@ -84,6 +88,7 @@ class StreamDemuxerTransactionTest {
                 return false
             }
             writtenEpochs += epoch
+            flacFrames = 960000L
             callback.onFirstPcmWritten()
             return true
         }
@@ -342,11 +347,48 @@ class StreamDemuxerTransactionTest {
     }
 
     @Test
+    fun flacStreamNaturalCompletionTriggersNonAbortedComplete() = runBlocking {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        var endedFlag: Boolean? = null
+        val fakeGateway = FakeAudioGateway().apply {
+            flacFrames = 44100L * 5
+        }
+        val demuxer = StreamDemuxer(
+            scope = scope,
+            audioGateway = fakeGateway,
+            onAcquireStreamEpoch = { 1L },
+            onStreamEnded = { aborted, _ ->
+                endedFlag = aborted
+            }
+        )
+
+        val (streamUrl, serverSocket) = serveOnceOverHttp(
+            scope,
+            "fLaC".toByteArray(Charsets.US_ASCII) + ByteArray(1024),
+            blockUntilClosed = true
+        )
+        try {
+            demuxer.start(streamUrl)
+            val deadline = System.currentTimeMillis() + 5000L
+            while (endedFlag == null && System.currentTimeMillis() < deadline) {
+                delay(20)
+            }
+
+            // 验证 FLAC 播完不会被误判为 aborted，正常触发非中止完成
+            assertEquals("FLAC 曲目播完必须触发非中止完成 (hasStreamedData=true)", false, endedFlag)
+        } finally {
+            try { serverSocket.close() } catch (_: Exception) {}
+            demuxer.stop()
+            scope.cancel()
+        }
+    }
+
+    @Test
     fun soapPauseToPlayPreservesEpochAndBufferAndSeekOnLiveReturns701() = runBlocking {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         val fakeNative = FakeNativeFastPath().apply { currentEpoch = 5L }
         val fastPath = HardwareFastPathController(fakeNative)
-        val events = mutableListOf<SessionEventEnvelope<SessionEventPayload>>()
+        val events = java.util.concurrent.CopyOnWriteArrayList<SessionEventEnvelope<SessionEventPayload>>()
         val sidGen = AtomicLong(0L)
         val seqGen = AtomicLong(0L)
         val wavBytes = buildWavStreamBytes(44100, 16, 2, pcmPayloadSize = 4096)
@@ -587,5 +629,240 @@ class StreamDemuxerTransactionTest {
             serverSocket.close()
             scope.cancel()
         }
+    }
+
+    @Test
+    fun `seekTo restarts progress ticker and keeps reporting position updates`(): Unit = runBlocking {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val gateway = FakeAudioGateway()
+        // 构造较长的 WAV 流 (44.1kHz 16bit 2ch，每个采样 4 字节，每秒 176400 字节，生成 60 秒的 WAV)
+        val sampleRate = 44100
+        val bitDepth = 16
+        val channels = 2
+        val bytesPerSec = sampleRate * channels * (bitDepth / 8)
+        val totalSec = 60
+        val pcmSize = bytesPerSec * totalSec
+        val wavBytes = buildWavStreamBytes(sampleRate, bitDepth, channels, pcmSize)
+
+        val serverSocket = ServerSocket(0)
+        val port = serverSocket.localPort
+        val serverThread = Thread {
+            while (!serverSocket.isClosed) {
+                try {
+                    val client = serverSocket.accept()
+                    Thread {
+                        client.use { s ->
+                            val reader = s.getInputStream().bufferedReader()
+                            var rangeHeader: String? = null
+                            while (true) {
+                                val line = reader.readLine() ?: break
+                                if (line.isEmpty()) break
+                                if (line.startsWith("Range:", ignoreCase = true)) {
+                                    rangeHeader = line.substringAfter(":").trim()
+                                }
+                            }
+                            val out = s.getOutputStream()
+                            val (header, startInt) = if (rangeHeader != null && rangeHeader.startsWith("bytes=")) {
+                                val startByte = rangeHeader.substringAfter("=").substringBefore("-").trim().toLongOrNull() ?: 0L
+                                val start = startByte.toInt().coerceIn(0, wavBytes.size)
+                                val length = wavBytes.size - start
+                                val respHeader = "HTTP/1.1 206 Partial Content\r\n" +
+                                    "Content-Type: audio/wav\r\n" +
+                                    "Content-Range: bytes $startByte-${wavBytes.size - 1}/${wavBytes.size}\r\n" +
+                                    "Content-Length: $length\r\n" +
+                                    "Connection: close\r\n\r\n"
+                                respHeader to start
+                            } else {
+                                val respHeader = "HTTP/1.1 200 OK\r\n" +
+                                    "Content-Type: audio/wav\r\n" +
+                                    "Content-Length: ${wavBytes.size}\r\n" +
+                                    "Connection: close\r\n\r\n"
+                                respHeader to 0
+                            }
+                            out.write(header.toByteArray(Charsets.US_ASCII))
+                            out.flush()
+                            val chunkSize = 32768
+                            var sent = startInt
+                            while (sent < wavBytes.size && !s.isClosed) {
+                                val toWrite = minOf(chunkSize, wavBytes.size - sent)
+                                out.write(wavBytes, sent, toWrite)
+                                out.flush()
+                                sent += toWrite
+                                Thread.sleep(150)
+                            }
+                        }
+                    }.apply { isDaemon = true; start() }
+                } catch (_: Exception) {
+                }
+            }
+        }.apply {
+            isDaemon = true
+            start()
+        }
+
+        try {
+            val url = "http://127.0.0.1:$port/long_stream.wav"
+            val positionUpdates = CopyOnWriteArrayList<Long>()
+            var firstPacketReceived = false
+            var seekFlushCalled = false
+
+            val demuxer = StreamDemuxer(
+                scope = scope,
+                audioGateway = gateway,
+                onAcquireStreamEpoch = { 10L },
+                onFirstDataPacket = { _, _ -> firstPacketReceived = true },
+                onStreamEnded = { _, _ -> },
+                onError = { },
+                onPositionUpdated = { pos -> positionUpdates += pos },
+                onSeekFlush = {
+                    seekFlushCalled = true
+                    11L
+                }
+            )
+
+            demuxer.start(url)
+            val deadline1 = System.currentTimeMillis() + 3000L
+            while (!firstPacketReceived && System.currentTimeMillis() < deadline1) {
+                delay(20)
+            }
+            assertTrue("Demuxer 正常就绪并完成首帧写入", firstPacketReceived)
+
+            val seekResult = demuxer.seekTo(25000L)
+            assertTrue("seekTo 调用成功", seekResult)
+
+            // 💡 验证：seekTo 入口立即将 seekBaseBytes 更新至目标范围，当前进度立即 >= 24000ms
+            val posImmediately = demuxer.getCurrentPlayPositionMs()
+            assertTrue("寻道后即时进度必须反映目标位置 (pos=$posImmediately)", posImmediately >= 24000L)
+
+            // 等待网络建立 206 传输并触发 onSeekFlush
+            val deadline2 = System.currentTimeMillis() + 3000L
+            while (!seekFlushCalled && System.currentTimeMillis() < deadline2) {
+                delay(20)
+            }
+            assertTrue("onSeekFlush 回调被成功触发", seekFlushCalled)
+
+            // 💡 核心验证：seekTo 之后，progressTicker 循环必须继续运行并推送后续进度更新 (解决进度永久冻结 Bug)
+            val countBeforeWait = positionUpdates.size
+            val deadline3 = System.currentTimeMillis() + 3000L
+            while (positionUpdates.size <= countBeforeWait && System.currentTimeMillis() < deadline3) {
+                delay(20)
+            }
+            val countAfterWait = positionUpdates.size
+            assertTrue(
+                "seekTo 后 progressJob 必须持续运行推送进度 (before=$countBeforeWait, after=$countAfterWait)",
+                countAfterWait > countBeforeWait
+            )
+            assertTrue(
+                "后续进度更新必须基于 seek 位置推进 (lastPos=${positionUpdates.last()})",
+                positionUpdates.last() >= 25000L
+            )
+        } finally {
+            serverSocket.close()
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun `soapGetPositionInfoEscapesAmpersandInUrlAndDidlLiteRecursivelyUnescapesCover`() = runBlocking {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val events = java.util.concurrent.CopyOnWriteArrayList<SessionEventEnvelope<SessionEventPayload>>()
+        val sidGen = AtomicLong(0L)
+        val seqGen = AtomicLong(0L)
+
+        val server = UpnpRendererServer(
+            scope = scope,
+            dispatchEvent = { events += it },
+            allocateSessionId = { sidGen.incrementAndGet() },
+            allocateSequence = { seqGen.incrementAndGet() },
+            onAcquireHardwareForStream = { _, _, _, _ -> 1L },
+            snapshotProvider = {
+                PlayerSessionSnapshot(
+                    sessionId = 1L,
+                    activeProtocol = StreamProtocol.UPNP_DLNA,
+                    businessState = BusinessSessionState.PLAYING
+                )
+            },
+            fastPath = HardwareFastPathController(FakeNativeFastPath()),
+            audioGateway = FakeAudioGateway()
+        )
+
+        // 1. 设置带有多个 & 参数的 URL 与带双重转义 &amp;amp; 封面的 DIDL-Lite
+        val testUrl = "http://192.168.1.100:8080/music/track?id=123&format=flac&token=xyz"
+        val didlMetadata = "&lt;DIDL-Lite xmlns=&quot;urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/&quot;&gt;" +
+                "&lt;item&gt;&lt;dc:title&gt;Test Track&lt;/dc:title&gt;" +
+                "&lt;upnp:albumArtURI&gt;http://example.com/cover?id=100&amp;amp;size=large&lt;/upnp:albumArtURI&gt;" +
+                "&lt;/item&gt;&lt;/DIDL-Lite&gt;"
+
+        server.processSoapActionForTest(
+            "SetAVTransportURI",
+            "<CurrentURI>$testUrl</CurrentURI><CurrentURIMetaData>$didlMetadata</CurrentURIMetaData>"
+        )
+
+        // 2. 验证 GetPositionInfoResponse 包含转义后的 &amp;，杜绝非法 XML
+        val posInfoResponse = server.processSoapActionForTest("GetPositionInfo", "")
+        assertTrue("SOAP 响应必须对 URL 中包含的 & 进行转义", posInfoResponse.contains("id=123&amp;format=flac&amp;token=xyz"))
+        assertFalse("SOAP 响应绝不能出现未转义的 bare '&'", posInfoResponse.contains("id=123&format"))
+
+        // 3. 验证解析得到的元数据中的 coverUri 已被完全解转义
+        val meta = server.getCurrentTrackMetadataForTest()
+        assertEquals("http://example.com/cover?id=100&size=large", meta.coverUri)
+
+        scope.cancel()
+    }
+
+    @Test
+    fun `wavListInfoChunkWithOversizedSubLengthIsSafelySkipped`() {
+        // 构造一个带有超大 subSize (> 64KB) 的 LIST INFO 块，验证解析不抛异常且安全跳过
+        val bos = ByteArrayOutputStream()
+        val dataOut = DataOutputStream(bos)
+
+        // RIFF Header
+        bos.write("RIFF".toByteArray())
+        val riffSizePos = bos.size()
+        dataOut.writeInt(Integer.reverseBytes(0)) // 占位
+        bos.write("WAVE".toByteArray())
+
+        // fmt Chunk (16 bytes)
+        bos.write("fmt ".toByteArray())
+        dataOut.writeInt(Integer.reverseBytes(16))
+        dataOut.writeShort(java.lang.Short.reverseBytes(1).toInt()) // PCM
+        dataOut.writeShort(java.lang.Short.reverseBytes(2).toInt()) // 2 ch
+        dataOut.writeInt(Integer.reverseBytes(44100))
+        dataOut.writeInt(Integer.reverseBytes(44100 * 2 * 2))
+        dataOut.writeShort(java.lang.Short.reverseBytes(4).toInt())
+        dataOut.writeShort(java.lang.Short.reverseBytes(16).toInt())
+
+        // LIST Chunk (包含异常 70000 字节声明的 subChunk，实际 bytesRemaining=20 字节)
+        val listPayloadRemaining = 20
+        val listSize = 4 + 8 + listPayloadRemaining // INFO (4) + XXXX sub header (8) + 20 字节负载
+        bos.write("LIST".toByteArray())
+        dataOut.writeInt(Integer.reverseBytes(listSize))
+        bos.write("INFO".toByteArray())
+
+        // 超大 subChunk: ID = "XXXX", subSize = 70000L (> 65536)
+        bos.write("XXXX".toByteArray())
+        dataOut.writeInt(Integer.reverseBytes(70000))
+        // 写入 20 字节实际 payload 供安全跳过
+        bos.write(ByteArray(listPayloadRemaining))
+
+        // data Chunk (0 字节)
+        bos.write("data".toByteArray())
+        dataOut.writeInt(Integer.reverseBytes(0))
+
+        val wavBytes = bos.toByteArray()
+        val demuxer = StreamDemuxer(
+            scope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
+            audioGateway = FakeAudioGateway(),
+            onFirstDataPacket = { _, _ -> },
+            onAcquireStreamEpoch = { 1L },
+            onStreamEnded = { _, _ -> },
+            onError = { }
+        )
+
+        val inStream = ByteArrayInputStream(wavBytes)
+        val format = demuxer.parseHeader(inStream)
+        assertEquals(44100, format.sampleRate)
+        assertEquals(16, format.bitDepth)
+        assertEquals(2, format.channels)
     }
 }

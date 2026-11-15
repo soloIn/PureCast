@@ -9,6 +9,8 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -16,6 +18,8 @@ import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.focusProperties
 import com.solo.purecast.model.PlaybackStatus
 import com.solo.purecast.service.PlaybackService
 import com.solo.purecast.ui.screen.MainTvScreen
@@ -93,21 +97,28 @@ class MainActivity : ComponentActivity() {
                     animationSpec = tween(300),
                     label = "PageNavigation"
                 ) { screen ->
-                    when (screen) {
-                        TvNavScreen.PLAYBACK -> {
-                            MainTvScreen(
-                                onTogglePlayPause = { togglePlayPause() },
-                                onPreviousTrack = { handlePreviousTrack() },
-                                onNextTrack = { handleNextTrack() },
-                                onOpenSettings = { currentScreen = TvNavScreen.SETTINGS },
-                                onSeekTo = { posMs -> PlaybackService.instance?.seekTo(posMs) }
-                            )
-                        }
-                        TvNavScreen.SETTINGS -> {
-                            SettingsScreen(
-                                audioState = audioPathState,
-                                onDismiss = { currentScreen = TvNavScreen.PLAYBACK }
-                            )
+                    // 💡 Crossfade 动画淡入淡出期间隔离焦点，严禁未激活页面竞争抢夺焦点导致 D-Pad 失焦
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .focusProperties { canFocus = (screen == currentScreen) }
+                    ) {
+                        when (screen) {
+                            TvNavScreen.PLAYBACK -> {
+                                MainTvScreen(
+                                    onTogglePlayPause = { togglePlayPause() },
+                                    onPreviousTrack = { handlePreviousTrack() },
+                                    onNextTrack = { handleNextTrack() },
+                                    onOpenSettings = { currentScreen = TvNavScreen.SETTINGS },
+                                    onSeekTo = { posMs -> PlaybackService.instance?.seekTo(posMs) }
+                                )
+                            }
+                            TvNavScreen.SETTINGS -> {
+                                SettingsScreen(
+                                    audioState = audioPathState,
+                                    onDismiss = { currentScreen = TvNavScreen.PLAYBACK }
+                                )
+                            }
                         }
                     }
                 }
@@ -118,7 +129,7 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         Logger.ui.i(TAG, "MainActivity onResume: 检查 USB DAC 授权状态与屏保常亮状态...")
-        PlaybackService.instance?.registerUsbPermissionActivity(this)
+        PlaybackService.registerUsbPermissionActivityStatic(this)
         updateKeepScreenOn()
     }
 
@@ -160,7 +171,7 @@ class MainActivity : ComponentActivity() {
     override fun onStop() {
         super.onStop()
         Logger.ui.i(TAG, "MainActivity onStop: 退入后台，清除 FLAG_KEEP_SCREEN_ON 释放屏保控制权")
-        PlaybackService.instance?.registerUsbPermissionActivity(null)
+        PlaybackService.registerUsbPermissionActivityStatic(null)
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
     }
 

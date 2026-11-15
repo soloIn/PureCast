@@ -1,6 +1,5 @@
 package com.solo.purecast.ui.components
 
-import android.view.KeyEvent
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloat
@@ -56,11 +55,9 @@ internal sealed interface ProgressRightLabelMode {
 
 /**
  * 💡 PureCast 纤细圆角进度条与时间轴组件 (ProgressBarComponent)
- * 遵循 Apple TV 极简工业美学设计：
- * 1. 轨道高度默认为 4dp，D-Pad 获得焦点时动态平滑展开至 6dp 并点亮白色微光发光边框与游标。
+ * 1. 轨道高度默认为 4dp，纯展示状态指示，完全禁用焦点捕获与点击/Seek 交互。
  * 2. 悬浮对比度保护：轨道底槽采用高透半白 [Color(0x40FFFFFF)]，填充条使用高纯亮白 [Color.White]，在任意流光背景下清晰可见。
  * 3. 左侧展示当前播放时间 (mm:ss)，右侧依据 [DurationState] 展示总时长、"等待投屏接入"、"--:--" 或实时流 "LIVE / 实时直通" 状态。
- * 4. 仅当 [SeekCapability.SEEKABLE] 且为固定点播时长 [DurationState.FIXED] 时启用遥控器 D-Pad 寻道焦点。
  */
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
@@ -68,8 +65,8 @@ fun ProgressBarComponent(
     currentPositionMs: Long,
     totalDurationMs: Long,
     durationState: DurationState,
-    seekCapability: SeekCapability,
-    onSeek: (newPositionMs: Long) -> Unit,
+    seekCapability: SeekCapability = SeekCapability.UNSEEKABLE,
+    onSeek: ((newPositionMs: Long) -> Unit)? = null,
     onSeekImmediate: ((newPositionMs: Long) -> Unit)? = null,
     modifier: Modifier = Modifier,
     hasDarkBackground: Boolean = true,
@@ -83,30 +80,14 @@ fun ProgressBarComponent(
         durationState = durationState,
         playbackStatus = playbackStatus
     )
-    val canFocus = seekCapability == SeekCapability.SEEKABLE &&
-        durationState == DurationState.FIXED &&
-        totalDurationMs > 0L &&
-        !isIdle
-    val interactionSource = remember { MutableInteractionSource() }
-    val isFocused by interactionSource.collectIsFocusedAsState()
 
     // 💡 视觉对比度自适应色彩
     val trackBgColor = if (hasDarkBackground) Color(0x40FFFFFF) else Color(0x18000000)
-    val trackBorderColor = if (hasDarkBackground) Color.White.copy(alpha = 0.6f) else Color(0x4D000000)
     val progressFillColor = if (hasDarkBackground) Color.White else Color(0xFF1C1C1E)
-    val thumbColor = if (hasDarkBackground) Color.White else Color(0xFF1C1C1E)
-    val currentTimeColor = if (hasDarkBackground) {
-        if (isFocused && canFocus) Color.White else Color(0xEEFFFFFF)
-    } else {
-        if (isFocused && canFocus) Color(0xFF1C1C1E) else Color(0xFF3C3C43)
-    }
+    val currentTimeColor = if (hasDarkBackground) Color(0xEEFFFFFF) else Color(0xFF3C3C43)
     val totalTimeColor = if (hasDarkBackground) Color(0xB3FFFFFF) else Color(0xFF6E6E73)
 
-    val animatedHeight by animateDpAsState(
-        targetValue = if (isFocused && canFocus) 6.dp else 4.dp,
-        animationSpec = tween(durationMillis = 200),
-        label = "progressBarHeight"
-    )
+    val trackHeight = 4.dp
 
     val progressFraction = calculateProgressFraction(
         currentPositionMs = currentPositionMs,
@@ -118,86 +99,32 @@ fun ProgressBarComponent(
     Column(
         modifier = modifier
             .fillMaxWidth()
-            .then(if (canFocus && focusRequester != null) Modifier.focusRequester(focusRequester) else Modifier)
-            .then(if (canFocus) Modifier.focusable(interactionSource = interactionSource) else Modifier)
-            // 💡 遥控器 D-Pad 左右方向键寻道拦截 (快退 / 快进 10 秒) 及中心确认键
-            .onPreviewKeyEvent { keyEvent ->
-                if (canFocus && keyEvent.nativeKeyEvent.action == KeyEvent.ACTION_DOWN) {
-                    when (keyEvent.nativeKeyEvent.keyCode) {
-                        KeyEvent.KEYCODE_DPAD_LEFT -> {
-                            val target = (currentPositionMs - 10_000L).coerceAtLeast(0L)
-                            onSeek(target)
-                            return@onPreviewKeyEvent true
-                        }
-                        KeyEvent.KEYCODE_DPAD_RIGHT -> {
-                            val target = (currentPositionMs + 10_000L).coerceAtMost(totalDurationMs)
-                            onSeek(target)
-                            return@onPreviewKeyEvent true
-                        }
-                        KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> {
-                            // 💡 进度条聚焦时按下确认键，意图是确认/立即提交当前位置寻道，绝不得误触发暂停
-                            if (onSeekImmediate != null) {
-                                onSeekImmediate(currentPositionMs)
-                            } else {
-                                onSeek(currentPositionMs)
-                            }
-                            return@onPreviewKeyEvent true
-                        }
-                    }
-                }
-                false
-            }
             .padding(vertical = 2.dp)
     ) {
-        // 进度条轨道容器
+        // 进度条轨道容器 (纯展示，无交互)
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(vertical = if (isFocused) 2.dp else 3.dp),
+                .padding(vertical = 3.dp),
             contentAlignment = Alignment.CenterStart
         ) {
             // 背景槽（未播放部分）
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(animatedHeight)
-                    .clip(RoundedCornerShape(animatedHeight / 2))
+                    .height(trackHeight)
+                    .clip(RoundedCornerShape(trackHeight / 2))
                     .background(trackBgColor)
-                    .then(
-                        if (isFocused) {
-                            Modifier.border(
-                                width = 1.dp,
-                                color = trackBorderColor,
-                                shape = RoundedCornerShape(animatedHeight / 2)
-                            )
-                        } else Modifier
-                    )
             )
 
             // 高亮填充条（已播放部分）
             Box(
                 modifier = Modifier
                     .fillMaxWidth(progressFraction)
-                    .height(animatedHeight)
-                    .clip(RoundedCornerShape(animatedHeight / 2))
+                    .height(trackHeight)
+                    .clip(RoundedCornerShape(trackHeight / 2))
                     .background(progressFillColor)
             )
-
-            // 💡 获得焦点时的进度发光游标点 (Thumb Indicator)
-            if (isFocused && canFocus) {
-                Box(
-                    modifier = Modifier.fillMaxWidth(progressFraction),
-                    contentAlignment = Alignment.CenterEnd
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .size(12.dp)
-                            .shadow(6.dp, CircleShape, spotColor = thumbColor)
-                            .clip(CircleShape)
-                            .background(thumbColor)
-                    )
-                }
-            }
         }
 
         Spacer(modifier = Modifier.height(6.dp))

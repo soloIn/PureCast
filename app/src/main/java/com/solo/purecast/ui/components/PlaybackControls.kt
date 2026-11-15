@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -135,6 +136,14 @@ private fun TransportIconButton(
     onClick: () -> Unit
 ) {
     var isFocused by remember { mutableStateOf(false) }
+
+    // 💡 当控件被禁用时立即清除获焦状态，防止失焦事件被吞后残留“双焦点”高亮
+    LaunchedEffect(enabled) {
+        if (!enabled) {
+            isFocused = false
+        }
+    }
+
     val shape = if (isCircle) CircleShape else RoundedCornerShape(14.dp)
     val noBorder = Border(BorderStroke(0.dp, Color.Transparent))
 
@@ -154,7 +163,7 @@ private fun TransportIconButton(
         modifier = Modifier
             .size(buttonSize)
             .then(if (enabled && focusRequester != null) Modifier.focusRequester(focusRequester) else Modifier)
-            .onFocusChanged { if (enabled) isFocused = it.isFocused },
+            .onFocusChanged { isFocused = enabled && it.isFocused },
         shape = ClickableSurfaceDefaults.shape(shape),
         scale = ClickableSurfaceDefaults.scale(
             scale = 1.0f,

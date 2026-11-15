@@ -59,6 +59,18 @@ public:
     bool pop(std::vector<uint8_t>& out_pcm);
 
     /**
+     * 💡 修复 Finding 5: 探查下一待出队帧的字节尺寸，不弹出数据亦不改变游标与有效状态
+     * @param out_size 输出的待消费帧字节大小
+     * @return true 存在就绪帧；false 处于预充或正在等待乱序包
+     */
+    bool peek_size(size_t& out_size);
+
+    /**
+     * 获取当前 JitterBuffer 中缓存的有效音频包数量
+     */
+    size_t buffered_packets() const { return buffered_count_.load(std::memory_order_relaxed); }
+
+    /**
      * 当前是否处于预充阶段
      */
     bool is_buffering() const { return is_buffering_.load(std::memory_order_relaxed); }
@@ -73,7 +85,6 @@ private:
         return static_cast<int16_t>(a - b) < 0;
     }
 
-private:
     mutable std::mutex mutex_;
     std::vector<JitterPacket> slots_;
 
@@ -82,6 +93,7 @@ private:
     bool first_packet_{true};
 
     std::atomic<bool> is_buffering_{true};
+    std::atomic<size_t> buffered_count_{0};
     std::atomic<uint32_t> lost_packets_{0};
     size_t frame_bytes_{FRAME_BYTES};
 };

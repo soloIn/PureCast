@@ -73,6 +73,12 @@ internal class AirPlayNativeEventDispatcher(
     @Volatile
     private var pendingOrphanCoverTimestampMs: Long = 0L
 
+    @Volatile
+    private var lastActiveMetadata: TrackMetadata? = null
+
+    @Volatile
+    private var lastClientIp: String? = null
+
     fun resetSessions() {
         nativeToGlobalSessionMap.clear()
         lastStateSequenceByNative.clear()
@@ -81,6 +87,8 @@ internal class AirPlayNativeEventDispatcher(
         lastTrackSwitchFlushedTimestampMs = 0L
         pendingOrphanCoverBytes = null
         pendingOrphanCoverTimestampMs = 0L
+        lastActiveMetadata = null
+        lastClientIp = null
         onRtpActiveChanged(false)
     }
 
@@ -130,24 +138,43 @@ internal class AirPlayNativeEventDispatcher(
         val globalSessionId = allocateSessionId()
         val initialTxGen: Long
         synchronized(eventDispatchLock) {
+            val isSameClient = (lastClientIp != null && lastClientIp == clientIp) ||
+                (lastClientIp == null && clientIp.isNotBlank())
+            lastClientIp = clientIp
+            val isSameNativeSession = (latestNativeSessionId.get() == nativeSessionId) || isSameClient
+            latestNativeSessionId.set(nativeSessionId)
             nativeToGlobalSessionMap[nativeSessionId] = globalSessionId
             lastStateSequenceByNative[nativeSessionId] = sequence
-            latestNativeSessionId.set(nativeSessionId)
             initialTxGen = trackGenerationGenerator.incrementAndGet()
             currentTrackGeneration = initialTxGen
-            currentTrackTitle = ""
-            currentTrackArtist = ""
-            currentTrackDurationFixed = false
-            currentTrackMarkedLive = false
 
-            val initialMetadata = TrackMetadata(
-                title = "AirPlay 音频直通",
-                artist = "AirPlay 设备",
-                album = "",
-                durationMs = 0L,
-                durationState = DurationState.UNKNOWN,
-                seekCapability = SeekCapability.UNKNOWN
-            )
+            // 💡 修复 Finding 5: 续播识别支持同客户端跨 SETUP 重连保持已有元数据，杜绝暂停续播时歌名封面被刷空
+            val cachedMeta = lastActiveMetadata
+            val isResuming = isSameNativeSession &&
+                cachedMeta != null &&
+                cachedMeta.title.isNotBlank() &&
+                cachedMeta.title != "AirPlay 音频直通"
+
+            if (!isResuming) {
+                lastActiveMetadata = null
+            }
+
+            val initialMetadata = if (isResuming) {
+                cachedMeta!!
+            } else {
+                TrackMetadata(
+                    title = "AirPlay 音频直通",
+                    artist = "AirPlay 设备",
+                    album = "",
+                    durationMs = 0L,
+                    durationState = DurationState.UNKNOWN,
+                    seekCapability = SeekCapability.UNKNOWN
+                )
+            }
+            currentTrackTitle = initialMetadata.title
+            currentTrackArtist = initialMetadata.artist
+            currentTrackDurationFixed = initialMetadata.durationMs > 0L
+            currentTrackMarkedLive = false
             emitLocked(
                 sessionId = globalSessionId,
                 payload = StreamSetupEvent(
@@ -319,9 +346,8 @@ internal class AirPlayNativeEventDispatcher(
                 )
                 postFlushProgressDurationMs = 0L // 💡 消费后清空
                 lastTrackSwitchFlushedTimestampMs = 0L
-                if (effectiveCover != null && effectiveCover === pendingOrphanCoverBytes) {
-                    pendingOrphanCoverBytes = null
-                }
+                // 💡 修复 Finding 4: 切歌边界彻底清空上一曲残留的孤立封面缓存，杜绝无封面歌曲误继承旧封面
+                pendingOrphanCoverBytes = null
             }
 
             if (trimmedTitle.isNotEmpty()) {
@@ -334,7 +360,8 @@ internal class AirPlayNativeEventDispatcher(
                 currentTrackDurationFixed = true
                 currentTrackMarkedLive = false
                 try {
-                    com.solo.purecast.core.nativebridge.NativeAudioEngine.updateAirPlayTrackProgress(0L, effectiveDurationMs)
+                    // 💡 修复 Finding 3: 传入 -1L 保持 Native 已有播放进度，严禁硬编码 0L 冲刷进度归零
+                    com.solo.purecast.core.nativebridge.NativeAudioEngine.updateAirPlayTrackProgress(-1L, effectiveDurationMs)
                 } catch (t: Throwable) {
                     Logger.airplay.w(TAG, "同步 Native 曲目时长异常: ${t.message}")
                 }
@@ -351,18 +378,37 @@ internal class AirPlayNativeEventDispatcher(
                 else -> null
             }
 
+            val patch = MetadataPatchEvent(
+                trackGeneration = currentTrackGeneration,
+                title = trimmedTitle.ifEmpty { null },
+                artist = trimmedArtist.ifEmpty { null },
+                album = trimmedAlbum.ifEmpty { null },
+                coverBytes = effectiveCover?.takeIf { it.isNotEmpty() },
+                durationMs = effectiveDurationMs.takeIf { it > 0L },
+                durationState = patchedDurationState,
+                seekCapability = patchedSeek
+            )
+
+            // 💡 维护活跃会话元数据快照，以便在 RTSP TEARDOWN 挂起恢复时无缝继承
+            val prevMeta = lastActiveMetadata ?: TrackMetadata()
+            lastActiveMetadata = prevMeta.copy(
+                title = patch.title ?: prevMeta.title,
+                artist = patch.artist ?: prevMeta.artist,
+                album = patch.album ?: prevMeta.album,
+                coverBytes = patch.coverBytes ?: prevMeta.coverBytes,
+                durationMs = patch.durationMs ?: prevMeta.durationMs,
+                durationState = patch.durationState ?: prevMeta.durationState,
+                seekCapability = patch.seekCapability ?: prevMeta.seekCapability
+            )
+            // 💡 仅当当前报文包含歌名或艺术家信息且已成功消费孤立封面时，才清空 pendingOrphanCoverBytes，
+            // 严禁在纯封面报文 (image/jpeg) 自身到达时误清空，确保紧随其后的曲目元数据包能够完整继承封面！
+            if ((trimmedTitle.isNotEmpty() || trimmedArtist.isNotEmpty()) && effectiveCover != null && effectiveCover.isNotEmpty()) {
+                pendingOrphanCoverBytes = null
+            }
+
             emitLocked(
                 sessionId = globalSid,
-                payload = MetadataPatchEvent(
-                    trackGeneration = currentTrackGeneration,
-                    title = trimmedTitle.ifEmpty { null },
-                    artist = trimmedArtist.ifEmpty { null },
-                    album = trimmedAlbum.ifEmpty { null },
-                    coverBytes = effectiveCover?.takeIf { it.isNotEmpty() },
-                    durationMs = effectiveDurationMs.takeIf { it > 0L },
-                    durationState = patchedDurationState,
-                    seekCapability = patchedSeek
-                )
+                payload = patch
             )
         }
     }
@@ -384,37 +430,49 @@ internal class AirPlayNativeEventDispatcher(
                 postFlushProgressDurationMs = durationMs
             }
 
-            if (durationMs > 0L && !currentTrackDurationFixed) {
-                currentTrackDurationFixed = true
-                currentTrackMarkedLive = false
-                emitLocked(
-                    sessionId = globalSid,
-                    payload = MetadataPatchEvent(
-                        trackGeneration = currentTrackGeneration,
+            if (durationMs > 0L) {
+                // 💡 同步更新活跃会话快照中的时长与寻道能力
+                val prev = lastActiveMetadata ?: TrackMetadata()
+                if (prev.durationMs != durationMs) {
+                    lastActiveMetadata = prev.copy(
                         durationMs = durationMs,
                         durationState = DurationState.FIXED,
                         seekCapability = SeekCapability.SEEKABLE
                     )
-                )
-            }
-            if (durationMs > 0L) {
+                }
+
+                if (!currentTrackDurationFixed) {
+                    currentTrackDurationFixed = true
+                    currentTrackMarkedLive = false
+                    emitLocked(
+                        sessionId = globalSid,
+                        payload = MetadataPatchEvent(
+                            trackGeneration = currentTrackGeneration,
+                            durationMs = durationMs,
+                            durationState = DurationState.FIXED,
+                            seekCapability = SeekCapability.SEEKABLE
+                        )
+                    )
+                }
                 try {
                     com.solo.purecast.core.nativebridge.NativeAudioEngine.updateAirPlayTrackProgress(positionMs, durationMs)
                 } catch (t: Throwable) {
                     Logger.airplay.w(TAG, "同步 Native 曲目进度异常: ${t.message}")
                 }
             }
-            // 💡 R7 契约：当 durationMs == 0 时保持 UNKNOWN，绝不能因 positionMs > 0 而武断标记为 LIVE，
-            // 避免切歌或首播进度先于元数据到达时 UI 误报 LIVE 红点并永久锁定不可寻道。
 
-            emitLocked(
-                sessionId = globalSid,
-                payload = ProgressUpdateEvent(
-                    positionMs = positionMs.coerceAtLeast(0L),
-                    durationMs = durationMs.coerceAtLeast(0L),
-                    trackGeneration = currentTrackGeneration
+            // 💡 修复 Finding 5: 当 positionMs < 0L 时说明首帧尚在本地缓冲区排队，已通过上方 MetadataPatchEvent 校准了总时长，
+            // 绝不发射 ProgressUpdateEvent，杜绝将已走字进度归零
+            if (positionMs >= 0L) {
+                emitLocked(
+                    sessionId = globalSid,
+                    payload = ProgressUpdateEvent(
+                        positionMs = positionMs,
+                        durationMs = durationMs.coerceAtLeast(0L),
+                        trackGeneration = currentTrackGeneration
+                    )
                 )
-            )
+            }
         }
     }
 

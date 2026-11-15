@@ -1,5 +1,6 @@
 package com.solo.purecast.core.session
 
+import com.solo.purecast.model.AudioPathState
 import com.solo.purecast.model.BusinessSessionState
 import com.solo.purecast.model.DurationState
 import com.solo.purecast.model.ErrorCode
@@ -994,6 +995,40 @@ class PlaybackSessionCoordinatorTest {
     }
 
     @Test
+    fun `RemoteSkipNext in PAUSED state keeps playbackStatus PAUSED during TRANSITIONING and after rollback`() = runTest(StandardTestDispatcher()) {
+        val hw = FakeSessionHardwareBridge()
+        val c = createCoordinator(this, hwBridge = hw)
+        c.dispatch(env(c, EventOrigin.USB_HARDWARE, 0L, HardwareAttachedEvent("ZX300A", hasPermission = true)))
+        val sid = c.allocateSessionId()
+        c.dispatch(env(c, EventOrigin.AIRPLAY, sid, StreamSetupEvent(StreamProtocol.AIRPLAY_1)))
+        c.dispatch(env(c, EventOrigin.AIRPLAY, sid, FirstDataPacketEvent(StreamProtocol.AIRPLAY_1, 1L, 44100, 16, 2, "ALAC")))
+        runCurrent()
+        assertEquals(BusinessSessionState.PLAYING, c.snapshot.value.businessState)
+        assertEquals(PlaybackStatus.PLAYING, c.snapshot.value.playbackStatus)
+
+        // 用户主动显式暂停
+        c.dispatch(env(c, EventOrigin.USER_ACTION, sid, ExplicitPauseEvent(epoch = 1L)))
+        runCurrent()
+        assertEquals(BusinessSessionState.PAUSED, c.snapshot.value.businessState)
+        assertEquals(PlaybackStatus.PAUSED, c.snapshot.value.playbackStatus)
+
+        // 💡 暂停状态下按遥控器切歌：businessState 进入 TRANSITIONING，但对外 playbackStatus 严格保持 PAUSED 杜绝跳变！
+        val cmdId = c.allocateCommandId()
+        c.dispatch(env(c, EventOrigin.USER_ACTION, sid, RemoteSkipNextEvent(RemoteCommandType.NEXT, cmdId)))
+        runCurrent()
+        assertEquals(BusinessSessionState.TRANSITIONING, c.snapshot.value.businessState)
+        assertEquals(BusinessSessionState.PAUSED, c.snapshot.value.transitionOriginState)
+        assertEquals(PlaybackStatus.PAUSED, c.snapshot.value.playbackStatus)
+
+        // 收到切歌失败并回滚至 PAUSED
+        c.dispatch(env(c, EventOrigin.AIRPLAY, sid, RemoteCommandFailedEvent(cmdId, ErrorCode.REMOTE_COMMAND_TIMEOUT, "timeout")))
+        runCurrent()
+        assertEquals(BusinessSessionState.PAUSED, c.snapshot.value.businessState)
+        assertNull(c.snapshot.value.transitionOriginState)
+        assertEquals(PlaybackStatus.PAUSED, c.snapshot.value.playbackStatus)
+    }
+
+    @Test
     fun `OpenDeviceOnResume handles STREAMING_READY RESTARTING and PRODUCER_DEAD uniformly`() = runTest(StandardTestDispatcher()) {
         var resumeBehavior = ProtocolResumeReopenResult.STREAMING_READY
         val resumeCallbacks = mutableListOf<Triple<StreamProtocol, Long, Long>>()
@@ -1283,10 +1318,18 @@ class PlaybackSessionCoordinatorTest {
         runCurrent()
         assertEquals("Seek 触发的 FLUSH 必须保留 progressPositionMs (R11)", 45000L, c.snapshot.value.progressPositionMs)
 
-        // 💡 常规切歌引起的 FLUSH (isSeekFlush = false)，进度必须归零杜绝残留上一首位置 (B-3)
+        // 💡 FLUSH 无论是寻道、切歌还是暂停均保留当前进度，杜绝 iPhone 暂停时被误清零
         c.dispatch(env(c, EventOrigin.AIRPLAY, s1, TrackSwitchEvent(FlushReason.FLUSH_SWITCH, 12L, null, isSeekFlush = false)))
         runCurrent()
-        assertEquals("常规切歌触发的 FLUSH 必须立即归零 progressPositionMs (B-3)", 0L, c.snapshot.value.progressPositionMs)
+        assertEquals("FLUSH 阶段保留进度杜绝暂停误抹零", 45000L, c.snapshot.value.progressPositionMs)
+
+        // 💡 随后收到新曲目的 TrackBoundaryEvent 时，进度才正式重置为 0L
+        c.dispatch(env(c, EventOrigin.AIRPLAY, s1, TrackBoundaryEvent(
+            trackKey = "song-2",
+            trackGeneration = 2L
+        )))
+        runCurrent()
+        assertEquals("新曲目边界到达后 progressPositionMs 归零", 0L, c.snapshot.value.progressPositionMs)
     }
 
     @Test
@@ -1354,5 +1397,626 @@ class PlaybackSessionCoordinatorTest {
         advanceTimeBy(60_000L)
         runCurrent()
         assertEquals(BusinessSessionState.IDLE, c.snapshot.value.businessState)
+    }
+
+    @Test
+    fun `FirstDataPacketEvent in PAUSED state preserves PAUSED and EXCLUSIVE_MUTED without resuming native output`() = runTest(StandardTestDispatcher()) {
+        val hw = FakeSessionHardwareBridge()
+        val c = createCoordinator(this, hw)
+
+        c.dispatch(env(c, EventOrigin.USB_HARDWARE, 0L, HardwareAttachedEvent("Sony ZX300A", hasPermission = true), deviceGen = 1L))
+        runCurrent()
+
+        val s1 = c.allocateSessionId()
+        c.dispatch(env(c, EventOrigin.UPNP, s1, StreamSetupEvent(StreamProtocol.UPNP_DLNA, 44100, 16, 2, "WAV", 10L)))
+        c.dispatch(env(c, EventOrigin.UPNP, s1, FirstDataPacketEvent(StreamProtocol.UPNP_DLNA, 10L, 44100, 16, 2, "WAV")))
+        runCurrent()
+        assertEquals(BusinessSessionState.PLAYING, c.snapshot.value.businessState)
+        assertEquals(HardwarePipelineState.EXCLUSIVE_ACTIVE, c.snapshot.value.hardwareState)
+        val initialResumes = hw.fastPath.resumeCalls
+
+        // 显式暂停 -> 业务态进入 PAUSED，硬件态 EXCLUSIVE_MUTED
+        c.dispatch(env(c, EventOrigin.USER_ACTION, s1, ExplicitPauseEvent(epoch = 10L)))
+        runCurrent()
+        assertEquals(BusinessSessionState.PAUSED, c.snapshot.value.businessState)
+        assertEquals(HardwarePipelineState.EXCLUSIVE_MUTED, c.snapshot.value.hardwareState)
+
+        // 暂停态下寻道换代 (TrackSwitchEvent isSeekFlush=true)
+        c.dispatch(env(c, EventOrigin.UPNP, s1, TrackSwitchEvent(FlushReason.FLUSH_SWITCH, 11L, null, isSeekFlush = true)))
+        runCurrent()
+        assertEquals(BusinessSessionState.PAUSED, c.snapshot.value.businessState)
+
+        // 寻道后首包数据写入完成派发 FirstDataPacketEvent
+        c.dispatch(env(c, EventOrigin.UPNP, s1, FirstDataPacketEvent(StreamProtocol.UPNP_DLNA, 11L, 44100, 16, 2, "WAV")))
+        runCurrent()
+
+        // 💡 验证：必须严格保持 PAUSED 与 EXCLUSIVE_MUTED，绝不调用 resumeStream 偷跑声音！
+        assertEquals("暂停态寻道首包必须保持 PAUSED 业务态", BusinessSessionState.PAUSED, c.snapshot.value.businessState)
+        assertEquals("暂停态寻道首包必须保持 EXCLUSIVE_MUTED 硬件态", HardwarePipelineState.EXCLUSIVE_MUTED, c.snapshot.value.hardwareState)
+        assertEquals("传输状态应更新为就绪 STREAMING", TransportPipeState.STREAMING, c.snapshot.value.transportState)
+        assertEquals("绝不能触发 native resumeCalls 解除静音", initialResumes, hw.fastPath.resumeCalls)
+
+        // 验证 10 分钟挂起定时器正常生效
+        advanceTimeBy(600_001L)
+        runCurrent()
+        assertEquals("10 分钟挂起超时后应安全退回 IDLE", BusinessSessionState.IDLE, c.snapshot.value.businessState)
+    }
+
+    @Test
+    fun `FirstDataPacketEvent in PAUSED state with AIRPLAY_1 preserves PAUSED and EXCLUSIVE_MUTED without resuming native output`() = runTest(StandardTestDispatcher()) {
+        val hw = FakeSessionHardwareBridge()
+        val c = createCoordinator(this, hw)
+
+        c.dispatch(env(c, EventOrigin.USB_HARDWARE, 0L, HardwareAttachedEvent("Sony ZX300A", hasPermission = true), deviceGen = 1L))
+        runCurrent()
+
+        val s1 = c.allocateSessionId()
+        c.dispatch(env(c, EventOrigin.AIRPLAY, s1, StreamSetupEvent(StreamProtocol.AIRPLAY_1, 44100, 16, 2, "ALAC", 10L)))
+        c.dispatch(env(c, EventOrigin.AIRPLAY, s1, FirstDataPacketEvent(StreamProtocol.AIRPLAY_1, 10L, 44100, 16, 2, "ALAC")))
+        runCurrent()
+        assertEquals(BusinessSessionState.PLAYING, c.snapshot.value.businessState)
+        assertEquals(HardwarePipelineState.EXCLUSIVE_ACTIVE, c.snapshot.value.hardwareState)
+        val initialResumes = hw.fastPath.resumeCalls
+
+        // 用户在电视端或 iPhone 按暂停 -> 业务态进入 PAUSED，硬件态 EXCLUSIVE_MUTED
+        c.dispatch(env(c, EventOrigin.USER_ACTION, s1, ExplicitPauseEvent(epoch = 10L)))
+        runCurrent()
+        assertEquals(BusinessSessionState.PAUSED, c.snapshot.value.businessState)
+        assertEquals(HardwarePipelineState.EXCLUSIVE_MUTED, c.snapshot.value.hardwareState)
+
+        // 暂停态下执行寻道或切曲 (TrackSwitchEvent FLUSH)
+        c.dispatch(env(c, EventOrigin.AIRPLAY, s1, TrackSwitchEvent(FlushReason.FLUSH_SWITCH, 11L, null, isSeekFlush = true)))
+        runCurrent()
+        assertEquals(BusinessSessionState.PAUSED, c.snapshot.value.businessState)
+
+        // 寻道后首包数据写入完成派发 FirstDataPacketEvent
+        c.dispatch(env(c, EventOrigin.AIRPLAY, s1, FirstDataPacketEvent(StreamProtocol.AIRPLAY_1, 11L, 44100, 16, 2, "ALAC")))
+        runCurrent()
+
+        // 💡 验证 Finding 2: AirPlay 首包在 PAUSED 态下绝不能误判 resume 唤醒播放与偷跑声音！
+        assertEquals("AirPlay 暂停态寻道首包必须保持 PAUSED 业务态", BusinessSessionState.PAUSED, c.snapshot.value.businessState)
+        assertEquals("AirPlay 暂停态寻道首包必须保持 EXCLUSIVE_MUTED 硬件态", HardwarePipelineState.EXCLUSIVE_MUTED, c.snapshot.value.hardwareState)
+        assertEquals("绝不能触发 native resumeCalls 解除静音", initialResumes, hw.fastPath.resumeCalls)
+    }
+
+    @Test
+    fun `TrackBoundaryEvent resets progress to 0L on track generation change when snap trackGeneration is greater than 0`() = runTest(StandardTestDispatcher()) {
+        val hw = FakeSessionHardwareBridge()
+        val c = createCoordinator(this, hw)
+
+        c.dispatch(env(c, EventOrigin.USB_HARDWARE, 0L, HardwareAttachedEvent("Sony ZX300A", hasPermission = true), deviceGen = 1L))
+        runCurrent()
+
+        val s1 = c.allocateSessionId()
+        c.dispatch(env(c, EventOrigin.AIRPLAY, s1, StreamSetupEvent(StreamProtocol.AIRPLAY_1, 44100, 16, 2, "ALAC", 10L)))
+        c.dispatch(env(c, EventOrigin.AIRPLAY, s1, TrackBoundaryEvent(trackGeneration = 1L, trackKey = "Song1", initialDurationState = DurationState.FIXED, seekCapability = SeekCapability.SEEKABLE, trackUri = null)))
+        // 模拟已播放 2000ms
+        c.dispatch(env(c, EventOrigin.AIRPLAY, s1, ProgressUpdateEvent(positionMs = 2000L, durationMs = 180000L)))
+        runCurrent()
+        assertEquals(2000L, c.snapshot.value.progressPositionMs)
+        assertEquals(1L, c.snapshot.value.trackGeneration)
+
+        // 切歌 (TrackSwitchEvent FLUSH -> 进度保留为 2000ms)
+        c.dispatch(env(c, EventOrigin.AIRPLAY, s1, TrackSwitchEvent(FlushReason.FLUSH_SWITCH, 11L, null, isSeekFlush = false)))
+        runCurrent()
+        assertEquals(2000L, c.snapshot.value.progressPositionMs)
+
+        // 新歌边界到来 (TrackBoundaryEvent generation = 2L)
+        c.dispatch(env(c, EventOrigin.AIRPLAY, s1, TrackBoundaryEvent(trackGeneration = 2L, trackKey = "Song2", initialDurationState = DurationState.FIXED, seekCapability = SeekCapability.SEEKABLE, trackUri = null)))
+        runCurrent()
+
+        // 💡 验证 Finding 8: 切歌换代时，上一首歌残留的 2000ms 进度必须被坚决归零，绝不继承给新歌！
+        assertEquals("新曲目边界到来必须将进度归零", 0L, c.snapshot.value.progressPositionMs)
+        assertEquals("曲目代数应推进为 2", 2L, c.snapshot.value.trackGeneration)
+    }
+
+    private fun <T : SessionEventPayload> matrixEnv(
+        payload: T,
+        sessionId: Long = 1L,
+        origin: EventOrigin = EventOrigin.UPNP,
+        sequence: Long = 1L
+    ) = SessionEventEnvelope(
+        origin = origin,
+        sessionId = sessionId,
+        deviceGeneration = 1L,
+        sequence = sequence,
+        timestampElapsedMs = 100L,
+        payload = payload
+    )
+
+    @Test
+    fun `TriStateTransitionMatrix covers all branches of isCrossProtocolPreempting in StreamSetupEvent`() {
+        val tm = TrackTransactionManager()
+        val baseEnvelope = matrixEnv(
+            origin = EventOrigin.AIRPLAY,
+            sessionId = 2L,
+            payload = StreamSetupEvent(StreamProtocol.AIRPLAY_1, 44100, 16, 2, "ALAC", 10L)
+        )
+
+        // 1. snap.sessionId == 0L：空闲态建流，不触发抢占
+        val snapZero = PlayerSessionSnapshot(
+            sessionId = 0L,
+            activeProtocol = StreamProtocol.NONE,
+            hardwareState = HardwarePipelineState.RELEASED
+        )
+        val outZero = TriStateTransitionMatrix.reduce(TransitionContext(snapshot = snapZero), baseEnvelope, tm, 100L)
+        assertFalse(outZero.effects.any { it is TransitionEffect.NotifyPreemptedProtocol })
+
+        // 2. snap.sessionId == envelope.sessionId：同会话重入建流，不触发抢占
+        val snapSameSession = PlayerSessionSnapshot(
+            sessionId = 2L,
+            activeProtocol = StreamProtocol.AIRPLAY_1,
+            hardwareState = HardwarePipelineState.RELEASED
+        )
+        val outSameSession = TriStateTransitionMatrix.reduce(TransitionContext(snapshot = snapSameSession), baseEnvelope, tm, 100L)
+        assertFalse(outSameSession.effects.any { it is TransitionEffect.NotifyPreemptedProtocol })
+
+        // 3. activeProtocol 为 NONE：虽然有旧 sessionId，但 activeProtocol == NONE，isCrossProtocolPreempting 为 false
+        val snapNone = PlayerSessionSnapshot(
+            sessionId = 1L,
+            activeProtocol = StreamProtocol.NONE,
+            hardwareState = HardwarePipelineState.RELEASED
+        )
+        val outNone = TriStateTransitionMatrix.reduce(TransitionContext(snapshot = snapNone), baseEnvelope, tm, 100L)
+        assertFalse(outNone.effects.any { it is TransitionEffect.NotifyPreemptedProtocol })
+
+        // 4. 相同协议：activeProtocol == ev.protocol，isCrossProtocolPreempting 为 false
+        val snapSameProto = PlayerSessionSnapshot(
+            sessionId = 1L,
+            activeProtocol = StreamProtocol.AIRPLAY_1,
+            hardwareState = HardwarePipelineState.RELEASED
+        )
+        val outSameProto = TriStateTransitionMatrix.reduce(TransitionContext(snapshot = snapSameProto), baseEnvelope, tm, 100L)
+        assertFalse(outSameProto.effects.any { it is TransitionEffect.NotifyPreemptedProtocol })
+
+        // 5. 跨协议抢占：activeProtocol != NONE 且 activeProtocol != ev.protocol，isCrossProtocolPreempting 为 true
+        val snapCrossProto = PlayerSessionSnapshot(
+            sessionId = 1L,
+            activeProtocol = StreamProtocol.UPNP_DLNA,
+            hardwareState = HardwarePipelineState.RELEASED
+        )
+        val outCrossProto = TriStateTransitionMatrix.reduce(TransitionContext(snapshot = snapCrossProto), baseEnvelope, tm, 100L)
+        val preemptEffect = outCrossProto.effects.filterIsInstance<TransitionEffect.NotifyPreemptedProtocol>().firstOrNull()
+        assertNotNull("跨协议抢占必须派发 NotifyPreemptedProtocol", preemptEffect)
+        assertEquals(StreamProtocol.UPNP_DLNA, preemptEffect?.protocol)
+        assertEquals(1L, preemptEffect?.sessionId)
+    }
+
+    @Test
+    fun `TriStateTransitionMatrix covers all branches of TransitionTimeoutEvent`() {
+        val tm = TrackTransactionManager()
+
+        // 1. sessionId 匹配但 businessState != TRANSITIONING (例如处于 PLAYING)，直接忽略
+        val snapPlaying = PlayerSessionSnapshot(
+            sessionId = 1L,
+            businessState = BusinessSessionState.PLAYING
+        )
+        val envMatchSessionNotTransitioning = matrixEnv(
+            origin = EventOrigin.SERVICE,
+            sessionId = 1L,
+            payload = TransitionTimeoutEvent(sessionId = 1L)
+        )
+        val outPlaying = TriStateTransitionMatrix.reduce(TransitionContext(snapshot = snapPlaying), envMatchSessionNotTransitioning, tm, 100L)
+        assertEquals(snapPlaying, outPlaying.nextContext.snapshot)
+        assertTrue(outPlaying.effects.isEmpty())
+
+        // 2. sessionId 不匹配即使处于 TRANSITIONING 也直接忽略
+        val snapTransitioning = PlayerSessionSnapshot(
+            sessionId = 1L,
+            businessState = BusinessSessionState.TRANSITIONING
+        )
+        val envMismatchSession = matrixEnv(
+            origin = EventOrigin.SERVICE,
+            sessionId = 2L,
+            sequence = 2L,
+            payload = TransitionTimeoutEvent(sessionId = 2L)
+        )
+        val outMismatch = TriStateTransitionMatrix.reduce(TransitionContext(snapshot = snapTransitioning), envMismatchSession, tm, 100L)
+        assertEquals(snapTransitioning, outMismatch.nextContext.snapshot)
+        assertTrue(outMismatch.effects.isEmpty())
+
+        // 3. PREPARING 阶段超时（从未收到过有效首包），回退至 STOPPED 并触发 10s 硬件空闲让渡释放
+        val snapPreparing = PlayerSessionSnapshot(
+            sessionId = 1L,
+            businessState = BusinessSessionState.TRANSITIONING,
+            transportState = TransportPipeState.PREPARING,
+            hardwareState = HardwarePipelineState.EXCLUSIVE_ACTIVE
+        )
+        val envPreparingTimeout = matrixEnv(
+            origin = EventOrigin.SERVICE,
+            sessionId = 1L,
+            sequence = 3L,
+            payload = TransitionTimeoutEvent(sessionId = 1L)
+        )
+        val outPreparing = TriStateTransitionMatrix.reduce(TransitionContext(snapshot = snapPreparing), envPreparingTimeout, tm, 100L)
+        assertEquals("PREPARING 超时必须回退至 STOPPED", BusinessSessionState.STOPPED, outPreparing.nextContext.snapshot.businessState)
+        assertEquals("PREPARING 超时硬件态静音", HardwarePipelineState.EXCLUSIVE_MUTED, outPreparing.nextContext.snapshot.hardwareState)
+        assertTrue("PREPARING 超时必须调度 10s 空闲释放定时器", outPreparing.effects.any { it is TransitionEffect.ScheduleHardwareIdleTimeout })
+
+        // 4. INTERRUPTED 阶段超时（切歌换代中），回退至 PAUSED 并启动 10 分钟挂起定时器
+        val snapInterrupted = PlayerSessionSnapshot(
+            sessionId = 1L,
+            businessState = BusinessSessionState.TRANSITIONING,
+            transportState = TransportPipeState.INTERRUPTED,
+            hardwareState = HardwarePipelineState.EXCLUSIVE_ACTIVE
+        )
+        val envInterruptedTimeout = matrixEnv(
+            origin = EventOrigin.SERVICE,
+            sessionId = 1L,
+            sequence = 4L,
+            payload = TransitionTimeoutEvent(sessionId = 1L)
+        )
+        val outInterrupted = TriStateTransitionMatrix.reduce(TransitionContext(snapshot = snapInterrupted), envInterruptedTimeout, tm, 100L)
+        assertEquals("INTERRUPTED 超时必须回退至 PAUSED", BusinessSessionState.PAUSED, outInterrupted.nextContext.snapshot.businessState)
+        assertEquals("INTERRUPTED 超时硬件态维持静音", HardwarePipelineState.EXCLUSIVE_MUTED, outInterrupted.nextContext.snapshot.hardwareState)
+        assertTrue("INTERRUPTED 超时必须调度 10 分钟挂起定时器", outInterrupted.effects.any { it is TransitionEffect.ScheduleSuspendTimeout })
+    }
+
+    @Test
+    fun `FirstDataPacketEvent in PAUSED state with detached DAC still schedules suspend timeout`() {
+        val tm = TrackTransactionManager()
+        val snapPausedDetached = PlayerSessionSnapshot(
+            sessionId = 1L,
+            businessState = BusinessSessionState.PAUSED,
+            transportState = TransportPipeState.INTERRUPTED,
+            hardwareState = HardwarePipelineState.ATTACHED
+        )
+        val envFirstPacket = matrixEnv(
+            origin = EventOrigin.UPNP,
+            sessionId = 1L,
+            payload = FirstDataPacketEvent(StreamProtocol.UPNP_DLNA, 10L, 44100, 16, 2, "WAV")
+        )
+        val out = TriStateTransitionMatrix.reduce(TransitionContext(snapshot = snapPausedDetached), envFirstPacket, tm, 100L)
+        assertEquals(BusinessSessionState.PAUSED, out.nextContext.snapshot.businessState)
+        assertEquals(HardwarePipelineState.ATTACHED, out.nextContext.snapshot.hardwareState)
+        assertTrue("声卡未就绪时暂停首包仍须调度 10 分钟挂起定时器", out.effects.any { it is TransitionEffect.ScheduleSuspendTimeout })
+        assertFalse("严禁触发 ResumeNativeOutput", out.effects.any { it is TransitionEffect.ResumeNativeOutput })
+    }
+
+    @Test
+    fun `TriStateTransitionMatrix covers all branches of ProgressUpdateEvent`() {
+        val tm = TrackTransactionManager()
+        val snap = PlayerSessionSnapshot(
+            sessionId = 1L,
+            trackGeneration = 2L,
+            progressPositionMs = 1000L,
+            progressDurationMs = 5000L
+        )
+
+        // 1. trackGeneration == 0L: 兼容无代数信息进度包，正常更新
+        val envGenZero = matrixEnv(
+            origin = EventOrigin.UPNP,
+            sessionId = 1L,
+            payload = ProgressUpdateEvent(positionMs = 2000L, durationMs = 5000L, trackGeneration = 0L)
+        )
+        val outGenZero = TriStateTransitionMatrix.reduce(TransitionContext(snapshot = snap), envGenZero, tm, 100L)
+        assertEquals(2000L, outGenZero.nextContext.snapshot.progressPositionMs)
+
+        // 2. trackGeneration > 0L 但不匹配当前代数 (如在途旧代数包 1L != 2L)，丢弃不更新
+        val envGenMismatch = matrixEnv(
+            origin = EventOrigin.UPNP,
+            sessionId = 1L,
+            sequence = 2L,
+            payload = ProgressUpdateEvent(positionMs = 3000L, durationMs = 5000L, trackGeneration = 1L)
+        )
+        val outGenMismatch = TriStateTransitionMatrix.reduce(TransitionContext(snapshot = snap), envGenMismatch, tm, 100L)
+        assertEquals("代数不匹配的进度包必须被丢弃", 1000L, outGenMismatch.nextContext.snapshot.progressPositionMs)
+
+        // 3. trackGeneration > 0L 且匹配当前代数 (2L == 2L)，正常更新
+        val envGenMatch = matrixEnv(
+            origin = EventOrigin.UPNP,
+            sessionId = 1L,
+            sequence = 3L,
+            payload = ProgressUpdateEvent(positionMs = 4000L, durationMs = 5000L, trackGeneration = 2L)
+        )
+        val outGenMatch = TriStateTransitionMatrix.reduce(TransitionContext(snapshot = snap), envGenMatch, tm, 100L)
+        assertEquals(4000L, outGenMatch.nextContext.snapshot.progressPositionMs)
+    }
+
+    @Test
+    fun `TriStateTransitionMatrix covers UsbPermissionGrantedEvent and HardwareStateSyncedEvent branches`() {
+        val tm = TrackTransactionManager()
+
+        // --- 1. UsbPermissionGrantedEvent 分支覆盖 ---
+        // 1.1 独占态下收到授权成功，保持独占态且 isExclusive 为 true
+        val snapExclusive = PlayerSessionSnapshot(
+            hardwareState = HardwarePipelineState.EXCLUSIVE_ACTIVE,
+            audioPath = AudioPathState(isDacConnected = true, isExclusive = true, dacName = "DAC1")
+        )
+        val envPermGrantedExclusive = matrixEnv(
+            origin = EventOrigin.USB_HARDWARE,
+            sessionId = 1L,
+            sequence = 1L,
+            payload = UsbPermissionGrantedEvent(deviceName = "DAC1", granted = true)
+        )
+        val outPermExclusive = TriStateTransitionMatrix.reduce(TransitionContext(snapshot = snapExclusive), envPermGrantedExclusive, tm, 100L)
+        assertEquals(HardwarePipelineState.EXCLUSIVE_ACTIVE, outPermExclusive.nextContext.snapshot.hardwareState)
+        assertTrue(outPermExclusive.nextContext.snapshot.audioPath.isExclusive)
+
+        // 1.2 非独占态下收到授权成功，状态转换为 RELEASED 且 isExclusive 为 false
+        val snapPending = PlayerSessionSnapshot(
+            hardwareState = HardwarePipelineState.PERMISSION_PENDING,
+            audioPath = AudioPathState(isDacConnected = true, isExclusive = false, dacName = "DAC1")
+        )
+        val outPermPending = TriStateTransitionMatrix.reduce(TransitionContext(snapshot = snapPending), envPermGrantedExclusive, tm, 100L)
+        assertEquals(HardwarePipelineState.RELEASED, outPermPending.nextContext.snapshot.hardwareState)
+        assertFalse(outPermPending.nextContext.snapshot.audioPath.isExclusive)
+
+        // 1.3 授权被拒绝 (granted = false)
+        val envPermDenied = matrixEnv(
+            origin = EventOrigin.USB_HARDWARE,
+            sessionId = 1L,
+            sequence = 2L,
+            payload = UsbPermissionGrantedEvent(deviceName = "DAC1", granted = false)
+        )
+        val outPermDenied = TriStateTransitionMatrix.reduce(TransitionContext(snapshot = snapExclusive), envPermDenied, tm, 100L)
+        assertEquals(HardwarePipelineState.PERMISSION_PENDING, outPermDenied.nextContext.snapshot.hardwareState)
+        assertFalse(outPermDenied.nextContext.snapshot.audioPath.isExclusive)
+
+        // --- 2. HardwareStateSyncedEvent 分支覆盖 ---
+        val envSyncReconfig = matrixEnv(
+            origin = EventOrigin.USB_HARDWARE,
+            sessionId = 1L,
+            sequence = 3L,
+            payload = HardwareStateSyncedEvent(newHardwareState = HardwarePipelineState.AUDIO_RECONFIGURING)
+        )
+
+        // 2.1 修复 Finding 11: 原位重配切频状态 (AUDIO_RECONFIGURING) 正常透传同步，通知 UI，不被强行覆盖
+        val snapPlaying = PlayerSessionSnapshot(
+            hardwareState = HardwarePipelineState.EXCLUSIVE_ACTIVE,
+            businessState = BusinessSessionState.PLAYING,
+            transportState = TransportPipeState.STREAMING
+        )
+        val outSyncPlaying = TriStateTransitionMatrix.reduce(TransitionContext(snapshot = snapPlaying), envSyncReconfig, tm, 100L)
+        assertEquals(HardwarePipelineState.AUDIO_RECONFIGURING, outSyncPlaying.nextContext.snapshot.hardwareState)
+        assertTrue(outSyncPlaying.nextContext.snapshot.audioPath.isExclusive)
+
+        // 2.3 EXCLUSIVE_ACTIVE 但非 PLAYING 且非 STREAMING (例如 PAUSED/DISCONNECTED)：正常同步为 AUDIO_RECONFIGURING
+        val snapPaused = PlayerSessionSnapshot(
+            hardwareState = HardwarePipelineState.EXCLUSIVE_ACTIVE,
+            businessState = BusinessSessionState.PAUSED,
+            transportState = TransportPipeState.DISCONNECTED
+        )
+        val outSyncPaused = TriStateTransitionMatrix.reduce(TransitionContext(snapshot = snapPaused), envSyncReconfig, tm, 100L)
+        assertEquals(HardwarePipelineState.AUDIO_RECONFIGURING, outSyncPaused.nextContext.snapshot.hardwareState)
+
+        // 2.4 非 EXCLUSIVE_ACTIVE (例如 RELEASED) 且 PLAYING：正常同步为 AUDIO_RECONFIGURING
+        val snapReleasedPlaying = PlayerSessionSnapshot(
+            hardwareState = HardwarePipelineState.RELEASED,
+            businessState = BusinessSessionState.PLAYING,
+            transportState = TransportPipeState.STREAMING
+        )
+        val outSyncReleased = TriStateTransitionMatrix.reduce(TransitionContext(snapshot = snapReleasedPlaying), envSyncReconfig, tm, 100L)
+        assertEquals(HardwarePipelineState.AUDIO_RECONFIGURING, outSyncReleased.nextContext.snapshot.hardwareState)
+
+        // 2.5 同步到非 AUDIO_RECONFIGURING 状态 (例如 EXCLUSIVE_MUTED)
+        val envSyncMuted = matrixEnv(
+            origin = EventOrigin.USB_HARDWARE,
+            sessionId = 1L,
+            sequence = 4L,
+            payload = HardwareStateSyncedEvent(newHardwareState = HardwarePipelineState.EXCLUSIVE_MUTED)
+        )
+        val outSyncMuted = TriStateTransitionMatrix.reduce(TransitionContext(snapshot = snapPlaying), envSyncMuted, tm, 100L)
+        assertEquals(HardwarePipelineState.EXCLUSIVE_MUTED, outSyncMuted.nextContext.snapshot.hardwareState)
+    }
+
+    @Test
+    fun `TriStateTransitionMatrix covers pause resume metadata preservation in StreamSetupEvent`() {
+        val tm = TrackTransactionManager()
+
+        // 1. hasCustomInitial == true：传入明确歌名，直接采用传入的元数据
+        val customMeta = TrackMetadata(title = "Custom Song", artist = "Artist")
+        val envCustom = matrixEnv(
+            origin = EventOrigin.AIRPLAY,
+            sessionId = 2L,
+            payload = StreamSetupEvent(StreamProtocol.AIRPLAY_1, 44100, 16, 2, "ALAC", 10L, initialMetadata = customMeta)
+        )
+        val snapIdle = PlayerSessionSnapshot(sessionId = 0L, activeProtocol = StreamProtocol.NONE, hardwareState = HardwarePipelineState.RELEASED)
+        val outCustom = TriStateTransitionMatrix.reduce(TransitionContext(snapshot = snapIdle), envCustom, tm, 100L)
+        assertEquals("Custom Song", outCustom.nextContext.snapshot.metadata.title)
+
+        // 2. isResumingPausedSession == true 且 snap 包含非默认歌名：无缝继承
+        val snapPausedWithSong = PlayerSessionSnapshot(
+            sessionId = 1L,
+            businessState = BusinessSessionState.PAUSED,
+            activeProtocol = StreamProtocol.AIRPLAY_1,
+            hardwareState = HardwarePipelineState.EXCLUSIVE_MUTED,
+            metadata = TrackMetadata(title = "Preserved Song", artist = "Faye Wong"),
+            progressPositionMs = 25000L
+        )
+        val defaultMeta = TrackMetadata(title = "AirPlay 音频直通", artist = "AirPlay 设备")
+        val envResumeDefault = matrixEnv(
+            origin = EventOrigin.AIRPLAY,
+            sessionId = 2L,
+            payload = StreamSetupEvent(StreamProtocol.AIRPLAY_1, 44100, 16, 2, "ALAC", 10L, initialMetadata = defaultMeta)
+        )
+        val outResume = TriStateTransitionMatrix.reduce(TransitionContext(snapshot = snapPausedWithSong), envResumeDefault, tm, 100L)
+        assertEquals("Preserved Song", outResume.nextContext.snapshot.metadata.title)
+        assertEquals(25000L, outResume.nextContext.snapshot.progressPositionMs)
+
+        // 3. isResumingPausedSession 但 snap 歌名为 "AirPlay 音频直通"：回退到 initialMeta
+        val snapPausedDefaultSong = snapPausedWithSong.copy(
+            metadata = TrackMetadata(title = "AirPlay 音频直通")
+        )
+        val outResumeDefault = TriStateTransitionMatrix.reduce(TransitionContext(snapshot = snapPausedDefaultSong), envResumeDefault, tm, 100L)
+        assertEquals("AirPlay 音频直通", outResumeDefault.nextContext.snapshot.metadata.title)
+
+        // 4. isResumingPausedSession 但 snap 歌名为空：回退到 initialMeta
+        val snapPausedEmptySong = snapPausedWithSong.copy(
+            metadata = TrackMetadata(title = "")
+        )
+        val outResumeEmpty = TriStateTransitionMatrix.reduce(TransitionContext(snapshot = snapPausedEmptySong), envResumeDefault, tm, 100L)
+        assertEquals("AirPlay 音频直通", outResumeEmpty.nextContext.snapshot.metadata.title)
+
+        // 5. snap 处于 PAUSED 但不同协议 (如 UPNP -> AIRPLAY)：isResumingPausedSession 为 false
+        val snapPausedDifferentProto = snapPausedWithSong.copy(
+            activeProtocol = StreamProtocol.UPNP_DLNA
+        )
+        val outDiffProto = TriStateTransitionMatrix.reduce(TransitionContext(snapshot = snapPausedDifferentProto), envResumeDefault, tm, 100L)
+        assertEquals("AirPlay 音频直通", outDiffProto.nextContext.snapshot.metadata.title)
+        assertEquals(0L, outDiffProto.nextContext.snapshot.progressPositionMs)
+
+        // 6. initialMetadata 存在但 title 为空字符串：hasCustomInitial 为 false
+        val envEmptyTitle = matrixEnv(
+            origin = EventOrigin.AIRPLAY,
+            sessionId = 3L,
+            payload = StreamSetupEvent(StreamProtocol.AIRPLAY_1, 44100, 16, 2, "ALAC", 10L, initialMetadata = TrackMetadata(title = ""))
+        )
+        val outEmptyTitle = TriStateTransitionMatrix.reduce(TransitionContext(snapshot = snapIdle), envEmptyTitle, tm, 100L)
+        assertEquals("", outEmptyTitle.nextContext.snapshot.metadata.title)
+
+        // 7. initialMetadata 为 null：hasCustomInitial 为 false，但命中 isResumingPausedSession
+        val envNullMeta = matrixEnv(
+            origin = EventOrigin.AIRPLAY,
+            sessionId = 4L,
+            payload = StreamSetupEvent(StreamProtocol.AIRPLAY_1, 44100, 16, 2, "ALAC", 10L, initialMetadata = null)
+        )
+        val outNullMeta = TriStateTransitionMatrix.reduce(TransitionContext(snapshot = snapPausedWithSong), envNullMeta, tm, 100L)
+        assertEquals("Preserved Song", outNullMeta.nextContext.snapshot.metadata.title)
+        assertEquals(25000L, outNullMeta.nextContext.snapshot.progressPositionMs)
+
+        // 8. hasCustomInitial == true 且 initialMeta.title == snap.metadata.title：同曲名恢复
+        val sameSongMeta = TrackMetadata(title = "Preserved Song", artist = "Faye Wong")
+        val envSameSong = matrixEnv(
+            origin = EventOrigin.AIRPLAY,
+            sessionId = 5L,
+            payload = StreamSetupEvent(StreamProtocol.AIRPLAY_1, 44100, 16, 2, "ALAC", 10L, initialMetadata = sameSongMeta)
+        )
+        val outSameSong = TriStateTransitionMatrix.reduce(TransitionContext(snapshot = snapPausedWithSong), envSameSong, tm, 100L)
+        assertEquals("Preserved Song", outSameSong.nextContext.snapshot.metadata.title)
+        assertEquals(25000L, outSameSong.nextContext.snapshot.progressPositionMs)
+
+        // 9. hasCustomInitial == true 且 initialMeta.title != snap.metadata.title：切歌换曲目，isResumingPausedSession 为 false
+        val differentSongMeta = TrackMetadata(title = "Different Song", artist = "Different Artist")
+        val envDiffSong = matrixEnv(
+            origin = EventOrigin.AIRPLAY,
+            sessionId = 6L,
+            payload = StreamSetupEvent(StreamProtocol.AIRPLAY_1, 44100, 16, 2, "ALAC", 10L, initialMetadata = differentSongMeta)
+        )
+        val outDiffSong = TriStateTransitionMatrix.reduce(TransitionContext(snapshot = snapPausedWithSong), envDiffSong, tm, 100L)
+        assertEquals("Different Song", outDiffSong.nextContext.snapshot.metadata.title)
+        assertEquals(0L, outDiffSong.nextContext.snapshot.progressPositionMs)
+    }
+
+    @Test
+    fun `TriStateTransitionMatrix covers early progress preservation in TrackBoundaryEvent`() {
+        val tm = TrackTransactionManager()
+
+        // 1. accepted && progressPositionMs in 1L..3000L (例如已播 1500ms)：保留进度
+        val snapEarlyPlay = PlayerSessionSnapshot(
+            sessionId = 1L,
+            businessState = BusinessSessionState.PLAYING,
+            activeProtocol = StreamProtocol.AIRPLAY_1,
+            progressPositionMs = 1500L,
+            progressDurationMs = 200000L
+        )
+        val envBoundary1 = matrixEnv(
+            origin = EventOrigin.AIRPLAY,
+            sessionId = 1L,
+            payload = TrackBoundaryEvent(trackGeneration = 1L, trackKey = "Song1|Artist1")
+        )
+        val outEarly = TriStateTransitionMatrix.reduce(TransitionContext(snapshot = snapEarlyPlay), envBoundary1, tm, 100L)
+        assertEquals(1500L, outEarly.nextContext.snapshot.progressPositionMs)
+
+        // 2. accepted && progressPositionMs > 3000L (例如残留上一首 180000ms)：归零
+        val snapOldSongPlay = PlayerSessionSnapshot(
+            sessionId = 1L,
+            businessState = BusinessSessionState.PLAYING,
+            activeProtocol = StreamProtocol.AIRPLAY_1,
+            progressPositionMs = 180000L,
+            progressDurationMs = 200000L
+        )
+        val envBoundary2 = matrixEnv(
+            origin = EventOrigin.AIRPLAY,
+            sessionId = 1L,
+            payload = TrackBoundaryEvent(trackGeneration = 2L, trackKey = "Song2|Artist2")
+        )
+        val outOldSong = TriStateTransitionMatrix.reduce(TransitionContext(snapshot = snapOldSongPlay), envBoundary2, tm, 100L)
+        assertEquals(0L, outOldSong.nextContext.snapshot.progressPositionMs)
+
+        // 3. accepted && progressPositionMs == 0L：保持 0L
+        val snapZero = PlayerSessionSnapshot(
+            sessionId = 1L,
+            businessState = BusinessSessionState.PLAYING,
+            activeProtocol = StreamProtocol.AIRPLAY_1,
+            progressPositionMs = 0L,
+            progressDurationMs = 200000L
+        )
+        val envBoundary3 = matrixEnv(
+            origin = EventOrigin.AIRPLAY,
+            sessionId = 1L,
+            payload = TrackBoundaryEvent(trackGeneration = 3L, trackKey = "Song3|Artist3")
+        )
+        val outZero = TriStateTransitionMatrix.reduce(TransitionContext(snapshot = snapZero), envBoundary3, tm, 100L)
+        assertEquals(0L, outZero.nextContext.snapshot.progressPositionMs)
+
+        // 4. rejected (trackGeneration <= current)：保持原进度
+        val envRejected = matrixEnv(
+            origin = EventOrigin.AIRPLAY,
+            sessionId = 1L,
+            payload = TrackBoundaryEvent(trackGeneration = 1L, trackKey = "SongOld|ArtistOld")
+        )
+        val outRejected = TriStateTransitionMatrix.reduce(TransitionContext(snapshot = snapEarlyPlay), envRejected, tm, 100L)
+        assertEquals(1500L, outRejected.nextContext.snapshot.progressPositionMs)
+    }
+
+    @Test
+    fun `StreamSetupEvent when activeProtocol matches but sessionId is 0 does not resume session`() {
+        val tm = TrackTransactionManager()
+        val baseSnap = PlayerSessionSnapshot(
+            sessionId = 0L,
+            activeProtocol = StreamProtocol.AIRPLAY_1,
+            progressPositionMs = 25000L
+        )
+        val env = matrixEnv(
+            origin = EventOrigin.AIRPLAY,
+            sessionId = 1L,
+            payload = StreamSetupEvent(StreamProtocol.AIRPLAY_1, 44100, 16, 2, "ALAC", 10L)
+        )
+        val output = TriStateTransitionMatrix.reduce(
+            TransitionContext(snapshot = baseSnap),
+            env,
+            tm,
+            nowMs = 1000L
+        )
+        assertEquals(0L, output.nextContext.snapshot.progressPositionMs)
+    }
+
+    @Test
+    fun `SERVICE and USER_ACTION events with inactive sessionId are dropped and do not pollute active session`() = runTest(StandardTestDispatcher()) {
+        val hw = FakeSessionHardwareBridge()
+        val c = createCoordinator(this, hw)
+
+        // 1. 建立会话 101 并进入 PLAYING
+        val s1 = c.allocateSessionId()
+        c.dispatch(env(c, EventOrigin.AIRPLAY, s1, StreamSetupEvent(StreamProtocol.AIRPLAY_1)))
+        c.dispatch(env(c, EventOrigin.USB_HARDWARE, 0L, HardwareAttachedEvent("DAC", true), deviceGen = 1L))
+        c.dispatch(env(c, EventOrigin.AIRPLAY, s1, FirstDataPacketEvent(StreamProtocol.AIRPLAY_1, 10L, 44100, 16, 2, "ALAC")))
+        runCurrent()
+        assertEquals(BusinessSessionState.PLAYING, c.snapshot.value.businessState)
+        assertEquals(s1, c.snapshot.value.sessionId)
+
+        // 2. 模拟过期会话 99 的 USER_ACTION 和 SERVICE 事件 (Pause, Stop, Progress, Timeout)
+        val deadSid = 99L
+        c.dispatch(env(c, EventOrigin.USER_ACTION, deadSid, ExplicitPauseEvent(epoch = 1L)))
+        c.dispatch(env(c, EventOrigin.USER_ACTION, deadSid, StreamStopEvent(FlushReason.STOP_OR_TEARDOWN, 1L, false)))
+        c.dispatch(env(c, EventOrigin.SERVICE, deadSid, ProgressUpdateEvent(99999L, 99999L, 1L)))
+        c.dispatch(env(c, EventOrigin.SERVICE, deadSid, TransitionTimeoutEvent(deadSid)))
+        c.dispatch(env(c, EventOrigin.SERVICE, deadSid, CoverGraceTimeoutEvent(1L)))
+        runCurrent()
+
+        // 验证：当前活跃会话 101 完全不受污染，依然保持 PLAYING 且进度未被篡改
+        assertEquals(BusinessSessionState.PLAYING, c.snapshot.value.businessState)
+        assertEquals(s1, c.snapshot.value.sessionId)
+
+        // 3. 全局 sessionId == 0L 的合法服务事件（如全局错误消除）应正常受理
+        c.dispatch(env(c, EventOrigin.SERVICE, 0L, ErrorClearedEvent(ErrorCode.USB_DEVICE_DETACHED)))
+        runCurrent()
+        assertEquals(BusinessSessionState.PLAYING, c.snapshot.value.businessState)
+
+        // 4. 当前活跃会话自身的 USER_ACTION 事件正常受理
+        c.dispatch(env(c, EventOrigin.USER_ACTION, s1, ExplicitPauseEvent(epoch = 10L)))
+        runCurrent()
+        assertEquals(BusinessSessionState.PAUSED, c.snapshot.value.businessState)
     }
 }

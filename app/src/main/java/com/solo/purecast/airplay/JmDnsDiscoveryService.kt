@@ -10,6 +10,8 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.net.InetAddress
 import java.net.NetworkInterface
@@ -58,7 +60,11 @@ class JmDnsDiscoveryService(private val context: Context) {
 
     @Volatile
     private var isBroadcasting = false
+    @Volatile
     private var boundIp: InetAddress? = null
+    private var currentFriendlyName: String? = null
+    private var currentRaopPort: Int = DEFAULT_RAOP_PORT
+    private val broadcastMutex = Mutex()
 
     /**
      * 获取当前是否正在广播
@@ -80,15 +86,8 @@ class JmDnsDiscoveryService(private val context: Context) {
         friendlyName: String = "PureCast TV",
         airPlayPort: Int = DEFAULT_AIRPLAY_PORT,
         raopPort: Int = DEFAULT_RAOP_PORT
-    ): Boolean = withContext(Dispatchers.IO) {
-        if (isBroadcasting) {
-            Logger.service.w(TAG, "JmDnsDiscoveryService 已处于运行状态，无需重复启动")
-            return@withContext true
-        }
-
-        try {
-            acquireMulticastLock()
-
+    ): Boolean = broadcastMutex.withLock {
+        withContext(Dispatchers.IO) {
             val localIp = getLocalIpv4Address()
             if (localIp == null) {
                 Logger.service.e(TAG, "未获取到有效的局域网 IPv4 地址，广播启动失败")
@@ -96,77 +95,98 @@ class JmDnsDiscoveryService(private val context: Context) {
                 return@withContext false
             }
 
-            val macAddressFormatted = getMacAddressFormatted()
-            // 💡 严格遵循 RFC 1034 / RFC 6762 规范：mDNS 主机名严禁包含空格等非法字符！
-            // 传入纯小写字母与连字符构造合法的主机名 (如 purecast-1485540bcbc4)，SRV 记录的 Target 即为合规的 purecast-1485540bcbc4.local.
-            // 解决 iOS 的 mDNSResponder 将带空格的主机名判定为 Malformed DNS Label 导致 iPhone 直接搜不到设备的致命 Bug
-            val hostName = "purecast-${macAddressFormatted.lowercase()}"
-            Logger.service.i(TAG, "初始化 JmDNS 实例: IP=${localIp.hostAddress}, MAC=$macAddressFormatted, HostName=$hostName, FriendlyName=$friendlyName")
-
-            jmdns = JmDNS.create(localIp, hostName)
-
-            // 💡 彻底注销旧残留的 _airplay._tcp 服务，杜绝 iOS/macOS 误入 AirPlay 2 配对通道
-            try {
-                val staleAirPlayInfo = ServiceInfo.create(AIRPLAY_SERVICE_TYPE, friendlyName, raopPort, 0, 0, emptyMap<String, String>())
-                jmdns?.unregisterService(staleAirPlayInfo)
-            } catch (e: Exception) {
-                // ignore
+            // 💡 若已在运行且绑定 IP、端口、服务名完全相同，则复用现有实例无需重复注册
+            if (isBroadcasting && jmdns != null && boundIp == localIp && currentFriendlyName == friendlyName && currentRaopPort == raopPort) {
+                Logger.service.w(TAG, "JmDnsDiscoveryService 已处于运行状态且配置一致，无需重复启动")
+                return@withContext true
             }
 
-            // 💡 严格遵循经典 AirTunes / AirPort Express 纯音频规范 (与实测通过的 AirReceiver 100% 对齐)
-            // 严禁注册 _airplay._tcp，iOS / macOS 音乐 App 仅凭借 _raop._tcp 即可直接发现并显示为无线音频音箱
-            // am 使用 "AirRecever3,1" 避开 Apple 对官方硬件指纹与固件配对的严格校验，解决 macOS 报“不兼容”问题
-            val raopInstanceName = "${macAddressFormatted}@$friendlyName"
-            val raopProps = mapOf(
-                "txtvers" to "1",
-                "ch" to "2",
-                "cn" to "0,1",
-                "et" to "0,1",
-                "sv" to "false",
-                "da" to "true",
-                "sr" to "44100",
-                "ss" to "16",
-                "pw" to "false",
-                "vn" to "3",
-                "tp" to "UDP",
-                "md" to "0,1,2",
-                "vs" to "105.1",
-                "am" to "AirRecever3,1",
-                "sf" to "0x4",
-                "fv" to "76400.10",
-                "ek" to "1"
-            )
+            // 💡 修复 Finding 1: 若已有旧实例或配置变动，先安全彻底同步关闭，杜绝 JmDNS 实例泄漏与组播套接字冲突
+            stopBroadcastInternal()
 
-            raopServiceInfo = ServiceInfo.create(
-                RAOP_SERVICE_TYPE,
-                raopInstanceName,
-                raopPort,
-                0,
-                0,
-                raopProps
-            )
+            try {
+                acquireMulticastLock()
 
-            jmdns?.registerService(raopServiceInfo)
+                val macAddressFormatted = getMacAddressFormatted()
+                // 💡 严格遵循 RFC 1034 / RFC 6762 规范：mDNS 主机名严禁包含空格等非法字符！
+                // 传入纯小写字母与连字符构造合法的主机名 (如 purecast-1485540bcbc4)，SRV 记录的 Target 即为合规的 purecast-1485540bcbc4.local.
+                // 解决 iOS 的 mDNSResponder 将带空格的主机名判定为 Malformed DNS Label 导致 iPhone 直接搜不到设备的致命 Bug
+                val hostName = "purecast-${macAddressFormatted.lowercase()}"
+                Logger.service.i(TAG, "初始化 JmDNS 实例: IP=${localIp.hostAddress}, MAC=$macAddressFormatted, HostName=$hostName, FriendlyName=$friendlyName")
 
-            // 💡 注册 DACP 服务监听器，实时捕获 iPhone / iPad 在局域网中广播的临时 DACP 端口
-            setupDacpServiceListener()
+                jmdns = JmDNS.create(localIp, hostName)
 
-            boundIp = localIp
-            isBroadcasting = true
-            Logger.service.i(TAG, "AirPlay 1 (AirTunes / RAOP) 纯音频广播已成功注册: Instance=$raopInstanceName, Target=$hostName.local.:$raopPort, am=AirRecever3,1")
-            true
-        } catch (e: Exception) {
-            Logger.service.e(TAG, "启动 JmDnsDiscoveryService 异常", e)
-            stopBroadcast()
-            false
+                // 💡 彻底注销旧残留的 _airplay._tcp 服务，杜绝 iOS/macOS 误入 AirPlay 2 配对通道
+                try {
+                    val staleAirPlayInfo = ServiceInfo.create(AIRPLAY_SERVICE_TYPE, friendlyName, raopPort, 0, 0, emptyMap<String, String>())
+                    jmdns?.unregisterService(staleAirPlayInfo)
+                } catch (e: Exception) {
+                    Logger.service.w(TAG, "注销残留 _airplay._tcp 服务异常", e)
+                }
+
+                // 💡 严格遵循经典 AirTunes / AirPort Express 纯音频规范 (与实测通过的 AirReceiver 100% 对齐)
+                // 严禁注册 _airplay._tcp，iOS / macOS 音乐 App 仅凭借 _raop._tcp 即可直接发现并显示为无线音频音箱
+                // am 使用 "AirRecever3,1" 避开 Apple 对官方硬件指纹与固件配对的严格校验，解决 macOS 报“不兼容”问题
+                val raopInstanceName = "${macAddressFormatted}@$friendlyName"
+                val raopProps = mapOf(
+                    "txtvers" to "1",
+                    "ch" to "2",
+                    "cn" to "0,1",
+                    "et" to "0,1",
+                    "sv" to "false",
+                    "da" to "true",
+                    "sr" to "44100",
+                    "ss" to "16",
+                    "pw" to "false",
+                    "vn" to "3",
+                    "tp" to "UDP",
+                    "md" to "0,1,2",
+                    "vs" to "105.1",
+                    "am" to "AirRecever3,1",
+                    "sf" to "0x4",
+                    "fv" to "76400.10",
+                    "ek" to "1"
+                )
+
+                raopServiceInfo = ServiceInfo.create(
+                    RAOP_SERVICE_TYPE,
+                    raopInstanceName,
+                    raopPort,
+                    0,
+                    0,
+                    raopProps
+                )
+
+                jmdns?.registerService(raopServiceInfo)
+
+                // 💡 注册 DACP 服务监听器，实时捕获 iPhone / iPad 在局域网中广播的临时 DACP 端口
+                setupDacpServiceListener()
+
+                boundIp = localIp
+                currentFriendlyName = friendlyName
+                currentRaopPort = raopPort
+                isBroadcasting = true
+                Logger.service.i(TAG, "AirPlay 1 (AirTunes / RAOP) 纯音频广播已成功注册: Instance=$raopInstanceName, Target=$hostName.local.:$raopPort, am=AirRecever3,1")
+                true
+            } catch (e: Exception) {
+                Logger.service.e(TAG, "启动 JmDnsDiscoveryService 异常", e)
+                stopBroadcastInternal()
+                false
+            }
         }
     }
 
     /**
      * 停止并注销广播服务
      */
-    suspend fun stopBroadcast() = withContext(Dispatchers.IO) {
-        if (!isBroadcasting && jmdns == null) return@withContext
+    suspend fun stopBroadcast() = broadcastMutex.withLock {
+        withContext(Dispatchers.IO) {
+            stopBroadcastInternal()
+        }
+    }
+
+    private fun stopBroadcastInternal() {
+        if (!isBroadcasting && jmdns == null) return
 
         Logger.service.i(TAG, "正在停止 JmDNS 广播并注销 Bonjour 服务...")
         try {
@@ -184,6 +204,7 @@ class JmDnsDiscoveryService(private val context: Context) {
             airPlayServiceInfo = null
             raopServiceInfo = null
             boundIp = null
+            currentFriendlyName = null
             isBroadcasting = false
             releaseMulticastLock()
             Logger.service.i(TAG, "JmDNS 广播已注销，MulticastLock 已释放")

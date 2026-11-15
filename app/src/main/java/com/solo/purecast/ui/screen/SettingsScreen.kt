@@ -42,6 +42,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -79,6 +80,7 @@ import com.solo.purecast.ui.theme.ThemeMode
 import com.solo.purecast.util.Logger
 import com.solo.purecast.util.PermissionHelper
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import java.util.Locale
 
 private const val TAG = "SettingsScreen"
@@ -136,6 +138,8 @@ fun SettingsScreen(
         )
     }
 
+    val coroutineScope = rememberCoroutineScope()
+
     // 1. 设备广播名与外观状态
     var currentThemeMode by remember { mutableStateOf(AppPalette.mode) }
     var friendlyName by remember { mutableStateOf(settingsRepo.getFriendlyName()) }
@@ -143,10 +147,24 @@ fun SettingsScreen(
     var customNameInput by remember { mutableStateOf(friendlyName) }
     var currentFluidQuality by remember { mutableStateOf(settingsRepo.getFluidQuality()) }
     val customNameFocusRequester = remember { FocusRequester() }
+    val customEditButtonFocusRequester = remember { FocusRequester() }
     var isTextFieldFocused by remember { mutableStateOf(false) }
     var isAirPlayEnabled by remember { mutableStateOf(settingsRepo.isAirPlayEnabled()) }
     var isUpnpEnabled by remember { mutableStateOf(settingsRepo.isUpnpEnabled()) }
     var idleTimeoutSeconds by remember { mutableIntStateOf(settingsRepo.getIdleTimeoutSeconds()) }
+
+    // 💡 退出自定义名称编辑并平滑请求焦点至“✏️ 自定义”按钮，防止大屏丢失焦点失灵
+    fun exitCustomNameEditing() {
+        isEditingCustomName = false
+        coroutineScope.launch {
+            delay(50)
+            try {
+                customEditButtonFocusRequester.requestFocus()
+            } catch (e: Exception) {
+                Logger.ui.w(TAG, "退出自定义名称编辑后请求焦点异常", e)
+            }
+        }
+    }
 
     // 💡 自定义输入框展开时，主动将遥控器焦点请求至 BasicTextField，避免落入焦点陷阱
     LaunchedEffect(isEditingCustomName) {
@@ -154,22 +172,27 @@ fun SettingsScreen(
             delay(150)
             try {
                 customNameFocusRequester.requestFocus()
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                Logger.ui.w(TAG, "展开输入框请求焦点异常", e)
+            }
         }
     }
 
     // 💡 严谨的 Apple TV 双栏 Back 键层级路由
     BackHandler(enabled = isFocusInRightContent || isEditingCustomName) {
         if (isEditingCustomName) {
-            isEditingCustomName = false
+            exitCustomNameEditing()
         } else if (isFocusInRightContent) {
             // 右侧按 Back：将焦点请求回左侧当前分类项 (附带首项回退兜底，杜绝焦点丢失)
             try {
                 navFocusRequesters[selectedCategory.ordinal].requestFocus()
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                Logger.ui.w(TAG, "返回键请求导航分类焦点异常，尝试首项兜底", e)
                 try {
                     navFocusRequesters.firstOrNull()?.requestFocus()
-                } catch (_: Exception) {}
+                } catch (ex: Exception) {
+                    Logger.ui.w(TAG, "导航分类首项兜底焦点请求异常", ex)
+                }
             }
             isFocusInRightContent = false
         }
@@ -185,12 +208,24 @@ fun SettingsScreen(
     var bufferAvailableRead by remember { mutableIntStateOf(0) }
     var libusbVer by remember { mutableStateOf("1.0.27") }
 
+    fun checkUsbPermission(ctx: Context): Boolean {
+        val usbManager = ctx.getSystemService(Context.USB_SERVICE) as UsbManager
+        return usbManager.deviceList.values.any { device ->
+            val isAudio = device.deviceClass == UsbConstants.USB_CLASS_AUDIO ||
+                (0 until device.interfaceCount).any { device.getInterface(it).interfaceClass == UsbConstants.USB_CLASS_AUDIO }
+            isAudio && usbManager.hasPermission(device)
+        }
+    }
+
+    var isUsbGranted by remember { mutableStateOf(checkUsbPermission(context)) }
+
     LaunchedEffect(Unit) {
         while (true) {
             try {
                 bufferCapacity = NativeAudioEngine.getBufferCapacity().coerceAtLeast(1)
                 bufferAvailableRead = NativeAudioEngine.getAvailableRead()
                 libusbVer = NativeAudioEngine.getLibusbVersion()
+                isUsbGranted = checkUsbPermission(context)
             } catch (e: Exception) {
                 Logger.ui.w(TAG, "获取底层驱动信息异常", e)
             }
@@ -199,14 +234,6 @@ fun SettingsScreen(
     }
 
     // 3. 权限自检计算
-    val isUsbGranted = remember(audioState) {
-        val usbManager = context.getSystemService(Context.USB_SERVICE) as UsbManager
-        usbManager.deviceList.values.any { device ->
-            val isAudio = device.deviceClass == UsbConstants.USB_CLASS_AUDIO ||
-                    (0 until device.interfaceCount).any { device.getInterface(it).interfaceClass == UsbConstants.USB_CLASS_AUDIO }
-            isAudio && usbManager.hasPermission(device)
-        }
-    }
     var isRecordAudioGranted by remember {
         mutableStateOf(PermissionHelper.isRecordAudioGranted(context))
     }
@@ -221,6 +248,7 @@ fun SettingsScreen(
     androidx.compose.runtime.DisposableEffect(lifecycleOwner) {
         val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
             if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+                isUsbGranted = checkUsbPermission(context)
                 isRecordAudioGranted = PermissionHelper.isRecordAudioGranted(context)
                 isIgnoringBattery = PermissionHelper.isBatteryOptimizationIgnored(context)
                 isOverlayGranted = PermissionHelper.isOverlayGranted(context)
@@ -237,7 +265,9 @@ fun SettingsScreen(
         delay(120)
         try {
             navFocusRequesters[0].requestFocus()
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            Logger.ui.w(TAG, "页面进入聚焦首项异常", e)
+        }
     }
 
     // 100% 实心不透明背景
@@ -289,6 +319,9 @@ fun SettingsScreen(
                                 if (it.isFocused) {
                                     selectedCategory = cat
                                     isFocusInRightContent = false
+                                    if (isEditingCustomName) {
+                                        exitCustomNameEditing()
+                                    }
                                 }
                             },
                         scale = ClickableSurfaceDefaults.scale(scale = 1.0f, focusedScale = 1.05f),
@@ -316,6 +349,9 @@ fun SettingsScreen(
             val scrollState = rememberScrollState()
             LaunchedEffect(selectedCategory) {
                 scrollState.scrollTo(0)
+                if (isEditingCustomName) {
+                    exitCustomNameEditing()
+                }
             }
             Column(
                 modifier = Modifier
@@ -390,7 +426,8 @@ fun SettingsScreen(
                                 subtitle = "当前网络标识: \"$friendlyName\" (用于 AirPlay 1 与 UPnP 广播)"
                             ) {
                                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                    listOf("PureCast TV", "客厅 Hi-Fi", "影音室 TV").forEachIndexed { pIdx, preset ->
+                                    val presets = listOf("PureCast TV", "客厅 Hi-Fi", "影音室 TV")
+                                    presets.forEachIndexed { pIdx, preset ->
                                         val isCur = friendlyName == preset && !isEditingCustomName
                                         SegmentOptionButton(
                                             label = preset,
@@ -405,9 +442,12 @@ fun SettingsScreen(
                                             }
                                         )
                                     }
+                                    val isCustomSelected = isEditingCustomName || friendlyName !in presets
+                                    val customLabel = if (!isEditingCustomName && friendlyName !in presets) "✏️ $friendlyName" else "✏️ 自定义"
                                     SegmentOptionButton(
-                                        label = "✏️ 自定义",
-                                        isSelected = isEditingCustomName,
+                                        label = customLabel,
+                                        isSelected = isCustomSelected,
+                                        focusRequester = customEditButtonFocusRequester,
                                         onClick = {
                                             customNameInput = friendlyName
                                             isEditingCustomName = !isEditingCustomName
@@ -452,7 +492,7 @@ fun SettingsScreen(
                                                             friendlyName = t
                                                             settingsRepo.setFriendlyName(t)
                                                             PlaybackService.instance?.updateFriendlyName(t)
-                                                            isEditingCustomName = false
+                                                            exitCustomNameEditing()
                                                             Toast.makeText(context, "已保存广播名为: $t", Toast.LENGTH_SHORT).show()
                                                         }
                                                     }
@@ -473,7 +513,7 @@ fun SettingsScreen(
                                                     friendlyName = t
                                                     settingsRepo.setFriendlyName(t)
                                                     PlaybackService.instance?.updateFriendlyName(t)
-                                                    isEditingCustomName = false
+                                                    exitCustomNameEditing()
                                                     Toast.makeText(context, "已保存广播名为: $t", Toast.LENGTH_SHORT).show()
                                                 }
                                             }
@@ -481,7 +521,7 @@ fun SettingsScreen(
                                         SegmentOptionButton(
                                             label = "取消",
                                             isSelected = false,
-                                            onClick = { isEditingCustomName = false }
+                                            onClick = { exitCustomNameEditing() }
                                         )
                                     }
                                 }
@@ -522,7 +562,7 @@ fun SettingsScreen(
                         SettingsSection(title = "USB DAC 硬件独占接管") {
                             SettingInlineRow(
                                 title = "声卡端点与驱动状态",
-                                subtitle = if (audioState.isExclusive) "已解绑 Linux snd-usb-audio 内核驱动，直通 UAC2 硬件 (绕过 48kHz SRC)" else "声卡处于待机让渡或系统共享状态"
+                                subtitle = if (audioState.isExclusive) "已解绑 Linux snd-usb-audio 内核驱动，直通 UAC 音频硬件 (绕过 48kHz SRC)" else "声卡处于待机让渡或系统共享状态"
                             ) {
                                 Row(
                                     verticalAlignment = Alignment.CenterVertically,
@@ -645,7 +685,7 @@ fun SettingsScreen(
                                 value = "${bufferAvailableKb} KB / ${bufferCapacityKb} KB (${bufferMs}ms / $bufferUsagePercent% 水位)"
                             )
                             SettingDivider()
-                            MetricDataRow(label = "UAC 物理时钟锁定", value = if (audioState.isExclusive) "UAC2 Explicit Feedback 闭环物理时钟 (SOF 纳秒级同步)" else "让渡共享时钟")
+                            MetricDataRow(label = "UAC 物理时钟锁定", value = if (audioState.isExclusive) "UAC1/UAC2 异步/显式反馈闭环物理时钟 (SOF 同步)" else "让渡共享时钟")
                             SettingDivider()
                             MetricDataRow(label = "底层驱动与内核通信", value = "libusb-$libusbVer (usbfs 根权限包装)")
                         }
@@ -655,7 +695,7 @@ fun SettingsScreen(
                         SettingsSection(title = "Android 权限与系统保活自检") {
                             PermissionCheckRow(
                                 label = "USB 硬件直接访问权限",
-                                description = "直通 UAC2 异步时钟与 Linux usbfs 底层声卡驱动",
+                                description = "直通 UAC 音频时钟与 Linux usbfs 底层声卡驱动",
                                 isGranted = isUsbGranted,
                                 focusRequester = categoryFirstFocusRequesters[SettingsCategory.HEALTH_CHECK],
                                 leftNavFocusRequester = navFocusRequesters[selectedCategory.ordinal],

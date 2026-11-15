@@ -39,6 +39,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -209,6 +210,7 @@ fun MainTvScreen(
 
     val playPauseFocusRequester = remember { FocusRequester() }
     val settingsFocusRequester = remember { FocusRequester() }
+    val coroutineScope = rememberCoroutineScope()
 
     // ==========================================
     // 1. OLED 防烧屏引擎: 微像素平滑微移 (每 10 秒平滑移动 2~3 像素，3秒线性插值杜绝生硬抽动)
@@ -237,6 +239,17 @@ fun MainTvScreen(
         label = "pixelShiftYAnim"
     )
 
+    // 💡 首次开机/权限自检向导显示状态
+    var showOnboarding by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) {
+        val shouldShow = withContext(Dispatchers.IO) {
+            !settingsRepo.isOnboardingCompleted() && PermissionHelper.hasMissingCriticalPermission(context)
+        }
+        if (shouldShow) {
+            showOnboarding = true
+        }
+    }
+
     // 💡 焦点路由：从待机空闲 (IDLE/STOPPED) 首次进入活跃播放时，自动聚焦到“播放/暂停”；
     // 在切歌 (TRANSITIONING)、暂停、恢复与弹窗刷新期间，严格保留用户遥控器当前选中的按钮，绝不强行夺焦！
     var hasAutoFocusedOnPlay by remember { mutableStateOf(false) }
@@ -252,7 +265,9 @@ fun MainTvScreen(
                 delay(200)
                 playPauseFocusRequester.requestFocus()
             }
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            Logger.ui.w("MainTvScreen", "空闲与播放态自动焦点请求异常", e)
+        }
     }
 
     // ==========================================
@@ -281,6 +296,7 @@ fun MainTvScreen(
         isIdle
     ) {
         if (isIdle) {
+            // 💡 完全空闲待机态：立即清空封面与指纹
             persistentCover = null
             persistentCoverHash = 0
         } else if (hasValidCover && coverData != null) {
@@ -289,16 +305,19 @@ fun MainTvScreen(
             } else {
                 metadata.coverUri.hashCode()
             }
+            // 💡 修复 Finding 4: 指纹一致且已存在封面时严格跳过赋值，杜绝相同封面重复触发 Crossfade 动画
             if (incomingHash != persistentCoverHash || persistentCover == null) {
                 persistentCover = coverData
                 persistentCoverHash = incomingHash
             }
         } else {
-            // 💡 P2-3 修复：TrackTransactionManager 已经执行了 1200ms 封面宽限期；此处收到 null 立即清空，杜绝 2.4 秒双重延迟
-            if (!hasValidCover && metadata.coverBytes == null && metadata.coverUri.isNullOrEmpty()) {
-                persistentCover = null
-                persistentCoverHash = 0
+            // 💡 修复 Finding 4: 切歌期间若新曲目暂无封面（如 DMAP 文本先于 image/jpeg 到达），
+            // 给予 1200ms 宽限期防抖，杜绝旧封面瞬时闪黑与同一个专辑切歌误触发过渡；若 1200ms 超时仍无封面方优雅清除
+            if (persistentCover != null) {
+                delay(1200L)
             }
+            persistentCover = null
+            persistentCoverHash = 0
         }
     }
 
@@ -337,10 +356,11 @@ fun MainTvScreen(
             )
         }
 
-        // 2. 主体 42% / 58% Apple TV 黄金比例布局
+        // 2. 主体 42% / 58% Apple TV 黄金比例布局 (向导展示时禁用底层获焦，彻底隔离焦点)
         Row(
             modifier = Modifier
                 .fillMaxSize()
+                .focusProperties { canFocus = !showOnboarding }
                 .offset { IntOffset(animatedShiftX.roundToInt(), animatedShiftY.roundToInt()) }
                 .padding(horizontal = 72.dp, vertical = 48.dp),
             verticalAlignment = Alignment.CenterVertically
@@ -373,10 +393,10 @@ fun MainTvScreen(
                     contentAlignment = Alignment.Center
                 ) {
                     Crossfade(
-                        targetState = persistentCover,
+                        targetState = persistentCoverHash to persistentCover,
                         animationSpec = tween(300),
                         label = "coverCrossfade"
-                    ) { resolvedCover ->
+                    ) { (_, resolvedCover) ->
                         if (resolvedCover != null) {
                             val coverRequest = remember(context, resolvedCover) {
                                 ImageRequest.Builder(context)
@@ -387,7 +407,12 @@ fun MainTvScreen(
                                 model = coverRequest,
                                 contentDescription = "Album Cover",
                                 contentScale = ContentScale.Crop,
-                                modifier = Modifier.fillMaxSize()
+                                modifier = Modifier.fillMaxSize(),
+                                onError = {
+                                    // 💡 封面网络 404 或解码失败时立即清理 persistentCover，回退默认卡片并修正浅色模式背景与文字对比度
+                                    persistentCover = null
+                                    persistentCoverHash = 0
+                                }
                             )
                         } else {
                             DefaultCoverCard(
@@ -443,7 +468,9 @@ fun MainTvScreen(
                 // 纯色彩语义的实时音频品质胶囊 (格式: 协议 · 音频格式 | 设备名 + 软过渡提示)
                 SignalPathPill(
                     audioState = audioPathState,
-                    hardwareState = uiState.hardwareState
+                    hardwareState = uiState.hardwareState,
+                    isIdle = isIdle,
+                    hasDarkBackground = hasDarkBackground
                 )
 
                 Spacer(modifier = Modifier.height(20.dp))
@@ -527,20 +554,19 @@ fun MainTvScreen(
         }
 
         // 3. 首次开机/权限自检向导
-        var showOnboarding by remember { mutableStateOf(false) }
-        LaunchedEffect(Unit) {
-            val shouldShow = withContext(Dispatchers.IO) {
-                !settingsRepo.isOnboardingCompleted() && PermissionHelper.hasMissingCriticalPermission(context)
-            }
-            if (shouldShow) {
-                showOnboarding = true
-            }
-        }
         if (showOnboarding) {
             OnboardingWizard(
                 onDismiss = {
                     showOnboarding = false
                     settingsRepo.setOnboardingCompleted(true)
+                    coroutineScope.launch {
+                        delay(100)
+                        try {
+                            if (uiState.isIdle) settingsFocusRequester.requestFocus() else playPauseFocusRequester.requestFocus()
+                        } catch (e: Exception) {
+                            Logger.ui.w("MainTvScreen", "向导关闭后请求焦点异常", e)
+                        }
+                    }
                 }
             )
         }
@@ -562,56 +588,15 @@ private fun IsolatedProgressBar(
 ) {
     val currentSnapshot by remember { PlaybackService.sessionSnapshot }.collectAsState()
     val servicePositionMs = currentSnapshot.progressPositionMs
-    val trackGeneration = currentSnapshot.trackGeneration
 
-    var seekPositionMs by remember { mutableLongStateOf(0L) }
-    var isScrubbing by remember { mutableStateOf(false) }
-    val coroutineScope = rememberCoroutineScope()
-    var debounceJob by remember { mutableStateOf<Job?>(null) }
-
-    // 💡 P2-2: 切歌换代时立即取消正在防抖的寻道任务，防止旧歌寻道覆盖新歌
-    LaunchedEffect(trackGeneration) {
-        debounceJob?.cancel()
-        debounceJob = null
-        isScrubbing = false
-    }
-
-    // 💡 只有在非用户拖拽寻道防抖期间，才接受 servicePositionMs 的覆盖，并结合总时长安全钳位
-    LaunchedEffect(servicePositionMs, totalDurationMs) {
-        if (!isScrubbing) {
-            val clamped = if (totalDurationMs > 0) servicePositionMs.coerceIn(0L, totalDurationMs) else servicePositionMs
-            seekPositionMs = clamped
-        }
-    }
+    val clampedPosition = if (totalDurationMs > 0) servicePositionMs.coerceIn(0L, totalDurationMs) else servicePositionMs
 
     ProgressBarComponent(
-        currentPositionMs = seekPositionMs,
+        currentPositionMs = clampedPosition,
         totalDurationMs = totalDurationMs,
         durationState = durationState,
-        seekCapability = seekCapability,
         playbackStatus = playbackStatus,
-        hasDarkBackground = hasDarkBackground,
-        onSeek = { newPositionMs ->
-            seekPositionMs = newPositionMs
-            isScrubbing = true
-            debounceJob?.cancel()
-            debounceJob = coroutineScope.launch {
-                delay(300)
-                onSeekTo(newPositionMs)
-                isScrubbing = false
-                Logger.ui.i("MainTvScreen", "D-Pad 寻道防抖完成，提交 Seek: ${newPositionMs / 1000} 秒")
-            }
-        },
-        onSeekImmediate = { newPositionMs ->
-            // 💡 P2-2: 确认键立即提交寻道，取消 300ms 延时
-            debounceJob?.cancel()
-            debounceJob = null
-            seekPositionMs = newPositionMs
-            isScrubbing = false
-            onSeekTo(newPositionMs)
-            Logger.ui.i("MainTvScreen", "D-Pad 确认键立即提交 Seek: ${newPositionMs / 1000} 秒")
-        },
-        onPlayPauseClick = onPlayPauseClick
+        hasDarkBackground = hasDarkBackground
     )
 }
 

@@ -406,6 +406,9 @@ class PlaybackServiceSessionHost(
 
         // 💡 AirPlay 1 在 PLAYING 期间维护单调时钟平滑进度推进，补偿 iOS 不周期推 Progress 包的特性
         val isProtocolProgressUpdate = next.progressPositionMs != lastTickerEmittedPosMs
+        val isFirstPlayAtZero = prev?.businessState != next.businessState &&
+            next.businessState == BusinessSessionState.PLAYING &&
+            next.progressPositionMs == 0L
         if (prev == null ||
             prev.sessionId != next.sessionId ||
             prev.trackGeneration != next.trackGeneration ||
@@ -413,7 +416,9 @@ class PlaybackServiceSessionHost(
             (isProtocolProgressUpdate && prev.progressPositionMs != next.progressPositionMs)
         ) {
             lastAnchorPosMs = next.progressPositionMs
-            lastAnchorClockMs = clockMs()
+            // 💡 修复 Finding 6: 刚开播 (pos=0ms) 时声卡存在约 600ms 的物理排队延迟 (100ms 预充 + 50ms Warmup + 64ms URB + 缓冲)，
+            // 延迟 600ms 启动计时走字，确保电视进度条与扬声器真正出声及 iPhone 同步
+            lastAnchorClockMs = if (isFirstPlayAtZero) clockMs() + 600L else clockMs()
         }
 
         val needTicker = next.activeProtocol == StreamProtocol.AIRPLAY_1 &&

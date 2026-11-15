@@ -22,6 +22,8 @@ captures/
 
 # Temp
 /tmp/
+app/src/main/cpp/tests/build/
+app/src/main/cpp/tests/Testing/
 
 # Agent Context
 .context/

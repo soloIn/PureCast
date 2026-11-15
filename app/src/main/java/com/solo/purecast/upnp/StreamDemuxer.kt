@@ -134,8 +134,6 @@ class StreamDemuxer(
     @Volatile
     private var totalDurationSeconds: Long = 0L
     @Volatile
-    private var flacStartTimeMs: Long = 0L
-    @Volatile
     private var flacTotalFrames: Long = 0L
     @Volatile
     private var currentSampleRate: Int = 0
@@ -168,9 +166,6 @@ class StreamDemuxer(
                 val playedBytes = (seekBaseBytes + totalBytesStreamed - audioGateway.getAvailableRead().toLong()).coerceAtLeast(0L)
                 return (playedBytes / bps) * 1000L + ((playedBytes % bps) * 1000L) / bps
             }
-        }
-        if (flacStartTimeMs > 0L && isDemuxing) {
-            return (System.currentTimeMillis() - flacStartTimeMs).coerceAtLeast(0L)
         }
         return 0L
     }
@@ -213,15 +208,18 @@ class StreamDemuxer(
             alignedPcmOffset = (maxSafePcmOffset / bytesPerFrame) * bytesPerFrame
         }
 
-        // 💡 防御协程竞争：先取消先前的 streamingJob，并递增会话 token 隔离旧连接
+        // 💡 立即设置 seekBaseBytes 并通知 UI 目标位置，杜绝在网络建连期间外部读取旧偏移导致进度条回弹 (P0 寻道修复)
+        seekBaseBytes = alignedPcmOffset
+        totalBytesStreamed = 0L
+        onPositionUpdated?.invoke(clampedMs)
+
+        // 💡 防御协程竞争：先取消先前的 streamingJob 与 progressJob，并递增会话 token 隔离旧连接
         val prevJob = streamingJob
         prevJob?.cancel()
         val thisSession = sessionToken.incrementAndGet()
-        val oldConn = activeConnection
-        val oldStream = activeInputStream
-        activeConnection = null
-        activeInputStream = null
-        closeDetachedStreamAsync(oldConn, oldStream)
+        progressJob?.cancel()
+        progressJob = null
+        detachAndCloseActiveStreamAsync()
 
         streamingJob = scope.launch(Dispatchers.IO) {
             var connection: HttpURLConnection? = null
@@ -245,17 +243,23 @@ class StreamDemuxer(
                 connection.connect()
                 val responseCode = connection.responseCode
                 if (responseCode == 206) {
-                        inputStream = BufferedInputStream(connection.inputStream, 64 * 1024)
-                        activeInputStream = inputStream
+                    // 💡 P0 修复：防御迟到 206 竞态。若网络建连期间触发了新寻道或协程已取消，立即丢弃，严禁调用 onSeekFlush 冲刷有效 Epoch！
+                    if (!isActive || thisSession != sessionToken.get()) {
+                        Logger.upnp.w(TAG, "Seek HTTP 206 响应到达但会话已过期 (session=$thisSession, current=${sessionToken.get()})，放弃冲刷")
+                        abortedByEpoch = true
+                        return@launch
+                    }
+                    inputStream = BufferedInputStream(connection.inputStream, 64 * 1024)
+                    activeInputStream = inputStream
 
-                        seekEpoch = onSeekFlush?.invoke() ?: acquiredEpoch
-                        this@StreamDemuxer.acquiredEpoch = seekEpoch
-                        seekBaseBytes = alignedPcmOffset
-                        totalBytesStreamed = 0L
-                        onPositionUpdated?.invoke(clampedMs)
+                    seekEpoch = onSeekFlush?.invoke() ?: acquiredEpoch
+                    this@StreamDemuxer.acquiredEpoch = seekEpoch
 
-                        val pcmBuffer = ByteArray(32768)
-                        var seekFirstPacketEmitted = false
+                    // 💡 寻道成功建立 206 传输后，重启进度轮询循环，彻底解决 seekTo 后播放进度永久冻结的缺陷 (P0)
+                    startProgressTicker(thisSession)
+
+                    val pcmBuffer = ByteArray(32768)
+                    var seekFirstPacketEmitted = false
                         val currentSpec = DemuxedStreamSpec(
                             sampleRate = currentSampleRate,
                             bitDepth = currentBitDepth,
@@ -281,7 +285,15 @@ class StreamDemuxer(
                                         }
                                         offset += written
                                         remaining -= written
-                                    } else if (written == -2 || written == -1) {
+                                    } else if (written < 0) {
+                                        // 💡 修复 Finding 7: 区分世代抢占 (-2) 与真实管道故障 (-1, -3)
+                                        if (written == -2) {
+                                            Logger.upnp.i(TAG, "Seek writePcm 收到世代过期 (-2)，安全中止本轮写入: epoch=$seekEpoch")
+                                        } else {
+                                            Logger.upnp.e(TAG, "Seek writePcm 遭遇底层管道致命错误: ret=$written, epoch=$seekEpoch")
+                                            val errorMsg = if (written == -1) "Audio pipeline closed" else "Audio latch timeout"
+                                            onError(errorMsg)
+                                        }
                                         abortedByEpoch = true
                                         break
                                     } else {
@@ -363,9 +375,9 @@ class StreamDemuxer(
         isDemuxing = true
         currentStreamUrl = streamUrl
         totalBytesStreamed = 0L
+        seekBaseBytes = 0L // 💡 P1 修复：切歌换曲启动新流时彻底重置 seekBaseBytes，杜绝继承上一首曲目的寻道基数导致播放进度漂移
         bytesPerSecond = 0L
         totalDurationSeconds = 0L
-        flacStartTimeMs = 0L
         flacTotalFrames = 0L
         currentSampleRate = 0
         currentBitDepth = 0
@@ -373,17 +385,7 @@ class StreamDemuxer(
         isFlacStream = false
 
         // 💡 启动播放进度定期更新任务 (每 500ms 刷新一次)
-        progressJob = scope.launch(Dispatchers.Default) {
-            var lastEmittedPosMs = -1L
-            while (isActive && isDemuxing && thisSession == sessionToken.get()) {
-                val posMs = getCurrentPlayPositionMs()
-                if (posMs != lastEmittedPosMs) {
-                    lastEmittedPosMs = posMs
-                    onPositionUpdated?.invoke(posMs)
-                }
-                delay(500)
-            }
-        }
+        startProgressTicker(thisSession)
 
         streamingJob = scope.launch(Dispatchers.IO) {
             // 💡 确保前序 native 解码任务彻底退出，消除快速切歌时计数器与 JNI 资源的并发竞争
@@ -400,7 +402,7 @@ class StreamDemuxer(
             var connection: HttpURLConnection? = null
             var inputStream: InputStream? = null
             var abortedByEpoch = false
-            var acquiredEpoch = -1L
+            this@StreamDemuxer.acquiredEpoch = -1L
 
             try {
                 if (thisSession != sessionToken.get()) return@launch
@@ -442,7 +444,6 @@ class StreamDemuxer(
                 if (magicStr == "fLaC") {
                     isFlacStream = true
                     Logger.upnp.i(TAG, "检测到 FLAC 无损流容器 (fLaC)，交由 Native dr_flac 流式无损解码...")
-                    flacStartTimeMs = System.currentTimeMillis()
                     var currentSpec: DemuxedStreamSpec? = null
                     val ok = audioGateway.decodeFlacStream(
                         inputStream,
@@ -474,17 +475,19 @@ class StreamDemuxer(
                                     seekCapability = seekCap
                                 )
                                 currentSpec = spec
-                                acquiredEpoch = onAcquireStreamEpoch(spec)
-                                if (acquiredEpoch <= 0L) {
+                                val epoch = onAcquireStreamEpoch(spec)
+                                this@StreamDemuxer.acquiredEpoch = epoch
+                                if (epoch <= 0L) {
                                     abortedByEpoch = true
                                 }
-                                return acquiredEpoch
+                                return epoch
                             }
 
                             override fun onFirstPcmWritten() {
                                 val spec = currentSpec ?: return
-                                if (thisSession == sessionToken.get() && acquiredEpoch > 0L) {
-                                    onFirstDataPacket(acquiredEpoch, spec)
+                                val ep = this@StreamDemuxer.acquiredEpoch
+                                if (thisSession == sessionToken.get() && ep > 0L) {
+                                    onFirstDataPacket(ep, spec)
                                 }
                             }
                         }
@@ -524,19 +527,32 @@ class StreamDemuxer(
                         durationState = durState,
                         seekCapability = seekCap
                     )
-                    acquiredEpoch = onAcquireStreamEpoch(spec)
-                    this@StreamDemuxer.acquiredEpoch = acquiredEpoch
-                    if (acquiredEpoch <= 0L) {
+                    val epoch = onAcquireStreamEpoch(spec)
+                    this@StreamDemuxer.acquiredEpoch = epoch
+                    if (epoch <= 0L) {
                         abortedByEpoch = true
-                        Logger.upnp.w(TAG, "WAV 获取硬件世代失败 ($acquiredEpoch)，中止推流 (session=$thisSession)")
+                        Logger.upnp.w(TAG, "WAV 获取硬件世代失败 ($epoch)，中止推流 (session=$thisSession)")
                         return@launch
                     }
 
+                    val wavDataSizeBytes = format.dataSize
+                    val hasDataSizeLimit = wavDataSizeBytes > 0L && wavDataSizeBytes < 0x7FFFFFFFL
                     val pcmBuffer = ByteArray(32768)
                     var firstPacketEmitted = false
 
                     while (isActive && isDemuxing && thisSession == sessionToken.get() && !abortedByEpoch) {
-                        val bytesRead = inputStream.read(pcmBuffer, 0, pcmBuffer.size)
+                        if (hasDataSizeLimit && totalBytesStreamed >= wavDataSizeBytes) {
+                            Logger.upnp.i(TAG, "已到达 WAV dataSize 边界 ($totalBytesStreamed/$wavDataSizeBytes 字节)，停止继续读取 (session=$thisSession)")
+                            break
+                        }
+
+                        val maxToRead = if (hasDataSizeLimit) {
+                            (wavDataSizeBytes - totalBytesStreamed).coerceAtMost(pcmBuffer.size.toLong()).toInt()
+                        } else {
+                            pcmBuffer.size
+                        }
+
+                        val bytesRead = inputStream.read(pcmBuffer, 0, maxToRead)
                         if (bytesRead == -1) {
                             Logger.upnp.i(TAG, "音频流正常读取至 EOF 边界 (session=$thisSession)")
                             break
@@ -547,17 +563,24 @@ class StreamDemuxer(
                             var offset = 0
                             var remaining = bytesRead
                             while (remaining > 0 && isActive && isDemuxing && thisSession == sessionToken.get()) {
-                                val written = audioGateway.writePcm(pcmBuffer, offset, remaining, acquiredEpoch)
+                                val currentEp = this@StreamDemuxer.acquiredEpoch
+                                val written = audioGateway.writePcm(pcmBuffer, offset, remaining, currentEp)
                                 if (written > 0) {
                                     if (!firstPacketEmitted) {
                                         firstPacketEmitted = true
-                                        onFirstDataPacket(acquiredEpoch, spec)
+                                        onFirstDataPacket(currentEp, spec)
                                     }
                                     offset += written
                                     remaining -= written
-                                } else if (written == -2 || written == -1) {
-                                    // 💡 收到 -2 世代过期或 -1 引擎停止立即跳出，严禁阻塞或跨代覆写
-                                    Logger.upnp.w(TAG, "WAV writePcm 因世代过期或引擎停止中止写入: ret=$written, epoch=$acquiredEpoch")
+                                } else if (written < 0) {
+                                    // 💡 修复 Finding 7: 区分世代抢占 (-2) 与真实管道故障 (-1, -3)
+                                    if (written == -2) {
+                                        Logger.upnp.i(TAG, "WAV writePcm 收到世代过期 (-2)，安全中止本轮写入: epoch=$currentEp")
+                                    } else {
+                                        Logger.upnp.e(TAG, "WAV writePcm 遭遇底层管道致命错误: ret=$written, epoch=$currentEp")
+                                        val errorMsg = if (written == -1) "Audio pipeline closed" else "Audio latch timeout"
+                                        onError(errorMsg)
+                                    }
                                     abortedByEpoch = true
                                     break
                                 } else {
@@ -582,6 +605,8 @@ class StreamDemuxer(
                     Logger.upnp.i(TAG, "音频流数据拉取完毕，等待环形缓冲排空播放 (session=$thisSession)...")
                     var waitCount = 0
                     var pausedWaitCount = 0
+                    var lastAvailableRead = -1
+                    var stableCount = 0
                     while (isActive && isDemuxing && thisSession == sessionToken.get() && audioGateway.getAvailableRead() > 0 && waitCount < 120) {
                         // 💡 暂停态下底层 fill_isoc_transfer 填零静音，环形缓冲被冻结不会被消费。
                         // 此时若累计 waitCount 会导致 6 秒超时误判 EOF 强停。暂停期间挂起循环等待，不计入排空超时。
@@ -593,6 +618,21 @@ class StreamDemuxer(
                             }
                             continue
                         }
+
+                        val avail = audioGateway.getAvailableRead()
+                        // 💡 尾部排空优化：若剩余字节不足单微帧或处于极低水位（<= 1024 字节）且连续 300ms 无变化，判定为已播完
+                        if (avail <= 1024) {
+                            if (avail == lastAvailableRead) {
+                                if (++stableCount >= 6) { // 6 * 50ms = 300ms
+                                    Logger.upnp.i(TAG, "环形缓冲尾部残余不足单微帧/极低水位已停止消费 ($avail 字节)，提早判定排空完成")
+                                    break
+                                }
+                            } else {
+                                lastAvailableRead = avail
+                                stableCount = 0
+                            }
+                        }
+
                         delay(50)
                         waitCount++
                     }
@@ -624,8 +664,16 @@ class StreamDemuxer(
                     progressJob?.cancel()
                     progressJob = null
                     isDemuxing = false
-                    onStreamEnded(abortedByEpoch, acquiredEpoch)
-                    Logger.upnp.i(TAG, "活跃会话 (session=$thisSession) 结束 (abortedByEpoch=$abortedByEpoch)")
+                    // 💡 防御空流假播完：区分 FLAC（通过 Native 统计解码帧数）与 WAV（通过读取流累加字节），
+                    // 若两者均未产生任何实际推流或未获取到合法硬件世代，强制标记为中断，杜绝误触发切歌
+                    val hasStreamedData = if (isFlacStream) {
+                        audioGateway.getFlacDecodedFrames() > 0L
+                    } else {
+                        totalBytesStreamed > 0L
+                    }
+                    val isAborted = abortedByEpoch || !hasStreamedData || this@StreamDemuxer.acquiredEpoch <= 0L
+                    onStreamEnded(isAborted, this@StreamDemuxer.acquiredEpoch)
+                    Logger.upnp.i(TAG, "活跃会话 (session=$thisSession) 结束 (abortedByEpoch=$isAborted, isFlac=$isFlacStream, totalBytesStreamed=$totalBytesStreamed, flacFrames=${audioGateway.getFlacDecodedFrames()})")
                 } else {
                     Logger.upnp.i(TAG, "旧协程 (session=$thisSession) 资源清理完成，当前活跃会话为 ${sessionToken.get()}，跳过全局状态重置")
                 }
@@ -638,12 +686,29 @@ class StreamDemuxer(
         detachAndCloseActiveStreamAsync()
         isDemuxing = false
         currentStreamUrl = ""
+        totalBytesStreamed = 0L
+        seekBaseBytes = 0L // 💡 P1 修复：停止推流时同步清零寻道基数
         isFlacStream = false
         progressJob?.cancel()
         progressJob = null
         streamingJob?.cancel()
         streamingJob = null
         audioGateway.resetFlacDecodedFrames()
+    }
+
+    private fun startProgressTicker(session: Long) {
+        progressJob?.cancel()
+        progressJob = scope.launch(Dispatchers.Default) {
+            var lastEmittedPosMs = -1L
+            while (isActive && isDemuxing && session == sessionToken.get()) {
+                val posMs = getCurrentPlayPositionMs()
+                if (posMs != lastEmittedPosMs) {
+                    lastEmittedPosMs = posMs
+                    onPositionUpdated?.invoke(posMs)
+                }
+                delay(500)
+            }
+        }
     }
 
     data class AudioStreamFormat(
@@ -742,11 +807,18 @@ class StreamDemuxer(
                                     val subSize = ByteBuffer.wrap(subHeader, 4, 4).order(ByteOrder.LITTLE_ENDIAN).int.toLong() and 0xFFFFFFFFL
                                     bytesRemaining -= 8L
 
-                                    if (subSize < 0L || subSize > bytesRemaining) {
-                                        Logger.upnp.w(TAG, "异常 subChunk 尺寸: subId=$subId, subSize=$subSize, 剩余=$bytesRemaining")
-                                        skipFullyTracked(bytesRemaining)
-                                        bytesRemaining = 0L
-                                        break
+                                    if (subSize < 0L || subSize > bytesRemaining || subSize > 65536L) {
+                                        Logger.upnp.w(TAG, "异常 subChunk 尺寸或超过安全上限 64KB: subId=$subId, subSize=$subSize, 剩余=$bytesRemaining")
+                                        val toSkip = if (subSize in 0L..bytesRemaining) subSize else bytesRemaining
+                                        skipFullyTracked(toSkip)
+                                        bytesRemaining -= toSkip
+                                        // 💡 修复 Finding 12: RIFF/WAV 规范严格要求 subChunk 按 2 字节对齐。
+                                        // 当跳过的 subChunk 长度为奇数时，必须补跳 1 字节 padding，否则后续 subHeader 指针错位 1 字节导致元数据解析全部损坏
+                                        if (toSkip % 2L != 0L && bytesRemaining > 0L) {
+                                            skipFullyTracked(1L)
+                                            bytesRemaining -= 1L
+                                        }
+                                        continue
                                     }
 
                                     val subLen = subSize.toInt()
@@ -843,9 +915,13 @@ class StreamDemuxer(
         scope.launch(Dispatchers.IO) {
             try {
                 stream?.close()
+            } catch (e: Exception) {
+                Logger.upnp.w(TAG, "关闭分离输入流异常: ${e.message}")
+            }
+            try {
                 conn?.disconnect()
             } catch (e: Exception) {
-                Logger.upnp.w(TAG, "关闭分离 HTTP 流异常: ${e.message}")
+                Logger.upnp.w(TAG, "断开分离 HTTP 连接异常: ${e.message}")
             }
         }
     }

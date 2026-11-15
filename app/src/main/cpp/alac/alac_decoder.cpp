@@ -52,6 +52,14 @@ bool AlacDecoder::init(const int32_t* fmtp) {
     int channels = active_fmtp[7] > 0 ? active_fmtp[7] : 2;
     int rate = active_fmtp[11];
 
+    // 💡 修复 Finding 1 (CWE-122): AirPlay 1 ALAC 严格仅支持单声道 (1) 或立体声 (2)
+    // 限制 channels 只能为 1 或 2，且单帧最大输出字节数不得超过 16384 (4096 samples * 2 ch * 2 bytes)，杜绝堆缓冲区溢出
+    if (frame_size <= 0 || frame_size > 4096 || (channels != 1 && channels != 2) ||
+        (frame_size * channels * 2 > 16384) || rate < 8000 || rate > 192000) {
+        LOGE("ALAC 参数超出合法安全范围: frame_size=%d, channels=%d, rate=%d", frame_size, channels, rate);
+        return false;
+    }
+
     if (sample_size != 16) {
         LOGE("ALAC 目前仅支持 16-bit 线性 PCM (当前: %d-bit)", sample_size);
         return false;

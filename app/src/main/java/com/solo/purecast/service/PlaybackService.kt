@@ -47,6 +47,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -87,7 +89,6 @@ class PlaybackService : LifecycleService() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var mediaSession: MediaSession? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
-    private var pendingPermissionActivityRef: WeakReference<Activity>? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
@@ -116,7 +117,16 @@ class PlaybackService : LifecycleService() {
         acquireStandingLocks()
         registerNetworkCallback()
 
-        audioFocusManager = AudioFocusManager(this) { shouldPlay ->
+        audioFocusManager = AudioFocusManager(
+            context = this,
+            isPlaybackActiveProvider = {
+                if (::coordinator.isInitialized) {
+                    coordinator.snapshot.value.playbackStatus == PlaybackStatus.PLAYING
+                } else {
+                    false
+                }
+            }
+        ) { shouldPlay ->
             if (shouldPlay) {
                 resumePlayback()
             } else {
@@ -401,32 +411,10 @@ class PlaybackService : LifecycleService() {
         session.setPlaybackState(playbackState)
     }
 
-    private fun updateMediaSessionMetadata(metadata: TrackMetadata) {
-        val session = mediaSession ?: return
-        try {
-            val builder = MediaMetadata.Builder()
-                .putString(MediaMetadata.METADATA_KEY_TITLE, metadata.title)
-                .putString(MediaMetadata.METADATA_KEY_ARTIST, metadata.artist)
-                .putString(MediaMetadata.METADATA_KEY_ALBUM, metadata.album)
-                .putLong(MediaMetadata.METADATA_KEY_DURATION, metadata.durationMs)
+    private val mediaSessionMetadataHelper = MediaSessionMetadataHelper()
 
-            // 💡 P2-4: 同步封面至系统全局 MediaSession 卡片
-            val coverBytes = metadata.coverBytes
-            if (coverBytes != null && coverBytes.isNotEmpty()) {
-                try {
-                    val bitmap = android.graphics.BitmapFactory.decodeByteArray(coverBytes, 0, coverBytes.size)
-                    if (bitmap != null) {
-                        builder.putBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART, bitmap)
-                        builder.putBitmap(MediaMetadata.METADATA_KEY_ART, bitmap)
-                    }
-                } catch (t: Throwable) {
-                    Logger.service.w(TAG, "解码 MediaSession 封面 Bitmap 异常: ${t.message}")
-                }
-            }
-            session.setMetadata(builder.build())
-        } catch (e: Exception) {
-            Logger.service.w(TAG, "更新 MediaMetadata 异常", e)
-        }
+    private fun updateMediaSessionMetadata(metadata: TrackMetadata) {
+        mediaSessionMetadataHelper.updateMediaSessionMetadata(mediaSession, metadata, lifecycleScope)
     }
 
     private fun acquireStandingLocks() {
@@ -600,18 +588,7 @@ class PlaybackService : LifecycleService() {
     }
 
     fun registerUsbPermissionActivity(activity: Activity?) {
-        if (activity != null) {
-            pendingPermissionActivityRef = WeakReference(activity)
-            if (::usbDeviceManager.isInitialized) {
-                usbDeviceManager.bindPermissionActivity(activity)
-                usbDeviceManager.scanAndRequestPermissionAsync(activity)
-            }
-        } else {
-            pendingPermissionActivityRef = null
-            if (::usbDeviceManager.isInitialized) {
-                usbDeviceManager.bindPermissionActivity(null)
-            }
-        }
+        registerUsbPermissionActivityStatic(activity)
     }
 
     /**
@@ -628,7 +605,7 @@ class PlaybackService : LifecycleService() {
     }
 
     /**
-     * 💡 供设置界面手动独占接管声卡：枚举设备、校验权限并尝试直通打开
+     * 💡 供设置界面手动独占接管声卡：枚举设备、校验权限并尝试直通打开 (异步执行避免阻塞 UI 线程)
      */
     fun claimUsbExclusiveManually(activity: Activity, onResult: (Boolean, String) -> Unit) {
         if (!::usbDeviceManager.isInitialized) {
@@ -636,25 +613,42 @@ class PlaybackService : LifecycleService() {
             return
         }
         usbDeviceManager.bindPermissionActivity(activity)
-        val attached = usbDeviceManager.scanAndAttachDevice()
-        val snap = sessionSnapshot.value
-        if (!attached && !snap.audioPath.isDacConnected) {
-            usbDeviceManager.scanAndRequestPermissionAsync(activity)
-            onResult(false, "未连接可用 USB DAC 或正在请求授权")
-            return
-        }
-        val rate = snap.audioPath.sampleRate.takeIf { it > 0 } ?: 44100
-        val bits = snap.audioPath.bitDepth.takeIf { it > 0 } ?: 16
-        val ch = snap.audioPath.channels.takeIf { it > 0 } ?: 2
-        val openRes = usbDeviceManager.openDeviceWithCurrentFd(rate, bits, ch, forceNewEpoch = true)
-        openRes.fold(
-            onSuccess = { success ->
-                onResult(true, "已成功独占接管: ${success.dacName}")
-            },
-            onFailure = { err ->
-                onResult(false, "独占接管失败: ${err.message}")
+        lifecycleScope.launch(Dispatchers.IO) {
+            val attached = usbDeviceManager.scanAndAttachDevice()
+            val snap = sessionSnapshot.value
+            val hasPerm = usbDeviceManager.hasPermission()
+
+            if (!attached && !snap.audioPath.isDacConnected) {
+                withContext(Dispatchers.Main) {
+                    usbDeviceManager.scanAndRequestPermissionAsync(activity)
+                    onResult(false, "未连接可用 USB DAC 设备")
+                }
+                return@launch
             }
-        )
+
+            if (!hasPerm) {
+                withContext(Dispatchers.Main) {
+                    usbDeviceManager.scanAndRequestPermissionAsync(activity)
+                    onResult(false, "正在请求 USB 权限，请在电视弹窗中确认")
+                }
+                return@launch
+            }
+
+            val rate = snap.audioPath.sampleRate.takeIf { it > 0 } ?: 44100
+            val bits = snap.audioPath.bitDepth.takeIf { it > 0 } ?: 16
+            val ch = snap.audioPath.channels.takeIf { it > 0 } ?: 2
+            val openRes = usbDeviceManager.openDeviceWithCurrentFd(rate, bits, ch, forceNewEpoch = true)
+            withContext(Dispatchers.Main) {
+                openRes.fold(
+                    onSuccess = { success ->
+                        onResult(true, "已成功独占接管: ${success.dacName}")
+                    },
+                    onFailure = { err ->
+                        onResult(false, "独占接管失败: ${err.message}")
+                    }
+                )
+            }
+        }
     }
 
     fun bindUsbPermissionActivity(activity: Activity?) {
@@ -847,6 +841,7 @@ class PlaybackService : LifecycleService() {
     override fun onDestroy() {
         Logger.service.i(TAG, "PlaybackService onDestroy: 彻底清理服务...")
         instance = null
+        mediaSessionMetadataHelper.clear()
         unregisterNetworkCallback()
         if (::sessionHost.isInitialized) {
             sessionHost.stop()
@@ -881,6 +876,31 @@ class PlaybackService : LifecycleService() {
         @Volatile
         var instance: PlaybackService? = null
             private set
+
+        @Volatile
+        private var pendingPermissionActivityRef: WeakReference<Activity>? = null
+
+        /**
+         * 💡 静态绑定或注销 USB 授权请求宿主 Activity (冷启动时即便 instance 尚未就绪亦可预存)
+         */
+        fun registerUsbPermissionActivityStatic(activity: Activity?) {
+            if (activity != null) {
+                pendingPermissionActivityRef = WeakReference(activity)
+                instance?.let { service ->
+                    if (service::usbDeviceManager.isInitialized) {
+                        service.usbDeviceManager.bindPermissionActivity(activity)
+                        service.usbDeviceManager.scanAndRequestPermissionAsync(activity)
+                    }
+                }
+            } else {
+                pendingPermissionActivityRef = null
+                instance?.let { service ->
+                    if (service::usbDeviceManager.isInitialized) {
+                        service.usbDeviceManager.bindPermissionActivity(null)
+                    }
+                }
+            }
+        }
 
         private val _sessionSnapshot = MutableStateFlow(PlayerSessionSnapshot())
         val sessionSnapshot: StateFlow<PlayerSessionSnapshot> = _sessionSnapshot.asStateFlow()

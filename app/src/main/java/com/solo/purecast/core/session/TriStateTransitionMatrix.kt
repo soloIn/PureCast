@@ -84,8 +84,34 @@ internal object TriStateTransitionMatrix {
                 val oldProtocol = snap.activeProtocol
                 val oldSessionId = snap.sessionId
 
+                val initialMeta = ev.initialMetadata
+                val hasCustomInitial = initialMeta != null &&
+                    initialMeta.title.isNotEmpty() &&
+                    initialMeta.title != "AirPlay 音频直通"
+
+                // 💡 修复 Finding 9: 续播状态继承仅限同协议、处于 PAUSED 态且未明确指定不同新歌名的情况
+                // 1) 若传入了明确的不同新歌名 (hasCustomInitial && initialMeta.title != snap.metadata.title)，判定为换歌，不继承进度与元数据；
+                // 2) 若为占位/空元数据或相同歌名，判定为同曲目续播，继承元数据与播放进度。
+                val isSameTrack = if (hasCustomInitial) {
+                    initialMeta.title == snap.metadata.title
+                } else {
+                    true
+                }
+                val isResumingPausedSession = snap.activeProtocol == ev.protocol &&
+                    snap.sessionId != 0L &&
+                    snap.businessState == BusinessSessionState.PAUSED &&
+                    isSameTrack
+
+                val resolvedInitialMeta = if (hasCustomInitial) {
+                    initialMeta
+                } else if (isResumingPausedSession && snap.metadata.title.isNotEmpty() && snap.metadata.title != "AirPlay 音频直通") {
+                    snap.metadata
+                } else {
+                    initialMeta
+                }
+
                 val txGen = ev.trackGeneration ?: (trackManager.currentTrackGeneration + 1L)
-                val nextMeta = trackManager.resetForNewStream(txGen, ev.initialMetadata)
+                val nextMeta = trackManager.resetForNewStream(txGen, resolvedInitialMeta)
 
                 val nextHwState: HardwarePipelineState
                 if (snap.hardwareState == HardwarePipelineState.RELEASED) {
@@ -120,7 +146,7 @@ internal object TriStateTransitionMatrix {
                         codec = ev.codec,
                         isExclusive = isExclusiveActiveOrReconfiguring(nextHwState)
                     ),
-                    progressPositionMs = 0L,
+                    progressPositionMs = if (isResumingPausedSession) snap.progressPositionMs else 0L,
                     progressDurationMs = nextMeta.durationMs,
                     errors = clearTransientCommandErrors(snap.errors),
                     uiProtectionActive = false
@@ -137,8 +163,22 @@ internal object TriStateTransitionMatrix {
 
             is FirstDataPacketEvent -> {
                 addCancelAllTimers(effects)
+                // 💡 修复 Finding 2: 显式暂停契约捍卫。
+                // 若当前处于显式 PAUSED 状态（无论是用户在 TV 端按暂停、或远端协议触发暂停、或暂停状态下的 Seek/换曲推流首包到达），
+                // 业务态必须严格保持 PAUSED，硬件态维持 EXCLUSIVE_MUTED 持续泵 0 保活，绝不提前调用 ResumeNativeOutput 偷跑发声！
+                // 真正的播放恢复统一交由显式信令触发的 StreamResumeEvent 处理。
+                val isAlreadyPaused = snap.businessState == BusinessSessionState.PAUSED
+                val nextBiz = if (isAlreadyPaused) BusinessSessionState.PAUSED else BusinessSessionState.PLAYING
+                if (isAlreadyPaused) {
+                    // 💡 P2 修复：解耦挂起定时器。只要处于 PAUSED 态，首包到达（包含 DAC 处于断开或等待权限时）均必须注册 10 分钟挂起超时
+                    effects += TransitionEffect.ScheduleSuspendTimeout(snap.sessionId)
+                }
                 val nextHw = if (isDetachedOrPendingPermission(snap.hardwareState)) {
                     snap.hardwareState
+                } else if (isAlreadyPaused) {
+                    // 💡 若当前处于稳定 PAUSED 态（如 AirPlay / UPnP 暂停态下执行寻道或换曲预充首包写入），
+                    // 硬件维持 EXCLUSIVE_MUTED 持续泵 0 保活，绝不提前调用 ResumeNativeOutput，彻底杜绝声音偷跑与界面跳闪！
+                    HardwarePipelineState.EXCLUSIVE_MUTED
                 } else {
                     effects += TransitionEffect.ResumeNativeOutput
                     HardwarePipelineState.EXCLUSIVE_ACTIVE
@@ -146,7 +186,7 @@ internal object TriStateTransitionMatrix {
 
                 val nextSnap = snap.copy(
                     transportState = TransportPipeState.STREAMING,
-                    businessState = BusinessSessionState.PLAYING,
+                    businessState = nextBiz,
                     hardwareState = nextHw,
                     activeProtocol = ev.protocol,
                     currentEpoch = ev.epoch,
@@ -156,7 +196,7 @@ internal object TriStateTransitionMatrix {
                         channels = ev.channels,
                         codec = ev.codec,
                         protocol = ev.protocol,
-                        isExclusive = nextHw == HardwarePipelineState.EXCLUSIVE_ACTIVE
+                        isExclusive = isExclusiveActiveOrReconfiguring(nextHw)
                     ),
                     errors = clearTransientCommandErrors(snap.errors),
                     uiProtectionActive = false
@@ -177,13 +217,9 @@ internal object TriStateTransitionMatrix {
                 effects += TransitionEffect.CancelHardwareIdleTimeout
                 effects += TransitionEffect.CancelSuspendTimeout
 
-                // 💡 R11 / B-3 契约：只有在明确由 Seek 触发的 FLUSH (ev.isSeekFlush == true) 时才保留当前进度，避免置零跳变；
-                // 常规切歌换代 (ev.isSeekFlush == false) 进度必须立即归零，杜绝切歌后进度残留上一首位置
-                val nextPositionMs = if (ev.isSeekFlush) {
-                    snap.progressPositionMs
-                } else {
-                    0L
-                }
+                // 💡 修复 Finding 1: 在 AirPlay 中，FLUSH 既用于切歌，也用于暂停和 Seek。
+                // 收到 FLUSH 时始终保留当前已播进度，仅在真正收到新曲目的 TrackBoundaryEvent 时才归零进度，杜绝暂停与换代误清零
+                val nextPositionMs = snap.progressPositionMs
 
                 // 💡 P0-4 修复：若当前已处于稳定 PAUSED 状态（如 iOS 暂停后发 FLUSH 或暂停态拖动进度条），
                 // 必须保持 PAUSED 状态，严禁进入 TRANSITIONING（避免大屏跳回播放中 5 秒），维持挂起定时器
@@ -255,7 +291,8 @@ internal object TriStateTransitionMatrix {
                     transportState = TransportPipeState.INTERRUPTED,
                     businessState = BusinessSessionState.PAUSED,
                     hardwareState = muteIfExclusive(snap.hardwareState),
-                    uiProtectionActive = false
+                    uiProtectionActive = false,
+                    transitionOriginState = null
                 )
                 return TransitionOutput(ctx.copy(snapshot = nextSnap, pendingDebounceToken = 0L), effects)
             }
@@ -325,7 +362,8 @@ internal object TriStateTransitionMatrix {
                     transportState = TransportPipeState.INTERRUPTED,
                     businessState = BusinessSessionState.PAUSED,
                     hardwareState = muteIfExclusive(snap.hardwareState),
-                    uiProtectionActive = false
+                    uiProtectionActive = false,
+                    transitionOriginState = null
                 )
                 return TransitionOutput(ctx.copy(snapshot = nextSnap, pendingDebounceToken = 0L), effects)
             }
@@ -365,7 +403,8 @@ internal object TriStateTransitionMatrix {
                     businessState = BusinessSessionState.TRANSITIONING,
                     hardwareState = muteIfExclusive(snap.hardwareState),
                     uiProtectionActive = true,
-                    errors = clearTransientCommandErrors(snap.errors)
+                    errors = clearTransientCommandErrors(snap.errors),
+                    transitionOriginState = preState
                 )
                 return TransitionOutput(
                     ctx.copy(
@@ -440,7 +479,8 @@ internal object TriStateTransitionMatrix {
                             hardwareState = HardwarePipelineState.EXCLUSIVE_ACTIVE,
                             currentEpoch = ev.resumedEpoch,
                             audioPath = snap.audioPath.copy(isExclusive = true, protocol = ev.protocol),
-                            uiProtectionActive = false
+                            uiProtectionActive = false,
+                            transitionOriginState = null
                         )
                         TransitionOutput(ctx.copy(snapshot = nextSnap, pendingDebounceToken = 0L), effects)
                     }
@@ -480,11 +520,15 @@ internal object TriStateTransitionMatrix {
             }
 
             is UsbPermissionGrantedEvent -> {
-                val nextHw = if (ev.granted) {
-                    HardwarePipelineState.RELEASED
-                } else {
+                val wasExclusive = isExclusiveActiveOrReconfiguring(snap.hardwareState)
+                val nextHw = if (!ev.granted) {
                     HardwarePipelineState.PERMISSION_PENDING
+                } else if (wasExclusive) {
+                    snap.hardwareState // 💡 防御：当前已处于独占或切频态时，授权回执保持独占态，严防误降级为 RELEASED
+                } else {
+                    HardwarePipelineState.RELEASED
                 }
+                val nextExclusive = ev.granted && wasExclusive
                 val nextErrors = if (ev.granted) {
                     clearUsbErrors(snap.errors)
                 } else {
@@ -503,7 +547,7 @@ internal object TriStateTransitionMatrix {
                     audioPath = snap.audioPath.copy(
                         isDacConnected = true,
                         dacName = ev.deviceName,
-                        isExclusive = false
+                        isExclusive = nextExclusive
                     ),
                     errors = nextErrors
                 )
@@ -580,12 +624,14 @@ internal object TriStateTransitionMatrix {
             }
 
             is HardwareStateSyncedEvent -> {
+                // 💡 修复 Finding 11: 允许原位重配切频状态 (AUDIO_RECONFIGURING) 正常透传，通知 UI 与上层状态机，绝不无条件覆写回 EXCLUSIVE_ACTIVE
+                val targetHwState = ev.newHardwareState
                 val nextSnap = snap.copy(
-                    hardwareState = ev.newHardwareState,
+                    hardwareState = targetHwState,
                     audioPath = snap.audioPath.copy(
                         dacName = ev.dacName ?: snap.audioPath.dacName,
                         bufferAvailablePercent = ev.bufferAvailablePercent ?: snap.audioPath.bufferAvailablePercent,
-                        isExclusive = isExclusiveActiveOrReconfiguring(ev.newHardwareState)
+                        isExclusive = isExclusiveActiveOrReconfiguring(targetHwState)
                     )
                 )
                 return TransitionOutput(ctx.copy(snapshot = nextSnap), emptyList())
@@ -593,10 +639,19 @@ internal object TriStateTransitionMatrix {
 
             is TrackBoundaryEvent -> {
                 val result = trackManager.onTrackBoundary(ev)
+                // 💡 修复 Finding 8: 跨曲目边界进度严格归零。
+                // 仅在首曲开播冷启动（snap.trackGeneration == 0L）且音频已先于元数据走字 (1L..3000L) 时才保留当前微小进度；
+                // 只要此前已有活跃曲目（snap.trackGeneration > 0L）发生切歌换代，新曲目进度必须坚决归零 (0L)，彻底杜绝前序曲目残存早期进度继承给新歌！
+                val nextPosMs = if (result.accepted) {
+                    val pos = snap.progressPositionMs
+                    if (snap.trackGeneration == 0L && pos in 1L..3000L) pos else 0L
+                } else {
+                    snap.progressPositionMs
+                }
                 val nextSnap = snap.copy(
                     trackGeneration = result.activeGeneration,
                     metadata = result.metadata,
-                    progressPositionMs = if (result.accepted) 0L else snap.progressPositionMs,
+                    progressPositionMs = nextPosMs,
                     progressDurationMs = if (result.accepted) 0L else snap.progressDurationMs
                 )
                 if (result.accepted) {
@@ -682,7 +737,8 @@ internal object TriStateTransitionMatrix {
             hardwareState = muteIfExclusive(ctx.snapshot.hardwareState),
             currentEpoch = newEpoch,
             errors = clearTransientCommandErrors(ctx.snapshot.errors),
-            uiProtectionActive = false
+            uiProtectionActive = false,
+            transitionOriginState = null
         )
         return TransitionOutput(ctx.copy(snapshot = nextSnap, pendingDebounceToken = 0L), effects)
     }
@@ -708,7 +764,8 @@ internal object TriStateTransitionMatrix {
             progressPositionMs = 0L,
             progressDurationMs = 0L,
             errors = clearTransientCommandErrors(snap.errors),
-            uiProtectionActive = false
+            uiProtectionActive = false,
+            transitionOriginState = null
         )
         return TransitionOutput(ctx.copy(snapshot = nextSnap), effects)
     }
@@ -753,7 +810,8 @@ internal object TriStateTransitionMatrix {
             businessState = fallbackState,
             hardwareState = nextHw,
             uiProtectionActive = false,
-            errors = snap.errors + (errorCode to err)
+            errors = snap.errors + (errorCode to err),
+            transitionOriginState = null
         )
         return TransitionOutput(
             ctx.copy(
