@@ -54,6 +54,7 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
@@ -65,25 +66,21 @@ import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import com.solo.purecast.R
 import com.solo.purecast.core.lyrics.LyricsSyncClock
-import com.solo.purecast.model.AudioPathState
-import com.solo.purecast.model.HardwarePipelineState
 import com.solo.purecast.model.LyricLine
 import com.solo.purecast.model.LyricTimeline
 import com.solo.purecast.model.LyricUiState
+import com.solo.purecast.model.PlaybackStatus
 import com.solo.purecast.model.TrackMetadata
+import com.solo.purecast.ui.components.TransportIconButton
 import kotlin.math.abs
 
 /**
  * 💡 PureCast Apple Music TV 风格歌词全屏展开屏 (LyricsScreen)
- * 严格遵照 10-Foot UI 与 Android TV 交互规范及用户指令修改：
- * 1. 移除 SignalPathPill 胶囊，保持大屏纯净极简 (Finding 8)；
- * 2. 界面比例调整为：左侧 45% (信息区) + 右侧 55% (歌词流) (Finding 8)；
- * 3. 前奏期高亮与焦点抑制，activeLineIndex=-1 时不提前高亮第一句 (Finding 11, 14)；
- * 4. 浅色模式/深色背景智能自适应文字色，杜绝白字隐形 (Finding 10)；
- * 5. VSYNC 60fps 仅更新高亮激活行扫光，全列表非活动行与高频解耦，杜绝低端盒子掉帧 (Finding 9, 18)；
- * 6. 自动滚动偏移基于 Density 转精确 dp，与顶部 80dp 羽化及内边距完美对齐 (Finding 17)；
- * 7. 优雅 Shimmer 呼吸骨架动画 (Finding 10)；
- * 8. 遥控器 Back 键通过 BackHandler 拦截优雅缩回主屏。
+ * 严格遵照 10-Foot UI 与 Android TV 交互规范：
+ * 1. 左侧 45%：封面 + 歌曲信息水平居中 + 上一曲/暂停/下一曲播放控制条；
+ * 2. 右侧 55%：巨幅沉浸歌词流 (动态隔离 60fps 逐字扫光)；
+ * 3. 严格遵循“PureCast 播放进度是唯一真实来源”的设计契约，与 iPhone 进度毫秒级同步；
+ * 4. 遥控器 Back 键通过 BackHandler 拦截优雅缩回主屏。
  */
 @OptIn(ExperimentalTvMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
@@ -91,10 +88,12 @@ fun LyricsScreen(
     lyricUiState: LyricUiState,
     syncClock: LyricsSyncClock,
     metadata: TrackMetadata,
-    audioPathState: AudioPathState,
-    hardwareState: HardwarePipelineState,
+    playbackStatus: PlaybackStatus,
     coverData: Any?,
     hasDarkBackground: Boolean,
+    onPlayPauseClick: () -> Unit,
+    onPreviousClick: () -> Unit,
+    onNextClick: () -> Unit,
     onClose: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -108,22 +107,23 @@ fun LyricsScreen(
     Row(
         modifier = modifier
             .fillMaxSize()
-            .padding(horizontal = 64.dp, vertical = 40.dp),
+            .padding(horizontal = 64.dp, vertical = 36.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         // ==========================================
-        // 左侧 45%: 封面与歌曲元数据信息 (Finding 8)
+        // 左侧 45%: 封面、歌曲元数据与播放控制栏 (水平居中)
         // ==========================================
         Column(
             modifier = Modifier
                 .weight(0.45f)
                 .fillMaxHeight(),
+            horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center
         ) {
             val coverShape = RoundedCornerShape(16.dp)
             Box(
                 modifier = Modifier
-                    .fillMaxWidth(0.82f)
+                    .fillMaxWidth(0.72f)
                     .aspectRatio(1f)
                     .shadow(
                         elevation = 24.dp,
@@ -161,43 +161,85 @@ fun LyricsScreen(
                 }
             }
 
-            Spacer(modifier = Modifier.height(28.dp))
+            Spacer(modifier = Modifier.height(24.dp))
 
-            // 歌曲标题
+            // 歌曲标题 (水平居中)
             Text(
                 text = metadata.title,
-                fontSize = 32.sp,
+                fontSize = 28.sp,
                 fontWeight = FontWeight.Bold,
                 color = if (hasDarkBackground) Color.White else Color(0xFF1C1C1E),
                 maxLines = 1,
-                lineHeight = 38.sp,
+                lineHeight = 34.sp,
+                textAlign = TextAlign.Center,
                 modifier = Modifier
                     .fillMaxWidth(0.92f)
                     .basicMarquee(initialDelayMillis = 2000, delayMillis = 1500)
             )
 
-            Spacer(modifier = Modifier.height(8.dp))
+            Spacer(modifier = Modifier.height(6.dp))
 
-            // 艺术家
+            // 艺术家 (水平居中)
             Text(
                 text = metadata.artist,
-                fontSize = 20.sp,
+                fontSize = 18.sp,
                 fontWeight = FontWeight.Medium,
                 color = if (hasDarkBackground) Color.White.copy(alpha = 0.70f) else Color(0xFF1C1C1E).copy(alpha = 0.70f),
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
+                textAlign = TextAlign.Center,
                 modifier = Modifier.fillMaxWidth(0.92f)
             )
 
             if (metadata.album.isNotEmpty()) {
-                Spacer(modifier = Modifier.height(6.dp))
+                Spacer(modifier = Modifier.height(4.dp))
                 Text(
                     text = metadata.album,
-                    fontSize = 15.sp,
+                    fontSize = 14.sp,
                     color = if (hasDarkBackground) Color.White.copy(alpha = 0.50f) else Color(0xFF1C1C1E).copy(alpha = 0.50f),
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
+                    textAlign = TextAlign.Center,
                     modifier = Modifier.fillMaxWidth(0.92f)
+                )
+            }
+
+            Spacer(modifier = Modifier.height(20.dp))
+
+            // 💡 播放控制栏：上一曲、播放/暂停、下一曲
+            val isPlaying = playbackStatus == PlaybackStatus.PLAYING
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(20.dp)
+            ) {
+                // 上一曲按钮 (⏮)
+                TransportIconButton(
+                    iconResId = R.drawable.ic_backward_end_fill,
+                    contentDescription = "上一曲",
+                    buttonSize = 48.dp,
+                    iconSize = 24.dp,
+                    hasDarkBackground = hasDarkBackground,
+                    onClick = onPreviousClick
+                )
+
+                // 播放/暂停按钮 (▶ / ❚❚)
+                TransportIconButton(
+                    iconResId = if (isPlaying) R.drawable.ic_pause_fill else R.drawable.ic_play_fill,
+                    contentDescription = if (isPlaying) "暂停" else "播放",
+                    buttonSize = 52.dp,
+                    iconSize = 26.dp,
+                    hasDarkBackground = hasDarkBackground,
+                    onClick = onPlayPauseClick
+                )
+
+                // 下一曲按钮 (⏭)
+                TransportIconButton(
+                    iconResId = R.drawable.ic_forward_end_fill,
+                    contentDescription = "下一曲",
+                    buttonSize = 48.dp,
+                    iconSize = 24.dp,
+                    hasDarkBackground = hasDarkBackground,
+                    onClick = onNextClick
                 )
             }
         }
@@ -205,7 +247,7 @@ fun LyricsScreen(
         Spacer(modifier = Modifier.width(36.dp))
 
         // ==========================================
-        // 右侧 55%: 沉浸巨幅歌词流与异常分支 (Finding 8)
+        // 右侧 55%: 沉浸巨幅歌词流与异常分支
         // ==========================================
         Box(
             modifier = Modifier
@@ -250,7 +292,7 @@ fun LyricsScreen(
 
 /**
  * 💡 沉浸式歌词流滚动视口：上下 80dp 渐变羽化遮罩 + 黄金居中自动滚动
- * 针对低端电视盒子实施高频隔离渲染：仅高亮激活行参与 60fps VSYNC 重组 (Finding 9, 18)
+ * 针对低端电视盒子实施高频隔离渲染：仅高亮激活行参与 60fps VSYNC 重组
  */
 @Composable
 private fun LyricsStreamView(
@@ -279,12 +321,11 @@ private fun LyricsStreamView(
         }
     }
 
-    // 💡 Finding 17: 精确基于 density 计算 scrollOffset，避开 80dp 羽化遮罩
     val targetOffsetPx = remember(density) {
         with(density) { (-120).dp.roundToPx() }
     }
 
-    // 💡 Finding 11: 前奏期 (activeLineIndex == -1) 时抑制滚动与高亮
+    // 前奏期 (activeLineIndex == -1) 时抑制滚动与高亮
     LaunchedEffect(activeLineIndex) {
         if (activeLineIndex in timeline.lines.indices) {
             listState.animateScrollToItem(
@@ -355,7 +396,7 @@ private fun LyricsStreamView(
 }
 
 /**
- * 💡 激活行专属渲染器：仅在此组件内进行音节级 60fps 扫光，不影响列表其他所有行 (Finding 9, 18)
+ * 💡 激活行专属渲染器：仅在此组件内进行音节级 60fps 扫光，不影响列表其他所有行
  */
 @Composable
 private fun ActiveLyricLineRow(
@@ -415,7 +456,7 @@ private fun ActiveLyricLineRow(
 }
 
 /**
- * 💡 非激活行静态渲染器：完全解耦高频时间戳，零无效重组 (Finding 9, 18)
+ * 💡 非激活行静态渲染器：完全解耦高频时间戳，零无效重组
  */
 @Composable
 private fun InactiveLyricLineRow(
@@ -493,7 +534,6 @@ private fun InstrumentalStateView(
 
 /**
  * 💡 歌词加载中骨架呼吸占位 (Loading)
- * 采用平滑呼吸动画 (Finding 10)
  */
 @Composable
 private fun LoadingShimmerView(

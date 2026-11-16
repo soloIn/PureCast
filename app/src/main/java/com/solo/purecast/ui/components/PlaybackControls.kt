@@ -142,7 +142,7 @@ fun PlaybackControls(
  */
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
-private fun TransportIconButton(
+internal fun TransportIconButton(
     iconResId: Int,
     contentDescription: String,
     buttonSize: Dp,

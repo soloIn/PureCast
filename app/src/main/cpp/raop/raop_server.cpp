@@ -722,14 +722,11 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
                                 const bool is_initial_queueing = (curr_ts < start_ts);
                                 const long raw_pos_ms = is_initial_queueing ? 0L : static_cast<long>((curr_ts - start_ts) * 1000ULL / rate);
 
-                                // 💡 修复 Finding 5: 当 curr_ts < start_ts 或 raw_pos_ms < total_latency_ms 时，
-                                // 说明首帧尚在本地缓冲区排队尚未出声。此时上报 pos_ms = -1L 仅校准总时长 dur_ms，绝不覆写当前走字进度
-                                const long pos_ms = (is_initial_queueing || raw_pos_ms < total_latency_ms)
-                                    ? -1L
-                                    : (raw_pos_ms - total_latency_ms);
+                                // 💡 与 iPhone 进度保持完全一致：上报非负真实播放位置，杜绝向前拖动因负数判定被吃掉导致滞后
+                                const long pos_ms = is_initial_queueing ? 0L : std::max(0L, raw_pos_ms);
 
-                                LOGD("AirPlay %s进度实时校准: raw_pos=%ld ms, latency=%ld ms (ring=%ld, jitter=%ld), pos=%ld ms, dur=%ld ms (RTP: %s)",
-                                     has_valid_duration ? "" : "直播流", raw_pos_ms, total_latency_ms, ring_delay_ms, jitter_delay_ms, pos_ms, dur_ms, prog_val.c_str());
+                                LOGD("AirPlay %s进度实时校准: raw_pos=%ld ms, pos=%ld ms, dur=%ld ms (RTP: %s)",
+                                     has_valid_duration ? "" : "直播流", raw_pos_ms, pos_ms, dur_ms, prog_val.c_str());
                                 rtp_.update_track_progress(pos_ms, dur_ms);
                                 if (progress_cb_) {
                                     progress_cb_(active_session_id_.load(std::memory_order_acquire), next_seq(), pos_ms, dur_ms);

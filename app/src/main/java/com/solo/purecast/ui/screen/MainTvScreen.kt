@@ -400,10 +400,12 @@ fun MainTvScreen(
                     lyricUiState = lyricUiState,
                     syncClock = lyricsSyncClock,
                     metadata = metadata,
-                    audioPathState = audioPathState,
-                    hardwareState = uiState.hardwareState,
+                    playbackStatus = playbackStatus,
                     coverData = persistentCover,
                     hasDarkBackground = hasDarkBackground,
+                    onPlayPauseClick = onTogglePlayPause,
+                    onPreviousClick = onPreviousTrack,
+                    onNextClick = onNextTrack,
                     onClose = {
                         isLyricsExpanded = false
                         coroutineScope.launch {

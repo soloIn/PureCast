@@ -7,18 +7,17 @@ import com.solo.purecast.util.Logger
 import kotlin.math.abs
 
 /**
- * 💡 单调时钟高频帧间线性插值与回弹抑制引擎
- * 遵循 R10、R11 与 Finding 3, 11, 14 契约：
- * 1. 抹平播放器 500ms~1000ms 离散进度上报，向 Compose TV 提供 60fps/120fps 平滑连续时间轴；
- * 2. 250ms 死区方向性拦截，放行合法快退 (Finding 3)；
- * 3. 暂停瞬间单调冻结，杜绝时钟向后回跳 (Finding 3)；
- * 4. 前奏期 (Intro) 明确返回 -1，杜绝未开口提前高亮与焦点错位 (Finding 11, 14)；
- * 5. 基于 startMs 单调递增的容错二分查找，稳健支持交叠行与和声行 (Finding 14)。
+ * 💡 单调时钟高频帧间线性插值引擎
+ * 严格遵照“PureCast 播放进度是唯一真实来源”的设计原则：
+ * 1. 抹平播放器 250ms~500ms 离散进度上报，向 Compose TV 提供 60fps 平滑连续时间轴；
+ * 2. 任何大于 350ms 的进度跳变（iPhone 拖动寻道/切歌/快进/快退）均立即 0 延迟瞬时重定位，彻底杜绝向前拖动滞后；
+ * 3. 暂停瞬间单调冻结，恢复瞬间平滑接续；
+ * 4. 前奏期 (Intro) 明确返回 -1，未开口时不提前高亮；
+ * 5. 基于 startMs 单调递增的容错二分查找，稳健支持交叠行与和声行。
  */
 class LyricsSyncClock(
     private val maxExtrapolationMs: Long = DEFAULT_MAX_EXTRAPOLATION_MS,
-    private val seekThresholdMs: Long = DEFAULT_SEEK_THRESHOLD_MS,
-    private val seekDeadbandDurationMs: Long = DEFAULT_SEEK_DEADBAND_MS
+    private val jumpThresholdMs: Long = DEFAULT_JUMP_THRESHOLD_MS
 ) {
 
     data class ActiveLineState(
@@ -32,61 +31,53 @@ class LyricsSyncClock(
     private var anchorNanoTime: Long = 0L
     private var isPlaying: Boolean = false
 
-    private var lastSeekTimestampNano: Long = 0L
-    private var seekTargetPositionMs: Long = 0L
-    private var isSeekForward: Boolean = true
-
-    // 💡 记录最高推演时间，用于暂停瞬间防止时钟倒退
+    // 💡 记录当前推演时间，用于暂停瞬间防止时钟倒退
     private var lastInterpolatedTimeMs: Long = 0L
 
     /**
      * 💡 接收播放器底层进度推送更新
+     * 保持与 PureCast 进度条和 iPhone 播放进度严格一致
      */
     fun updatePosition(
         newPositionMs: Long,
         playing: Boolean,
         nowNanoTime: Long = System.nanoTime()
     ) {
-        val delta = newPositionMs - reportedPositionMs
-
-        // 1. 检测大跨度进度突变 (Seek 寻道)
-        if (abs(delta) > seekThresholdMs) {
-            isSeekForward = delta > 0
-            lastSeekTimestampNano = nowNanoTime
-            seekTargetPositionMs = newPositionMs
-            Logger.lyrics.i(
-                TAG,
-                "检测到进度跳变 (Seek): $reportedPositionMs -> $newPositionMs (delta=${delta}ms, forward=$isSeekForward)"
-            )
+        val currentEstimatedTime = if (isPlaying && anchorNanoTime > 0L) {
+            val elapsedMs = (nowNanoTime - anchorNanoTime) / 1_000_000L
+            reportedPositionMs + elapsedMs.coerceIn(0L, maxExtrapolationMs)
         } else {
-            // 2. 检查是否处于 250ms Seek 回弹抑制死区内 (Finding 3)
-            val elapsedSinceSeekMs = (nowNanoTime - lastSeekTimestampNano) / 1_000_000L
-            if (elapsedSinceSeekMs < seekDeadbandDurationMs) {
-                // 仅拦截与 Seek 意图反向的残余旧包回跳抖动，放行合法连续快退/快进
-                val isJitterBounce = if (isSeekForward) {
-                    newPositionMs < seekTargetPositionMs
-                } else {
-                    newPositionMs > seekTargetPositionMs
-                }
-                if (isJitterBounce) {
-                    Logger.lyrics.d(
-                        TAG,
-                        "Seek 死区拦截回跳抖动包: target=${seekTargetPositionMs}ms, incoming=${newPositionMs}ms, forward=$isSeekForward"
-                    )
-                    return
-                }
-            }
+            reportedPositionMs
         }
 
-        // 3. 暂停瞬间单调冻结防回跳 (Finding 3)
+        val jumpDelta = abs(newPositionMs - currentEstimatedTime)
+
+        // 1. 检测进度跳变 (iPhone 拖动寻道，无论是向前还是向后拖动)
+        if (jumpDelta > jumpThresholdMs) {
+            Logger.lyrics.i(
+                TAG,
+                "进度跳变寻道 (Seek): $currentEstimatedTime -> $newPositionMs (delta=${newPositionMs - currentEstimatedTime}ms)"
+            )
+            reportedPositionMs = newPositionMs
+            lastInterpolatedTimeMs = newPositionMs
+            anchorNanoTime = nowNanoTime
+            isPlaying = playing
+            return
+        }
+
+        // 2. 状态切换或正常推进更新
         if (!playing && isPlaying) {
-            // 从播放转为暂停：以当前推演出的平滑时间或上报时间的最大值冻结，杜绝时钟瞬间倒退
+            // 播放转暂停：冻结在当前平滑时间或新到达时间的最大值
             val frozenTime = maxOf(newPositionMs, lastInterpolatedTimeMs)
             reportedPositionMs = frozenTime
             lastInterpolatedTimeMs = frozenTime
-        } else {
+        } else if (playing && !isPlaying) {
+            // 暂停转播放：重新锚定当前时间
             reportedPositionMs = newPositionMs
             lastInterpolatedTimeMs = newPositionMs
+        } else {
+            // 正常连续推流更新基准
+            reportedPositionMs = newPositionMs
         }
 
         anchorNanoTime = nowNanoTime
@@ -103,19 +94,15 @@ class LyricsSyncClock(
         }
 
         val elapsedMs = (nowNanoTime - anchorNanoTime) / 1_000_000L
-        // 限制最大外推硬上限（防止播放器卡顿引起过度跑偏）
         val extrapolatedMs = elapsedMs.coerceIn(0L, maxExtrapolationMs)
         val calculated = reportedPositionMs + extrapolatedMs
 
-        // 保持单调性不减
-        val monotone = maxOf(lastInterpolatedTimeMs, calculated)
-        lastInterpolatedTimeMs = monotone
-        return monotone
+        lastInterpolatedTimeMs = calculated
+        return calculated
     }
 
     /**
      * 💡 针对当前推演时间检索当前高亮行并计算逐字/逐行进度比例
-     * 遵循前奏期明确返回 -1 (Finding 11, 14) 及基于 startMs 的单调二分定位 (Finding 14)
      */
     fun calculateActiveLineState(
         timeline: LyricTimeline,
@@ -126,12 +113,12 @@ class LyricsSyncClock(
             return ActiveLineState(lineIndex = -1, lineProgressFraction = 0f)
         }
 
-        // 💡 Finding 11 & 14: 前奏期判定 —— 若当前时间尚未到达第一句歌词的起始时间，明确返回 -1
+        // 前奏期判定 —— 若当前时间尚未到达第一句歌词的起始时间，明确返回 -1
         if (currentTimeMs < lines[0].startMs) {
             return ActiveLineState(lineIndex = -1, lineProgressFraction = 0f)
         }
 
-        // 💡 Finding 14: 基于单调递增的 startMs 进行二分搜索，找到最后一个 startMs <= currentTimeMs 的行
+        // 基于单调递增的 startMs 进行二分搜索，找到最后一个 startMs <= currentTimeMs 的行
         var low = 0
         var high = lines.size - 1
         var candidateIndex = 0
@@ -164,7 +151,7 @@ class LyricsSyncClock(
         val lineElapsed = (currentTimeMs - activeLine.startMs).coerceIn(0L, lineDuration)
         val lineProgressFraction = (lineElapsed.toFloat() / lineDuration).coerceIn(0f, 1f)
 
-        // 2. 音节逐字时间戳解析 (若存在逐字标记)
+        // 音节逐字时间戳解析 (若存在逐字标记)
         var activeWordIndex = -1
         var wordProgressFraction = 0f
 
@@ -207,16 +194,12 @@ class LyricsSyncClock(
         reportedPositionMs = 0L
         anchorNanoTime = 0L
         isPlaying = false
-        lastSeekTimestampNano = 0L
-        seekTargetPositionMs = 0L
-        isSeekForward = true
         lastInterpolatedTimeMs = 0L
     }
 
     companion object {
         private const val TAG = "LyricsSyncClock"
-        const val DEFAULT_MAX_EXTRAPOLATION_MS = 1200L
-        const val DEFAULT_SEEK_THRESHOLD_MS = 1500L
-        const val DEFAULT_SEEK_DEADBAND_MS = 250L
+        const val DEFAULT_MAX_EXTRAPOLATION_MS = 1000L
+        const val DEFAULT_JUMP_THRESHOLD_MS = 350L
     }
 }

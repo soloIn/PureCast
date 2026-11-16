@@ -20,8 +20,7 @@ class LyricsSyncClockTest {
     fun setUp() {
         syncClock = LyricsSyncClock(
             maxExtrapolationMs = 1200L,
-            seekThresholdMs = 1500L,
-            seekDeadbandDurationMs = 250L
+            jumpThresholdMs = 350L
         )
     }
 
@@ -65,21 +64,23 @@ class LyricsSyncClockTest {
     }
 
     @Test
-    fun `seek triggers deadband suppressing backward jitter packets within 250ms`() {
+    fun `seek jumps immediately reset clock anchor whether forward or backward`() {
         val baseNano = 1_000_000_000L
         syncClock.updatePosition(10_000L, playing = true, nowNanoTime = baseNano)
 
-        // 发生 Seek: 10000ms -> 45000ms (|delta| = 35000ms > 1500ms)
-        val seekNano = baseNano + 500_000_000L
-        syncClock.updatePosition(45_000L, playing = true, nowNanoTime = seekNano)
+        // 发生向前 Seek (快进): 10000ms -> 45000ms (|delta| = 35000ms > 350ms)
+        val seekForwardNano = baseNano + 500_000_000L
+        syncClock.updatePosition(45_000L, playing = true, nowNanoTime = seekForwardNano)
 
-        // 50ms 后到达一个由于网络 Jitter 导致的细微回跳包 44950ms (< 45000ms, 位于 250ms 死区内)
-        val jitterNano = seekNano + 50_000_000L
-        syncClock.updatePosition(44_950L, playing = true, nowNanoTime = jitterNano)
+        val tForward = syncClock.getCurrentInterpolatedTimeMs(seekForwardNano)
+        assertEquals(45_000L, tForward)
 
-        // 验证回跳包被死区严格过滤，当前推演时钟保持在 >= 45000ms
-        val current = syncClock.getCurrentInterpolatedTimeMs(jitterNano)
-        assertTrue("当前时间不能小于 Seek 目标值: current=$current", current >= 45_000L)
+        // 发生向后 Seek (快退): 45000ms -> 12000ms (|delta| = 33000ms > 350ms)
+        val seekBackwardNano = seekForwardNano + 200_000_000L
+        syncClock.updatePosition(12_000L, playing = true, nowNanoTime = seekBackwardNano)
+
+        val tBackward = syncClock.getCurrentInterpolatedTimeMs(seekBackwardNano)
+        assertEquals(12_000L, tBackward)
     }
 
     @Test

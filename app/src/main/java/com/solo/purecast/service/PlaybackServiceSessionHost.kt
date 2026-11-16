@@ -416,9 +416,8 @@ class PlaybackServiceSessionHost(
             (isProtocolProgressUpdate && prev.progressPositionMs != next.progressPositionMs)
         ) {
             lastAnchorPosMs = next.progressPositionMs
-            // 💡 修复 Finding 6: 刚开播 (pos=0ms) 时声卡存在约 600ms 的物理排队延迟 (100ms 预充 + 50ms Warmup + 64ms URB + 缓冲)，
-            // 延迟 600ms 启动计时走字，确保电视进度条与扬声器真正出声及 iPhone 同步
-            lastAnchorClockMs = if (isFirstPlayAtZero) clockMs() + 600L else clockMs()
+            // 💡 保持与 iPhone 单调时间完全一致，以当前物理时钟为唯一定位锚点
+            lastAnchorClockMs = clockMs()
         }
 
         val needTicker = next.activeProtocol == StreamProtocol.AIRPLAY_1 &&
