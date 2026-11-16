@@ -68,8 +68,8 @@ object LyricCandidateScorer {
         val titleSim = MetadataNormalizer.calculateSimilarity(cleanExpTitle, cleanCandTitle)
         val titleScore = if (isArtistUnknown) titleSim * 60.0f else titleSim * 40.0f
 
-        // 3. 歌手相似度 (若歌手未知，自适应分数为 0)
-        val artistSim = if (isArtistUnknown) 0.0f else MetadataNormalizer.calculateSimilarity(cleanExpArtist, cleanCandArtist)
+        // 3. 歌手相似度 (若歌手未知，自适应分数为 0；已知时采用 tokenSetRatio 天然容忍倒置、脏数据与多歌手)
+        val artistSim = if (isArtistUnknown) 0.0f else MetadataNormalizer.calculateTokenSetSimilarity(cleanExpArtist, cleanCandArtist)
         val artistScore = artistSim * 30.0f
 
         // 4. 时长容差与智能一票否决裁决 (若歌手已知满分 20 分；若歌手未知自适应满分 30 分)

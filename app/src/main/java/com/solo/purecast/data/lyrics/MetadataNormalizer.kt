@@ -1,8 +1,11 @@
 package com.solo.purecast.data.lyrics
 
+import me.xdrop.fuzzywuzzy.FuzzySearch
+
 /**
  * 💡 流媒体元数据清洗与归一化工具类
- * 借鉴 Lyrimuse 设计：剥离多源流媒体推流中的版本冗余、合作者标签及特殊括号标点，提升歌词检索命中率与打分稳定性。
+ * 借鉴 Lyrimuse 设计：剥离多源流媒体推流中的版本冗余、合作者标签及特殊括号标点，
+ * 并结合工业级 JavaWuzzy NLP 模糊字符串匹配，提升歌词检索命中率与打分稳定性。
  */
 object MetadataNormalizer {
 
@@ -72,9 +75,9 @@ object MetadataNormalizer {
     }
 
     /**
-     * 💡 计算两字符串的归一化相似度 (0.0f ~ 1.0f)
-     * 融合 Levenshtein 字符编辑距离与 Token Jaccard / Overlap 标记相似度：
-     * 既支持拼写容差，又天然支持西方倒置姓名（如 "Spears, Britney" vs "Britney Spears"）。
+     * 💡 计算两字符串的综合相似度 (0.0f ~ 1.0f)
+     * 基于 JavaWuzzy 的 WeightedRatio (WRatio)：
+     * 综合评估完全匹配、局部包含（Partial Ratio）、词序无关（Token Sort）与长度惩罚，天然抵抗副标题及拼写容差。
      */
     fun calculateSimilarity(s1: String, s2: String): Float {
         val str1 = s1.trim().lowercase()
@@ -83,55 +86,24 @@ object MetadataNormalizer {
         if (str1 == str2) return 1.0f
         if (str1.isEmpty() || str2.isEmpty()) return 0.0f
 
-        val maxLen = maxOf(str1.length, str2.length)
-        val charSim = (1.0f - levenshteinDistance(str1, str2).toFloat() / maxLen).coerceIn(0.0f, 1.0f)
-
-        // 词袋/标记重合度 (Token-based Overlap & Jaccard)
-        val tokSim = calculateTokenSimilarity(str1, str2)
-
-        return maxOf(charSim, tokSim)
-    }
-
-    private fun calculateTokenSimilarity(s1: String, s2: String): Float {
-        val tokens1 = s1.split(Regex("""\s+""")).filter { it.isNotBlank() }.toSet()
-        val tokens2 = s2.split(Regex("""\s+""")).filter { it.isNotBlank() }.toSet()
-
-        if (tokens1.isEmpty() || tokens2.isEmpty()) return 0.0f
-
-        val intersection = tokens1.intersect(tokens2)
-        val union = tokens1.union(tokens2)
-
-        if (intersection.isEmpty()) return 0.0f
-
-        // 若分词集合完全一致（如 "spears britney" vs "britney spears"），直接 1.0 满分
-        if (tokens1 == tokens2) return 1.0f
-
-        val jaccard = intersection.size.toFloat() / union.size.toFloat()
-        // 子集重合度（针对 "spears britney - baby one more time" 包含 "britney spears"）
-        val minSize = minOf(tokens1.size, tokens2.size).toFloat()
-        val overlap = (intersection.size.toFloat() / minSize) * 0.90f
-
-        return maxOf(jaccard, overlap)
+        val ratio = FuzzySearch.weightedRatio(str1, str2)
+        return (ratio / 100.0f).coerceIn(0.0f, 1.0f)
     }
 
     /**
-     * 💡 经典双行空间优化的 Levenshtein 距离算法
+     * 💡 计算两字符串的词集交集相似度 (0.0f ~ 1.0f)
+     * 基于 JavaWuzzy 的 TokenSetRatio：
+     * 天然支持西方倒置姓名（如 "Spears, Britney" vs "Britney Spears"）、
+     * 合作者多歌手组合、以及候选歌手字段混入歌名脏数据（如 "Spears, Britney - Baby One More Time"）。
      */
-    private fun levenshteinDistance(lhs: CharSequence, rhs: CharSequence): Int {
-        var v0 = IntArray(rhs.length + 1) { it }
-        var v1 = IntArray(rhs.length + 1)
+    fun calculateTokenSetSimilarity(s1: String, s2: String): Float {
+        val str1 = s1.trim().lowercase()
+        val str2 = s2.trim().lowercase()
 
-        for (i in lhs.indices) {
-            v1[0] = i + 1
-            for (j in rhs.indices) {
-                val cost = if (lhs[i] == rhs[j]) 0 else 1
-                v1[j + 1] = minOf(v1[j] + 1, v0[j + 1] + 1, v0[j] + cost)
-            }
-            val temp = v0
-            v0 = v1
-            v1 = temp
-        }
+        if (str1 == str2) return 1.0f
+        if (str1.isEmpty() || str2.isEmpty()) return 0.0f
 
-        return v0[rhs.length]
+        val ratio = FuzzySearch.tokenSetRatio(str1, str2)
+        return (ratio / 100.0f).coerceIn(0.0f, 1.0f)
     }
 }

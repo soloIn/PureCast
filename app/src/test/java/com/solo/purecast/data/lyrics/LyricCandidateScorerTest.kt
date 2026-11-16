@@ -163,4 +163,38 @@ class LyricCandidateScorerTest {
         assertTrue("歌手未知但歌名与时长精准匹配时应通过准入门槛", result.isPassed)
         assertTrue("自适应权重下总分应达到准入门槛", result.totalScore >= 65.0f)
     }
+
+    @Test
+    fun `candidate artist contaminated with repeated title and inverted name still scores high and passes`() {
+        val result = LyricCandidateScorer.evaluate(
+            expectedArtist = "Britney Spears",
+            expectedTitle = "Baby One More Time",
+            expectedDurationMs = 211000L,
+            candidateArtist = "Spears, Britney - Baby One More Time - Spears, Britney - Baby One More Time",
+            candidateTitle = "Baby One More Time",
+            candidateDurationMs = 211000L,
+            candidateFormat = LyricFormat.LRC_LINE_SYNC
+        )
+
+        assertTrue("混入脏数据的候选歌手依然能够通过 tokenSetRatio 识别并准入", result.isPassed)
+        assertTrue("歌手得分应非常高", result.artistScore >= 27.0f)
+        assertTrue("总分应远高于 65 分阈值", result.totalScore >= 90.0f)
+    }
+
+    @Test
+    fun `collaborator artists match expected single main artist`() {
+        val result = LyricCandidateScorer.evaluate(
+            expectedArtist = "周杰伦",
+            expectedTitle = "千里之外",
+            expectedDurationMs = 256000L,
+            candidateArtist = "周杰伦 / 费玉清",
+            candidateTitle = "千里之外",
+            candidateDurationMs = 256000L,
+            candidateFormat = LyricFormat.LRC_LINE_SYNC
+        )
+
+        assertTrue("包含合唱歌手时主歌手应判定匹配", result.isPassed)
+        assertTrue("歌手得分应保持高分", result.artistScore >= 25.0f)
+        assertTrue("总分达到准入门槛", result.totalScore >= 85.0f)
+    }
 }

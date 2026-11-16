@@ -113,6 +113,9 @@ dependencies {
     implementation(libs.ktor.client.cio)
     implementation(libs.jmdns)
 
+    // NLP & String Similarity
+    implementation(libs.fuzzywuzzy)
+
     // Testing
     testImplementation(libs.junit)
     testImplementation(libs.kotlinx.coroutines.test)
