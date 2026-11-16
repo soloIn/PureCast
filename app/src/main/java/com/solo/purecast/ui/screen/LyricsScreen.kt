@@ -1,11 +1,15 @@
 package com.solo.purecast.ui.screen
 
 import androidx.activity.compose.BackHandler
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
@@ -46,6 +50,7 @@ import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.CompositingStrategy
+import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -374,120 +379,129 @@ private fun LyricsStreamView(
                 key = { index, line -> "${line.startMs}_$index" }
             ) { index, line ->
                 val isActive = index == activeLineIndex
-                val distance = if (activeLineIndex >= 0) abs(index - activeLineIndex) else 10
+                val distance = if (activeLineIndex >= 0) abs(index - activeLineIndex) else (index + 1)
 
-                if (isActive) {
-                    ActiveLyricLineRow(
-                        line = line,
-                        currentTimeMs = currentRenderTimeMs,
-                        syncClock = syncClock,
-                        primaryColor = primaryTextColor
-                    )
-                } else {
-                    InactiveLyricLineRow(
-                        line = line,
-                        distanceFromActive = distance,
-                        primaryColor = primaryTextColor
-                    )
-                }
+                SmoothLyricLineRow(
+                    line = line,
+                    isActive = isActive,
+                    isFirstLine = (index == 0),
+                    distanceFromActive = distance,
+                    currentTimeMs = currentRenderTimeMs,
+                    syncClock = syncClock,
+                    primaryColor = primaryTextColor
+                )
             }
         }
     }
 }
 
 /**
- * 💡 激活行专属渲染器：仅在此组件内进行音节级 60fps 扫光，不影响列表其他所有行
+ * 💡 丝滑 Apple Music TV 级歌词行渲染器：
+ * 1. 消除原 Active/Inactive 树节点瞬间重建，统一为单一稳定组件；
+ * 2. 通过 Spring 弹性缩放 (1.0f -> 1.08f) 与平滑透明度淡入淡出，消除生硬跳变；
+ * 3. 针对前奏结束第一句入场实施优雅微距上浮 (translationY)，杜绝大字突现闪烁；
+ * 4. 纯 GPU RenderNode (graphicsLayer) 硬件加速合成，避免 CPU 重新 measure/layout，低端盒子 60fps 不掉帧。
  */
 @Composable
-private fun ActiveLyricLineRow(
+private fun SmoothLyricLineRow(
     line: LyricLine,
+    isActive: Boolean,
+    isFirstLine: Boolean,
+    distanceFromActive: Int,
     currentTimeMs: Long,
     syncClock: LyricsSyncClock,
     primaryColor: Color,
     modifier: Modifier = Modifier
 ) {
+    // 💡 1. 缩放动画 (Spring 曲线，优雅弹性，平滑缩放 1.0f -> 1.08f)
+    val animatedScale by animateFloatAsState(
+        targetValue = if (isActive) 1.08f else 1.0f,
+        animationSpec = spring(
+            dampingRatio = 0.82f,
+            stiffness = 220f
+        ),
+        label = "lyricScale"
+    )
+
+    // 💡 2. 透明度动画 (针对激活行 1.0f 与非激活行平滑过渡，消除生硬突变)
+    val targetAlpha = if (isActive) {
+        1.0f
+    } else {
+        (0.42f - (distanceFromActive - 1) * 0.08f).coerceIn(0.18f, 0.42f)
+    }
+    val animatedAlpha by animateFloatAsState(
+        targetValue = targetAlpha,
+        animationSpec = tween(durationMillis = 350, easing = FastOutSlowInEasing),
+        label = "lyricAlpha"
+    )
+
+    // 💡 3. 微距位移动画 (第一句入场或行激活时平滑上浮 3dp，呈现沉浸层次感)
+    val targetTranslationY = if (isActive) -3f else 0f
+    val animatedTranslationY by animateFloatAsState(
+        targetValue = targetTranslationY,
+        animationSpec = spring(
+            dampingRatio = Spring.DampingRatioNoBouncy,
+            stiffness = 180f
+        ),
+        label = "lyricOffsetY"
+    )
+
+    val density = LocalDensity.current
+    val offsetYPx = with(density) { animatedTranslationY.dp.toPx() }
+
     Column(
-        modifier = modifier.fillMaxWidth(),
+        modifier = modifier
+            .fillMaxWidth()
+            .graphicsLayer {
+                scaleX = animatedScale
+                scaleY = animatedScale
+                alpha = animatedAlpha
+                translationY = offsetYPx
+                // 💡 锚定左侧居中，确保大屏文字放大时左边界平齐不抖动
+                transformOrigin = TransformOrigin(0f, 0.5f)
+            },
         verticalArrangement = Arrangement.spacedBy(6.dp)
     ) {
         val words = line.words
         val translation = line.translationText
 
-        if (!words.isNullOrEmpty()) {
+        // 主歌词行 (统一基础字号 34sp，排版稳定，由 GPU RenderNode 缩放驱动至 36.7sp 视觉尺寸)
+        if (isActive && !words.isNullOrEmpty()) {
             val annotatedText = buildAnnotatedString {
                 words.forEach { word ->
                     val progress = syncClock.calculateWordProgress(word, currentTimeMs)
-                    val alpha = 0.35f + 0.65f * progress
-                    withStyle(SpanStyle(color = primaryColor.copy(alpha = alpha))) {
+                    val wordAlpha = 0.38f + 0.62f * progress
+                    withStyle(SpanStyle(color = primaryColor.copy(alpha = wordAlpha))) {
                         append(word.text)
                     }
                 }
             }
             Text(
                 text = annotatedText,
-                fontSize = 36.sp,
+                fontSize = 34.sp,
                 fontWeight = FontWeight.Bold,
-                lineHeight = 46.sp,
+                lineHeight = 44.sp,
                 modifier = Modifier.fillMaxWidth()
             )
         } else {
             Text(
                 text = line.mainText,
-                fontSize = 36.sp,
-                fontWeight = FontWeight.Bold,
+                fontSize = 34.sp,
+                fontWeight = if (isActive) FontWeight.Bold else FontWeight.SemiBold,
                 color = primaryColor,
-                lineHeight = 46.sp,
+                lineHeight = 44.sp,
                 modifier = Modifier.fillMaxWidth()
             )
         }
 
-        // 翻译行 (22sp, 60% 基础色)
+        // 简体中文翻译行 (统一基础字号 20sp)
         if (!translation.isNullOrEmpty()) {
             Text(
                 text = translation,
-                fontSize = 22.sp,
+                fontSize = 20.sp,
                 fontWeight = FontWeight.Normal,
-                color = primaryColor.copy(alpha = 0.60f),
-                lineHeight = 30.sp,
-                modifier = Modifier.fillMaxWidth()
-            )
-        }
-    }
-}
-
-/**
- * 💡 非激活行静态渲染器：完全解耦高频时间戳，零无效重组
- */
-@Composable
-private fun InactiveLyricLineRow(
-    line: LyricLine,
-    distanceFromActive: Int,
-    primaryColor: Color,
-    modifier: Modifier = Modifier
-) {
-    Column(
-        modifier = modifier.fillMaxWidth(),
-        verticalArrangement = Arrangement.spacedBy(6.dp)
-    ) {
-        val lineAlpha = (0.45f - (distanceFromActive - 1) * 0.08f).coerceIn(0.18f, 0.45f)
-        val translation = line.translationText
-
-        Text(
-            text = line.mainText,
-            fontSize = 28.sp,
-            fontWeight = FontWeight.SemiBold,
-            color = primaryColor.copy(alpha = lineAlpha),
-            lineHeight = 38.sp,
-            modifier = Modifier.fillMaxWidth()
-        )
-
-        if (!translation.isNullOrEmpty()) {
-            Text(
-                text = translation,
-                fontSize = 18.sp,
-                fontWeight = FontWeight.Normal,
-                color = primaryColor.copy(alpha = lineAlpha * 0.70f),
-                lineHeight = 24.sp,
+                color = primaryColor.copy(alpha = if (isActive) 0.75f else 0.55f),
+                lineHeight = 28.sp,
                 modifier = Modifier.fillMaxWidth()
             )
         }

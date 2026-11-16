@@ -1,5 +1,6 @@
 package com.solo.purecast.data.lyrics.parser
 
+import com.solo.purecast.data.lyrics.ChineseConverter
 import com.solo.purecast.model.LyricFormat
 import com.solo.purecast.model.LyricLine
 import com.solo.purecast.model.LyricTimeline
@@ -101,7 +102,7 @@ object LrcParser {
                         lineIndex = idx,
                         startMs = 0L,
                         endMs = 0L,
-                        mainText = text
+                        mainText = ChineseConverter.toSimplified(text)
                     )
                 }
                 return LyricTimeline(
@@ -210,14 +211,20 @@ object LrcParser {
                     }
                 }
 
+                val simplifiedMain = ChineseConverter.toSimplified(mainText)
+                val simplifiedTrans = translationText?.let { ChineseConverter.toSimplified(it) }
+                val simplifiedWords = words?.map { w ->
+                    w.copy(text = ChineseConverter.toSimplified(w.text))
+                }
+
                 consolidatedLines.add(
                     LyricLine(
                         lineIndex = currentLineIndex++,
                         startMs = curr.startMs,
                         endMs = endMs,
-                        mainText = mainText,
-                        translationText = translationText,
-                        words = words
+                        mainText = simplifiedMain,
+                        translationText = simplifiedTrans,
+                        words = simplifiedWords
                     )
                 )
 

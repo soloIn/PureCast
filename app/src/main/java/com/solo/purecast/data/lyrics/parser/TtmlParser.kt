@@ -1,5 +1,6 @@
 package com.solo.purecast.data.lyrics.parser
 
+import com.solo.purecast.data.lyrics.ChineseConverter
 import com.solo.purecast.model.LyricFormat
 import com.solo.purecast.model.LyricLine
 import com.solo.purecast.model.LyricTimeline
@@ -146,15 +147,19 @@ object TtmlParser {
                                     currentWords.lastOrNull()?.endMs?.takeIf { it > pStartMs } ?: (pStartMs + 3000L)
                                 }
 
-                                val wordsList = if (currentWords.isNotEmpty()) currentWords.toList() else null
+                                val simplifiedMain = ChineseConverter.toSimplified(mainText)
+                                val simplifiedTrans = translationText?.let { ChineseConverter.toSimplified(it) }
+                                val wordsList = if (currentWords.isNotEmpty()) {
+                                    currentWords.map { w -> w.copy(text = ChineseConverter.toSimplified(w.text)) }
+                                } else null
 
                                 lines.add(
                                     LyricLine(
                                         lineIndex = currentLineIndex++,
                                         startMs = pStartMs,
                                         endMs = resolvedEndMs,
-                                        mainText = mainText,
-                                        translationText = translationText,
+                                        mainText = simplifiedMain,
+                                        translationText = simplifiedTrans,
                                         words = wordsList
                                     )
                                 )

@@ -107,8 +107,8 @@ def main():
     stream_url = f"http://{local_ip}:{TEST_PORT}/test_yellow_268.wav"
     print(f">> 本地音频服务: {stream_url}")
 
-    # 元数据: 晴天 - 周杰伦 (269秒)
-    didl = f"""&lt;DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/"&gt;&lt;item id="1" parentID="0" restricted="1"&gt;&lt;dc:title&gt;晴天&lt;/dc:title&gt;&lt;upnp:artist&gt;周杰伦&lt;/upnp:artist&gt;&lt;upnp:album&gt;叶惠美&lt;/upnp:album&gt;&lt;res duration="00:04:29" protocolInfo="http-get:*:audio/wav:*"&gt;{stream_url}&lt;/res&gt;&lt;/item&gt;&lt;/DIDL-Lite&gt;"""
+    # 元数据: Yellow - Coldplay (267秒)
+    didl = f"""&lt;DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/"&gt;&lt;item id="1" parentID="0" restricted="1"&gt;&lt;dc:title&gt;Yellow&lt;/dc:title&gt;&lt;upnp:artist&gt;Coldplay&lt;/upnp:artist&gt;&lt;upnp:album&gt;Parachutes&lt;/upnp:album&gt;&lt;res duration="00:04:27" protocolInfo="http-get:*:audio/wav:*"&gt;{stream_url}&lt;/res&gt;&lt;/item&gt;&lt;/DIDL-Lite&gt;"""
 
     set_uri_xml = f"""<InstanceID>0</InstanceID><CurrentURI>{stream_url}</CurrentURI><CurrentURIMetaData>{didl}</CurrentURIMetaData>"""
     print(">> 发送 SetAVTransportURI...")
@@ -120,8 +120,8 @@ def main():
     print(">> 发送 Play...")
     send_soap_action_via_curl("Play", play_xml)
 
-    print(f">> 保持播放中，等待 5 秒观察歌词拉取...")
-    time.sleep(5)
+    print(f">> 保持播放中，等待 8 秒观察歌词拉取...")
+    time.sleep(8)
 
     print(">> 发送 Stop...")
     stop_xml = "<InstanceID>0</InstanceID>"

@@ -38,6 +38,7 @@ import com.solo.purecast.data.lyrics.LyricsWaterfallFetcher
 import com.solo.purecast.data.lyrics.remote.AmllDataSource
 import com.solo.purecast.data.lyrics.remote.DefaultLyricsHttpClient
 import com.solo.purecast.data.lyrics.remote.LrclibDataSource
+import com.solo.purecast.data.lyrics.remote.NeteaseDataSource
 import com.solo.purecast.model.ErrorCode
 import com.solo.purecast.model.LyricUiState
 import com.solo.purecast.model.PlaybackStatus
@@ -263,10 +264,12 @@ class PlaybackService : LifecycleService() {
         val lyricsHttpClient = DefaultLyricsHttpClient()
         val amllSource = AmllDataSource(lyricsHttpClient)
         val lrclibSource = LrclibDataSource(lyricsHttpClient)
+        val neteaseSource = NeteaseDataSource(lyricsHttpClient)
         val waterfallFetcher = LyricsWaterfallFetcher(
             cacheRepository = lyricsCacheRepo,
             amllDataSource = amllSource,
-            lrclibDataSource = lrclibSource
+            lrclibDataSource = lrclibSource,
+            neteaseDataSource = neteaseSource
         )
         lyricsTriggerManager = LyricsTriggerManager(
             scope = lifecycleScope,
