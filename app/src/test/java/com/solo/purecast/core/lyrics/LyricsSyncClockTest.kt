@@ -125,4 +125,56 @@ class LyricsSyncClockTest {
         assertEquals(1, state3.activeWordIndex)
         assertEquals(0.5f, state3.wordProgressFraction, 0.01f)
     }
+
+    @Test
+    fun `intro period returns lineIndex minus 1 and does not prematurely highlight first line`() {
+        val timeline = LyricTimeline(
+            source = "test",
+            format = LyricFormat.LRC_LINE_SYNC,
+            lines = listOf(
+                LyricLine(lineIndex = 0, startMs = 15_000L, endMs = 25_000L, mainText = "First Line"),
+                LyricLine(lineIndex = 1, startMs = 25_000L, endMs = 35_000L, mainText = "Second Line")
+            )
+        )
+
+        // 歌曲刚播放到第 5 秒，第一句在 15 秒（前奏期）
+        val state = syncClock.calculateActiveLineState(timeline, 5_000L)
+        assertEquals(-1, state.lineIndex)
+        assertEquals(0f, state.lineProgressFraction, 0.001f)
+    }
+
+    @Test
+    fun `pausing does not jump backward even if reported position is behind interpolated time`() {
+        val baseNano = 1_000_000_000L
+        syncClock.updatePosition(10_000L, playing = true, nowNanoTime = baseNano)
+
+        // 外推推进到 10_300ms
+        val interpolatedTime = syncClock.getCurrentInterpolatedTimeMs(baseNano + 300_000_000L)
+        assertEquals(10_300L, interpolatedTime)
+
+        // 暂停瞬间底层上报 10_100ms（比已外推时间略小）
+        syncClock.updatePosition(10_100L, playing = false, nowNanoTime = baseNano + 301_000_000L)
+
+        // 验证暂停后时间原地冻结在 >= 10_300ms，绝不倒退至 10_100ms
+        val frozenTime = syncClock.getCurrentInterpolatedTimeMs(baseNano + 500_000_000L)
+        assertTrue("暂停时间不能倒退: frozen=$frozenTime", frozenTime >= 10_300L)
+    }
+
+    @Test
+    fun `continuous rewind seek is not blocked by deadband`() {
+        val baseNano = 1_000_000_000L
+        syncClock.updatePosition(50_000L, playing = true, nowNanoTime = baseNano)
+
+        // 第一次快退 Seek: 50s -> 30s (|delta| = 20s > 1500ms, backward)
+        val seek1Nano = baseNano + 100_000_000L
+        syncClock.updatePosition(30_000L, playing = true, nowNanoTime = seek1Nano)
+
+        // 100ms 内再次快退 Seek: 30s -> 10s (|delta| = 20s > 1500ms, 合法连续快退)
+        val seek2Nano = seek1Nano + 100_000_000L
+        syncClock.updatePosition(10_000L, playing = true, nowNanoTime = seek2Nano)
+
+        // 验证连续快退成功应用，没有被 250ms 死区错误吃掉
+        val current = syncClock.getCurrentInterpolatedTimeMs(seek2Nano)
+        assertEquals(10_000L, current)
+    }
 }

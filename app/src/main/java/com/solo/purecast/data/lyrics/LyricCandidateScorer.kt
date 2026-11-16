@@ -7,7 +7,7 @@ import kotlin.math.abs
  * 💡 候选歌词多维打分决策引擎
  * 严格对齐 R7 与 Lyrimuse 架构规范：
  * 歌名相似度 (40分) + 歌手相似度 (30分) + 时长容差 (20分) + 格式权重 (10分)。
- * 设 65 分准入门槛，支持纯音乐判定与硬性时长一票否决。
+ * 设 65 分准入门槛，支持纯音乐优先判定与尾奏智能容差。
  */
 object LyricCandidateScorer {
 
@@ -22,7 +22,10 @@ object LyricCandidateScorer {
         val durationScore: Float,
         val formatScore: Float,
         val vetoReason: String? = null
-    )
+    ) {
+        val accepted: Boolean
+            get() = isPassed
+    }
 
     /**
      * 💡 对单条候选歌词进行多维打分与准入裁决
@@ -35,14 +38,15 @@ object LyricCandidateScorer {
         candidateTitle: String,
         candidateDurationMs: Long,
         candidateFormat: LyricFormat,
+        isInstrumental: Boolean = false,
         isInstrumentalReported: Boolean = false
     ): ScoreResult {
-        // 1. 纯音乐判定（LRCLIB instrumental 或标题包含纯音乐/Instrumental）
-        val isInstrumental = isInstrumentalReported ||
+        // 1. 优先纯音乐判定（在进行任何标题剥离前执行，杜绝归一化冲刷关键字）
+        val isInst = isInstrumental || isInstrumentalReported ||
             isInstrumentalTitle(expectedTitle) ||
             isInstrumentalTitle(candidateTitle)
 
-        if (isInstrumental) {
+        if (isInst) {
             return ScoreResult(
                 totalScore = 100.0f,
                 isPassed = true,
@@ -67,15 +71,30 @@ object LyricCandidateScorer {
         val artistSim = MetadataNormalizer.calculateSimilarity(cleanExpArtist, cleanCandArtist)
         val artistScore = artistSim * 30.0f
 
-        // 4. 时长容差与一票否决裁决 (20 分)
+        // 4. 时长容差与智能一票否决裁决 (20 分)
         var durationScore = 0.0f
         var vetoReason: String? = null
 
         if (expectedDurationMs > 0 && candidateDurationMs > 0) {
-            val deltaMs = abs(expectedDurationMs - candidateDurationMs)
-            if (deltaMs > 5000L) {
-                // 💡 偏差大于 5 秒一票否决淘汰，防止跨版本串扰（如现场版 vs 录音室版）
-                vetoReason = "时长偏差超标一票否决: delta=${deltaMs}ms > 5000ms"
+            val deltaMs = expectedDurationMs - candidateDurationMs
+
+            // 💡 智能尾奏容忍机制 (Finding 2)：
+            // 若歌词由末句推导时长，且 candidateDurationMs < expectedDurationMs（典型的歌曲尾奏空白），
+            // 只要歌名和歌手相似度极高 (>=85%) 且尾奏时差在 60 秒以内，判定为合法尾奏，不予一票否决！
+            val isHighMetadataMatch = titleScore >= 34.0f && artistScore >= 24.0f
+            val isAcceptableOutro = deltaMs in 0L..60_000L && isHighMetadataMatch
+
+            if (isAcceptableOutro) {
+                // 合法尾奏，根据尾奏时长给予递减时长分
+                durationScore = when {
+                    deltaMs <= 5000L -> 18.0f
+                    deltaMs <= 15000L -> 14.0f
+                    deltaMs <= 30000L -> 10.0f
+                    else -> 6.0f
+                }
+            } else if (abs(deltaMs) > 5000L) {
+                // 歌词比音轨更长超过 5 秒（严重跨版本/加长版），或非高匹配歌曲短超过 5 秒：硬性一票否决
+                vetoReason = "时长偏差超标一票否决: delta=${deltaMs}ms"
                 return ScoreResult(
                     totalScore = 0.0f,
                     isPassed = false,
@@ -86,14 +105,14 @@ object LyricCandidateScorer {
                     formatScore = 0.0f,
                     vetoReason = vetoReason
                 )
-            } else if (deltaMs <= 1000L) {
+            } else if (abs(deltaMs) <= 1000L) {
                 durationScore = 20.0f
-            } else if (deltaMs <= 2000L) {
+            } else if (abs(deltaMs) <= 2000L) {
                 durationScore = 16.0f
-            } else if (deltaMs <= 3000L) {
+            } else if (abs(deltaMs) <= 3000L) {
                 durationScore = 10.0f
             } else {
-                durationScore = 0.0f
+                durationScore = 5.0f
             }
         } else {
             // 时长未知时给保底分 10 分
@@ -122,10 +141,13 @@ object LyricCandidateScorer {
         )
     }
 
-    private fun isInstrumentalTitle(title: String): Boolean {
+    fun isInstrumentalTitle(title: String): Boolean {
         val lower = title.lowercase()
         return lower.contains("instrumental") ||
             lower.contains("纯音乐") ||
-            lower.contains("伴奏")
+            lower.contains("伴奏") ||
+            lower.contains("karaoke") ||
+            lower.contains("off vocal") ||
+            lower.contains("backing track")
     }
 }

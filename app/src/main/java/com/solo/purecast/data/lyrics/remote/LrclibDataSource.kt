@@ -11,8 +11,9 @@ import org.json.JSONObject
 import java.net.URLEncoder
 
 /**
- * 💡 LRCLIB 远端数据源
- * 遵循官方 RESTful API 范式：支持 /api/get 精确四元组匹配与 /api/search 模糊降级搜索
+ * 💡 LRCLIB 官方 RESTful 远端数据源
+ * 遵循官方规范：支持 /api/get 精确多元匹配与 /api/search 候选打分决胜
+ * 严格使用 RFC 3986 百分号编码 (空格转为 %20)。
  */
 class LrclibDataSource(
     private val httpClient: LyricsHttpClient,
@@ -21,25 +22,39 @@ class LrclibDataSource(
 
     /**
      * 💡 精确匹配检索 (/api/get)
-     * 超时限制: 1.5s
+     * 支持 track_name, artist_name, album_name 及 duration 四元组精确匹配
      */
-    suspend fun getExact(artist: String, title: String, durationMs: Long): LyricTimeline? {
+    suspend fun getExact(
+        artist: String,
+        title: String,
+        album: String? = null,
+        durationMs: Long = 0L
+    ): LyricTimeline? {
         val cleanArtist = MetadataNormalizer.normalizeArtist(artist)
         val cleanTitle = MetadataNormalizer.normalizeTitle(title)
 
         if (cleanArtist.isBlank() || cleanTitle.isBlank()) return null
 
-        val encodedArtist = URLEncoder.encode(cleanArtist, "UTF-8")
-        val encodedTitle = URLEncoder.encode(cleanTitle, "UTF-8")
+        val encArtist = rfc3986Encode(cleanArtist)
+        val encTitle = rfc3986Encode(cleanTitle)
 
-        val url = if (durationMs > 0) {
-            val durationSec = (durationMs / 1000L).toInt()
-            "$baseUrl/api/get?artist_name=$encodedArtist&track_name=$encodedTitle&duration=$durationSec"
-        } else {
-            "$baseUrl/api/get?artist_name=$encodedArtist&track_name=$encodedTitle"
+        val queryParams = StringBuilder("track_name=$encTitle&artist_name=$encArtist")
+
+        if (!album.isNullOrBlank()) {
+            val cleanAlbum = MetadataNormalizer.normalizeTitle(album)
+            if (cleanAlbum.isNotBlank()) {
+                queryParams.append("&album_name=").append(rfc3986Encode(cleanAlbum))
+            }
         }
 
+        if (durationMs > 0L) {
+            val durationSec = (durationMs / 1000L).toInt()
+            queryParams.append("&duration=").append(durationSec)
+        }
+
+        val url = "$baseUrl/api/get?$queryParams"
         val resp = httpClient.get(url, timeoutMs = EXACT_TIMEOUT_MS)
+
         if (!resp.isSuccessful || resp.body.isBlank()) {
             Logger.lyrics.d(TAG, "LRCLIB /api/get 精确未命中: $cleanArtist - $cleanTitle (HTTP ${resp.statusCode})")
             return null
@@ -50,21 +65,32 @@ class LrclibDataSource(
 
     /**
      * 💡 模糊搜索回退检索 (/api/search)
-     * 超时限制: 2.0s，取前 3 条候选执行多维打分决胜
+     * 超时限制 2.0s，取前 3 条候选执行多维打分决胜
      */
-    suspend fun searchFuzzy(artist: String, title: String, durationMs: Long): LyricTimeline? {
+    suspend fun searchFuzzy(
+        artist: String,
+        title: String,
+        album: String? = null,
+        durationMs: Long = 0L
+    ): LyricTimeline? {
         val cleanArtist = MetadataNormalizer.normalizeArtist(artist)
         val cleanTitle = MetadataNormalizer.normalizeTitle(title)
 
         if (cleanArtist.isBlank() && cleanTitle.isBlank()) return null
 
-        val query = "$cleanTitle $cleanArtist".trim()
-        val encodedQ = URLEncoder.encode(query, "UTF-8")
-        val url = "$baseUrl/api/search?q=$encodedQ"
+        // 1. 优先使用精准参数组合搜索
+        var url = "$baseUrl/api/search?track_name=${rfc3986Encode(cleanTitle)}&artist_name=${rfc3986Encode(cleanArtist)}"
+        var resp = httpClient.get(url, timeoutMs = SEARCH_TIMEOUT_MS)
 
-        val resp = httpClient.get(url, timeoutMs = SEARCH_TIMEOUT_MS)
+        // 2. 若返回空列表，降级使用全文本 q
+        if (!resp.isSuccessful || resp.body.isBlank() || isEmptyArray(resp.body)) {
+            val query = "$cleanTitle $cleanArtist".trim()
+            url = "$baseUrl/api/search?q=${rfc3986Encode(query)}"
+            resp = httpClient.get(url, timeoutMs = SEARCH_TIMEOUT_MS)
+        }
+
         if (!resp.isSuccessful || resp.body.isBlank()) {
-            Logger.lyrics.d(TAG, "LRCLIB /api/search 搜索失败: query=$query (HTTP ${resp.statusCode})")
+            Logger.lyrics.d(TAG, "LRCLIB /api/search 搜索失败: $cleanTitle (HTTP ${resp.statusCode})")
             return null
         }
 
@@ -75,7 +101,6 @@ class LrclibDataSource(
             var bestTimeline: LyricTimeline? = null
             var bestScore = 0.0f
 
-            // 限制最多评审前 3 条候选
             val evaluateCount = minOf(3, array.length())
             for (i in 0 until evaluateCount) {
                 val item = array.getJSONObject(i)
@@ -102,101 +127,86 @@ class LrclibDataSource(
                     candidateTitle = candTitle,
                     candidateDurationMs = candDurationMs,
                     candidateFormat = candFormat,
-                    isInstrumentalReported = isInst
+                    isInstrumental = isInst
                 )
 
-                if (scoreResult.isPassed && scoreResult.totalScore > bestScore) {
-                    val timeline = when {
-                        isInst || scoreResult.isInstrumental -> {
-                            LyricTimeline(source = "LRCLIB-search", format = LyricFormat.PLAIN_TEXT, isInstrumental = true)
-                        }
-                        syncedLrc.isNotBlank() -> {
-                            LrcParser.parse(syncedLrc, sourceName = "LRCLIB-search")
-                        }
-                        plainLrc.isNotBlank() -> {
-                            LrcParser.parse(plainLrc, sourceName = "LRCLIB-search")
-                        }
-                        else -> null
-                    }
+                if (scoreResult.accepted && scoreResult.totalScore > bestScore) {
+                    val timeline = if (isInst) {
+                        LyricTimeline(
+                            source = "LRCLIB",
+                            format = candFormat,
+                            isInstrumental = true,
+                            lines = emptyList(),
+                            durationMs = candDurationMs
+                        )
+                    } else if (syncedLrc.isNotBlank()) {
+                        LrcParser.parse(syncedLrc, sourceName = "LRCLIB", expectedDurationMs = candDurationMs)
+                    } else if (plainLrc.isNotBlank()) {
+                        LrcParser.parse(plainLrc, sourceName = "LRCLIB", expectedDurationMs = candDurationMs)
+                    } else null
 
                     if (timeline != null) {
-                        bestScore = scoreResult.totalScore
                         bestTimeline = timeline
+                        bestScore = scoreResult.totalScore
                     }
                 }
             }
 
-            if (bestTimeline != null) {
-                Logger.lyrics.i(TAG, "LRCLIB /api/search 命中最佳候选 (评分=$bestScore): $cleanArtist - $cleanTitle")
-            }
             return bestTimeline
         } catch (e: Exception) {
-            Logger.lyrics.e(TAG, "解析 LRCLIB 搜索响应 JSON 失败", e)
+            Logger.lyrics.w(TAG, "解析 LRCLIB /api/search 响应异常", e)
             return null
         }
     }
 
     private fun parseSingleEntry(
         jsonStr: String,
-        expectedArtist: String,
-        expectedTitle: String,
+        cleanArtist: String,
+        cleanTitle: String,
         expectedDurationMs: Long
     ): LyricTimeline? {
-        try {
-            val root = JSONObject(jsonStr)
-            val isInst = root.optBoolean("instrumental", false)
-            val candArtist = root.optString("artistName", "")
-            val candTitle = root.optString("trackName", "")
-            val candDurationSec = root.optDouble("duration", 0.0)
+        return try {
+            val json = JSONObject(jsonStr)
+            val isInst = json.optBoolean("instrumental", false)
+            val candDurationSec = json.optDouble("duration", 0.0)
             val candDurationMs = (candDurationSec * 1000).toLong()
-            val syncedLrc = root.optString("syncedLyrics", "")
-            val plainLrc = root.optString("plainLyrics", "")
+            val syncedLrc = json.optString("syncedLyrics", "")
+            val plainLrc = json.optString("plainLyrics", "")
 
-            val candFormat = when {
-                syncedLrc.contains("<") -> LyricFormat.LRC_WORD_SYNC
-                syncedLrc.isNotBlank() -> LyricFormat.LRC_LINE_SYNC
-                else -> LyricFormat.PLAIN_TEXT
-            }
-
-            val score = LyricCandidateScorer.evaluate(
-                expectedArtist = expectedArtist,
-                expectedTitle = expectedTitle,
-                expectedDurationMs = expectedDurationMs,
-                candidateArtist = candArtist,
-                candidateTitle = candTitle,
-                candidateDurationMs = candDurationMs,
-                candidateFormat = candFormat,
-                isInstrumentalReported = isInst
-            )
-
-            if (!score.isPassed) {
-                Logger.lyrics.w(TAG, "LRCLIB 精确候选评分未达标 (score=${score.totalScore}): ${score.vetoReason}")
-                return null
-            }
-
-            if (isInst || score.isInstrumental) {
+            if (isInst) {
                 return LyricTimeline(
                     source = "LRCLIB",
                     format = LyricFormat.PLAIN_TEXT,
                     isInstrumental = true,
+                    lines = emptyList(),
                     durationMs = candDurationMs
                 )
             }
 
-            if (syncedLrc.isNotBlank()) {
-                val parsed = LrcParser.parse(syncedLrc, sourceName = "LRCLIB")
-                if (parsed != null) return parsed
-            }
+            val lrcContent = syncedLrc.ifBlank { plainLrc }
+            if (lrcContent.isBlank()) return null
 
-            if (plainLrc.isNotBlank()) {
-                return LrcParser.parse(plainLrc, sourceName = "LRCLIB")
-            }
-
-            return null
+            LrcParser.parse(lrcContent, sourceName = "LRCLIB", expectedDurationMs = candDurationMs)
         } catch (e: Exception) {
-            Logger.lyrics.e(TAG, "解析 LRCLIB 精确匹配 JSON 异常", e)
-            return null
+            Logger.lyrics.w(TAG, "解析 LRCLIB 条目异常", e)
+            null
         }
+    }
+
+    private fun isEmptyArray(jsonStr: String): Boolean {
+        return try {
+            val arr = JSONArray(jsonStr)
+            arr.length() == 0
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun rfc3986Encode(value: String): String {
+        return URLEncoder.encode(value, "UTF-8")
+            .replace("+", "%20")
+            .replace("*", "%2A")
+            .replace("%7E", "~")
     }
 
     companion object {

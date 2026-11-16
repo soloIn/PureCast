@@ -92,10 +92,15 @@ class LyricsTriggerManagerTest {
 
     @Test
     fun `rapid track switching cancels earlier in-flight requests and executes only latest`() = testScope.runTest {
-        val url2 = "https://raw.githubusercontent.com/amll-dev/amll-ttml-db/main/lyrics/artist2%20-%20song2.ttml"
-        fakeClient.responses[url2] = LyricsHttpClient.HttpResponse(
+        val amllSearchUrl = "https://api.amll.dev/v1/lyrics/search?musicName=song2&artistName=artist2"
+        fakeClient.responses[amllSearchUrl] = LyricsHttpClient.HttpResponse(
             statusCode = 200,
-            body = """<tt xmlns="http://www.w3.org/ns/ttml"><body><div><p begin="00:10.00" end="02:00.00"><span>Song 2</span></p></div></body></tt>"""
+            body = """{"code":200,"data":[{"id":2002,"musicName":"Song 2","artists":["Artist 2"]}]}"""
+        )
+        val amllGetUrl = "https://api.amll.dev/v1/lyrics/get?id=2002"
+        fakeClient.responses[amllGetUrl] = LyricsHttpClient.HttpResponse(
+            statusCode = 200,
+            body = """{"code":200,"data":{"id":2002,"lyrics":"<tt xmlns=\"http://www.w3.org/ns/ttml\"><body><div><p begin=\"00:10.00\" end=\"02:00.00\"><span>Song 2</span></p></div></body></tt>"}}"""
         )
 
         // 连续快速触发代数 1 与 代数 2 (间隔 100ms < 350ms)

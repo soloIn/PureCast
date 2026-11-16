@@ -38,11 +38,12 @@ class LyricsCacheRepository(
 
     /**
      * 💡 计算标准 SHA-256 缓存键
+     * 统一使用 MetadataNormalizer 进行清洗归一化，杜绝键值裂变 (Finding 5)
      * [durationMs] 实施 3 秒分桶（durationMs / 3000L），有效吸收流媒体传输中的毫秒级边界抖动
      */
     fun computeCacheKey(artist: String, title: String, durationMs: Long): String {
-        val cleanArtist = artist.trim().lowercase()
-        val cleanTitle = title.trim().lowercase()
+        val cleanArtist = MetadataNormalizer.normalizeArtist(artist)
+        val cleanTitle = MetadataNormalizer.normalizeTitle(title)
         val durationBucket = if (durationMs > 0) durationMs / 3000L else 0L
         val raw = "${cleanArtist}_${cleanTitle}_$durationBucket"
 

@@ -4,15 +4,19 @@ import com.solo.purecast.data.lyrics.MetadataNormalizer
 import com.solo.purecast.data.lyrics.parser.TtmlParser
 import com.solo.purecast.model.LyricTimeline
 import com.solo.purecast.util.Logger
+import org.json.JSONObject
 import java.net.URLEncoder
 
 /**
- * 💡 AMLL TTML DB 远端数据源
- * 依据规范化元数据请求 GitHub 上的高精音节逐字歌词库，硬超时 1.5s
+ * 💡 AMLL (Apple Music-like Lyrics) 官方 RESTful API 远端数据源
+ * 遵循官方 OpenAPI 规范 (https://api.amll.dev):
+ * 1. Step 1: 调用 /v1/lyrics/search?musicName={title}&artistName={artist} 检索歌曲条目 ID;
+ * 2. Step 2: 调用 /v1/lyrics/get?id={id} 获取高精音节逐字 TTML 歌词;
+ * 3. 严格遵循 RFC 3986 百分号编码 (空格转为 %20，绝不转为 +)。
  */
 class AmllDataSource(
     private val httpClient: LyricsHttpClient,
-    private val baseUrl: String = DEFAULT_BASE_URL
+    private val apiBaseUrl: String = DEFAULT_API_BASE_URL
 ) {
 
     suspend fun fetch(artist: String, title: String): LyricTimeline? {
@@ -21,39 +25,97 @@ class AmllDataSource(
 
         if (cleanArtist.isBlank() || cleanTitle.isBlank()) return null
 
-        // 尝试构建常见的 AMLL 路径
-        val encodedArtist = URLEncoder.encode(cleanArtist, "UTF-8")
-        val encodedTitle = URLEncoder.encode(cleanTitle, "UTF-8")
+        val encArtist = rfc3986Encode(cleanArtist)
+        val encTitle = rfc3986Encode(cleanTitle)
 
-        // 路径样式 1: lyrics/artist - title.ttml
-        val path1 = "$baseUrl/lyrics/$encodedArtist%20-%20$encodedTitle.ttml"
-        val resp1 = httpClient.get(path1, timeoutMs = TIMEOUT_MS)
-        if (resp1.isSuccessful && resp1.body.isNotBlank()) {
-            val timeline = TtmlParser.parse(resp1.body, sourceName = "AMLL")
-            if (timeline != null) {
-                Logger.lyrics.i(TAG, "AMLL 路径 1 命中: $cleanArtist - $cleanTitle")
-                return timeline
-            }
+        // 1. 尝试以精准字段组合检索
+        var searchUrl = "$apiBaseUrl/v1/lyrics/search?musicName=$encTitle&artistName=$encArtist"
+        var searchResp = httpClient.get(searchUrl, timeoutMs = TIMEOUT_MS)
+
+        // 若精准字段未匹配，降级使用全局模糊搜索 q
+        if (!searchResp.isSuccessful || searchResp.body.isBlank() || !hasValidItem(searchResp.body)) {
+            val encQ = rfc3986Encode("$cleanTitle $cleanArtist")
+            searchUrl = "$apiBaseUrl/v1/lyrics/search?q=$encQ"
+            searchResp = httpClient.get(searchUrl, timeoutMs = TIMEOUT_MS)
         }
 
-        // 路径样式 2: lyrics/artist/title.ttml
-        val path2 = "$baseUrl/lyrics/$encodedArtist/$encodedTitle.ttml"
-        val resp2 = httpClient.get(path2, timeoutMs = TIMEOUT_MS)
-        if (resp2.isSuccessful && resp2.body.isNotBlank()) {
-            val timeline = TtmlParser.parse(resp2.body, sourceName = "AMLL")
-            if (timeline != null) {
-                Logger.lyrics.i(TAG, "AMLL 路径 2 命中: $cleanArtist - $cleanTitle")
-                return timeline
-            }
+        if (!searchResp.isSuccessful || searchResp.body.isBlank()) {
+            Logger.lyrics.d(TAG, "AMLL 搜索未命中: $cleanArtist - $cleanTitle (HTTP ${searchResp.statusCode})")
+            return null
         }
 
-        Logger.lyrics.d(TAG, "AMLL 未命中: $cleanArtist - $cleanTitle")
-        return null
+        val lyricId = extractFirstLyricId(searchResp.body)
+        if (lyricId == null) {
+            Logger.lyrics.d(TAG, "AMLL 搜索结果为空: $cleanArtist - $cleanTitle")
+            return null
+        }
+
+        // 2. 根据获取到的歌词 ID 拉取完整 TTML 内容
+        val getUrl = "$apiBaseUrl/v1/lyrics/get?id=$lyricId"
+        val getResp = httpClient.get(getUrl, timeoutMs = TIMEOUT_MS)
+        if (!getResp.isSuccessful || getResp.body.isBlank()) {
+            Logger.lyrics.d(TAG, "AMLL /v1/lyrics/get 请求失败: id=$lyricId (HTTP ${getResp.statusCode})")
+            return null
+        }
+
+        val ttmlContent = extractTtmlContent(getResp.body)
+        if (ttmlContent.isNullOrBlank()) {
+            Logger.lyrics.d(TAG, "AMLL 响应中缺少有效 TTML 歌词内容: id=$lyricId")
+            return null
+        }
+
+        val timeline = TtmlParser.parse(ttmlContent, sourceName = "AMLL")
+        if (timeline != null) {
+            Logger.lyrics.i(TAG, "AMLL 官方 API 成功命中: $cleanArtist - $cleanTitle (id=$lyricId, lines=${timeline.lineCount})")
+        }
+        return timeline
+    }
+
+    private fun hasValidItem(jsonStr: String): Boolean {
+        return try {
+            val root = JSONObject(jsonStr)
+            val dataObj = root.optJSONObject("data")
+            val items = dataObj?.optJSONArray("items") ?: root.optJSONArray("data")
+            items != null && items.length() > 0
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun extractFirstLyricId(jsonStr: String): Long? {
+        return try {
+            val root = JSONObject(jsonStr)
+            val dataObj = root.optJSONObject("data")
+            val items = dataObj?.optJSONArray("items") ?: root.optJSONArray("data") ?: return null
+            if (items.length() == 0) return null
+            val first = items.getJSONObject(0)
+            first.optLong("id").takeIf { it > 0 }
+        } catch (e: Exception) {
+            Logger.lyrics.w(TAG, "解析 AMLL 搜索结果异常", e)
+            null
+        }
+    }
+
+    private fun extractTtmlContent(jsonStr: String): String? {
+        return try {
+            val root = JSONObject(jsonStr)
+            root.optJSONObject("data")?.optString("lyrics")?.takeIf { it.isNotBlank() }
+        } catch (e: Exception) {
+            Logger.lyrics.w(TAG, "解析 AMLL 歌词内容异常", e)
+            null
+        }
+    }
+
+    private fun rfc3986Encode(value: String): String {
+        return URLEncoder.encode(value, "UTF-8")
+            .replace("+", "%20")
+            .replace("*", "%2A")
+            .replace("%7E", "~")
     }
 
     companion object {
         private const val TAG = "AmllDataSource"
-        const val DEFAULT_BASE_URL = "https://raw.githubusercontent.com/amll-dev/amll-ttml-db/main"
+        const val DEFAULT_API_BASE_URL = "https://api.amll.dev"
         const val TIMEOUT_MS = 1500
     }
 }

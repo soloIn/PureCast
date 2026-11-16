@@ -1,10 +1,16 @@
 package com.solo.purecast.ui.screen
 
 import androidx.activity.compose.BackHandler
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.basicMarquee
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -19,10 +25,14 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -39,6 +49,7 @@ import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
@@ -47,9 +58,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.itemsIndexed
-import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.tv.material3.ExperimentalTvMaterial3Api
 import androidx.tv.material3.Icon
 import androidx.tv.material3.Text
@@ -63,17 +71,19 @@ import com.solo.purecast.model.LyricLine
 import com.solo.purecast.model.LyricTimeline
 import com.solo.purecast.model.LyricUiState
 import com.solo.purecast.model.TrackMetadata
-import com.solo.purecast.ui.components.SignalPathPill
 import kotlin.math.abs
 
 /**
  * 💡 PureCast Apple Music TV 风格歌词全屏展开屏 (LyricsScreen)
- * 严格遵照 10-Foot UI 与 Android TV 交互规范：
- * 1. 左侧 35%：紧凑封面 + 音频品质胶囊 + 歌曲标题与艺术家；
- * 2. 右侧 65%：巨幅沉浸歌词流 (TvLazyColumn + 80dp 上下羽化渐变遮罩)；
- * 3. 聚焦行：36sp 粗体纯白高亮，音节级逐字扫光；下方一行 22sp 60% 白色翻译；
- * 4. 非聚焦行：28sp 35%~45% 透明度，随距离行数景深平滑衰减；
- * 5. 遥控器 Back 键通过 BackHandler 拦截优雅缩回主屏。
+ * 严格遵照 10-Foot UI 与 Android TV 交互规范及用户指令修改：
+ * 1. 移除 SignalPathPill 胶囊，保持大屏纯净极简 (Finding 8)；
+ * 2. 界面比例调整为：左侧 45% (信息区) + 右侧 55% (歌词流) (Finding 8)；
+ * 3. 前奏期高亮与焦点抑制，activeLineIndex=-1 时不提前高亮第一句 (Finding 11, 14)；
+ * 4. 浅色模式/深色背景智能自适应文字色，杜绝白字隐形 (Finding 10)；
+ * 5. VSYNC 60fps 仅更新高亮激活行扫光，全列表非活动行与高频解耦，杜绝低端盒子掉帧 (Finding 9, 18)；
+ * 6. 自动滚动偏移基于 Density 转精确 dp，与顶部 80dp 羽化及内边距完美对齐 (Finding 17)；
+ * 7. 优雅 Shimmer 呼吸骨架动画 (Finding 10)；
+ * 8. 遥控器 Back 键通过 BackHandler 拦截优雅缩回主屏。
  */
 @OptIn(ExperimentalTvMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
@@ -95,19 +105,6 @@ fun LyricsScreen(
         onClose()
     }
 
-    // 💡 VSYNC 60fps/120fps 单调平滑时钟推进
-    var currentRenderTimeMs by remember { mutableLongStateOf(0L) }
-    LaunchedEffect(lyricUiState) {
-        val timeline = (lyricUiState as? LyricUiState.Success)?.timeline
-        if (timeline != null) {
-            while (true) {
-                withFrameNanos {
-                    currentRenderTimeMs = syncClock.getCurrentInterpolatedTimeMs()
-                }
-            }
-        }
-    }
-
     Row(
         modifier = modifier
             .fillMaxSize()
@@ -115,18 +112,18 @@ fun LyricsScreen(
         verticalAlignment = Alignment.CenterVertically
     ) {
         // ==========================================
-        // 左侧 35%: 紧凑封面与歌曲元数据信息
+        // 左侧 45%: 封面与歌曲元数据信息 (Finding 8)
         // ==========================================
         Column(
             modifier = Modifier
-                .weight(0.35f)
+                .weight(0.45f)
                 .fillMaxHeight(),
             verticalArrangement = Arrangement.Center
         ) {
             val coverShape = RoundedCornerShape(16.dp)
             Box(
                 modifier = Modifier
-                    .fillMaxWidth(0.85f)
+                    .fillMaxWidth(0.82f)
                     .aspectRatio(1f)
                     .shadow(
                         elevation = 24.dp,
@@ -159,42 +156,32 @@ fun LyricsScreen(
                         painter = painterResource(id = R.drawable.ic_waveform),
                         contentDescription = "Music Placeholder",
                         tint = if (hasDarkBackground) Color.White.copy(alpha = 0.6f) else Color(0xFF1C1C1E).copy(alpha = 0.6f),
-                        modifier = Modifier.size(56.dp)
+                        modifier = Modifier.size(64.dp)
                     )
                 }
             }
 
-            Spacer(modifier = Modifier.height(24.dp))
-
-            // 音频信号胶囊
-            SignalPathPill(
-                audioState = audioPathState,
-                hardwareState = hardwareState,
-                isIdle = false,
-                hasDarkBackground = hasDarkBackground
-            )
-
-            Spacer(modifier = Modifier.height(16.dp))
+            Spacer(modifier = Modifier.height(28.dp))
 
             // 歌曲标题
             Text(
                 text = metadata.title,
-                fontSize = 28.sp,
+                fontSize = 32.sp,
                 fontWeight = FontWeight.Bold,
                 color = if (hasDarkBackground) Color.White else Color(0xFF1C1C1E),
                 maxLines = 1,
-                lineHeight = 34.sp,
+                lineHeight = 38.sp,
                 modifier = Modifier
                     .fillMaxWidth(0.92f)
                     .basicMarquee(initialDelayMillis = 2000, delayMillis = 1500)
             )
 
-            Spacer(modifier = Modifier.height(6.dp))
+            Spacer(modifier = Modifier.height(8.dp))
 
             // 艺术家
             Text(
                 text = metadata.artist,
-                fontSize = 18.sp,
+                fontSize = 20.sp,
                 fontWeight = FontWeight.Medium,
                 color = if (hasDarkBackground) Color.White.copy(alpha = 0.70f) else Color(0xFF1C1C1E).copy(alpha = 0.70f),
                 maxLines = 1,
@@ -203,10 +190,10 @@ fun LyricsScreen(
             )
 
             if (metadata.album.isNotEmpty()) {
-                Spacer(modifier = Modifier.height(4.dp))
+                Spacer(modifier = Modifier.height(6.dp))
                 Text(
                     text = metadata.album,
-                    fontSize = 14.sp,
+                    fontSize = 15.sp,
                     color = if (hasDarkBackground) Color.White.copy(alpha = 0.50f) else Color(0xFF1C1C1E).copy(alpha = 0.50f),
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
@@ -215,14 +202,14 @@ fun LyricsScreen(
             }
         }
 
-        Spacer(modifier = Modifier.width(32.dp))
+        Spacer(modifier = Modifier.width(36.dp))
 
         // ==========================================
-        // 右侧 65%: 沉浸巨幅歌词流与异常分支
+        // 右侧 55%: 沉浸巨幅歌词流与异常分支 (Finding 8)
         // ==========================================
         Box(
             modifier = Modifier
-                .weight(0.65f)
+                .weight(0.55f)
                 .fillMaxHeight(),
             contentAlignment = Alignment.Center
         ) {
@@ -230,8 +217,8 @@ fun LyricsScreen(
                 is LyricUiState.Success -> {
                     LyricsStreamView(
                         timeline = lyricUiState.timeline,
-                        currentTimeMs = currentRenderTimeMs,
                         syncClock = syncClock,
+                        hasDarkBackground = hasDarkBackground,
                         modifier = Modifier.fillMaxSize()
                     )
                 }
@@ -263,29 +250,51 @@ fun LyricsScreen(
 
 /**
  * 💡 沉浸式歌词流滚动视口：上下 80dp 渐变羽化遮罩 + 黄金居中自动滚动
+ * 针对低端电视盒子实施高频隔离渲染：仅高亮激活行参与 60fps VSYNC 重组 (Finding 9, 18)
  */
 @Composable
 private fun LyricsStreamView(
     timeline: LyricTimeline,
-    currentTimeMs: Long,
     syncClock: LyricsSyncClock,
+    hasDarkBackground: Boolean,
     modifier: Modifier = Modifier
 ) {
+    val density = LocalDensity.current
     val listState = rememberLazyListState()
-    val activeState = remember(currentTimeMs, timeline) {
-        syncClock.calculateActiveLineState(timeline, currentTimeMs)
-    }
-    val activeLineIndex = activeState.lineIndex
 
-    // 💡 智能居中位移：当高亮行推进时，平滑带动视口将当前行保持在偏上方阅读黄金区域
+    // 💡 只有当前激活行索引改变时，才驱动列表重组与平滑滚动
+    var activeLineIndex by remember { mutableIntStateOf(-1) }
+    var currentRenderTimeMs by remember { mutableLongStateOf(0L) }
+
+    LaunchedEffect(timeline) {
+        while (true) {
+            withFrameNanos {
+                val nowTimeMs = syncClock.getCurrentInterpolatedTimeMs()
+                currentRenderTimeMs = nowTimeMs
+                val state = syncClock.calculateActiveLineState(timeline, nowTimeMs)
+                if (state.lineIndex != activeLineIndex) {
+                    activeLineIndex = state.lineIndex
+                }
+            }
+        }
+    }
+
+    // 💡 Finding 17: 精确基于 density 计算 scrollOffset，避开 80dp 羽化遮罩
+    val targetOffsetPx = remember(density) {
+        with(density) { (-120).dp.roundToPx() }
+    }
+
+    // 💡 Finding 11: 前奏期 (activeLineIndex == -1) 时抑制滚动与高亮
     LaunchedEffect(activeLineIndex) {
         if (activeLineIndex in timeline.lines.indices) {
             listState.animateScrollToItem(
                 index = activeLineIndex,
-                scrollOffset = -120
+                scrollOffset = targetOffsetPx
             )
         }
     }
+
+    val primaryTextColor = if (hasDarkBackground) Color.White else Color(0xFF1C1C1E)
 
     Box(
         modifier = modifier
@@ -324,30 +333,36 @@ private fun LyricsStreamView(
                 key = { index, line -> "${line.startMs}_$index" }
             ) { index, line ->
                 val isActive = index == activeLineIndex
-                val distance = abs(index - activeLineIndex)
+                val distance = if (activeLineIndex >= 0) abs(index - activeLineIndex) else 10
 
-                LyricLineRow(
-                    line = line,
-                    isActive = isActive,
-                    distanceFromActive = distance,
-                    currentTimeMs = currentTimeMs,
-                    syncClock = syncClock
-                )
+                if (isActive) {
+                    ActiveLyricLineRow(
+                        line = line,
+                        currentTimeMs = currentRenderTimeMs,
+                        syncClock = syncClock,
+                        primaryColor = primaryTextColor
+                    )
+                } else {
+                    InactiveLyricLineRow(
+                        line = line,
+                        distanceFromActive = distance,
+                        primaryColor = primaryTextColor
+                    )
+                }
             }
         }
     }
 }
 
 /**
- * 💡 歌词单行渲染器：支持音节级逐字扫光与双语翻译并排
+ * 💡 激活行专属渲染器：仅在此组件内进行音节级 60fps 扫光，不影响列表其他所有行 (Finding 9, 18)
  */
 @Composable
-private fun LyricLineRow(
+private fun ActiveLyricLineRow(
     line: LyricLine,
-    isActive: Boolean,
-    distanceFromActive: Int,
     currentTimeMs: Long,
     syncClock: LyricsSyncClock,
+    primaryColor: Color,
     modifier: Modifier = Modifier
 ) {
     Column(
@@ -357,74 +372,83 @@ private fun LyricLineRow(
         val words = line.words
         val translation = line.translationText
 
-        if (isActive) {
-            // ==========================================
-            // 激活高亮行 (36sp 纯白粗体，音节级扫光)
-            // ==========================================
-            if (!words.isNullOrEmpty()) {
-                val annotatedText = buildAnnotatedString {
-                    words.forEach { word ->
-                        val progress = syncClock.calculateWordProgress(word, currentTimeMs)
-                        val alpha = 0.35f + 0.65f * progress
-                        withStyle(SpanStyle(color = Color.White.copy(alpha = alpha))) {
-                            append(word.text)
-                        }
+        if (!words.isNullOrEmpty()) {
+            val annotatedText = buildAnnotatedString {
+                words.forEach { word ->
+                    val progress = syncClock.calculateWordProgress(word, currentTimeMs)
+                    val alpha = 0.35f + 0.65f * progress
+                    withStyle(SpanStyle(color = primaryColor.copy(alpha = alpha))) {
+                        append(word.text)
                     }
                 }
-                Text(
-                    text = annotatedText,
-                    fontSize = 36.sp,
-                    fontWeight = FontWeight.Bold,
-                    lineHeight = 46.sp,
-                    modifier = Modifier.fillMaxWidth()
-                )
-            } else {
-                Text(
-                    text = line.mainText,
-                    fontSize = 36.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = Color.White,
-                    lineHeight = 46.sp,
-                    modifier = Modifier.fillMaxWidth()
-                )
             }
-
-            // 翻译行 (22sp, 60% 白色)
-            if (!translation.isNullOrEmpty()) {
-                Text(
-                    text = translation,
-                    fontSize = 22.sp,
-                    fontWeight = FontWeight.Normal,
-                    color = Color.White.copy(alpha = 0.60f),
-                    lineHeight = 30.sp,
-                    modifier = Modifier.fillMaxWidth()
-                )
-            }
-        } else {
-            // ==========================================
-            // 非激活行 (28sp，随行间距平滑景深衰减)
-            // ==========================================
-            val lineAlpha = (0.45f - (distanceFromActive - 1) * 0.08f).coerceIn(0.18f, 0.45f)
-
             Text(
-                text = line.mainText,
-                fontSize = 28.sp,
-                fontWeight = FontWeight.SemiBold,
-                color = Color.White.copy(alpha = lineAlpha),
-                lineHeight = 38.sp,
+                text = annotatedText,
+                fontSize = 36.sp,
+                fontWeight = FontWeight.Bold,
+                lineHeight = 46.sp,
                 modifier = Modifier.fillMaxWidth()
             )
+        } else {
+            Text(
+                text = line.mainText,
+                fontSize = 36.sp,
+                fontWeight = FontWeight.Bold,
+                color = primaryColor,
+                lineHeight = 46.sp,
+                modifier = Modifier.fillMaxWidth()
+            )
+        }
 
-            if (!translation.isNullOrEmpty()) {
-                Text(
-                    text = translation,
-                    fontSize = 18.sp,
-                    fontWeight = FontWeight.Normal,
-                    color = Color.White.copy(alpha = lineAlpha * 0.70f),
-                    lineHeight = 24.sp,
-                    modifier = Modifier.fillMaxWidth()
-                )
-            }
+        // 翻译行 (22sp, 60% 基础色)
+        if (!translation.isNullOrEmpty()) {
+            Text(
+                text = translation,
+                fontSize = 22.sp,
+                fontWeight = FontWeight.Normal,
+                color = primaryColor.copy(alpha = 0.60f),
+                lineHeight = 30.sp,
+                modifier = Modifier.fillMaxWidth()
+            )
+        }
+    }
+}
+
+/**
+ * 💡 非激活行静态渲染器：完全解耦高频时间戳，零无效重组 (Finding 9, 18)
+ */
+@Composable
+private fun InactiveLyricLineRow(
+    line: LyricLine,
+    distanceFromActive: Int,
+    primaryColor: Color,
+    modifier: Modifier = Modifier
+) {
+    Column(
+        modifier = modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(6.dp)
+    ) {
+        val lineAlpha = (0.45f - (distanceFromActive - 1) * 0.08f).coerceIn(0.18f, 0.45f)
+        val translation = line.translationText
+
+        Text(
+            text = line.mainText,
+            fontSize = 28.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = primaryColor.copy(alpha = lineAlpha),
+            lineHeight = 38.sp,
+            modifier = Modifier.fillMaxWidth()
+        )
+
+        if (!translation.isNullOrEmpty()) {
+            Text(
+                text = translation,
+                fontSize = 18.sp,
+                fontWeight = FontWeight.Normal,
+                color = primaryColor.copy(alpha = lineAlpha * 0.70f),
+                lineHeight = 24.sp,
+                modifier = Modifier.fillMaxWidth()
+            )
         }
     }
 }
@@ -469,13 +493,27 @@ private fun InstrumentalStateView(
 
 /**
  * 💡 歌词加载中骨架呼吸占位 (Loading)
+ * 采用平滑呼吸动画 (Finding 10)
  */
 @Composable
 private fun LoadingShimmerView(
     hasDarkBackground: Boolean,
     modifier: Modifier = Modifier
 ) {
-    val barColor = if (hasDarkBackground) Color.White.copy(alpha = 0.15f) else Color(0xFF1C1C1E).copy(alpha = 0.10f)
+    val transition = rememberInfiniteTransition(label = "shimmerTransition")
+    val alphaAnim by transition.animateFloat(
+        initialValue = 0.12f,
+        targetValue = 0.35f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 900, easing = LinearEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "shimmerAlpha"
+    )
+
+    val baseColor = if (hasDarkBackground) Color.White else Color(0xFF1C1C1E)
+    val barColor = baseColor.copy(alpha = alphaAnim)
+
     Box(
         modifier = modifier,
         contentAlignment = Alignment.Center
