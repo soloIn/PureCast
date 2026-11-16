@@ -152,6 +152,16 @@ class LyricsSyncClock(
         )
     }
 
+    /**
+     * 💡 计算单个音节/字的流式扫光进度 (0.0f ~ 1.0f)
+     */
+    fun calculateWordProgress(word: LyricWord, currentTimeMs: Long): Float {
+        if (currentTimeMs >= word.endMs) return 1f
+        if (currentTimeMs <= word.startMs) return 0f
+        val duration = (word.endMs - word.startMs).coerceAtLeast(1L)
+        return ((currentTimeMs - word.startMs).toFloat() / duration).coerceIn(0f, 1f)
+    }
+
     fun reset() {
         reportedPositionMs = 0L
         anchorNanoTime = 0L

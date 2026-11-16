@@ -30,6 +30,7 @@ import androidx.tv.material3.Glow
 import androidx.tv.material3.Icon
 import androidx.tv.material3.Surface
 import com.solo.purecast.R
+import com.solo.purecast.model.LyricUiState
 import com.solo.purecast.model.PlaybackStatus
 
 /**
@@ -52,12 +53,17 @@ fun PlaybackControls(
     onSettingsClick: () -> Unit,
     modifier: Modifier = Modifier,
     hasDarkBackground: Boolean = true,
+    lyricState: LyricUiState = LyricUiState.Idle,
+    isLyricsExpanded: Boolean = false,
+    onLyricsClick: () -> Unit = {},
     playPauseFocusRequester: FocusRequester? = null,
-    settingsFocusRequester: FocusRequester? = null
+    settingsFocusRequester: FocusRequester? = null,
+    lyricsFocusRequester: FocusRequester? = null
 ) {
     val isPlaying = playbackStatus == PlaybackStatus.PLAYING
     val isIdle = playbackStatus == PlaybackStatus.IDLE || playbackStatus == PlaybackStatus.STOPPED
     val transportButtonsEnabled = !isIdle
+    val lyricsButtonEnabled = !isIdle
 
     Row(
         modifier = modifier,
@@ -100,7 +106,19 @@ fun PlaybackControls(
             onClick = onNextClick
         )
 
-        // 4. 系统与硬件设置按钮 (⚙) - 始终保持可用，待机时绑定 settingsFocusRequester
+        // 4. 歌词展开/收起按钮 (💬) - 遵循 Apple Music TV 交互，点击展开大屏
+        LyricsControlButton(
+            lyricState = lyricState,
+            isExpanded = isLyricsExpanded,
+            onClick = onLyricsClick,
+            enabled = lyricsButtonEnabled,
+            hasDarkBackground = hasDarkBackground,
+            focusRequester = lyricsFocusRequester,
+            buttonSize = 48.dp,
+            iconSize = 24.dp
+        )
+
+        // 5. 系统与硬件设置按钮 (⚙) - 始终保持可用，待机时绑定 settingsFocusRequester
         TransportIconButton(
             iconResId = R.drawable.ic_gear,
             contentDescription = "设置",
