@@ -62,16 +62,18 @@ object LyricCandidateScorer {
         val cleanCandTitle = MetadataNormalizer.normalizeTitle(candidateTitle)
         val cleanExpArtist = MetadataNormalizer.normalizeArtist(expectedArtist)
         val cleanCandArtist = MetadataNormalizer.normalizeArtist(candidateArtist)
+        val isArtistUnknown = MetadataNormalizer.isPlaceholderArtist(expectedArtist)
 
-        // 2. 歌名相似度 (40 分)
+        // 2. 歌名相似度 (若歌手已知为 40 分；若歌手未知，自适应提升权重至 60 分)
         val titleSim = MetadataNormalizer.calculateSimilarity(cleanExpTitle, cleanCandTitle)
-        val titleScore = titleSim * 40.0f
+        val titleScore = if (isArtistUnknown) titleSim * 60.0f else titleSim * 40.0f
 
-        // 3. 歌手相似度 (30 分)
-        val artistSim = MetadataNormalizer.calculateSimilarity(cleanExpArtist, cleanCandArtist)
+        // 3. 歌手相似度 (若歌手未知，自适应分数为 0)
+        val artistSim = if (isArtistUnknown) 0.0f else MetadataNormalizer.calculateSimilarity(cleanExpArtist, cleanCandArtist)
         val artistScore = artistSim * 30.0f
 
-        // 4. 时长容差与智能一票否决裁决 (20 分)
+        // 4. 时长容差与智能一票否决裁决 (若歌手已知满分 20 分；若歌手未知自适应满分 30 分)
+        val durationWeightMultiplier = if (isArtistUnknown) 1.5f else 1.0f
         var durationScore = 0.0f
         var vetoReason: String? = null
 
@@ -80,18 +82,23 @@ object LyricCandidateScorer {
 
             // 💡 智能尾奏容忍机制 (Finding 2)：
             // 若歌词由末句推导时长，且 candidateDurationMs < expectedDurationMs（典型的歌曲尾奏空白），
-            // 只要歌名和歌手相似度极高 (>=85%) 且尾奏时差在 60 秒以内，判定为合法尾奏，不予一票否决！
-            val isHighMetadataMatch = titleScore >= 34.0f && artistScore >= 24.0f
+            // 只要歌名和歌手相似度极高 (>=85% 或歌手未知时歌名极高) 且尾奏时差在 60 秒以内，判定为合法尾奏，不予一票否决！
+            val isHighMetadataMatch = if (isArtistUnknown) {
+                titleScore >= 50.0f
+            } else {
+                titleScore >= 34.0f && artistScore >= 24.0f
+            }
             val isAcceptableOutro = deltaMs in 0L..60_000L && isHighMetadataMatch
 
             if (isAcceptableOutro) {
                 // 合法尾奏，根据尾奏时长给予递减时长分
-                durationScore = when {
+                val baseDur = when {
                     deltaMs <= 5000L -> 18.0f
                     deltaMs <= 15000L -> 14.0f
                     deltaMs <= 30000L -> 10.0f
                     else -> 6.0f
                 }
+                durationScore = baseDur * durationWeightMultiplier
             } else if (abs(deltaMs) > 5000L) {
                 // 歌词比音轨更长超过 5 秒（严重跨版本/加长版），或非高匹配歌曲短超过 5 秒：硬性一票否决
                 vetoReason = "时长偏差超标一票否决: delta=${deltaMs}ms"
@@ -106,17 +113,17 @@ object LyricCandidateScorer {
                     vetoReason = vetoReason
                 )
             } else if (abs(deltaMs) <= 1000L) {
-                durationScore = 20.0f
+                durationScore = 20.0f * durationWeightMultiplier
             } else if (abs(deltaMs) <= 2000L) {
-                durationScore = 16.0f
+                durationScore = 16.0f * durationWeightMultiplier
             } else if (abs(deltaMs) <= 3000L) {
-                durationScore = 10.0f
+                durationScore = 10.0f * durationWeightMultiplier
             } else {
-                durationScore = 5.0f
+                durationScore = 5.0f * durationWeightMultiplier
             }
         } else {
-            // 时长未知时给保底分 10 分
-            durationScore = 10.0f
+            // 时长未知时给保底分
+            durationScore = 10.0f * durationWeightMultiplier
         }
 
         // 5. 格式优先级加权 (10 分)

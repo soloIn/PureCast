@@ -68,43 +68,54 @@ class NeteaseDataSource(
     private suspend fun searchCandidateSongIds(artist: String, title: String, durationMs: Long): List<Long> {
         val cleanArtist = MetadataNormalizer.normalizeArtist(artist)
         val cleanTitle = MetadataNormalizer.normalizeTitle(title)
-        val query = "$cleanTitle $cleanArtist".trim()
-        if (query.isBlank()) return emptyList()
+        if (cleanTitle.isBlank() && cleanArtist.isBlank()) return emptyList()
 
-        val encodedQuery = URLEncoder.encode(query, "UTF-8")
-        val searchUrl = "$SEARCH_API_URL?s=$encodedQuery&type=1&limit=5"
-
-        return try {
-            val resp = httpClient.get(searchUrl, timeoutMs = TIMEOUT_MS)
-            if (!resp.isSuccessful || resp.body.isBlank()) return emptyList()
-
-            val root = JSONObject(resp.body)
-            val songs = root.optJSONObject("result")?.optJSONArray("songs") ?: return emptyList()
-            if (songs.length() == 0) return emptyList()
-
-            val candidateList = mutableListOf<Pair<Long, Long>>() // id to durationDiff
-
-            for (i in 0 until songs.length()) {
-                val song = songs.getJSONObject(i)
-                val id = song.optLong("id")
-                val songDuration = song.optLong("duration")
-
-                val diff = if (durationMs > 0L && songDuration > 0L) {
-                    abs(songDuration - durationMs)
-                } else {
-                    1000L * i // 保持原本顺序
-                }
-                candidateList.add(id to diff)
-            }
-
-            // 优先选择时长最接近的（容差 8s 内），其次按原本排名
-            candidateList.sortedWith(compareBy<Pair<Long, Long>> { (id, diff) ->
-                if (durationMs > 0L && diff <= 8000L) 0 else 1
-            }.thenBy { it.second }).map { it.first }
-        } catch (e: Exception) {
-            Logger.lyrics.w(TAG, "检索网易云歌曲异常: $query", e)
-            emptyList()
+        val queries = mutableListOf<String>()
+        if (cleanTitle.isNotBlank() && cleanArtist.isNotBlank()) {
+            queries.add("$cleanTitle $cleanArtist")
         }
+        if (cleanTitle.isNotBlank()) {
+            queries.add(cleanTitle)
+        }
+
+        for (query in queries) {
+            val encodedQuery = URLEncoder.encode(query, "UTF-8")
+            val searchUrl = "$SEARCH_API_URL?s=$encodedQuery&type=1&limit=8"
+
+            try {
+                val resp = httpClient.get(searchUrl, timeoutMs = TIMEOUT_MS)
+                if (!resp.isSuccessful || resp.body.isBlank()) continue
+
+                val root = JSONObject(resp.body)
+                val songs = root.optJSONObject("result")?.optJSONArray("songs") ?: continue
+                if (songs.length() == 0) continue
+
+                val candidateList = mutableListOf<Pair<Long, Long>>() // id to durationDiff
+
+                for (i in 0 until songs.length()) {
+                    val song = songs.getJSONObject(i)
+                    val id = song.optLong("id")
+                    val songDuration = song.optLong("duration")
+
+                    val diff = if (durationMs > 0L && songDuration > 0L) {
+                        abs(songDuration - durationMs)
+                    } else {
+                        1000L * i // 保持原本顺序
+                    }
+                    candidateList.add(id to diff)
+                }
+
+                // 优先选择时长最接近的（容差 8s 内），其次按原本排名
+                val sortedIds = candidateList.sortedWith(compareBy<Pair<Long, Long>> { (id, diff) ->
+                    if (durationMs > 0L && diff <= 8000L) 0 else 1
+                }.thenBy { it.second }).map { it.first }
+
+                if (sortedIds.isNotEmpty()) return sortedIds
+            } catch (e: Exception) {
+                Logger.lyrics.w(TAG, "检索网易云歌曲异常: $query", e)
+            }
+        }
+        return emptyList()
     }
 
     private suspend fun fetchLyricsBySongId(songId: Long, durationMs: Long): LyricTimeline? {

@@ -129,4 +129,38 @@ class LyricCandidateScorerTest {
         assertFalse(result.isPassed)
         assertEquals(0.0f, result.totalScore, 0.01f) // 触发了时长否决
     }
+
+    @Test
+    fun `inverted western name Spears Britney matches Britney Spears with high score`() {
+        val result = LyricCandidateScorer.evaluate(
+            expectedArtist = "Britney Spears",
+            expectedTitle = "Baby One More Time",
+            expectedDurationMs = 211000L,
+            candidateArtist = "Spears, Britney",
+            candidateTitle = "...Baby One More Time",
+            candidateDurationMs = 211000L,
+            candidateFormat = LyricFormat.LRC_LINE_SYNC
+        )
+
+        assertTrue("倒置歌手名应成功通过", result.isPassed)
+        assertTrue("歌手相似度得分应接近满分 30分", result.artistScore >= 27.0f)
+        assertTrue("歌名相似度得分应接近满分 40分", result.titleScore >= 38.0f)
+        assertTrue("总分应远高于 65 分阈值", result.totalScore >= 90.0f)
+    }
+
+    @Test
+    fun `unknown placeholder artist adapts weights and passes on high title and duration match`() {
+        val result = LyricCandidateScorer.evaluate(
+            expectedArtist = "",
+            expectedTitle = "Baby One More Time",
+            expectedDurationMs = 211000L,
+            candidateArtist = "Britney Spears",
+            candidateTitle = "Baby One More Time",
+            candidateDurationMs = 211000L,
+            candidateFormat = LyricFormat.LRC_LINE_SYNC
+        )
+
+        assertTrue("歌手未知但歌名与时长精准匹配时应通过准入门槛", result.isPassed)
+        assertTrue("自适应权重下总分应达到准入门槛", result.totalScore >= 65.0f)
+    }
 }

@@ -134,7 +134,8 @@ class LyricsTriggerManager(
 
             // 💡 Finding 14 修复：防抖结束时从最新的 snapshot 获取 metadata，避免 AirPlay 刚送达的真实时长被抹零！
             val currentMeta = latestSnapshot?.metadata ?: snapshot.metadata
-            val artist = currentMeta.artist
+            val rawArtist = currentMeta.artist
+            val artist = if (MetadataNormalizer.isPlaceholderArtist(rawArtist)) "" else rawArtist
             val title = currentMeta.title
             val durationMs = currentMeta.durationMs
             val album = currentMeta.album
@@ -246,23 +247,28 @@ class LyricsTriggerManager(
 
     private fun buildMetadataSignature(metadata: TrackMetadata): String {
         val normTitle = MetadataNormalizer.normalizeTitle(metadata.title)
-        val normArtist = MetadataNormalizer.normalizeArtist(metadata.artist)
+        val normArtist = if (MetadataNormalizer.isPlaceholderArtist(metadata.artist)) "" else MetadataNormalizer.normalizeArtist(metadata.artist)
         return "$normTitle|$normArtist"
     }
 
     /**
      * 💡 占位词精准黑名单过滤 (Finding 1)
+     * 核心契约：只要存在有效真实歌名，即便歌手暂缺或为未知占位词，亦允许触发歌词检索
      */
     private fun isMetadataValid(metadata: TrackMetadata): Boolean {
         val title = metadata.title.trim().lowercase()
-        val artist = metadata.artist.trim().lowercase()
 
+        // 标题必须有效且非待机占位词
         if (title.isEmpty() || title == TrackMetadata.DEFAULT_TITLE.lowercase() || title in PLACEHOLDER_TITLES) {
             return false
         }
-        if (artist.isEmpty() || artist == TrackMetadata.DEFAULT_ARTIST.lowercase() || artist in PLACEHOLDER_ARTISTS || artist.startsWith("airplay:")) {
+
+        // 纯 AirPlay 设备广播前缀拦截
+        val artist = metadata.artist.trim().lowercase()
+        if (artist.startsWith("airplay:")) {
             return false
         }
+
         return true
     }
 

@@ -38,7 +38,7 @@ class LyricsWaterfallFetcher(
         val cleanArtist = MetadataNormalizer.normalizeArtist(artist)
         val cleanTitle = MetadataNormalizer.normalizeTitle(title)
 
-        if (cleanArtist.isBlank() || cleanTitle.isBlank()) return@coroutineScope null
+        if (cleanTitle.isBlank()) return@coroutineScope null
 
         val cacheKey = cacheRepository.computeCacheKey(cleanArtist, cleanTitle, durationMs)
 
@@ -77,49 +77,53 @@ class LyricsWaterfallFetcher(
     ): LyricTimeline? {
         Logger.lyrics.i(TAG, "启动严格阶梯瀑布流检索: $cleanArtist - $cleanTitle (duration=${durationMs}ms, album=$album)")
 
-        // 阶梯 Step 1: AMLL TTML 逐字高精库 (硬超时 1.5s)
-        try {
-            val amllHit = amllDataSource.fetch(cleanArtist, cleanTitle)
-            if (amllHit != null) {
-                val score = LyricCandidateScorer.evaluate(
-                    expectedArtist = cleanArtist,
-                    expectedTitle = cleanTitle,
-                    expectedDurationMs = durationMs,
-                    candidateArtist = cleanArtist,
-                    candidateTitle = cleanTitle,
-                    candidateDurationMs = amllHit.durationMs,
-                    candidateFormat = amllHit.format
-                )
+        // 阶梯 Step 1: AMLL TTML 逐字高精库 (硬超时 1.5s，需已知歌手)
+        if (cleanArtist.isNotBlank()) {
+            try {
+                val amllHit = amllDataSource.fetch(cleanArtist, cleanTitle)
+                if (amllHit != null) {
+                    val score = LyricCandidateScorer.evaluate(
+                        expectedArtist = cleanArtist,
+                        expectedTitle = cleanTitle,
+                        expectedDurationMs = durationMs,
+                        candidateArtist = cleanArtist,
+                        candidateTitle = cleanTitle,
+                        candidateDurationMs = amllHit.durationMs,
+                        candidateFormat = amllHit.format
+                    )
 
-                if (score.isPassed) {
-                    Logger.lyrics.i(TAG, "阶梯 Step 1 (AMLL TTML) 命中且打分通过 (${score.totalScore}分): $cleanArtist - $cleanTitle")
-                    val enriched = enrichWithTranslation(amllHit, cleanArtist, cleanTitle, durationMs)
-                    cacheRepository.put(cacheKey, enriched)
-                    return enriched
-                } else {
-                    Logger.lyrics.w(TAG, "AMLL 候选评分未达标 (${score.totalScore}分): ${score.vetoReason}，降级至 Step 2")
+                    if (score.isPassed) {
+                        Logger.lyrics.i(TAG, "阶梯 Step 1 (AMLL TTML) 命中且打分通过 (${score.totalScore}分): $cleanArtist - $cleanTitle")
+                        val enriched = enrichWithTranslation(amllHit, cleanArtist, cleanTitle, durationMs)
+                        cacheRepository.put(cacheKey, enriched)
+                        return enriched
+                    } else {
+                        Logger.lyrics.w(TAG, "AMLL 候选评分未达标 (${score.totalScore}分): ${score.vetoReason}，降级至 Step 2")
+                    }
                 }
+            } catch (e: Exception) {
+                Logger.lyrics.w(TAG, "AMLL 检索异常，平滑降级至 Step 2", e)
             }
-        } catch (e: Exception) {
-            Logger.lyrics.w(TAG, "AMLL 检索异常，平滑降级至 Step 2", e)
         }
 
-        // 阶梯 Step 2: LRCLIB 精确匹配四元组 (硬超时 1.5s)
-        try {
-            val lrclibExactHit = lrclibDataSource.getExact(
-                artist = cleanArtist,
-                title = cleanTitle,
-                durationMs = durationMs,
-                album = album
-            )
-            if (lrclibExactHit != null) {
-                Logger.lyrics.i(TAG, "阶梯 Step 2 (LRCLIB /api/get) 精确命中: $cleanArtist - $cleanTitle")
-                val enriched = enrichWithTranslation(lrclibExactHit, cleanArtist, cleanTitle, durationMs)
-                cacheRepository.put(cacheKey, enriched)
-                return enriched
+        // 阶梯 Step 2: LRCLIB 精确匹配四元组 (硬超时 1.5s，需已知歌手)
+        if (cleanArtist.isNotBlank()) {
+            try {
+                val lrclibExactHit = lrclibDataSource.getExact(
+                    artist = cleanArtist,
+                    title = cleanTitle,
+                    durationMs = durationMs,
+                    album = album
+                )
+                if (lrclibExactHit != null) {
+                    Logger.lyrics.i(TAG, "阶梯 Step 2 (LRCLIB /api/get) 精确命中: $cleanArtist - $cleanTitle")
+                    val enriched = enrichWithTranslation(lrclibExactHit, cleanArtist, cleanTitle, durationMs)
+                    cacheRepository.put(cacheKey, enriched)
+                    return enriched
+                }
+            } catch (e: Exception) {
+                Logger.lyrics.w(TAG, "LRCLIB 精确匹配异常，平滑降级至 Step 3", e)
             }
-        } catch (e: Exception) {
-            Logger.lyrics.w(TAG, "LRCLIB 精确匹配异常，平滑降级至 Step 3", e)
         }
 
         // 阶梯 Step 3: LRCLIB 模糊搜索决胜 (硬超时 2.0s)

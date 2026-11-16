@@ -99,16 +99,16 @@ def main():
     local_ip = get_local_ip()
     temp_dir = "/tmp/purecast_lyrics_test"
     os.makedirs(temp_dir, exist_ok=True)
-    wav_path = os.path.join(temp_dir, "test_yellow_268.wav")
-    duration_sec = 268
+    wav_path = os.path.join(temp_dir, "test_baby_211.wav")
+    duration_sec = 211
     generate_sine_wav(wav_path, duration_sec=duration_sec)
 
     server = start_http_server(temp_dir, TEST_PORT)
-    stream_url = f"http://{local_ip}:{TEST_PORT}/test_yellow_268.wav"
+    stream_url = f"http://{local_ip}:{TEST_PORT}/test_baby_211.wav"
     print(f">> 本地音频服务: {stream_url}")
 
-    # 元数据: Yellow - Coldplay (267秒)
-    didl = f"""&lt;DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/"&gt;&lt;item id="1" parentID="0" restricted="1"&gt;&lt;dc:title&gt;Yellow&lt;/dc:title&gt;&lt;upnp:artist&gt;Coldplay&lt;/upnp:artist&gt;&lt;upnp:album&gt;Parachutes&lt;/upnp:album&gt;&lt;res duration="00:04:27" protocolInfo="http-get:*:audio/wav:*"&gt;{stream_url}&lt;/res&gt;&lt;/item&gt;&lt;/DIDL-Lite&gt;"""
+    # 元数据: 模拟未知歌手场景: 仅有歌名 Baby One More Time (211秒)
+    didl = f"""&lt;DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/"&gt;&lt;item id="1" parentID="0" restricted="1"&gt;&lt;dc:title&gt;Baby One More Time&lt;/dc:title&gt;&lt;upnp:artist&gt;Unknown&lt;/upnp:artist&gt;&lt;upnp:album&gt;&lt;/upnp:album&gt;&lt;res duration="00:03:31" protocolInfo="http-get:*:audio/wav:*"&gt;{stream_url}&lt;/res&gt;&lt;/item&gt;&lt;/DIDL-Lite&gt;"""
 
     set_uri_xml = f"""<InstanceID>0</InstanceID><CurrentURI>{stream_url}</CurrentURI><CurrentURIMetaData>{didl}</CurrentURIMetaData>"""
     print(">> 发送 SetAVTransportURI...")

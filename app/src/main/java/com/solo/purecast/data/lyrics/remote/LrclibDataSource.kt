@@ -65,7 +65,7 @@ class LrclibDataSource(
 
     /**
      * 💡 模糊搜索回退检索 (/api/search)
-     * 超时限制 2.0s，取前 3 条候选执行多维打分决胜
+     * 支持精准参数 -> 复合全文 q -> 纯歌名 q 三级渐进决胜，评估前 10 条候选
      */
     suspend fun searchFuzzy(
         artist: String,
@@ -78,30 +78,49 @@ class LrclibDataSource(
 
         if (cleanArtist.isBlank() && cleanTitle.isBlank()) return null
 
-        // 1. 优先使用精准参数组合搜索
-        var url = "$baseUrl/api/search?track_name=${rfc3986Encode(cleanTitle)}&artist_name=${rfc3986Encode(cleanArtist)}"
-        var resp = httpClient.get(url, timeoutMs = SEARCH_TIMEOUT_MS)
-
-        // 2. 若返回空列表，降级使用全文本 q
-        if (!resp.isSuccessful || resp.body.isBlank() || isEmptyArray(resp.body)) {
-            val query = "$cleanTitle $cleanArtist".trim()
-            url = "$baseUrl/api/search?q=${rfc3986Encode(query)}"
-            resp = httpClient.get(url, timeoutMs = SEARCH_TIMEOUT_MS)
+        // 1. 若歌手已知，优先使用精准参数组合搜索
+        if (cleanArtist.isNotBlank()) {
+            val url = "$baseUrl/api/search?track_name=${rfc3986Encode(cleanTitle)}&artist_name=${rfc3986Encode(cleanArtist)}"
+            val hit = queryAndEvaluate(url, cleanArtist, cleanTitle, durationMs)
+            if (hit != null) return hit
         }
 
-        if (!resp.isSuccessful || resp.body.isBlank()) {
-            Logger.lyrics.d(TAG, "LRCLIB /api/search 搜索失败: $cleanTitle (HTTP ${resp.statusCode})")
-            return null
+        // 2. 联合全文 q 检索 ("title artist")
+        val combinedQuery = "$cleanTitle $cleanArtist".trim()
+        if (combinedQuery.isNotBlank()) {
+            val url = "$baseUrl/api/search?q=${rfc3986Encode(combinedQuery)}"
+            val hit = queryAndEvaluate(url, cleanArtist, cleanTitle, durationMs)
+            if (hit != null) return hit
         }
 
-        try {
+        // 3. 纯歌名 q 兜底检索（依靠时长与标题相似度强约束过滤决胜）
+        if (cleanTitle.isNotBlank()) {
+            val url = "$baseUrl/api/search?q=${rfc3986Encode(cleanTitle)}"
+            val hit = queryAndEvaluate(url, cleanArtist, cleanTitle, durationMs)
+            if (hit != null) return hit
+        }
+
+        Logger.lyrics.d(TAG, "LRCLIB /api/search 全链路检索未找到合格候选: $cleanArtist - $cleanTitle")
+        return null
+    }
+
+    private suspend fun queryAndEvaluate(
+        url: String,
+        cleanArtist: String,
+        cleanTitle: String,
+        durationMs: Long
+    ): LyricTimeline? {
+        val resp = httpClient.get(url, timeoutMs = SEARCH_TIMEOUT_MS)
+        if (!resp.isSuccessful || resp.body.isBlank() || isEmptyArray(resp.body)) return null
+
+        return try {
             val array = JSONArray(resp.body)
             if (array.length() == 0) return null
 
             var bestTimeline: LyricTimeline? = null
             var bestScore = 0.0f
 
-            val evaluateCount = minOf(3, array.length())
+            val evaluateCount = minOf(10, array.length())
             for (i in 0 until evaluateCount) {
                 val item = array.getJSONObject(i)
                 val candArtist = item.optString("artistName", "")
@@ -152,10 +171,10 @@ class LrclibDataSource(
                 }
             }
 
-            return bestTimeline
+            bestTimeline
         } catch (e: Exception) {
-            Logger.lyrics.w(TAG, "解析 LRCLIB /api/search 响应异常", e)
-            return null
+            Logger.lyrics.w(TAG, "解析 LRCLIB 响应异常: url=$url", e)
+            null
         }
     }
 
