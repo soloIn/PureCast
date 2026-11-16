@@ -464,6 +464,20 @@ Java_com_solo_purecast_core_nativebridge_NativeAudioEngine_getAvailableRead(
     return static_cast<jint>(purecast::AudioEngine::instance().get_available_read());
 }
 
+JNIEXPORT jint JNICALL
+Java_com_solo_purecast_core_nativebridge_NativeAudioEngine_getUnconsumedBytes(
+    JNIEnv * /* env */,
+    jobject /* thiz */) {
+    return static_cast<jint>(purecast::AudioEngine::instance().get_unconsumed_bytes());
+}
+
+JNIEXPORT jlong JNICALL
+Java_com_solo_purecast_core_nativebridge_NativeAudioEngine_getRingBufferDelayMs(
+    JNIEnv * /* env */,
+    jobject /* thiz */) {
+    return static_cast<jlong>(purecast::AudioEngine::instance().get_ring_buffer_delay_ms());
+}
+
 JNIEXPORT jboolean JNICALL
 Java_com_solo_purecast_core_nativebridge_NativeAudioEngine_isStreaming(
     JNIEnv * /* env */,

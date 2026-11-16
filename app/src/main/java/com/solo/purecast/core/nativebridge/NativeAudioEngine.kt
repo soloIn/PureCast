@@ -102,6 +102,28 @@ object NativeAudioEngine {
     external fun getAvailableRead(): Int
 
     /**
+     * 💡 获取当前环形缓冲区中尚未被 USB 等时线程消费的字节数 (语义化别名)
+     */
+    external fun getUnconsumedBytes(): Int
+
+    /**
+     * 💡 获取当前环形缓冲区中尚未消费数据对应的硬件物理输出延迟 (毫秒)
+     * 基于底层采样率、位深与声道数实时换算，供 UI 层进度与歌词时钟进行毫秒级精准扣除。
+     */
+    external fun getRingBufferDelayMs(): Long
+
+    /**
+     * 💡 计算指定字节量在指定音频格式下的毫秒时延
+     */
+    fun calculateLatencyMs(unconsumedBytes: Int, sampleRate: Int, bitDepth: Int, channels: Int): Long {
+        if (unconsumedBytes <= 0 || sampleRate <= 0 || bitDepth <= 0 || channels <= 0) return 0L
+        val bytesPerSample = (bitDepth / 8).coerceAtLeast(1)
+        val bytesPerSec = sampleRate.toLong() * channels.toLong() * bytesPerSample.toLong()
+        if (bytesPerSec <= 0L) return 0L
+        return (unconsumedBytes.toLong() * 1000L) / bytesPerSec
+    }
+
+    /**
      * 检查声卡当前是否处于独占活跃状态
      */
     external fun isStreaming(): Boolean

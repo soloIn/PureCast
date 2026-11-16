@@ -226,14 +226,30 @@ fun MainTvScreen(
     val lyricsSyncClock = remember { LyricsSyncClock() }
 
     val currentServiceSnapshot by remember { PlaybackService.sessionSnapshot }.collectAsState()
-    LaunchedEffect(currentServiceSnapshot.progressPositionMs, currentServiceSnapshot.playbackStatus, currentServiceSnapshot.businessState) {
+    var lastObservedTrackGen by remember { mutableLongStateOf(0L) }
+    LaunchedEffect(
+        currentServiceSnapshot.trackGeneration,
+        currentServiceSnapshot.progressPositionMs,
+        currentServiceSnapshot.playbackStatus,
+        currentServiceSnapshot.businessState
+    ) {
         // 💡 Finding 14 修复：TRANSITIONING 缓冲期间扬声器尚未真实出声，必须保持 playing = false 冻结时钟，防止歌词抢跑 1~2 秒
         val isTrulyPlaying = currentServiceSnapshot.businessState == BusinessSessionState.PLAYING &&
             currentServiceSnapshot.playbackStatus == PlaybackStatus.PLAYING
-        lyricsSyncClock.updatePosition(
-            newPositionMs = currentServiceSnapshot.progressPositionMs,
-            playing = isTrulyPlaying
-        )
+
+        if (currentServiceSnapshot.trackGeneration != lastObservedTrackGen) {
+            lastObservedTrackGen = currentServiceSnapshot.trackGeneration
+            // 💡 切歌换代：坚决瞬时排空旧代时钟并硬对齐目标进度，杜绝上一首歌残留时间对新歌产生干扰
+            lyricsSyncClock.hardAlign(
+                targetPositionMs = currentServiceSnapshot.progressPositionMs,
+                playing = isTrulyPlaying
+            )
+        } else {
+            lyricsSyncClock.updatePosition(
+                newPositionMs = currentServiceSnapshot.progressPositionMs,
+                playing = isTrulyPlaying
+            )
+        }
     }
 
     LaunchedEffect(uiState.isIdle) {

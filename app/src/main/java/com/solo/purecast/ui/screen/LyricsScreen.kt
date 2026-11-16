@@ -330,13 +330,25 @@ private fun LyricsStreamView(
         with(density) { (-120).dp.roundToPx() }
     }
 
-    // 前奏期 (activeLineIndex == -1) 时抑制滚动与高亮
+    // 前奏期 (activeLineIndex == -1) 时抑制滚动与高亮；跨行寻道 (>2行) 瞬时对齐杜绝滞后
+    var lastScrolledLineIndex by remember { mutableIntStateOf(-1) }
     LaunchedEffect(activeLineIndex) {
         if (activeLineIndex in timeline.lines.indices) {
-            listState.animateScrollToItem(
-                index = activeLineIndex,
-                scrollOffset = targetOffsetPx
-            )
+            val delta = abs(activeLineIndex - lastScrolledLineIndex)
+            lastScrolledLineIndex = activeLineIndex
+            if (delta > 2) {
+                // 💡 跨行寻道 (Seek) 或切歌大跨度跳变：立即瞬时定位对齐，杜绝缓慢滑行造成的滞后感
+                listState.scrollToItem(
+                    index = activeLineIndex,
+                    scrollOffset = targetOffsetPx
+                )
+            } else {
+                // 💡 正常逐句推进：丝滑动画平滑过渡
+                listState.animateScrollToItem(
+                    index = activeLineIndex,
+                    scrollOffset = targetOffsetPx
+                )
+            }
         }
     }
 

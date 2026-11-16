@@ -35,6 +35,20 @@ class LyricsSyncClock(
     private var lastInterpolatedTimeMs: Long = 0L
 
     /**
+     * 💡 显式时钟硬对齐 (Hard Align)
+     * 用于切歌换代、显式 Seek 寻道完成或重连时，瞬时排空历史插值缓存，
+     * 毫秒级硬重置锚点时间，彻底杜绝向前拖动滞后与跨曲目残存。
+     */
+    fun hardAlign(targetPositionMs: Long, playing: Boolean, nowNanoTime: Long = System.nanoTime()) {
+        val clamped = targetPositionMs.coerceAtLeast(0L)
+        reportedPositionMs = clamped
+        lastInterpolatedTimeMs = clamped
+        anchorNanoTime = if (playing) nowNanoTime else 0L
+        isPlaying = playing
+        Logger.lyrics.i(TAG, "时钟硬对齐完成 (Hard Align): target=${clamped}ms, playing=$playing")
+    }
+
+    /**
      * 💡 接收播放器底层进度推送更新
      * 保持与 PureCast 进度条和 iPhone 播放进度严格一致
      */
@@ -52,23 +66,24 @@ class LyricsSyncClock(
 
         val jumpDelta = abs(newPositionMs - currentEstimatedTime)
 
-        // 1. 检测进度跳变 (iPhone 拖动寻道，无论是向前还是向后拖动)
+        // 1. 检测进度跳变 (iPhone 拖动寻道，无论是向前还是向后拖动超过阈值)
         if (jumpDelta > jumpThresholdMs) {
             Logger.lyrics.i(
                 TAG,
                 "进度跳变寻道 (Seek): $currentEstimatedTime -> $newPositionMs (delta=${newPositionMs - currentEstimatedTime}ms)"
             )
-            reportedPositionMs = newPositionMs
-            lastInterpolatedTimeMs = newPositionMs
-            anchorNanoTime = nowNanoTime
-            isPlaying = playing
+            hardAlign(newPositionMs, playing, nowNanoTime)
             return
         }
 
         // 2. 状态切换或正常推进更新
         if (!playing && isPlaying) {
-            // 播放转暂停：冻结在当前平滑时间或新到达时间的最大值
-            val frozenTime = maxOf(newPositionMs, lastInterpolatedTimeMs)
+            // 播放转暂停/缓冲：若伴随向前跳变则无条件硬采纳新值，杜绝 maxOf 误杀向前拖动；仅在微小步进时防时钟倒退
+            val frozenTime = if (newPositionMs < lastInterpolatedTimeMs - jumpThresholdMs) {
+                newPositionMs
+            } else {
+                maxOf(newPositionMs, lastInterpolatedTimeMs)
+            }
             reportedPositionMs = frozenTime
             lastInterpolatedTimeMs = frozenTime
         } else if (playing && !isPlaying) {
@@ -200,6 +215,6 @@ class LyricsSyncClock(
     companion object {
         private const val TAG = "LyricsSyncClock"
         const val DEFAULT_MAX_EXTRAPOLATION_MS = 1000L
-        const val DEFAULT_JUMP_THRESHOLD_MS = 350L
+        const val DEFAULT_JUMP_THRESHOLD_MS = 200L
     }
 }

@@ -178,4 +178,32 @@ class LyricsSyncClockTest {
         val current = syncClock.getCurrentInterpolatedTimeMs(seek2Nano)
         assertEquals(10_000L, current)
     }
+
+    @Test
+    fun `hardAlign instantly resets clock anchor and clears interpolation history`() {
+        val baseNano = 1_000_000_000L
+        syncClock.updatePosition(240_000L, playing = true, nowNanoTime = baseNano)
+
+        // 切歌换曲：上一首歌残留时间 240s，新歌从 0s 开始硬对齐
+        syncClock.hardAlign(targetPositionMs = 0L, playing = true, nowNanoTime = baseNano + 100_000_000L)
+        val cur = syncClock.getCurrentInterpolatedTimeMs(baseNano + 100_000_000L)
+        assertEquals(0L, cur)
+    }
+
+    @Test
+    fun `forward rewind seek during buffering transitioning is not eaten by maxOf`() {
+        val baseNano = 1_000_000_000L
+        syncClock.updatePosition(90_000L, playing = true, nowNanoTime = baseNano)
+
+        // 推进到 90_300ms
+        val interpolatedTime = syncClock.getCurrentInterpolatedTimeMs(baseNano + 300_000_000L)
+        assertEquals(90_300L, interpolatedTime)
+
+        // iPhone 向前拖动到 30_000ms，同时触发缓冲 (playing = false)
+        syncClock.updatePosition(30_000L, playing = false, nowNanoTime = baseNano + 301_000_000L)
+
+        // 验证向前拖动被立刻采纳，绝不会被 maxOf 强制限制为 90_300ms
+        val frozenTime = syncClock.getCurrentInterpolatedTimeMs(baseNano + 500_000_000L)
+        assertEquals(30_000L, frozenTime)
+    }
 }

@@ -1333,4 +1333,24 @@ size_t AudioEngine::get_available_read() const {
     return (is_running_.load(std::memory_order_seq_cst) && ring_buffer_) ? ring_buffer_->available_read() : 0;
 }
 
+int64_t AudioEngine::get_ring_buffer_delay_ms() const {
+    ScopedActiveWriter writer_guard(active_writers_);
+    if (!is_running_.load(std::memory_order_seq_cst) || !ring_buffer_) {
+        return 0;
+    }
+    const size_t unconsumed_bytes = ring_buffer_->available_read();
+    const int sr = current_sample_rate_;
+    const int ch = current_channels_;
+    const int bd = current_bit_depth_;
+    if (sr <= 0 || ch <= 0 || bd <= 0) {
+        return 0;
+    }
+    const size_t bytes_per_sample = static_cast<size_t>(bd / 8);
+    const size_t bytes_per_sec = static_cast<size_t>(sr) * static_cast<size_t>(ch) * bytes_per_sample;
+    if (bytes_per_sec == 0) {
+        return 0;
+    }
+    return static_cast<int64_t>((unconsumed_bytes * 1000ULL) / bytes_per_sec);
+}
+
 } // namespace purecast
