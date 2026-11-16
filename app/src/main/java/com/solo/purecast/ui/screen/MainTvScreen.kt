@@ -1,10 +1,14 @@
 package com.solo.purecast.ui.screen
 
+import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -52,12 +56,14 @@ import androidx.tv.material3.ExperimentalTvMaterial3Api
 import androidx.tv.material3.Text
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
+import com.solo.purecast.core.lyrics.LyricsSyncClock
 import com.solo.purecast.data.SettingsRepository
 import com.solo.purecast.model.AudioPathState
 import com.solo.purecast.model.BusinessSessionState
 import com.solo.purecast.model.DurationState
 import com.solo.purecast.model.ErrorCode
 import com.solo.purecast.model.HardwarePipelineState
+import com.solo.purecast.model.LyricUiState
 import com.solo.purecast.model.PlaybackStatus
 import com.solo.purecast.ui.background.FluidQuality
 import com.solo.purecast.model.PlayerSessionSnapshot
@@ -68,6 +74,7 @@ import com.solo.purecast.ui.components.FluidBackground
 import com.solo.purecast.ui.components.PlaybackControls
 import com.solo.purecast.ui.components.ProgressBarComponent
 import com.solo.purecast.ui.components.SignalPathPill
+import com.solo.purecast.ui.screen.LyricsScreen
 import com.solo.purecast.ui.theme.AppPalette
 import com.solo.purecast.util.Logger
 import com.solo.purecast.util.PermissionHelper
@@ -210,7 +217,28 @@ fun MainTvScreen(
 
     val playPauseFocusRequester = remember { FocusRequester() }
     val settingsFocusRequester = remember { FocusRequester() }
+    val lyricsFocusRequester = remember { FocusRequester() }
     val coroutineScope = rememberCoroutineScope()
+
+    // 💡 歌词 UI 状态与 60fps/120fps 帧间平滑同步时钟 (U5, U6, U7)
+    val lyricUiState by remember { PlaybackService.lyricsUiState }.collectAsState()
+    var isLyricsExpanded by remember { mutableStateOf(false) }
+    val lyricsSyncClock = remember { LyricsSyncClock() }
+
+    val currentServiceSnapshot by remember { PlaybackService.sessionSnapshot }.collectAsState()
+    LaunchedEffect(currentServiceSnapshot.progressPositionMs, currentServiceSnapshot.playbackStatus) {
+        lyricsSyncClock.updatePosition(
+            newPositionMs = currentServiceSnapshot.progressPositionMs,
+            playing = currentServiceSnapshot.playbackStatus == PlaybackStatus.PLAYING
+        )
+    }
+
+    LaunchedEffect(uiState.isIdle) {
+        if (uiState.isIdle) {
+            isLyricsExpanded = false
+            lyricsSyncClock.reset()
+        }
+    }
 
     // ==========================================
     // 1. OLED 防烧屏引擎: 微像素平滑微移 (每 10 秒平滑移动 2~3 像素，3秒线性插值杜绝生硬抽动)
@@ -356,200 +384,235 @@ fun MainTvScreen(
             )
         }
 
-        // 2. 主体 42% / 58% Apple TV 黄金比例布局 (向导展示时禁用底层获焦，彻底隔离焦点)
-        Row(
-            modifier = Modifier
-                .fillMaxSize()
-                .focusProperties { canFocus = !showOnboarding }
-                .offset { IntOffset(animatedShiftX.roundToInt(), animatedShiftY.roundToInt()) }
-                .padding(horizontal = 72.dp, vertical = 48.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            // 左侧 42% 封面区
-            Box(
-                modifier = Modifier
-                    .weight(0.42f)
-                    .fillMaxHeight(),
-                contentAlignment = Alignment.Center
-            ) {
-                val coverShape = RoundedCornerShape(16.dp)
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth(0.88f)
-                        .aspectRatio(1f)
-                        .scale(coverScale)
-                        .shadow(
-                            elevation = 28.dp,
-                            shape = coverShape,
-                            spotColor = if (hasDarkBackground) Color(0x80000000) else Color(0x20000000)
-                        )
-                        .clip(coverShape)
-                        .background(if (hasDarkBackground) Color(0xFF161822) else Color.White)
-                        .then(
-                            if (!hasDarkBackground) {
-                                Modifier.border(1.dp, Color(0xFFE5E5EA), coverShape)
-                            } else Modifier
-                        ),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Crossfade(
-                        targetState = persistentCoverHash to persistentCover,
-                        animationSpec = tween(300),
-                        label = "coverCrossfade"
-                    ) { (_, resolvedCover) ->
-                        if (resolvedCover != null) {
-                            val coverRequest = remember(context, resolvedCover) {
-                                ImageRequest.Builder(context)
-                                    .data(resolvedCover)
-                                    .build()
-                            }
-                            AsyncImage(
-                                model = coverRequest,
-                                contentDescription = "Album Cover",
-                                contentScale = ContentScale.Crop,
-                                modifier = Modifier.fillMaxSize(),
-                                onError = {
-                                    // 💡 封面网络 404 或解码失败时立即清理 persistentCover，回退默认卡片并修正浅色模式背景与文字对比度
-                                    persistentCover = null
-                                    persistentCoverHash = 0
-                                }
-                            )
-                        } else {
-                            DefaultCoverCard(
-                                isPlaying = isPlaying,
-                                album = metadata.album,
-                                hasDarkBackground = hasDarkBackground
-                            )
+        // 2. 主体展示层：支持标准 42%/58% 主屏与 Apple Music TV 歌词全屏展开平滑过渡
+        AnimatedContent(
+            targetState = isLyricsExpanded,
+            transitionSpec = {
+                fadeIn(animationSpec = tween(300)) togetherWith fadeOut(animationSpec = tween(300))
+            },
+            label = "lyricsScreenExpansionTransition"
+        ) { expanded ->
+            if (expanded) {
+                LyricsScreen(
+                    lyricUiState = lyricUiState,
+                    syncClock = lyricsSyncClock,
+                    metadata = metadata,
+                    audioPathState = audioPathState,
+                    hardwareState = uiState.hardwareState,
+                    coverData = persistentCover,
+                    hasDarkBackground = hasDarkBackground,
+                    onClose = {
+                        isLyricsExpanded = false
+                        coroutineScope.launch {
+                            delay(150)
+                            try {
+                                lyricsFocusRequester.requestFocus()
+                            } catch (_: Exception) {}
                         }
-                    }
-                }
-            }
-
-            Spacer(modifier = Modifier.width(48.dp))
-
-            // 右侧 58% 控制与元数据区 (直接通透悬浮于背景之上，无任何死板 Dock)
-            Column(
-                modifier = Modifier
-                    .weight(0.58f)
-                    .fillMaxHeight(),
-                verticalArrangement = Arrangement.Center
-            ) {
-                // 分级异常告警条（不可获焦，严禁抢夺 D-Pad 当前焦点；恢复后随快照自动消除）
-                if (visibleErrorBanner != null) {
-                    val isBlocking = visibleErrorBanner.severity == BannerSeverity.WARNING_BLOCKING
-                    val bannerBg = if (isBlocking) {
-                        Color(0xFF8B0000).copy(alpha = 0.88f)
-                    } else {
-                        Color(0xFF3A2E00).copy(alpha = 0.85f)
-                    }
-                    val bannerBorder = if (isBlocking) {
-                        Color(0xFFFF6961).copy(alpha = 0.45f)
-                    } else {
-                        Color(0xFFFFD60A).copy(alpha = 0.45f)
-                    }
-                    val prefix = if (isBlocking) "⚠️" else "ℹ️"
+                    },
+                    modifier = Modifier.offset { IntOffset(animatedShiftX.roundToInt(), animatedShiftY.roundToInt()) }
+                )
+            } else {
+                Row(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .focusProperties { canFocus = !showOnboarding }
+                        .offset { IntOffset(animatedShiftX.roundToInt(), animatedShiftY.roundToInt()) }
+                        .padding(horizontal = 72.dp, vertical = 48.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    // 左侧 42% 封面区
                     Box(
                         modifier = Modifier
-                            .padding(bottom = 12.dp)
-                            .clip(RoundedCornerShape(8.dp))
-                            .background(bannerBg)
-                            .border(1.dp, bannerBorder, RoundedCornerShape(8.dp))
-                            .padding(horizontal = 12.dp, vertical = 6.dp)
+                            .weight(0.42f)
+                            .fillMaxHeight(),
+                        contentAlignment = Alignment.Center
                     ) {
+                        val coverShape = RoundedCornerShape(16.dp)
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth(0.88f)
+                                .aspectRatio(1f)
+                                .scale(coverScale)
+                                .shadow(
+                                    elevation = 28.dp,
+                                    shape = coverShape,
+                                    spotColor = if (hasDarkBackground) Color(0x80000000) else Color(0x20000000)
+                                )
+                                .clip(coverShape)
+                                .background(if (hasDarkBackground) Color(0xFF161822) else Color.White)
+                                .then(
+                                    if (!hasDarkBackground) {
+                                        Modifier.border(1.dp, Color(0xFFE5E5EA), coverShape)
+                                    } else Modifier
+                                ),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Crossfade(
+                                targetState = persistentCoverHash to persistentCover,
+                                animationSpec = tween(300),
+                                label = "coverCrossfade"
+                            ) { (_, resolvedCover) ->
+                                if (resolvedCover != null) {
+                                    val coverRequest = remember(context, resolvedCover) {
+                                        ImageRequest.Builder(context)
+                                            .data(resolvedCover)
+                                            .build()
+                                    }
+                                    AsyncImage(
+                                        model = coverRequest,
+                                        contentDescription = "Album Cover",
+                                        contentScale = ContentScale.Crop,
+                                        modifier = Modifier.fillMaxSize(),
+                                        onError = {
+                                            persistentCover = null
+                                            persistentCoverHash = 0
+                                        }
+                                    )
+                                } else {
+                                    DefaultCoverCard(
+                                        isPlaying = isPlaying,
+                                        album = metadata.album,
+                                        hasDarkBackground = hasDarkBackground
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.width(48.dp))
+
+                    // 右侧 58% 控制与元数据区 (直接通透悬浮于背景之上，无任何死板 Dock)
+                    Column(
+                        modifier = Modifier
+                            .weight(0.58f)
+                            .fillMaxHeight(),
+                        verticalArrangement = Arrangement.Center
+                    ) {
+                        // 分级异常告警条（不可获焦，严禁抢夺 D-Pad 当前焦点；恢复后随快照自动消除）
+                        if (visibleErrorBanner != null) {
+                            val isBlocking = visibleErrorBanner.severity == BannerSeverity.WARNING_BLOCKING
+                            val bannerBg = if (isBlocking) {
+                                Color(0xFF8B0000).copy(alpha = 0.88f)
+                            } else {
+                                Color(0xFF3A2E00).copy(alpha = 0.85f)
+                            }
+                            val bannerBorder = if (isBlocking) {
+                                Color(0xFFFF6961).copy(alpha = 0.45f)
+                            } else {
+                                Color(0xFFFFD60A).copy(alpha = 0.45f)
+                            }
+                            val prefix = if (isBlocking) "⚠️" else "ℹ️"
+                            Box(
+                                modifier = Modifier
+                                    .padding(bottom = 12.dp)
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(bannerBg)
+                                    .border(1.dp, bannerBorder, RoundedCornerShape(8.dp))
+                                    .padding(horizontal = 12.dp, vertical = 6.dp)
+                            ) {
+                                Text(
+                                    text = "$prefix ${visibleErrorBanner.message}",
+                                    color = Color.White,
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.Medium
+                                )
+                            }
+                        }
+
+                        // 纯色彩语义的实时音频品质胶囊 (格式: 协议 · 音频格式 | 设备名 + 软过渡提示)
+                        SignalPathPill(
+                            audioState = audioPathState,
+                            hardwareState = uiState.hardwareState,
+                            isIdle = isIdle,
+                            hasDarkBackground = hasDarkBackground
+                        )
+
+                        Spacer(modifier = Modifier.height(20.dp))
+
+                        val displayTitle = if (isIdle) "等待音频投屏接入" else metadata.title
+
+                        // 歌曲标题：推流时纯白高亮，待机浅色时纯黑；平滑跑马灯永不截断
                         Text(
-                            text = "$prefix ${visibleErrorBanner.message}",
-                            color = Color.White,
-                            fontSize = 13.sp,
-                            fontWeight = FontWeight.Medium
+                            text = displayTitle,
+                            fontSize = 40.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = if (hasDarkBackground) Color.White else AppPalette.primaryText,
+                            maxLines = 1,
+                            lineHeight = 48.sp,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .basicMarquee(
+                                    initialDelayMillis = 2000,
+                                    delayMillis = 1500
+                                )
+                        )
+
+                        Spacer(modifier = Modifier.height(8.dp))
+
+                        // 艺术家 / 待机投屏引导：次级色彩自适应
+                        val airPlayGuide = PlaybackService.formatAirPlayName(friendlyName)
+                        val upnpGuide = PlaybackService.formatUpnpName(friendlyName)
+                        val displayArtist = if (isIdle) {
+                            "AirPlay: $airPlayGuide  ·  UPnP: $upnpGuide"
+                        } else {
+                            metadata.artist
+                        }
+
+                        Text(
+                            text = displayArtist,
+                            fontSize = if (isIdle) 18.sp else 24.sp,
+                            fontWeight = FontWeight.Medium,
+                            color = if (hasDarkBackground) Color.White.copy(alpha = 0.70f) else AppPalette.secondaryText,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+
+                        // 专辑名称 (若存在且非待机)
+                        if (!isIdle && metadata.album.isNotEmpty()) {
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = metadata.album,
+                                fontSize = 16.sp,
+                                color = if (hasDarkBackground) Color.White.copy(alpha = 0.50f) else AppPalette.secondaryText.copy(alpha = 0.70f),
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.height(32.dp))
+
+                        IsolatedProgressBar(
+                            totalDurationMs = metadata.durationMs,
+                            durationState = metadata.durationState,
+                            seekCapability = metadata.seekCapability,
+                            playbackStatus = playbackStatus,
+                            hasDarkBackground = hasDarkBackground,
+                            onPlayPauseClick = onTogglePlayPause,
+                            onSeekTo = onSeekTo
+                        )
+
+                        Spacer(modifier = Modifier.height(16.dp))
+
+                        // 💡 纯几何图标交互控制按钮组 (上一曲 / 播放暂停 / 下一曲 / 歌词 / 设置)
+                        PlaybackControls(
+                            playbackStatus = playbackStatus,
+                            hasDarkBackground = hasDarkBackground,
+                            lyricState = lyricUiState,
+                            isLyricsExpanded = isLyricsExpanded,
+                            onLyricsClick = {
+                                isLyricsExpanded = !isLyricsExpanded
+                            },
+                            onPlayPauseClick = onTogglePlayPause,
+                            onPreviousClick = onPreviousTrack,
+                            onNextClick = onNextTrack,
+                            onSettingsClick = onOpenSettings,
+                            playPauseFocusRequester = playPauseFocusRequester,
+                            settingsFocusRequester = settingsFocusRequester,
+                            lyricsFocusRequester = lyricsFocusRequester
                         )
                     }
                 }
-
-                // 纯色彩语义的实时音频品质胶囊 (格式: 协议 · 音频格式 | 设备名 + 软过渡提示)
-                SignalPathPill(
-                    audioState = audioPathState,
-                    hardwareState = uiState.hardwareState,
-                    isIdle = isIdle,
-                    hasDarkBackground = hasDarkBackground
-                )
-
-                Spacer(modifier = Modifier.height(20.dp))
-
-                val displayTitle = if (isIdle) "等待音频投屏接入" else metadata.title
-
-                // 歌曲标题：推流时纯白高亮，待机浅色时纯黑；平滑跑马灯永不截断
-                Text(
-                    text = displayTitle,
-                    fontSize = 40.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = if (hasDarkBackground) Color.White else AppPalette.primaryText,
-                    maxLines = 1,
-                    lineHeight = 48.sp,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .basicMarquee(
-                            initialDelayMillis = 2000,
-                            delayMillis = 1500
-                        )
-                )
-
-                Spacer(modifier = Modifier.height(8.dp))
-
-                // 艺术家 / 待机投屏引导：次级色彩自适应
-                val airPlayGuide = PlaybackService.formatAirPlayName(friendlyName)
-                val upnpGuide = PlaybackService.formatUpnpName(friendlyName)
-                val displayArtist = if (isIdle) {
-                    "AirPlay: $airPlayGuide  ·  UPnP: $upnpGuide"
-                } else {
-                    metadata.artist
-                }
-
-                Text(
-                    text = displayArtist,
-                    fontSize = if (isIdle) 18.sp else 24.sp,
-                    fontWeight = FontWeight.Medium,
-                    color = if (hasDarkBackground) Color.White.copy(alpha = 0.70f) else AppPalette.secondaryText,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-
-                // 专辑名称 (若存在且非待机)
-                if (!isIdle && metadata.album.isNotEmpty()) {
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        text = metadata.album,
-                        fontSize = 16.sp,
-                        color = if (hasDarkBackground) Color.White.copy(alpha = 0.50f) else AppPalette.secondaryText.copy(alpha = 0.70f),
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                }
-
-                Spacer(modifier = Modifier.height(32.dp))
-
-                IsolatedProgressBar(
-                    totalDurationMs = metadata.durationMs,
-                    durationState = metadata.durationState,
-                    seekCapability = metadata.seekCapability,
-                    playbackStatus = playbackStatus,
-                    hasDarkBackground = hasDarkBackground,
-                    onPlayPauseClick = onTogglePlayPause,
-                    onSeekTo = onSeekTo
-                )
-
-                Spacer(modifier = Modifier.height(16.dp))
-
-                // 💡 纯几何图标交互控制按钮组 (上一曲 / 播放暂停 / 下一曲 / 设置，绝对居中自适应深浅)
-                PlaybackControls(
-                    playbackStatus = playbackStatus,
-                    hasDarkBackground = hasDarkBackground,
-                    onPlayPauseClick = onTogglePlayPause,
-                    onPreviousClick = onPreviousTrack,
-                    onNextClick = onNextTrack,
-                    onSettingsClick = onOpenSettings,
-                    playPauseFocusRequester = playPauseFocusRequester,
-                    settingsFocusRequester = settingsFocusRequester
-                )
             }
         }
 

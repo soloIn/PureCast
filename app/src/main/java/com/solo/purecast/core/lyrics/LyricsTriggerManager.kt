@@ -195,6 +195,13 @@ class LyricsTriggerManager(
         return true
     }
 
+    /**
+     * 💡 手动重置为空闲态并取消在途任务
+     */
+    fun reset() {
+        resetToIdle()
+    }
+
     private fun resetToIdle() {
         cancelInFlightJobs()
         currentTrackGeneration = -1L
