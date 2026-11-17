@@ -1,13 +1,20 @@
 package com.solo.purecast.ui.screen
 
 import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.AnimatedVisibilityScope
 import androidx.compose.animation.Crossfade
+import androidx.compose.animation.ExperimentalSharedTransitionApi
+import androidx.compose.animation.SharedTransitionLayout
+import androidx.compose.animation.SharedTransitionScope
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
@@ -23,7 +30,6 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -31,7 +37,6 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.runtime.mutableStateOf
@@ -41,16 +46,15 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.scale
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.tv.material3.ExperimentalTvMaterial3Api
@@ -86,8 +90,6 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import kotlin.math.roundToInt
-import kotlin.math.sin
 
 /**
  * 💡 界面顶部告警严重度分级：硬故障醒目红色条 vs 软故障温和提示条
@@ -189,7 +191,11 @@ internal fun PlayerSessionSnapshot.toMainTvUiState(): MainTvUiState = MainTvUiSt
  * 3. 控制栏与进度条常驻显示，永不自动淡出；
  * 4. 42% / 58% Apple TV 黄金比例布局 + OLED 微像素平移保护。
  */
-@OptIn(ExperimentalTvMaterial3Api::class, ExperimentalFoundationApi::class)
+@OptIn(
+    ExperimentalTvMaterial3Api::class,
+    ExperimentalFoundationApi::class,
+    ExperimentalSharedTransitionApi::class
+)
 @Composable
 fun MainTvScreen(
     onTogglePlayPause: () -> Unit,
@@ -259,33 +265,6 @@ fun MainTvScreen(
             lyricsSyncClock.reset()
         }
     }
-
-    // ==========================================
-    // 1. OLED 防烧屏引擎: 微像素平滑微移 (每 10 秒平滑移动 2~3 像素，3秒线性插值杜绝生硬抽动)
-    // ==========================================
-    var pixelShiftX by remember { mutableFloatStateOf(0f) }
-    var pixelShiftY by remember { mutableFloatStateOf(0f) }
-
-    LaunchedEffect(Unit) {
-        var tick = 0.0
-        while (true) {
-            delay(10_000)
-            tick += 0.2
-            pixelShiftX = (sin(tick) * 3).toFloat()
-            pixelShiftY = (sin(tick * 0.7) * 2).toFloat()
-        }
-    }
-
-    val animatedShiftX by animateFloatAsState(
-        targetValue = pixelShiftX,
-        animationSpec = tween(durationMillis = 3000, easing = LinearEasing),
-        label = "pixelShiftXAnim"
-    )
-    val animatedShiftY by animateFloatAsState(
-        targetValue = pixelShiftY,
-        animationSpec = tween(durationMillis = 3000, easing = LinearEasing),
-        label = "pixelShiftYAnim"
-    )
 
     // 💡 首次开机/权限自检向导显示状态
     var showOnboarding by remember { mutableStateOf(false) }
@@ -404,72 +383,90 @@ fun MainTvScreen(
             )
         }
 
-        // 2. 主体展示层：支持标准 42%/58% 主屏与 Apple Music TV 歌词全屏展开平滑过渡
-        AnimatedContent(
-            targetState = isLyricsExpanded,
-            transitionSpec = {
-                fadeIn(animationSpec = tween(300)) togetherWith fadeOut(animationSpec = tween(300))
-            },
-            label = "lyricsScreenExpansionTransition"
-        ) { expanded ->
-            if (expanded) {
-                LyricsScreen(
-                    lyricUiState = lyricUiState,
-                    syncClock = lyricsSyncClock,
-                    metadata = metadata,
-                    playbackStatus = playbackStatus,
-                    coverData = persistentCover,
-                    hasDarkBackground = hasDarkBackground,
-                    onPlayPauseClick = onTogglePlayPause,
-                    onPreviousClick = onPreviousTrack,
-                    onNextClick = onNextTrack,
-                    onClose = {
-                        isLyricsExpanded = false
-                        coroutineScope.launch {
-                            delay(150)
-                            try {
-                                lyricsFocusRequester.requestFocus()
-                            } catch (_: Exception) {}
-                        }
-                    },
-                    modifier = Modifier.offset { IntOffset(animatedShiftX.roundToInt(), animatedShiftY.roundToInt()) }
-                )
-            } else {
-                Row(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .focusProperties { canFocus = !showOnboarding }
-                        .offset { IntOffset(animatedShiftX.roundToInt(), animatedShiftY.roundToInt()) }
-                        .padding(horizontal = 72.dp, vertical = 48.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    // 左侧 42% 封面区
-                    Box(
+        // 2. 主体展示层：支持标准 42%/58% 主屏与 Apple Music TV 歌词全屏展开空间层次过渡
+        SharedTransitionLayout {
+            AnimatedContent(
+                targetState = isLyricsExpanded,
+                transitionSpec = {
+                    if (targetState) {
+                        (slideInHorizontally(animationSpec = tween(400, easing = FastOutSlowInEasing)) { it / 6 } +
+                            fadeIn(animationSpec = tween(350))) togetherWith
+                        (slideOutHorizontally(animationSpec = tween(400, easing = FastOutSlowInEasing)) { -it / 6 } +
+                            fadeOut(animationSpec = tween(250)))
+                    } else {
+                        (slideInHorizontally(animationSpec = tween(400, easing = FastOutSlowInEasing)) { -it / 6 } +
+                            fadeIn(animationSpec = tween(350))) togetherWith
+                        (slideOutHorizontally(animationSpec = tween(400, easing = FastOutSlowInEasing)) { it / 6 } +
+                            fadeOut(animationSpec = tween(250)))
+                    }
+                },
+                label = "lyricsScreenExpansionTransition"
+            ) { expanded ->
+                if (expanded) {
+                    LyricsScreen(
+                        lyricUiState = lyricUiState,
+                        syncClock = lyricsSyncClock,
+                        metadata = metadata,
+                        playbackStatus = playbackStatus,
+                        coverData = persistentCover,
+                        hasDarkBackground = hasDarkBackground,
+                        onPlayPauseClick = onTogglePlayPause,
+                        onPreviousClick = onPreviousTrack,
+                        onNextClick = onNextTrack,
+                        onClose = {
+                            isLyricsExpanded = false
+                            coroutineScope.launch {
+                                delay(150)
+                                try {
+                                    lyricsFocusRequester.requestFocus()
+                                } catch (_: Exception) {}
+                            }
+                        },
+                        sharedTransitionScope = this@SharedTransitionLayout,
+                        animatedVisibilityScope = this@AnimatedContent
+                    )
+                } else {
+                    Row(
                         modifier = Modifier
-                            .weight(0.42f)
-                            .fillMaxHeight(),
-                        contentAlignment = Alignment.Center
+                            .fillMaxSize()
+                            .focusProperties { canFocus = !showOnboarding }
+                            .padding(horizontal = 72.dp, vertical = 48.dp),
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        val coverShape = RoundedCornerShape(16.dp)
+                        // 左侧 42% 封面区
                         Box(
                             modifier = Modifier
-                                .fillMaxWidth(0.88f)
-                                .aspectRatio(1f)
-                                .scale(coverScale)
-                                .shadow(
-                                    elevation = 28.dp,
-                                    shape = coverShape,
-                                    spotColor = if (hasDarkBackground) Color(0x80000000) else Color(0x20000000)
-                                )
-                                .clip(coverShape)
-                                .background(if (hasDarkBackground) Color(0xFF161822) else Color.White)
-                                .then(
-                                    if (!hasDarkBackground) {
-                                        Modifier.border(1.dp, Color(0xFFE5E5EA), coverShape)
-                                    } else Modifier
-                                ),
+                                .weight(0.42f)
+                                .fillMaxHeight(),
                             contentAlignment = Alignment.Center
                         ) {
+                            val coverShape = RoundedCornerShape(16.dp)
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth(0.88f)
+                                    .aspectRatio(1f)
+                                    .sharedElement(
+                                        state = rememberSharedContentState(key = "album_cover"),
+                                        animatedVisibilityScope = this@AnimatedContent
+                                    )
+                                    .graphicsLayer {
+                                        scaleX = coverScale
+                                        scaleY = coverScale
+                                    }
+                                    .shadow(
+                                        elevation = 28.dp,
+                                        shape = coverShape,
+                                        spotColor = if (hasDarkBackground) Color(0x80000000) else Color(0x20000000)
+                                    )
+                                    .clip(coverShape)
+                                    .background(if (hasDarkBackground) Color(0xFF161822) else Color.White)
+                                    .then(
+                                        if (!hasDarkBackground) {
+                                            Modifier.border(1.dp, Color(0xFFE5E5EA), coverShape)
+                                        } else Modifier
+                                    ),
+                                contentAlignment = Alignment.Center
+                            ) {
                             Crossfade(
                                 targetState = persistentCoverHash to persistentCover,
                                 animationSpec = tween(300),
@@ -552,54 +549,64 @@ fun MainTvScreen(
 
                         Spacer(modifier = Modifier.height(20.dp))
 
-                        val displayTitle = if (isIdle) "等待音频投屏接入" else metadata.title
-
-                        // 歌曲标题：推流时纯白高亮，待机浅色时纯黑；平滑跑马灯永不截断
-                        Text(
-                            text = displayTitle,
-                            fontSize = 40.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = if (hasDarkBackground) Color.White else AppPalette.primaryText,
-                            maxLines = 1,
-                            lineHeight = 48.sp,
+                        // 歌曲标题与艺术家容器（共享元素绑定）
+                        Column(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .basicMarquee(
-                                    initialDelayMillis = 2000,
-                                    delayMillis = 1500
+                                .sharedElement(
+                                    state = rememberSharedContentState(key = "track_info"),
+                                    animatedVisibilityScope = this@AnimatedContent
                                 )
-                        )
+                        ) {
+                            val displayTitle = if (isIdle) "等待音频投屏接入" else metadata.title
 
-                        Spacer(modifier = Modifier.height(8.dp))
-
-                        // 艺术家 / 待机投屏引导：次级色彩自适应
-                        val airPlayGuide = PlaybackService.formatAirPlayName(friendlyName)
-                        val upnpGuide = PlaybackService.formatUpnpName(friendlyName)
-                        val displayArtist = if (isIdle) {
-                            "AirPlay: $airPlayGuide  ·  UPnP: $upnpGuide"
-                        } else {
-                            metadata.artist
-                        }
-
-                        Text(
-                            text = displayArtist,
-                            fontSize = if (isIdle) 18.sp else 24.sp,
-                            fontWeight = FontWeight.Medium,
-                            color = if (hasDarkBackground) Color.White.copy(alpha = 0.70f) else AppPalette.secondaryText,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-
-                        // 专辑名称 (若存在且非待机)
-                        if (!isIdle && metadata.album.isNotEmpty()) {
-                            Spacer(modifier = Modifier.height(4.dp))
+                            // 歌曲标题：推流时纯白高亮，待机浅色时纯黑；平滑跑马灯永不截断
                             Text(
-                                text = metadata.album,
-                                fontSize = 16.sp,
-                                color = if (hasDarkBackground) Color.White.copy(alpha = 0.50f) else AppPalette.secondaryText.copy(alpha = 0.70f),
+                                text = displayTitle,
+                                fontSize = 40.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = if (hasDarkBackground) Color.White else AppPalette.primaryText,
+                                maxLines = 1,
+                                lineHeight = 48.sp,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .basicMarquee(
+                                        initialDelayMillis = 2000,
+                                        repeatDelayMillis = 1500
+                                    )
+                            )
+
+                            Spacer(modifier = Modifier.height(8.dp))
+
+                            // 艺术家 / 待机投屏引导：次级色彩自适应
+                            val airPlayGuide = PlaybackService.formatAirPlayName(friendlyName)
+                            val upnpGuide = PlaybackService.formatUpnpName(friendlyName)
+                            val displayArtist = if (isIdle) {
+                                "AirPlay: $airPlayGuide  ·  UPnP: $upnpGuide"
+                            } else {
+                                metadata.artist
+                            }
+
+                            Text(
+                                text = displayArtist,
+                                fontSize = if (isIdle) 18.sp else 24.sp,
+                                fontWeight = FontWeight.Medium,
+                                color = if (hasDarkBackground) Color.White.copy(alpha = 0.70f) else AppPalette.secondaryText,
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis
                             )
+
+                            // 专辑名称 (若存在且非待机)
+                            if (!isIdle && metadata.album.isNotEmpty()) {
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(
+                                    text = metadata.album,
+                                    fontSize = 16.sp,
+                                    color = if (hasDarkBackground) Color.White.copy(alpha = 0.50f) else AppPalette.secondaryText.copy(alpha = 0.70f),
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
                         }
 
                         Spacer(modifier = Modifier.height(32.dp))
@@ -617,7 +624,7 @@ fun MainTvScreen(
 
                         Spacer(modifier = Modifier.height(16.dp))
 
-                        // 💡 纯几何图标交互控制按钮组 (上一曲 / 播放暂停 / 下一曲 / 歌词 / 设置)
+                        // 💡 纯几何图标交互控制按钮组 (上一曲 / 播放暂停 / 下一曲 / 歌词 / 设置，共享元素绑定)
                         PlaybackControls(
                             playbackStatus = playbackStatus,
                             hasDarkBackground = hasDarkBackground,
@@ -632,11 +639,16 @@ fun MainTvScreen(
                             onSettingsClick = onOpenSettings,
                             playPauseFocusRequester = playPauseFocusRequester,
                             settingsFocusRequester = settingsFocusRequester,
-                            lyricsFocusRequester = lyricsFocusRequester
+                            lyricsFocusRequester = lyricsFocusRequester,
+                            modifier = Modifier.sharedElement(
+                                state = rememberSharedContentState(key = "playback_controls"),
+                                animatedVisibilityScope = this@AnimatedContent
+                            )
                         )
                     }
                 }
             }
+        }
         }
 
         // 3. 首次开机/权限自检向导

@@ -102,9 +102,9 @@ internal class MacTextureView(
     }
 
     override fun onSurfaceTextureUpdated(texture: SurfaceTexture) {
-        // 💡 首帧就绪保护：首帧渲染成功后点亮 alpha 至 1.0f，此后恒定保持可见，杜绝 alpha 震荡闪屏
-        if (!closed && alpha != 1f && worker?.visibleFrame == true) {
-            alpha = 1f
+        // 💡 首帧就绪保护：首帧渲染成功后通过 350ms 属性动画平滑渐显点亮，杜绝瞬时突变闪烁
+        if (!closed && alpha == 0f && worker?.visibleFrame == true) {
+            animate().alpha(1f).setDuration(350L).start()
         }
     }
 
@@ -138,7 +138,7 @@ internal class MacTextureView(
         private var vsyncFrameCount = 0L
 
         private fun shouldContinueVsync(state: FluidRenderState): Boolean =
-            !stopping.get() && !closed && active && state.quality.animated && (state.playing || renderer?.isTransitioning == true)
+            !stopping.get() && !closed && active && state.quality.animated && (state.playing || renderer?.isAnimating == true)
 
         private fun onVsync() {
             if (!stopping.get() && !closed && active) {

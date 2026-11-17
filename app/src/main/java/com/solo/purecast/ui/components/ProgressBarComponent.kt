@@ -1,8 +1,10 @@
 package com.solo.purecast.ui.components
 
+import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
@@ -28,9 +30,12 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.key.onPreviewKeyEvent
@@ -96,34 +101,44 @@ fun ProgressBarComponent(
         isIdle = isIdle
     )
 
+    // 💡 500ms 线性平滑插值：消除 500ms 进度推送的阶跃顿挫感，实现 60fps 平滑推进
+    val animatedFraction by animateFloatAsState(
+        targetValue = progressFraction,
+        animationSpec = tween(durationMillis = 500, easing = LinearEasing),
+        label = "progressBarFractionAnim"
+    )
+
     Column(
         modifier = modifier
             .fillMaxWidth()
             .padding(vertical = 2.dp)
     ) {
-        // 进度条轨道容器 (纯展示，无交互)
+        // 进度条轨道容器 (纯展示，无交互；0 Layout 重新测量，100% 运行于 GPU Draw 阶段)
         Box(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(vertical = 3.dp),
             contentAlignment = Alignment.CenterStart
         ) {
-            // 背景槽（未播放部分）
+            // 背景槽与高亮进度：完全在 Draw 阶段合成圆角填充，跳过 Compose Layout 重新测量
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(trackHeight)
                     .clip(RoundedCornerShape(trackHeight / 2))
                     .background(trackBgColor)
-            )
-
-            // 高亮填充条（已播放部分）
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth(progressFraction)
-                    .height(trackHeight)
-                    .clip(RoundedCornerShape(trackHeight / 2))
-                    .background(progressFillColor)
+                    .drawWithContent {
+                        drawContent()
+                        val fillWidth = size.width * animatedFraction.coerceIn(0f, 1f)
+                        if (fillWidth > 0f) {
+                            val radius = size.height / 2f
+                            drawRoundRect(
+                                color = progressFillColor,
+                                size = Size(fillWidth, size.height),
+                                cornerRadius = CornerRadius(radius, radius)
+                            )
+                        }
+                    }
             )
         }
 

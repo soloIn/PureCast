@@ -123,6 +123,18 @@ internal class MacRenderer(private val context: Context, private val clock: MacC
     val isTransitioning: Boolean
         get() = image != 0 && outgoing != 0 && transition < MacScene.TRANSITION_SECONDS
 
+    /**
+     * 💡 动态速度因子：播放时为 1.0，暂停时在约 500ms 内按指数衰减至 0.0
+     */
+    var currentSpeedMultiplier: Double = 1.0
+        private set
+
+    /**
+     * 💡 活跃渲染状态判定：当前速度因子 >= 0.01 或处于封面过渡期时维持渲染循环
+     */
+    val isAnimating: Boolean
+        get() = currentSpeedMultiplier >= 0.01 || isTransitioning
+
     fun setArtwork(bitmap: Bitmap?, now: Long) {
         if (outgoing != 0) GL.glDeleteTextures(1, intArrayOf(outgoing), 0)
         outgoing = image
@@ -146,7 +158,17 @@ internal class MacRenderer(private val context: Context, private val clock: MacC
         if (width <= 0 || height <= 0) return false
         val dt = if (lastFrame == 0L) 0.0 else ((now - lastFrame) / 1e9).coerceIn(0.0, 0.1)
         lastFrame = now
-        clock.time = MacScene.advanceTime(clock.time, dt)
+
+        // 💡 阻尼减速动力学：播放时平滑维持 1.0 正常流速，暂停时在约 500ms 内按指数衰减至 0.0
+        if (state.playing) {
+            currentSpeedMultiplier = (currentSpeedMultiplier + (1.0 - currentSpeedMultiplier) * (1.0 - kotlin.math.exp(-dt * 12.0))).coerceIn(0.0, 1.0)
+            if (currentSpeedMultiplier > 0.99) currentSpeedMultiplier = 1.0
+        } else {
+            currentSpeedMultiplier = (currentSpeedMultiplier * kotlin.math.exp(-dt * 9.2)).coerceIn(0.0, 1.0)
+            if (currentSpeedMultiplier < 0.005) currentSpeedMultiplier = 0.0
+        }
+
+        clock.time = MacScene.advanceTime(clock.time, dt * currentSpeedMultiplier)
         transition += dt
         if (image == 0) return false
 

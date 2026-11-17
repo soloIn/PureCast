@@ -1,6 +1,9 @@
 package com.solo.purecast.ui.screen
 
 import androidx.activity.compose.BackHandler
+import androidx.compose.animation.AnimatedVisibilityScope
+import androidx.compose.animation.ExperimentalSharedTransitionApi
+import androidx.compose.animation.SharedTransitionScope
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
@@ -12,6 +15,7 @@ import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.gestures.animateScrollBy
 import androidx.compose.foundation.background
 import androidx.compose.foundation.basicMarquee
 import androidx.compose.foundation.border
@@ -35,9 +39,11 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameNanos
@@ -50,18 +56,17 @@ import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.CompositingStrategy
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
-import androidx.compose.ui.text.SpanStyle
-import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.tv.material3.ExperimentalTvMaterial3Api
@@ -71,13 +76,16 @@ import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import com.solo.purecast.R
 import com.solo.purecast.core.lyrics.LyricsSyncClock
+import com.solo.purecast.model.LyricFormat
 import com.solo.purecast.model.LyricLine
 import com.solo.purecast.model.LyricTimeline
 import com.solo.purecast.model.LyricUiState
 import com.solo.purecast.model.PlaybackStatus
 import com.solo.purecast.model.TrackMetadata
 import com.solo.purecast.ui.components.TransportIconButton
+import kotlinx.coroutines.delay
 import kotlin.math.abs
+import kotlin.math.max
 
 /**
  * 💡 PureCast Apple Music TV 风格歌词全屏展开屏 (LyricsScreen)
@@ -87,7 +95,7 @@ import kotlin.math.abs
  * 3. 严格遵循“PureCast 播放进度是唯一真实来源”的设计契约，与 iPhone 进度毫秒级同步；
  * 4. 遥控器 Back 键通过 BackHandler 拦截优雅缩回主屏。
  */
-@OptIn(ExperimentalTvMaterial3Api::class, ExperimentalFoundationApi::class)
+@OptIn(ExperimentalTvMaterial3Api::class, ExperimentalFoundationApi::class, ExperimentalSharedTransitionApi::class)
 @Composable
 fun LyricsScreen(
     lyricUiState: LyricUiState,
@@ -100,7 +108,9 @@ fun LyricsScreen(
     onPreviousClick: () -> Unit,
     onNextClick: () -> Unit,
     onClose: () -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    sharedTransitionScope: SharedTransitionScope? = null,
+    animatedVisibilityScope: AnimatedVisibilityScope? = null
 ) {
     val context = LocalContext.current
 
@@ -108,6 +118,27 @@ fun LyricsScreen(
     BackHandler(enabled = true) {
         onClose()
     }
+
+    val isPlaying = playbackStatus == PlaybackStatus.PLAYING
+
+    // 💡 优化 4：左栏封面动效统一，与 MainTvScreen 共享 1.0f <-> 0.94f 播放态缩放弹簧动画
+    val coverScale by animateFloatAsState(
+        targetValue = if (isPlaying) 1.0f else 0.94f,
+        animationSpec = spring(
+            dampingRatio = Spring.DampingRatioLowBouncy,
+            stiffness = Spring.StiffnessLow
+        ),
+        label = "lyricsCoverScaleAnim"
+    )
+
+    val coverSharedModifier = if (sharedTransitionScope != null && animatedVisibilityScope != null) {
+        with(sharedTransitionScope) {
+            Modifier.sharedElement(
+                state = rememberSharedContentState(key = "album_cover"),
+                animatedVisibilityScope = animatedVisibilityScope
+            )
+        }
+    } else Modifier
 
     Row(
         modifier = modifier
@@ -130,6 +161,11 @@ fun LyricsScreen(
                 modifier = Modifier
                     .fillMaxWidth(0.72f)
                     .aspectRatio(1f)
+                    .then(coverSharedModifier)
+                    .graphicsLayer {
+                        scaleX = coverScale
+                        scaleY = coverScale
+                    }
                     .shadow(
                         elevation = 24.dp,
                         shape = coverShape,
@@ -168,54 +204,78 @@ fun LyricsScreen(
 
             Spacer(modifier = Modifier.height(24.dp))
 
-            // 歌曲标题 (水平居中)
-            Text(
-                text = metadata.title,
-                fontSize = 28.sp,
-                fontWeight = FontWeight.Bold,
-                color = if (hasDarkBackground) Color.White else Color(0xFF1C1C1E),
-                maxLines = 1,
-                lineHeight = 34.sp,
-                textAlign = TextAlign.Center,
+            val infoSharedModifier = if (sharedTransitionScope != null && animatedVisibilityScope != null) {
+                with(sharedTransitionScope) {
+                    Modifier.sharedElement(
+                        state = rememberSharedContentState(key = "track_info"),
+                        animatedVisibilityScope = animatedVisibilityScope
+                    )
+                }
+            } else Modifier
+
+            // 歌曲信息（共享元素绑定）
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
                 modifier = Modifier
-                    .fillMaxWidth(0.92f)
-                    .basicMarquee(initialDelayMillis = 2000, delayMillis = 1500)
-            )
-
-            Spacer(modifier = Modifier.height(6.dp))
-
-            // 艺术家 (水平居中)
-            Text(
-                text = metadata.artist,
-                fontSize = 18.sp,
-                fontWeight = FontWeight.Medium,
-                color = if (hasDarkBackground) Color.White.copy(alpha = 0.70f) else Color(0xFF1C1C1E).copy(alpha = 0.70f),
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                textAlign = TextAlign.Center,
-                modifier = Modifier.fillMaxWidth(0.92f)
-            )
-
-            if (metadata.album.isNotEmpty()) {
-                Spacer(modifier = Modifier.height(4.dp))
+                    .fillMaxWidth()
+                    .then(infoSharedModifier)
+            ) {
                 Text(
-                    text = metadata.album,
-                    fontSize = 14.sp,
-                    color = if (hasDarkBackground) Color.White.copy(alpha = 0.50f) else Color(0xFF1C1C1E).copy(alpha = 0.50f),
+                    text = metadata.title,
+                    fontSize = 28.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = if (hasDarkBackground) Color.White else Color(0xFF1C1C1E),
+                    maxLines = 1,
+                    lineHeight = 34.sp,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier
+                        .fillMaxWidth(0.92f)
+                        .basicMarquee(initialDelayMillis = 2000, repeatDelayMillis = 1500)
+                )
+
+                Spacer(modifier = Modifier.height(6.dp))
+
+                Text(
+                    text = metadata.artist,
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = if (hasDarkBackground) Color.White.copy(alpha = 0.70f) else Color(0xFF1C1C1E).copy(alpha = 0.70f),
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                     textAlign = TextAlign.Center,
                     modifier = Modifier.fillMaxWidth(0.92f)
                 )
+
+                if (metadata.album.isNotEmpty()) {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = metadata.album,
+                        fontSize = 14.sp,
+                        color = if (hasDarkBackground) Color.White.copy(alpha = 0.50f) else Color(0xFF1C1C1E).copy(alpha = 0.50f),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.fillMaxWidth(0.92f)
+                    )
+                }
             }
 
             Spacer(modifier = Modifier.height(20.dp))
 
-            // 💡 播放控制栏：上一曲、播放/暂停、下一曲
-            val isPlaying = playbackStatus == PlaybackStatus.PLAYING
+            val controlsSharedModifier = if (sharedTransitionScope != null && animatedVisibilityScope != null) {
+                with(sharedTransitionScope) {
+                    Modifier.sharedElement(
+                        state = rememberSharedContentState(key = "playback_controls"),
+                        animatedVisibilityScope = animatedVisibilityScope
+                    )
+                }
+            } else Modifier
+
+            // 💡 播放控制栏：上一曲、播放/暂停、下一曲（共享元素绑定）
             Row(
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(20.dp)
+                horizontalArrangement = Arrangement.spacedBy(20.dp),
+                modifier = controlsSharedModifier
             ) {
                 // 上一曲按钮 (⏮)
                 TransportIconButton(
@@ -309,19 +369,31 @@ private fun LyricsStreamView(
     val density = LocalDensity.current
     val listState = rememberLazyListState()
 
-    // 💡 只有当前激活行索引改变时，才驱动列表重组与平滑滚动
+    val isWordSync = timeline.format == LyricFormat.TTML_SYLLABLE || timeline.format == LyricFormat.LRC_WORD_SYNC
     var activeLineIndex by remember { mutableIntStateOf(-1) }
-    var currentRenderTimeMs by remember { mutableLongStateOf(0L) }
 
-    LaunchedEffect(timeline) {
-        while (true) {
-            withFrameNanos {
+    // 💡 优化 1：按歌词格式按需降频。
+    // 当非逐字格式时，无需在每帧 VSYNC 更新时间戳，仅需每 80ms 低频监测 activeLineIndex 变化；
+    // 稳态下全列表重组开销降至 0 次/秒！
+    LaunchedEffect(timeline, isWordSync) {
+        if (isWordSync) {
+            while (true) {
+                withFrameNanos {
+                    val nowTimeMs = syncClock.getCurrentInterpolatedTimeMs()
+                    val state = syncClock.calculateActiveLineState(timeline, nowTimeMs)
+                    if (state.lineIndex != activeLineIndex) {
+                        activeLineIndex = state.lineIndex
+                    }
+                }
+            }
+        } else {
+            while (true) {
                 val nowTimeMs = syncClock.getCurrentInterpolatedTimeMs()
-                currentRenderTimeMs = nowTimeMs
                 val state = syncClock.calculateActiveLineState(timeline, nowTimeMs)
                 if (state.lineIndex != activeLineIndex) {
                     activeLineIndex = state.lineIndex
                 }
+                delay(80L)
             }
         }
     }
@@ -330,7 +402,9 @@ private fun LyricsStreamView(
         with(density) { (-120).dp.roundToPx() }
     }
 
-    // 前奏期 (activeLineIndex == -1) 时抑制滚动与高亮；跨行寻道 (>2行) 瞬时对齐杜绝滞后
+    // 💡 优化 4：滚动曲线定制。
+    // 通过 visibleItemsInfo 查找目标行的当前像素偏移 item.offset，
+    // 改用 animateScrollBy 配合 FastOutSlowInEasing，获得更具阻尼感的 Apple TV 级平滑滚动体验
     var lastScrolledLineIndex by remember { mutableIntStateOf(-1) }
     LaunchedEffect(activeLineIndex) {
         if (activeLineIndex in timeline.lines.indices) {
@@ -343,11 +417,20 @@ private fun LyricsStreamView(
                     scrollOffset = targetOffsetPx
                 )
             } else {
-                // 💡 正常逐句推进：丝滑动画平滑过渡
-                listState.animateScrollToItem(
-                    index = activeLineIndex,
-                    scrollOffset = targetOffsetPx
-                )
+                // 💡 正常逐句推进：高阻尼平滑动画过渡
+                val visibleItem = listState.layoutInfo.visibleItemsInfo.firstOrNull { it.index == activeLineIndex }
+                if (visibleItem != null) {
+                    val scrollDelta = (visibleItem.offset + targetOffsetPx).toFloat()
+                    listState.animateScrollBy(
+                        value = scrollDelta,
+                        animationSpec = tween(durationMillis = 480, easing = FastOutSlowInEasing)
+                    )
+                } else {
+                    listState.animateScrollToItem(
+                        index = activeLineIndex,
+                        scrollOffset = targetOffsetPx
+                    )
+                }
             }
         }
     }
@@ -398,7 +481,7 @@ private fun LyricsStreamView(
                     isActive = isActive,
                     isFirstLine = (index == 0),
                     distanceFromActive = distance,
-                    currentTimeMs = currentRenderTimeMs,
+                    currentTimeProvider = { syncClock.getCurrentInterpolatedTimeMs() },
                     syncClock = syncClock,
                     primaryColor = primaryTextColor
                 )
@@ -420,7 +503,7 @@ private fun SmoothLyricLineRow(
     isActive: Boolean,
     isFirstLine: Boolean,
     distanceFromActive: Int,
-    currentTimeMs: Long,
+    currentTimeProvider: () -> Long,
     syncClock: LyricsSyncClock,
     primaryColor: Color,
     modifier: Modifier = Modifier
@@ -458,9 +541,6 @@ private fun SmoothLyricLineRow(
         label = "lyricOffsetY"
     )
 
-    val density = LocalDensity.current
-    val offsetYPx = with(density) { animatedTranslationY.dp.toPx() }
-
     Column(
         modifier = modifier
             .fillMaxWidth(0.92f) // 💡 预留 8% 物理余量，确保 1.08x 放大时文字右侧绝不超出视口被裁剪
@@ -468,7 +548,8 @@ private fun SmoothLyricLineRow(
                 scaleX = animatedScale
                 scaleY = animatedScale
                 alpha = animatedAlpha
-                translationY = offsetYPx
+                // 💡 优化 2：直接在 graphicsLayer 内部转换 dp.toPx()，彻底跳过 Composition 与 Layout 阶段
+                translationY = animatedTranslationY.dp.toPx()
                 // 💡 锚定左侧居中，确保大屏文字放大时左边界平齐不抖动
                 transformOrigin = TransformOrigin(0f, 0.5f)
             },
@@ -477,23 +558,13 @@ private fun SmoothLyricLineRow(
         val words = line.words
         val translation = line.translationText
 
-        // 主歌词行 (统一基础字号 34sp，排版稳定，由 GPU RenderNode 缩放驱动至 36.7sp 视觉尺寸)
+        // 💡 优化 3：逐字歌词视觉与排版开销优化
         if (isActive && !words.isNullOrEmpty()) {
-            val annotatedText = buildAnnotatedString {
-                words.forEach { word ->
-                    val progress = syncClock.calculateWordProgress(word, currentTimeMs)
-                    val wordAlpha = 0.38f + 0.62f * progress
-                    withStyle(SpanStyle(color = primaryColor.copy(alpha = wordAlpha))) {
-                        append(word.text)
-                    }
-                }
-            }
-            Text(
-                text = annotatedText,
-                fontSize = 34.sp,
-                fontWeight = FontWeight.Bold,
-                lineHeight = 44.sp,
-                modifier = Modifier.fillMaxWidth()
+            WordSyncKaraokeText(
+                line = line,
+                syncClock = syncClock,
+                currentTimeProvider = currentTimeProvider,
+                primaryColor = primaryColor
             )
         } else {
             Text(
@@ -518,6 +589,111 @@ private fun SmoothLyricLineRow(
             )
         }
     }
+}
+
+/**
+ * 💡 优化 3：逐字歌词（Karaoke Word-Sync）视觉与排版开销优化组件：
+ * 1. 主歌词文本保持为不可变 String，使 TextLayoutResult 在整句生命周期内 100% 缓存复用，排版 CPU 开销降为 0；
+ * 2. 独立运行 withFrameNanos，完全隔离在当前激活行内部，杜绝 60fps 全列表重组；
+ * 3. 利用 onTextLayout 获取各词边界框，在 drawWithContent 中使用 BlendMode.SrcIn 叠加局部水平线性渐变，
+ *    实现真正的 Apple Music 卡拉 OK 逐像素平滑扫光与抗锯齿羽化边缘。
+ */
+@Composable
+private fun WordSyncKaraokeText(
+    line: LyricLine,
+    syncClock: LyricsSyncClock,
+    currentTimeProvider: () -> Long,
+    primaryColor: Color,
+    modifier: Modifier = Modifier
+) {
+    val words = line.words ?: return
+    val fullText = line.mainText
+
+    var currentFrameTimeMs by remember { mutableLongStateOf(currentTimeProvider()) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            withFrameNanos {
+                currentFrameTimeMs = currentTimeProvider()
+            }
+        }
+    }
+
+    var layoutResult by remember { mutableStateOf<TextLayoutResult?>(null) }
+
+    // 预先计算各词在 fullText 中的字符索引范围
+    val wordRanges = remember(words, fullText) {
+        var searchIndex = 0
+        words.map { word ->
+            val startIndex = fullText.indexOf(word.text, searchIndex).takeIf { it >= 0 } ?: searchIndex
+            val endIndex = (startIndex + word.text.length).coerceAtMost(fullText.length)
+            searchIndex = endIndex
+            startIndex to endIndex
+        }
+    }
+
+    val sweepX by remember(currentFrameTimeMs, layoutResult, wordRanges) {
+        derivedStateOf {
+            val lr = layoutResult ?: return@derivedStateOf 0f
+            val now = currentFrameTimeMs
+            var litX = 0f
+            for (i in words.indices) {
+                val word = words[i]
+                val range = wordRanges[i]
+                if (range.first >= fullText.length) continue
+                val charLeft = lr.getBoundingBox(range.first).left
+                val lastCharIndex = (range.second - 1).coerceIn(range.first, fullText.length - 1)
+                val charRight = lr.getBoundingBox(lastCharIndex).right
+
+                if (now >= word.endMs) {
+                    litX = max(litX, charRight)
+                } else if (now in word.startMs..word.endMs) {
+                    val progress = syncClock.calculateWordProgress(word, now)
+                    val currentWordX = charLeft + (charRight - charLeft) * progress
+                    litX = max(litX, currentWordX)
+                    break
+                } else {
+                    break
+                }
+            }
+            litX
+        }
+    }
+
+    Text(
+        text = fullText,
+        fontSize = 34.sp,
+        fontWeight = FontWeight.Bold,
+        lineHeight = 44.sp,
+        onTextLayout = { layoutResult = it },
+        color = Color.White,
+        modifier = modifier
+            .fillMaxWidth()
+            .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
+            .drawWithContent {
+                drawContent()
+                val feather = 10.dp.toPx()
+                val sweep = sweepX.coerceAtLeast(0f)
+                val unlitColor = primaryColor.copy(alpha = 0.38f)
+                val brush = if (sweep <= 0f) {
+                    SolidColor(unlitColor)
+                } else if (sweep >= size.width) {
+                    SolidColor(primaryColor)
+                } else {
+                    val stopLit = (sweep / size.width).coerceIn(0f, 1f)
+                    val stopUnlit = ((sweep + feather) / size.width).coerceIn(0f, 1f)
+                    Brush.horizontalGradient(
+                        0f to primaryColor,
+                        stopLit to primaryColor,
+                        stopUnlit to unlitColor,
+                        1f to unlitColor
+                    )
+                }
+                drawRect(
+                    brush = brush,
+                    blendMode = BlendMode.SrcIn
+                )
+            }
+    )
 }
 
 /**
