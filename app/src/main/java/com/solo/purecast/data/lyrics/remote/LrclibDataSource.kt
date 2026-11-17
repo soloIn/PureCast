@@ -123,18 +123,18 @@ class LrclibDataSource(
             val evaluateCount = minOf(10, array.length())
             for (i in 0 until evaluateCount) {
                 val item = array.getJSONObject(i)
-                val candArtist = item.optString("artistName", "")
-                val candTitle = item.optString("trackName", "")
+                val candArtist = item.optCleanString("artistName") ?: ""
+                val candTitle = item.optCleanString("trackName") ?: ""
                 val candDurationSec = item.optDouble("duration", 0.0)
                 val candDurationMs = (candDurationSec * 1000).toLong()
                 val isInst = item.optBoolean("instrumental", false)
-                val syncedLrc = item.optString("syncedLyrics", "")
-                val plainLrc = item.optString("plainLyrics", "")
+                val syncedLrc = item.optCleanString("syncedLyrics")
+                val plainLrc = item.optCleanString("plainLyrics")
 
                 val candFormat = when {
-                    syncedLrc.contains("<") -> LyricFormat.LRC_WORD_SYNC
-                    syncedLrc.isNotBlank() -> LyricFormat.LRC_LINE_SYNC
-                    plainLrc.isNotBlank() -> LyricFormat.PLAIN_TEXT
+                    syncedLrc != null && syncedLrc.contains("<") -> LyricFormat.LRC_WORD_SYNC
+                    syncedLrc != null && syncedLrc.isNotBlank() -> LyricFormat.LRC_LINE_SYNC
+                    plainLrc != null && plainLrc.isNotBlank() -> LyricFormat.PLAIN_TEXT
                     else -> LyricFormat.PLAIN_TEXT
                 }
 
@@ -158,9 +158,9 @@ class LrclibDataSource(
                             lines = emptyList(),
                             durationMs = candDurationMs
                         )
-                    } else if (syncedLrc.isNotBlank()) {
+                    } else if (!syncedLrc.isNullOrBlank()) {
                         LrcParser.parse(syncedLrc, sourceName = "LRCLIB", expectedDurationMs = candDurationMs)
-                    } else if (plainLrc.isNotBlank()) {
+                    } else if (!plainLrc.isNullOrBlank()) {
                         LrcParser.parse(plainLrc, sourceName = "LRCLIB", expectedDurationMs = candDurationMs)
                     } else null
 
@@ -189,8 +189,8 @@ class LrclibDataSource(
             val isInst = json.optBoolean("instrumental", false)
             val candDurationSec = json.optDouble("duration", 0.0)
             val candDurationMs = (candDurationSec * 1000).toLong()
-            val syncedLrc = json.optString("syncedLyrics", "")
-            val plainLrc = json.optString("plainLyrics", "")
+            val syncedLrc = json.optCleanString("syncedLyrics")
+            val plainLrc = json.optCleanString("plainLyrics")
 
             if (isInst) {
                 return LyricTimeline(
@@ -202,14 +202,20 @@ class LrclibDataSource(
                 )
             }
 
-            val lrcContent = syncedLrc.ifBlank { plainLrc }
-            if (lrcContent.isBlank()) return null
+            val lrcContent = syncedLrc ?: plainLrc
+            if (lrcContent.isNullOrBlank()) return null
 
             LrcParser.parse(lrcContent, sourceName = "LRCLIB", expectedDurationMs = candDurationMs)
         } catch (e: Exception) {
             Logger.lyrics.w(TAG, "解析 LRCLIB 条目异常", e)
             null
         }
+    }
+
+    private fun JSONObject.optCleanString(name: String): String? {
+        if (!has(name) || isNull(name)) return null
+        val v = optString(name, "")
+        return if (v.equals("null", ignoreCase = true) || v.isBlank()) null else v
     }
 
     private fun isEmptyArray(jsonStr: String): Boolean {

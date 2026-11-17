@@ -126,10 +126,10 @@ class NeteaseDataSource(
             if (!resp.isSuccessful || resp.body.isBlank()) return null
 
             val root = JSONObject(resp.body)
-            val lrcStr = root.optJSONObject("lrc")?.optString("lyric") ?: ""
-            val tlyricStr = root.optJSONObject("tlyric")?.optString("lyric") ?: ""
+            val lrcStr = root.optJSONObject("lrc")?.optString("lyric")?.trim() ?: ""
+            val tlyricStr = root.optJSONObject("tlyric")?.optString("lyric")?.trim() ?: ""
 
-            if (lrcStr.isBlank()) return null
+            if (lrcStr.isBlank() || lrcStr.equals("null", ignoreCase = true)) return null
 
             val baseTimeline = LrcParser.parse(lrcStr, sourceName = "Netease", expectedDurationMs = durationMs) ?: return null
 
@@ -184,7 +184,7 @@ class NeteaseDataSource(
                     text.startsWith("编曲") || text.startsWith("制作") || text.startsWith("混音") ||
                     text.startsWith("吉他") || text.startsWith("贝斯") || text.startsWith("鼓") ||
                     text.startsWith("键盘") || text.startsWith("录音") || text.startsWith("母带")
-            if (text.isNotEmpty() && !isMeta) {
+            if (text.isNotEmpty() && !isMeta && !text.equals("null", ignoreCase = true)) {
                 result.add(timeMs to ChineseConverter.toSimplified(text))
             }
         }

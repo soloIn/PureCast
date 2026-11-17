@@ -142,6 +142,71 @@ class LyricsWaterfallFetcherTest {
     }
 
     @Test
+    fun `step 2 LRCLIB plain text with null syncedLyrics continues to step 4 Netease for synced lyrics`() = runBlocking {
+        val amllSource = AmllDataSource(fakeClient)
+        val lrclibSource = LrclibDataSource(fakeClient)
+        val neteaseSource = com.solo.purecast.data.lyrics.remote.NeteaseDataSource(fakeClient)
+        val fetcherWithNetease = LyricsWaterfallFetcher(cacheRepo, amllSource, lrclibSource, neteaseSource)
+
+        val lrclibGetUrl = "https://lrclib.net/api/get?track_name=%E6%B3%AA%E6%B5%B7&artist_name=%E8%AE%B8%E8%8C%B9%E8%8A%B8&duration=300"
+        fakeClient.responses[lrclibGetUrl] = LyricsHttpClient.HttpResponse(
+            statusCode = 200,
+            body = """
+                {
+                    "trackName": "泪海",
+                    "artistName": "许茹芸",
+                    "duration": 300.0,
+                    "instrumental": false,
+                    "syncedLyrics": null,
+                    "plainLyrics": "爱已不能动\n还有什么 值得我心痛"
+                }
+            """.trimIndent()
+        )
+
+        val lrclibSearchUrl = "https://lrclib.net/api/search?track_name=%E6%B3%AA%E6%B5%B7&artist_name=%E8%AE%B8%E8%8C%B9%E8%8A%B8"
+        fakeClient.responses[lrclibSearchUrl] = LyricsHttpClient.HttpResponse(
+            statusCode = 200,
+            body = "[]"
+        )
+
+        val neteaseQuery = java.net.URLEncoder.encode("泪海 许茹芸", "UTF-8")
+        val neteaseSearchUrl = "https://music.163.com/api/search/get?s=$neteaseQuery&type=1&limit=8"
+        fakeClient.responses[neteaseSearchUrl] = LyricsHttpClient.HttpResponse(
+            statusCode = 200,
+            body = """
+                {
+                    "result": {
+                        "songs": [
+                            { "id": 123456, "name": "泪海", "duration": 300000 }
+                        ]
+                    }
+                }
+            """.trimIndent()
+        )
+
+        val neteaseLyricUrl = "https://music.163.com/api/song/lyric?id=123456&lv=1&kv=1&tv=1"
+        fakeClient.responses[neteaseLyricUrl] = LyricsHttpClient.HttpResponse(
+            statusCode = 200,
+            body = """
+                {
+                    "lrc": {
+                        "lyric": "[00:10.00]爱已不能动\n[00:15.00]还有什么 值得我心痛"
+                    }
+                }
+            """.trimIndent()
+        )
+
+        val timeline = fetcherWithNetease.fetch("许茹芸", "泪海", 300000L)
+
+        assertNotNull(timeline)
+        assertEquals("Netease", timeline?.source)
+        assertEquals(LyricFormat.LRC_LINE_SYNC, timeline?.format)
+        assertEquals(2, timeline?.lines?.size)
+        assertEquals("爱已不能动", timeline?.lines?.get(0)?.mainText)
+        assertEquals(10000L, timeline?.lines?.get(0)?.startMs)
+    }
+
+    @Test
     fun `all waterfall steps failing returns null`() = runBlocking {
         val timeline = fetcher.fetch("Unknown", "NonExistentSong", 120000L)
         assertNull(timeline)

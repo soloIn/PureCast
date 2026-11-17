@@ -3,6 +3,7 @@ package com.solo.purecast.data.lyrics
 import com.solo.purecast.data.lyrics.remote.AmllDataSource
 import com.solo.purecast.data.lyrics.remote.LrclibDataSource
 import com.solo.purecast.data.lyrics.remote.NeteaseDataSource
+import com.solo.purecast.model.LyricFormat
 import com.solo.purecast.model.LyricTimeline
 import com.solo.purecast.util.Logger
 import kotlinx.coroutines.Deferred
@@ -106,6 +107,8 @@ class LyricsWaterfallFetcher(
             }
         }
 
+        var fallbackPlainTimeline: LyricTimeline? = null
+
         // 阶梯 Step 2: LRCLIB 精确匹配四元组 (硬超时 1.5s，需已知歌手)
         if (cleanArtist.isNotBlank()) {
             try {
@@ -116,10 +119,15 @@ class LyricsWaterfallFetcher(
                     album = album
                 )
                 if (lrclibExactHit != null) {
-                    Logger.lyrics.i(TAG, "阶梯 Step 2 (LRCLIB /api/get) 精确命中: $cleanArtist - $cleanTitle")
-                    val enriched = enrichWithTranslation(lrclibExactHit, cleanArtist, cleanTitle, durationMs)
-                    cacheRepository.put(cacheKey, enriched)
-                    return enriched
+                    if (lrclibExactHit.format != LyricFormat.PLAIN_TEXT || lrclibExactHit.isInstrumental) {
+                        Logger.lyrics.i(TAG, "阶梯 Step 2 (LRCLIB /api/get) 精确命中时间戳歌词: $cleanArtist - $cleanTitle")
+                        val enriched = enrichWithTranslation(lrclibExactHit, cleanArtist, cleanTitle, durationMs)
+                        cacheRepository.put(cacheKey, enriched)
+                        return enriched
+                    } else {
+                        Logger.lyrics.d(TAG, "阶梯 Step 2 命中纯文本无时间戳歌词，暂存并继续寻找时间戳歌词: $cleanArtist - $cleanTitle")
+                        fallbackPlainTimeline = lrclibExactHit
+                    }
                 }
             } catch (e: Exception) {
                 Logger.lyrics.w(TAG, "LRCLIB 精确匹配异常，平滑降级至 Step 3", e)
@@ -135,10 +143,14 @@ class LyricsWaterfallFetcher(
                 durationMs = durationMs
             )
             if (lrclibFuzzyHit != null) {
-                Logger.lyrics.i(TAG, "阶梯 Step 3 (LRCLIB /api/search) 模糊命中最佳候选: $cleanArtist - $cleanTitle")
-                val enriched = enrichWithTranslation(lrclibFuzzyHit, cleanArtist, cleanTitle, durationMs)
-                cacheRepository.put(cacheKey, enriched)
-                return enriched
+                if (lrclibFuzzyHit.format != LyricFormat.PLAIN_TEXT || lrclibFuzzyHit.isInstrumental) {
+                    Logger.lyrics.i(TAG, "阶梯 Step 3 (LRCLIB /api/search) 模糊命中时间戳歌词: $cleanArtist - $cleanTitle")
+                    val enriched = enrichWithTranslation(lrclibFuzzyHit, cleanArtist, cleanTitle, durationMs)
+                    cacheRepository.put(cacheKey, enriched)
+                    return enriched
+                } else if (fallbackPlainTimeline == null) {
+                    fallbackPlainTimeline = lrclibFuzzyHit
+                }
             }
         } catch (e: Exception) {
             Logger.lyrics.w(TAG, "LRCLIB 模糊搜索异常，降级至网易云源", e)
@@ -156,6 +168,14 @@ class LyricsWaterfallFetcher(
             } catch (e: Exception) {
                 Logger.lyrics.w(TAG, "网易云歌词检索异常", e)
             }
+        }
+
+        // 💡 若时间戳歌词全链路未命中，降级采纳暂存的纯文本无时间戳歌词兜底
+        if (fallbackPlainTimeline != null) {
+            Logger.lyrics.i(TAG, "时间戳歌词全链路未命中，降级采纳纯文本歌词: $cleanArtist - $cleanTitle")
+            val enriched = enrichWithTranslation(fallbackPlainTimeline, cleanArtist, cleanTitle, durationMs)
+            cacheRepository.put(cacheKey, enriched)
+            return enriched
         }
 
         Logger.lyrics.w(TAG, "阶梯瀑布流全链路未命中有效歌词: $cleanArtist - $cleanTitle")

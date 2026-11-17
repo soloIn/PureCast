@@ -143,4 +143,21 @@ class LrcParserTest {
         val result = LrcParser.parse("   ")
         assertNull(result)
     }
+
+    @Test
+    fun `null literal content returns null`() {
+        assertNull(LrcParser.parse("null"))
+        assertNull(LrcParser.parse("NULL"))
+        assertNull(LrcParser.parse("  null  "))
+        assertNull(LrcParser.parse("[00:10.00]null"))
+    }
+
+    @Test
+    fun `plain text consisting only of null returns null`() {
+        val badContent = """
+            null
+            NULL
+        """.trimIndent()
+        assertNull(LrcParser.parse(badContent))
+    }
 }

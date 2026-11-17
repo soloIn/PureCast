@@ -202,7 +202,10 @@ class LyricsCacheRepository(
                 val startMs = lineObj.optLong("startMs", 0L)
                 val endMs = lineObj.optLong("endMs", 0L)
                 val mainText = lineObj.optString("mainText", "")
-                val translationText = if (lineObj.has("translationText")) lineObj.optString("translationText") else null
+                val translationText = if (lineObj.has("translationText") && !lineObj.isNull("translationText")) {
+                    val t = lineObj.optString("translationText")
+                    if (t.equals("null", ignoreCase = true) || t.isBlank()) null else t
+                } else null
 
                 var words: List<LyricWord>? = null
                 val wordsArray = lineObj.optJSONArray("words")
@@ -231,6 +234,14 @@ class LyricsCacheRepository(
                         words = words
                     )
                 )
+            }
+
+            // 💡 损坏/异常脏数据防御：非纯音乐但有效歌词行为空，或所有行文本均为 "null" / 空白
+            if (!isInstrumental) {
+                if (lines.isEmpty() || lines.all { it.mainText.isBlank() || it.mainText.equals("null", ignoreCase = true) }) {
+                    Logger.lyrics.w(TAG, "反序列化歌词检测到脏数据（全部为 null 或空行），拒绝采纳并触发磁盘缓存自愈删除")
+                    return null
+                }
             }
 
             LyricTimeline(

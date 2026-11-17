@@ -35,7 +35,8 @@ object LrcParser {
         sourceName: String = "LRC",
         expectedDurationMs: Long = 0L
     ): LyricTimeline? {
-        if (lrcContent.isBlank()) return null
+        val trimmedContent = lrcContent.trim()
+        if (trimmedContent.isEmpty() || trimmedContent.equals("null", ignoreCase = true)) return null
 
         try {
             var offsetMs = 0L
@@ -43,10 +44,10 @@ object LrcParser {
             val rawEntries = mutableListOf<RawLrcLine>()
             var hasWordLevelSync = false
 
-            val lines = lrcContent.lines()
+            val lines = trimmedContent.lines()
             for (rawLine in lines) {
                 val trimmed = rawLine.trim()
-                if (trimmed.isEmpty()) continue
+                if (trimmed.isEmpty() || trimmed.equals("null", ignoreCase = true)) continue
 
                 // 1. 解析元数据标签
                 val metaMatcher = META_TAG_REGEX.matcher(trimmed)
@@ -77,6 +78,8 @@ object LrcParser {
                 if (timestamps.isEmpty()) continue
 
                 val content = trimmed.substring(lastEnd).trim()
+                if (content.equals("null", ignoreCase = true)) continue
+
                 if (content.contains("<") && content.contains(">")) {
                     hasWordLevelSync = true
                 }
@@ -95,7 +98,11 @@ object LrcParser {
 
             if (rawEntries.isEmpty()) {
                 // 💡 纯文本无时间戳歌词平滑降级 (Finding 6)
-                val nonBlankLines = lines.map { it.trim() }.filter { it.isNotEmpty() && !META_TAG_REGEX.matcher(it).matches() }
+                val nonBlankLines = lines.map {
+                    TIME_TAG_REGEX.matcher(META_TAG_REGEX.matcher(it.trim()).replaceAll("")).replaceAll("").trim()
+                }.filter {
+                    it.isNotEmpty() && !it.equals("null", ignoreCase = true)
+                }
                 if (nonBlankLines.isEmpty()) return null
                 val plainLines = nonBlankLines.mapIndexed { idx, text ->
                     LyricLine(

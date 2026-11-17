@@ -104,6 +104,22 @@ class LyricsCacheRepositoryTest {
     }
 
     @Test
+    fun `corrupted disk cache with null mainText is rejected and auto-deleted`() {
+        val key = "corrupted_null_lyrics_key"
+        val badFile = File(cacheDir, "$key.json")
+        badFile.writeText(
+            """
+            {"source":"LRCLIB","format":"PLAIN_TEXT","isInstrumental":false,"durationMs":300000,"lines":[{"lineIndex":0,"startMs":0,"endMs":0,"mainText":"null"}]}
+            """.trimIndent()
+        )
+
+        assertTrue(badFile.exists())
+        val result = repository.get(key)
+        assertNull(result)
+        assertFalse(badFile.exists())
+    }
+
+    @Test
     fun `serialization preserves words syllable timestamps and translations`() {
         val timeline = sampleTimeline()
         val json = repository.serializeToJson(timeline)
