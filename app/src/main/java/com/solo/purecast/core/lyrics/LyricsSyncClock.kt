@@ -43,7 +43,10 @@ class LyricsSyncClock(
         val clamped = targetPositionMs.coerceAtLeast(0L)
         reportedPositionMs = clamped
         lastInterpolatedTimeMs = clamped
-        anchorNanoTime = if (playing) nowNanoTime else 0L
+        // 💡 硬件出声延迟对齐：开播时 (pos == 0L 且处于播放态) 锚点推迟 100ms，对齐声卡 100ms 硬件预充出声时钟
+        anchorNanoTime = if (playing) {
+            if (clamped == 0L) nowNanoTime + 100_000_000L else nowNanoTime
+        } else 0L
         isPlaying = playing
         Logger.lyrics.i(TAG, "时钟硬对齐完成 (Hard Align): target=${clamped}ms, playing=$playing")
     }
@@ -58,7 +61,7 @@ class LyricsSyncClock(
         nowNanoTime: Long = System.nanoTime()
     ) {
         val currentEstimatedTime = if (isPlaying && anchorNanoTime > 0L) {
-            val elapsedMs = (nowNanoTime - anchorNanoTime) / 1_000_000L
+            val elapsedMs = (nowNanoTime - anchorNanoTime).coerceAtLeast(0L) / 1_000_000L
             reportedPositionMs + elapsedMs.coerceIn(0L, maxExtrapolationMs)
         } else {
             reportedPositionMs
@@ -86,16 +89,18 @@ class LyricsSyncClock(
             }
             reportedPositionMs = frozenTime
             lastInterpolatedTimeMs = frozenTime
+            anchorNanoTime = 0L
         } else if (playing && !isPlaying) {
-            // 暂停转播放：重新锚定当前时间
+            // 暂停转播放：重新锚定当前时间 (若在 0ms 开播推迟 100ms 预充)
             reportedPositionMs = newPositionMs
             lastInterpolatedTimeMs = newPositionMs
+            anchorNanoTime = if (newPositionMs == 0L) nowNanoTime + 100_000_000L else nowNanoTime
         } else {
-            // 正常连续推流更新基准
-            reportedPositionMs = newPositionMs
+            // 正常连续推流更新基准：加入 50ms 负向微抖动保护，防止网络或调度偶发抖动引发扫光顿挫
+            reportedPositionMs = maxOf(newPositionMs, currentEstimatedTime - 50L)
+            anchorNanoTime = nowNanoTime
         }
 
-        anchorNanoTime = nowNanoTime
         isPlaying = playing
     }
 
@@ -108,7 +113,12 @@ class LyricsSyncClock(
             return reportedPositionMs
         }
 
-        val elapsedMs = (nowNanoTime - anchorNanoTime) / 1_000_000L
+        // 💡 nowNanoTime 可能早于 anchorNanoTime (当处于 100ms 硬件预充期时)，此时推演增量钳制为 0
+        val elapsedNano = nowNanoTime - anchorNanoTime
+        if (elapsedNano <= 0L) {
+            return reportedPositionMs
+        }
+        val elapsedMs = elapsedNano / 1_000_000L
         val extrapolatedMs = elapsedMs.coerceIn(0L, maxExtrapolationMs)
         val calculated = reportedPositionMs + extrapolatedMs
 
@@ -215,6 +225,6 @@ class LyricsSyncClock(
     companion object {
         private const val TAG = "LyricsSyncClock"
         const val DEFAULT_MAX_EXTRAPOLATION_MS = 1000L
-        const val DEFAULT_JUMP_THRESHOLD_MS = 200L
+        const val DEFAULT_JUMP_THRESHOLD_MS = 350L
     }
 }

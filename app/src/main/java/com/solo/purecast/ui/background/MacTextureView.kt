@@ -35,6 +35,7 @@ internal class MacTextureView(
     @Volatile private var surfaceGeneration = 0
     @Volatile private var surfaceWidth = 1
     @Volatile private var surfaceHeight = 1
+    private var fadeInStarted = false
     private var worker: Worker? = null
 
     init {
@@ -72,6 +73,8 @@ internal class MacTextureView(
         closed = true
         active = false
         artwork = null
+        animate().cancel()
+        fadeInStarted = false
         worker?.stop(false)
     }
 
@@ -95,6 +98,8 @@ internal class MacTextureView(
     }
 
     override fun onSurfaceTextureDestroyed(texture: SurfaceTexture): Boolean {
+        animate().cancel()
+        fadeInStarted = false
         val old = worker ?: return true
         worker = null
         old.stop(true)
@@ -102,8 +107,11 @@ internal class MacTextureView(
     }
 
     override fun onSurfaceTextureUpdated(texture: SurfaceTexture) {
-        // 💡 首帧就绪保护：首帧渲染成功后通过 350ms 属性动画平滑渐显点亮，杜绝瞬时突变闪烁
-        if (!closed && alpha == 0f && worker?.visibleFrame == true) {
+        // 💡 优化 5：MacTextureView 动画单次触发守卫
+        // 首帧渲染成功后通过 350ms 属性动画平滑渐显点亮，杜绝瞬时突变闪烁与每帧重复启动属性动画
+        if (!closed && !fadeInStarted && worker?.visibleFrame == true) {
+            fadeInStarted = true
+            alpha = 0.01f
             animate().alpha(1f).setDuration(350L).start()
         }
     }
@@ -330,6 +338,8 @@ internal class MacTextureView(
             Logger.ui.w("MacTextureView", "EGL 渲染异常，降级静态帧: ${error.message}")
             this@MacTextureView.post {
                 if (!closed && worker === this) {
+                    animate().cancel()
+                    fadeInStarted = false
                     alpha = 0f
                     onFailure()
                 }

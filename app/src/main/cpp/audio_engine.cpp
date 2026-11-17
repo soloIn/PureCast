@@ -1333,8 +1333,9 @@ size_t AudioEngine::get_available_read() const {
     if (!is_running_.load(std::memory_order_seq_cst) || !ring_buffer_) {
         return 0;
     }
-    // 💡 修复 FLUSH 后跨线程读取旧流残留水位：若当前正处于 Flushing 冲刷或消费端尚未追平最新世代，旧流已被作废，返回 0
-    if (is_flushing_until_reroll() || (consumed_epoch_.load(std::memory_order_acquire) != get_current_buffer_epoch())) {
+    // 💡 修复 FLUSH 后跨线程读取旧流残留水位：仅保留消费端世代追平判断，移除 is_flushing_until_reroll()。
+    // 杜绝开播首包写入后由于 flushing_until_reroll_ 为 true 而被误判返回 0 导致进度时钟来回回跳与倒退。
+    if (consumed_epoch_.load(std::memory_order_acquire) != get_current_buffer_epoch()) {
         return 0;
     }
     return ring_buffer_->available_read();

@@ -78,6 +78,7 @@ import com.solo.purecast.service.PlaybackService
 import com.solo.purecast.ui.components.FluidBackground
 import com.solo.purecast.ui.components.PlaybackControls
 import com.solo.purecast.ui.components.ProgressBarComponent
+import com.solo.purecast.ui.components.calculateProgressFraction
 import com.solo.purecast.ui.components.SignalPathPill
 import com.solo.purecast.ui.screen.LyricsScreen
 import com.solo.purecast.ui.theme.AppPalette
@@ -549,14 +550,9 @@ fun MainTvScreen(
 
                         Spacer(modifier = Modifier.height(20.dp))
 
-                        // 歌曲标题与艺术家容器（共享元素绑定）
+                        // 歌曲标题与艺术家容器（移除 sharedElement，消除异构空间几何形变）
                         Column(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .sharedElement(
-                                    state = rememberSharedContentState(key = "track_info"),
-                                    animatedVisibilityScope = this@AnimatedContent
-                                )
+                            modifier = Modifier.fillMaxWidth()
                         ) {
                             val displayTitle = if (isIdle) "等待音频投屏接入" else metadata.title
 
@@ -640,10 +636,7 @@ fun MainTvScreen(
                             playPauseFocusRequester = playPauseFocusRequester,
                             settingsFocusRequester = settingsFocusRequester,
                             lyricsFocusRequester = lyricsFocusRequester,
-                            modifier = Modifier.sharedElement(
-                                state = rememberSharedContentState(key = "playback_controls"),
-                                animatedVisibilityScope = this@AnimatedContent
-                            )
+                            modifier = Modifier
                         )
                     }
                 }
@@ -673,6 +666,7 @@ fun MainTvScreen(
 
 /**
  * 💡 辅助组件：主屏进度条组件，接入 LyricsSyncClock 单调高频插值 (60fps)，杜绝 500ms 离散跳动并与歌词大屏毫秒级完全对齐
+ * 优化 1：完全隔离秒级文本重组与 60fps GPU 进度填充绘制，实现 1 次/秒低频重组与 0 Layout 重新测量
  */
 @Composable
 private fun IsolatedProgressBar(
@@ -685,31 +679,52 @@ private fun IsolatedProgressBar(
     onPlayPauseClick: () -> Unit,
     onSeekTo: (Long) -> Unit = {}
 ) {
-    var interpolatedPositionMs by remember { mutableLongStateOf(0L) }
+    var drawTrigger by remember { mutableLongStateOf(0L) }
+    var displaySecondMs by remember { mutableLongStateOf(0L) }
     val isPlaying = playbackStatus == PlaybackStatus.PLAYING
+    val currentSnapshot by remember { PlaybackService.sessionSnapshot }.collectAsState()
+    val isIdle = playbackStatus == PlaybackStatus.IDLE || playbackStatus == PlaybackStatus.STOPPED
 
     LaunchedEffect(isPlaying) {
         if (isPlaying) {
             while (true) {
-                withFrameNanos {
-                    interpolatedPositionMs = syncClock.getCurrentInterpolatedTimeMs()
+                withFrameNanos { frameNanos ->
+                    drawTrigger = frameNanos
+                    val currentMs = syncClock.getCurrentInterpolatedTimeMs(frameNanos)
+                    val clamped = if (totalDurationMs > 0) currentMs.coerceIn(0L, totalDurationMs) else currentMs
+                    val sec = (clamped / 1000L) * 1000L
+                    if (sec != displaySecondMs) {
+                        displaySecondMs = sec
+                    }
                 }
             }
         } else {
-            interpolatedPositionMs = syncClock.getCurrentInterpolatedTimeMs()
+            val clamped = if (totalDurationMs > 0) currentSnapshot.progressPositionMs.coerceIn(0L, totalDurationMs) else currentSnapshot.progressPositionMs
+            displaySecondMs = (clamped / 1000L) * 1000L
         }
     }
 
-    val currentSnapshot by remember { PlaybackService.sessionSnapshot }.collectAsState()
-    val displayPosition = if (isPlaying) interpolatedPositionMs else currentSnapshot.progressPositionMs
-    val clampedPosition = if (totalDurationMs > 0) displayPosition.coerceIn(0L, totalDurationMs) else displayPosition
+    val progressFractionProvider = remember(totalDurationMs, durationState, isIdle, isPlaying) {
+        {
+            // 💡 仅在 Draw 阶段读取 drawTrigger，注册每帧重绘，彻底跳过 Composition 与 Layout 阶段
+            drawTrigger.let { }
+            val currentMs = if (isPlaying) syncClock.getCurrentInterpolatedTimeMs() else currentSnapshot.progressPositionMs
+            calculateProgressFraction(
+                currentPositionMs = currentMs,
+                totalDurationMs = totalDurationMs,
+                durationState = durationState,
+                isIdle = isIdle
+            )
+        }
+    }
 
     ProgressBarComponent(
-        currentPositionMs = clampedPosition,
+        currentPositionMs = displaySecondMs,
         totalDurationMs = totalDurationMs,
         durationState = durationState,
         playbackStatus = playbackStatus,
-        hasDarkBackground = hasDarkBackground
+        hasDarkBackground = hasDarkBackground,
+        progressFractionProvider = progressFractionProvider
     )
 }
 

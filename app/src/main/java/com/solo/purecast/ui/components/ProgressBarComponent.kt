@@ -1,10 +1,8 @@
 package com.solo.purecast.ui.components
 
-import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
@@ -77,7 +75,8 @@ fun ProgressBarComponent(
     hasDarkBackground: Boolean = true,
     focusRequester: FocusRequester? = null,
     onPlayPauseClick: (() -> Unit)? = null,
-    playbackStatus: PlaybackStatus = PlaybackStatus.IDLE
+    playbackStatus: PlaybackStatus = PlaybackStatus.IDLE,
+    progressFractionProvider: (() -> Float)? = null
 ) {
     val isIdle = playbackStatus == PlaybackStatus.IDLE || playbackStatus == PlaybackStatus.STOPPED
     val rightLabelMode = resolveProgressRightLabel(
@@ -94,18 +93,12 @@ fun ProgressBarComponent(
 
     val trackHeight = 4.dp
 
-    val progressFraction = calculateProgressFraction(
+    // 💡 静态计算进度兜底值
+    val fallbackFraction = calculateProgressFraction(
         currentPositionMs = currentPositionMs,
         totalDurationMs = totalDurationMs,
         durationState = durationState,
         isIdle = isIdle
-    )
-
-    // 💡 500ms 线性平滑插值：消除 500ms 进度推送的阶跃顿挫感，实现 60fps 平滑推进
-    val animatedFraction by animateFloatAsState(
-        targetValue = progressFraction,
-        animationSpec = tween(durationMillis = 500, easing = LinearEasing),
-        label = "progressBarFractionAnim"
     )
 
     Column(
@@ -120,7 +113,7 @@ fun ProgressBarComponent(
                 .padding(vertical = 3.dp),
             contentAlignment = Alignment.CenterStart
         ) {
-            // 背景槽与高亮进度：完全在 Draw 阶段合成圆角填充，跳过 Compose Layout 重新测量
+            // 背景槽与高亮进度：完全在 Draw 阶段合成圆角填充，跳过 Compose Layout 重新测量与 double-interpolation 延迟
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -129,7 +122,8 @@ fun ProgressBarComponent(
                     .background(trackBgColor)
                     .drawWithContent {
                         drawContent()
-                        val fillWidth = size.width * animatedFraction.coerceIn(0f, 1f)
+                        val fraction = progressFractionProvider?.invoke() ?: fallbackFraction
+                        val fillWidth = size.width * fraction.coerceIn(0f, 1f)
                         if (fillWidth > 0f) {
                             val radius = size.height / 2f
                             drawRoundRect(
@@ -150,9 +144,12 @@ fun ProgressBarComponent(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            // 左侧已播放时间
+            // 左侧已播放时间 (基于秒级变化隔离重组，稳态下每秒仅重组 1 次)
+            val formattedCurrentTime = remember(currentPositionMs / 1000L) {
+                formatTimeMs(currentPositionMs)
+            }
             Text(
-                text = formatTimeMs(currentPositionMs),
+                text = formattedCurrentTime,
                 fontSize = 12.sp,
                 fontWeight = FontWeight.Medium,
                 color = currentTimeColor
