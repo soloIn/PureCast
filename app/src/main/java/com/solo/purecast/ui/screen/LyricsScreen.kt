@@ -106,6 +106,7 @@ fun LyricsScreen(
     metadata: TrackMetadata,
     playbackStatus: PlaybackStatus,
     coverData: Any?,
+    coverHash: Int = 0,
     hasDarkBackground: Boolean,
     onPlayPauseClick: () -> Unit,
     onPreviousClick: () -> Unit,
@@ -155,15 +156,15 @@ fun LyricsScreen(
     Row(
         modifier = modifier
             .fillMaxSize()
-            .padding(horizontal = 64.dp, vertical = 36.dp),
+            .padding(start = 64.dp, end = 36.dp, top = 36.dp, bottom = 36.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         // ==========================================
-        // 左侧 38%: 封面、歌曲元数据与播放控制栏 (水平居中)
+        // 左侧 40%: 封面、歌曲元数据与播放控制栏 (水平居中)
         // ==========================================
         Column(
             modifier = Modifier
-                .weight(0.38f)
+                .weight(0.40f)
                 .fillMaxHeight(),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center
@@ -171,7 +172,7 @@ fun LyricsScreen(
             val coverShape = RoundedCornerShape(16.dp)
             Box(
                 modifier = Modifier
-                    .fillMaxWidth(0.72f)
+                    .fillMaxWidth(0.84f)
                     .aspectRatio(1f)
                     .then(coverSharedModifier)
                     .graphicsLayer {
@@ -193,9 +194,17 @@ fun LyricsScreen(
                 contentAlignment = Alignment.Center
             ) {
                 if (coverData != null) {
-                    val coverRequest = remember(context, coverData) {
+                    val coverRequest = remember(context, coverData, coverHash) {
+                        val cacheKey = if (coverHash != 0) "cover_$coverHash" else null
                         ImageRequest.Builder(context)
                             .data(coverData)
+                            .apply {
+                                if (cacheKey != null) {
+                                    memoryCacheKey(cacheKey)
+                                    placeholderMemoryCacheKey(cacheKey)
+                                }
+                            }
+                            .crossfade(false)
                             .build()
                     }
                     AsyncImage(
@@ -304,11 +313,11 @@ fun LyricsScreen(
         Spacer(modifier = Modifier.width(24.dp))
 
         // ==========================================
-        // 右侧 62%: 沉浸巨幅歌词流与异常分支 (空间充裕防右侧文字裁切)
+        // 右侧 60%: 沉浸巨幅歌词流与异常分支 (空间充裕防右侧文字裁切)
         // ==========================================
         Box(
             modifier = Modifier
-                .weight(0.62f)
+                .weight(0.60f)
                 .fillMaxHeight(),
             contentAlignment = Alignment.Center
         ) {
@@ -390,37 +399,40 @@ private fun LyricsStreamView(
         }
     }
 
-    val targetOffsetPx = remember(density) {
-        with(density) { (-120).dp.roundToPx() }
-    }
-
-    // 💡 优化 4：滚动曲线定制。
-    // 通过 visibleItemsInfo 查找目标行的当前像素偏移 item.offset，
-    // 改用 animateScrollBy 配合 FastOutSlowInEasing，获得更具阻尼感的 Apple TV 级平滑滚动体验
+    // 💡 滚动曲线定制与垂直中间偏上对齐 (38% 黄金视线分割点)
+    // 动态计算目标行物理中心与视口 38% 高度差值，通过 animateScrollBy 配合 FastOutSlowInEasing，获得更具阻尼感的 Apple TV 级平滑滚动体验
     var lastScrolledLineIndex by remember { mutableIntStateOf(-1) }
     LaunchedEffect(activeLineIndex) {
         if (activeLineIndex in timeline.lines.indices) {
             val delta = abs(activeLineIndex - lastScrolledLineIndex)
             lastScrolledLineIndex = activeLineIndex
+            val viewportHeight = listState.layoutInfo.viewportSize.height
+            val targetCenterY = if (viewportHeight > 0) (viewportHeight * 0.38f) else with(density) { 240.dp.toPx() }
+
             if (delta > 2) {
                 // 💡 跨行寻道 (Seek) 或切歌大跨度跳变：立即瞬时定位对齐，杜绝缓慢滑行造成的滞后感
+                val topPaddingPx = with(density) { 180.dp.roundToPx() }
+                val scrollOffsetPx = (topPaddingPx - targetCenterY.toInt()).coerceAtLeast(0)
                 listState.scrollToItem(
                     index = activeLineIndex,
-                    scrollOffset = targetOffsetPx
+                    scrollOffset = scrollOffsetPx
                 )
             } else {
-                // 💡 正常逐句推进：高阻尼平滑动画过渡
+                // 💡 正常逐句推进：高阻尼平滑动画过渡，动态将高亮行物理中心平移对齐至垂直中间偏上 (38%)
                 val visibleItem = listState.layoutInfo.visibleItemsInfo.firstOrNull { it.index == activeLineIndex }
                 if (visibleItem != null) {
-                    val scrollDelta = (visibleItem.offset + targetOffsetPx).toFloat()
+                    val currentCenter = visibleItem.offset + visibleItem.size / 2
+                    val scrollDelta = currentCenter - targetCenterY
                     listState.animateScrollBy(
                         value = scrollDelta,
                         animationSpec = tween(durationMillis = 480, easing = FastOutSlowInEasing)
                     )
                 } else {
+                    val topPaddingPx = with(density) { 180.dp.roundToPx() }
+                    val scrollOffsetPx = (topPaddingPx - targetCenterY.toInt()).coerceAtLeast(0)
                     listState.animateScrollToItem(
                         index = activeLineIndex,
-                        scrollOffset = targetOffsetPx
+                        scrollOffset = scrollOffsetPx
                     )
                 }
             }
@@ -457,7 +469,7 @@ private fun LyricsStreamView(
     ) {
         LazyColumn(
             state = listState,
-            contentPadding = PaddingValues(start = 0.dp, top = 180.dp, end = 32.dp, bottom = 220.dp),
+            contentPadding = PaddingValues(start = 0.dp, top = 180.dp, end = 0.dp, bottom = 220.dp),
             verticalArrangement = Arrangement.spacedBy(28.dp),
             modifier = Modifier.fillMaxSize()
         ) {
@@ -535,7 +547,7 @@ private fun SmoothLyricLineRow(
 
     Column(
         modifier = modifier
-            .fillMaxWidth(0.92f) // 💡 预留 8% 物理余量，确保 1.08x 放大时文字右侧绝不超出视口被裁剪
+            .fillMaxWidth(0.925f) // 💡 预留 7.5% 物理余量 (0.925 * 1.08 = 0.999)，确保 1.08x 放大时文字右侧绝不超出视口被裁剪，且多容纳 2~3 个大号汉字
             .graphicsLayer {
                 scaleX = animatedScale
                 scaleY = animatedScale

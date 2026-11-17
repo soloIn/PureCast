@@ -410,6 +410,7 @@ fun MainTvScreen(
                         metadata = metadata,
                         playbackStatus = playbackStatus,
                         coverData = persistentCover,
+                        coverHash = persistentCoverHash,
                         hasDarkBackground = hasDarkBackground,
                         onPlayPauseClick = onTogglePlayPause,
                         onPreviousClick = onPreviousTrack,
@@ -474,9 +475,17 @@ fun MainTvScreen(
                                 label = "coverCrossfade"
                             ) { (_, resolvedCover) ->
                                 if (resolvedCover != null) {
-                                    val coverRequest = remember(context, resolvedCover) {
+                                    val coverRequest = remember(context, resolvedCover, persistentCoverHash) {
+                                        val cacheKey = if (persistentCoverHash != 0) "cover_$persistentCoverHash" else null
                                         ImageRequest.Builder(context)
                                             .data(resolvedCover)
+                                            .apply {
+                                                if (cacheKey != null) {
+                                                    memoryCacheKey(cacheKey)
+                                                    placeholderMemoryCacheKey(cacheKey)
+                                                }
+                                            }
+                                            .crossfade(false)
                                             .build()
                                     }
                                     AsyncImage(

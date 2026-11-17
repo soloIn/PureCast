@@ -97,8 +97,12 @@ class LyricsSyncClock(
             anchorNanoTime = if (newPositionMs == 0L) nowNanoTime + 100_000_000L else nowNanoTime
         } else {
             // 正常连续推流更新基准：加入 50ms 负向微抖动保护，防止网络或调度偶发抖动引发扫光顿挫
+            // 💡 若仍处于 100ms 预充期 (newPositionMs == 0L 且 nowNanoTime < anchorNanoTime)，保留未来锚点不被提前覆盖
+            val isPrefillStillPending = (newPositionMs == 0L && nowNanoTime < anchorNanoTime)
             reportedPositionMs = maxOf(newPositionMs, currentEstimatedTime - 50L)
-            anchorNanoTime = nowNanoTime
+            if (!isPrefillStillPending) {
+                anchorNanoTime = nowNanoTime
+            }
         }
 
         isPlaying = playing
@@ -116,14 +120,18 @@ class LyricsSyncClock(
         // 💡 nowNanoTime 可能早于 anchorNanoTime (当处于 100ms 硬件预充期时)，此时推演增量钳制为 0
         val elapsedNano = nowNanoTime - anchorNanoTime
         if (elapsedNano <= 0L) {
-            return reportedPositionMs
+            val monotonic = maxOf(lastInterpolatedTimeMs, reportedPositionMs)
+            lastInterpolatedTimeMs = monotonic
+            return monotonic
         }
         val elapsedMs = elapsedNano / 1_000_000L
         val extrapolatedMs = elapsedMs.coerceIn(0L, maxExtrapolationMs)
         val calculated = reportedPositionMs + extrapolatedMs
 
-        lastInterpolatedTimeMs = calculated
-        return calculated
+        // 💡 保证非寻道期间推演时钟绝对单调不倒退：当底层上报因调度略微落后时，原地微等几十毫秒待其追平，绝不逆向回跳
+        val monotonic = maxOf(lastInterpolatedTimeMs, calculated)
+        lastInterpolatedTimeMs = monotonic
+        return monotonic
     }
 
     /**
