@@ -145,6 +145,12 @@ bool FlacDecoder::decode_stream(
     const unsigned int bits = pFlac->bitsPerSample;
     const unsigned int channels = pFlac->channels;
 
+    const bool is_24bit = (bits > 16);
+    std::vector<drflac_int32> pcm32_frames(is_24bit ? FRAMES_PER_READ * channels : 0);
+    std::vector<drflac_int16> pcm16_frames(is_24bit ? 0 : FRAMES_PER_READ * channels);
+    std::vector<uint8_t> pcm24_bytes(is_24bit ? FRAMES_PER_READ * channels * 3 : 0);
+    const size_t bytes_per_frame = channels * (is_24bit ? 3U : sizeof(drflac_int16));
+
     auto write_pcm_chunk = [&](const uint8_t* data, size_t bytes_to_write) -> bool {
         size_t written_total = 0;
         while (written_total < bytes_to_write && AudioEngine::instance().is_running()) {
@@ -166,6 +172,10 @@ bool FlacDecoder::decode_stream(
             );
             if (n > 0) {
                 written_total += static_cast<size_t>(n);
+                // 💡 修复时序竞态与块粒度阶跃：每当向 ring_buffer_ 实际写入 n 字节，立即原子同步累加已解码帧数
+                if (bytes_per_frame > 0) {
+                    s_flac_decoded_frames.fetch_add(static_cast<int64_t>(n / bytes_per_frame), std::memory_order_release);
+                }
                 if (!first_pcm_notified) {
                     first_pcm_notified = true;
                     if (on_first_pcm_written) on_first_pcm_written(user_data);
@@ -181,12 +191,6 @@ bool FlacDecoder::decode_stream(
         }
         return written_total == bytes_to_write;
     };
-
-    const bool is_24bit = (bits > 16);
-    std::vector<drflac_int32> pcm32_frames(is_24bit ? FRAMES_PER_READ * channels : 0);
-    std::vector<drflac_int16> pcm16_frames(is_24bit ? 0 : FRAMES_PER_READ * channels);
-    std::vector<uint8_t> pcm24_bytes(is_24bit ? FRAMES_PER_READ * channels * 3 : 0);
-    const size_t bytes_per_frame = channels * (is_24bit ? 3U : sizeof(drflac_int16));
 
     while (AudioEngine::instance().is_running() && !aborted_by_epoch) {
         if (AudioEngine::instance().get_current_buffer_epoch() != stream_epoch) {
@@ -226,9 +230,7 @@ bool FlacDecoder::decode_stream(
             raw_bytes = reinterpret_cast<const uint8_t*>(pcm16_frames.data());
         }
 
-        if (write_pcm_chunk(raw_bytes, frames_read * bytes_per_frame)) {
-            s_flac_decoded_frames.fetch_add(frames_read, std::memory_order_relaxed);
-        }
+        write_pcm_chunk(raw_bytes, frames_read * bytes_per_frame);
     }
 
     drflac_close(pFlac);

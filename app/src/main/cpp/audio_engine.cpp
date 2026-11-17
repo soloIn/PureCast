@@ -1330,15 +1330,21 @@ size_t AudioEngine::get_buffer_capacity() const {
 
 size_t AudioEngine::get_available_read() const {
     ScopedActiveWriter writer_guard(active_writers_);
-    return (is_running_.load(std::memory_order_seq_cst) && ring_buffer_) ? ring_buffer_->available_read() : 0;
-}
-
-int64_t AudioEngine::get_ring_buffer_delay_ms() const {
-    ScopedActiveWriter writer_guard(active_writers_);
     if (!is_running_.load(std::memory_order_seq_cst) || !ring_buffer_) {
         return 0;
     }
-    const size_t unconsumed_bytes = ring_buffer_->available_read();
+    // 💡 修复 FLUSH 后跨线程读取旧流残留水位：若当前正处于 Flushing 冲刷或消费端尚未追平最新世代，旧流已被作废，返回 0
+    if (is_flushing_until_reroll() || (consumed_epoch_.load(std::memory_order_acquire) != get_current_buffer_epoch())) {
+        return 0;
+    }
+    return ring_buffer_->available_read();
+}
+
+int64_t AudioEngine::get_ring_buffer_delay_ms() const {
+    const size_t unconsumed_bytes = get_available_read();
+    if (unconsumed_bytes == 0) {
+        return 0;
+    }
     const int sr = current_sample_rate_;
     const int ch = current_channels_;
     const int bd = current_bit_depth_;

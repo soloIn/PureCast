@@ -33,6 +33,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -604,6 +605,7 @@ fun MainTvScreen(
                         Spacer(modifier = Modifier.height(32.dp))
 
                         IsolatedProgressBar(
+                            syncClock = lyricsSyncClock,
                             totalDurationMs = metadata.durationMs,
                             durationState = metadata.durationState,
                             seekCapability = metadata.seekCapability,
@@ -658,10 +660,11 @@ fun MainTvScreen(
 }
 
 /**
- * 💡 辅助组件：隔离 500ms 高频播放进度重组范围至叶子组件，避免触发主屏幕全量重绘
+ * 💡 辅助组件：主屏进度条组件，接入 LyricsSyncClock 单调高频插值 (60fps)，杜绝 500ms 离散跳动并与歌词大屏毫秒级完全对齐
  */
 @Composable
 private fun IsolatedProgressBar(
+    syncClock: LyricsSyncClock,
     totalDurationMs: Long,
     durationState: DurationState,
     seekCapability: SeekCapability,
@@ -670,10 +673,24 @@ private fun IsolatedProgressBar(
     onPlayPauseClick: () -> Unit,
     onSeekTo: (Long) -> Unit = {}
 ) {
-    val currentSnapshot by remember { PlaybackService.sessionSnapshot }.collectAsState()
-    val servicePositionMs = currentSnapshot.progressPositionMs
+    var interpolatedPositionMs by remember { mutableLongStateOf(0L) }
+    val isPlaying = playbackStatus == PlaybackStatus.PLAYING
 
-    val clampedPosition = if (totalDurationMs > 0) servicePositionMs.coerceIn(0L, totalDurationMs) else servicePositionMs
+    LaunchedEffect(isPlaying) {
+        if (isPlaying) {
+            while (true) {
+                withFrameNanos {
+                    interpolatedPositionMs = syncClock.getCurrentInterpolatedTimeMs()
+                }
+            }
+        } else {
+            interpolatedPositionMs = syncClock.getCurrentInterpolatedTimeMs()
+        }
+    }
+
+    val currentSnapshot by remember { PlaybackService.sessionSnapshot }.collectAsState()
+    val displayPosition = if (isPlaying) interpolatedPositionMs else currentSnapshot.progressPositionMs
+    val clampedPosition = if (totalDurationMs > 0) displayPosition.coerceIn(0L, totalDurationMs) else displayPosition
 
     ProgressBarComponent(
         currentPositionMs = clampedPosition,

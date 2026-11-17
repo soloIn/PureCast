@@ -413,11 +413,14 @@ class PlaybackServiceSessionHost(
             prev.sessionId != next.sessionId ||
             prev.trackGeneration != next.trackGeneration ||
             prev.businessState != next.businessState ||
-            (isProtocolProgressUpdate && prev.progressPositionMs != next.progressPositionMs)
+            isFirstPlayAtZero ||
+            (isProtocolProgressUpdate && (prev.progressPositionMs != next.progressPositionMs || next.progressPositionMs == 0L))
         ) {
             lastAnchorPosMs = next.progressPositionMs
-            // 💡 保持与 iPhone 单调时间完全一致，以当前物理时钟为唯一定位锚点
-            lastAnchorClockMs = clockMs()
+            // 💡 修复 FirstDataPacketEvent 早于 DAC 真实出声 100ms：
+            // 首帧写入环形缓冲区触发 PLAYING 时，声卡正处于 100ms 预充阶段，将时钟锚点精准推迟 100ms，
+            // 确保进度走字与扬声器真实出声毫秒级完美同步；正常协议进度包则以当前物理时钟对齐。
+            lastAnchorClockMs = if (isFirstPlayAtZero) clockMs() + 100L else clockMs()
         }
 
         val needTicker = next.activeProtocol == StreamProtocol.AIRPLAY_1 &&

@@ -116,11 +116,11 @@ fun LyricsScreen(
         verticalAlignment = Alignment.CenterVertically
     ) {
         // ==========================================
-        // 左侧 45%: 封面、歌曲元数据与播放控制栏 (水平居中)
+        // 左侧 38%: 封面、歌曲元数据与播放控制栏 (水平居中)
         // ==========================================
         Column(
             modifier = Modifier
-                .weight(0.45f)
+                .weight(0.38f)
                 .fillMaxHeight(),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center
@@ -249,14 +249,14 @@ fun LyricsScreen(
             }
         }
 
-        Spacer(modifier = Modifier.width(36.dp))
+        Spacer(modifier = Modifier.width(24.dp))
 
         // ==========================================
-        // 右侧 55%: 沉浸巨幅歌词流与异常分支
+        // 右侧 62%: 沉浸巨幅歌词流与异常分支 (空间充裕防右侧文字裁切)
         // ==========================================
         Box(
             modifier = Modifier
-                .weight(0.55f)
+                .weight(0.62f)
                 .fillMaxHeight(),
             contentAlignment = Alignment.Center
         ) {
@@ -382,7 +382,7 @@ private fun LyricsStreamView(
     ) {
         LazyColumn(
             state = listState,
-            contentPadding = PaddingValues(top = 180.dp, bottom = 220.dp),
+            contentPadding = PaddingValues(start = 0.dp, top = 180.dp, end = 32.dp, bottom = 220.dp),
             verticalArrangement = Arrangement.spacedBy(28.dp),
             modifier = Modifier.fillMaxSize()
         ) {
@@ -463,7 +463,7 @@ private fun SmoothLyricLineRow(
 
     Column(
         modifier = modifier
-            .fillMaxWidth()
+            .fillMaxWidth(0.92f) // 💡 预留 8% 物理余量，确保 1.08x 放大时文字右侧绝不超出视口被裁剪
             .graphicsLayer {
                 scaleX = animatedScale
                 scaleY = animatedScale
