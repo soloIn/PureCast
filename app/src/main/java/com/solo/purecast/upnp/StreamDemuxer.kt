@@ -273,12 +273,12 @@ class StreamDemuxer(
                             val bytesRead = inputStream.read(pcmBuffer, 0, pcmBuffer.size)
                             if (bytesRead == -1) break
                             if (bytesRead > 0) {
-                                totalBytesStreamed += bytesRead
                                 var offset = 0
                                 var remaining = bytesRead
                                 while (remaining > 0 && isActive && isDemuxing && thisSession == sessionToken.get()) {
                                     val written = audioGateway.writePcm(pcmBuffer, offset, remaining, seekEpoch)
                                     if (written > 0) {
+                                        totalBytesStreamed += written // 💡 仅在实际写入环形缓冲区后累加，杜绝预累加引发的 ~186ms 进度抖动
                                         if (!seekFirstPacketEmitted) {
                                             seekFirstPacketEmitted = true
                                             onFirstDataPacket(seekEpoch, currentSpec) // 💡 P0-2 修复：寻道后首帧通知解除 TRANSITIONING 并取消 5s 看门狗
@@ -559,13 +559,13 @@ class StreamDemuxer(
                         }
 
                         if (bytesRead > 0) {
-                            totalBytesStreamed += bytesRead
                             var offset = 0
                             var remaining = bytesRead
                             while (remaining > 0 && isActive && isDemuxing && thisSession == sessionToken.get()) {
                                 val currentEp = this@StreamDemuxer.acquiredEpoch
                                 val written = audioGateway.writePcm(pcmBuffer, offset, remaining, currentEp)
                                 if (written > 0) {
+                                    totalBytesStreamed += written // 💡 仅在实际写入环形缓冲区后累加，杜绝预累加引发的 ~186ms 进度抖动
                                     if (!firstPacketEmitted) {
                                         firstPacketEmitted = true
                                         onFirstDataPacket(currentEp, spec)

@@ -109,6 +109,17 @@ public:
 
     [[nodiscard]] size_t get_available_read() const;
 
+    /**
+     * 💡 获取当前环形缓冲区中尚未被 USB 等时线程消费的有效 PCM 字节数 (与 get_available_read 等价)
+     */
+    [[nodiscard]] size_t get_unconsumed_bytes() const { return get_available_read(); }
+
+    /**
+     * 💡 获取当前环形缓冲区中尚未消费数据对应的硬件物理输出延迟 (毫秒)
+     * 基于当前实际运行的采样率、位深与声道数实时换算，供 UI 进度与歌词时钟进行毫秒级精确扣除。
+     */
+    [[nodiscard]] int64_t get_ring_buffer_delay_ms() const;
+
 private:
     void event_thread_func();
     static void LIBUSB_CALL isoc_transfer_cb(struct libusb_transfer* transfer);
@@ -183,9 +194,9 @@ private:
     std::atomic<bool> feedback_locked_{false};   // 是否已成功完成首次硬件时钟锁定
     uint32_t phase_accumulator_{0};              // 16.16 相位累加器 (仅消费线程修改)
 
-    int current_sample_rate_{44100};
-    int current_bit_depth_{16};
-    int current_channels_{2};
+    std::atomic<int> current_sample_rate_{44100};
+    std::atomic<int> current_bit_depth_{16};
+    std::atomic<int> current_channels_{2};
     size_t packet_size_{0};
 
     // 💡 Bresenham 时钟步进参数 (仅消费线程与 pipeline 初始化边界修改)

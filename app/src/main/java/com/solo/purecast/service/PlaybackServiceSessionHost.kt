@@ -409,16 +409,29 @@ class PlaybackServiceSessionHost(
         val isFirstPlayAtZero = prev?.businessState != next.businessState &&
             next.businessState == BusinessSessionState.PLAYING &&
             next.progressPositionMs == 0L
-        if (prev == null ||
+
+        // 💡 开播保护：在当前曲目开播前 3.5 秒内，若协议上报的极小进度 (<= 1500ms) 比当前服务已走字进度落后，不得逆向倒拉锚点
+        val currentServiceElapsed = (nowMs - lastAnchorClockMs).coerceAtLeast(0L)
+        val currentServicePos = lastAnchorPosMs + currentServiceElapsed
+        val isInitialProtocolLag = prev != null &&
+            prev.trackGeneration == next.trackGeneration &&
+            prev.businessState == BusinessSessionState.PLAYING &&
+            currentServicePos in 1L..3500L &&
+            next.progressPositionMs in 0L..1500L &&
+            next.progressPositionMs < currentServicePos
+
+        if (!isInitialProtocolLag && (prev == null ||
             prev.sessionId != next.sessionId ||
             prev.trackGeneration != next.trackGeneration ||
             prev.businessState != next.businessState ||
-            (isProtocolProgressUpdate && prev.progressPositionMs != next.progressPositionMs)
-        ) {
+            isFirstPlayAtZero ||
+            (isProtocolProgressUpdate && (prev.progressPositionMs != next.progressPositionMs || next.progressPositionMs == 0L))
+        )) {
             lastAnchorPosMs = next.progressPositionMs
-            // 💡 修复 Finding 6: 刚开播 (pos=0ms) 时声卡存在约 600ms 的物理排队延迟 (100ms 预充 + 50ms Warmup + 64ms URB + 缓冲)，
-            // 延迟 600ms 启动计时走字，确保电视进度条与扬声器真正出声及 iPhone 同步
-            lastAnchorClockMs = if (isFirstPlayAtZero) clockMs() + 600L else clockMs()
+            // 💡 修复 FirstDataPacketEvent 早于 DAC 真实出声 100ms：
+            // 首帧写入环形缓冲区触发 PLAYING 时，声卡正处于 100ms 预充阶段，将时钟锚点精准推迟 100ms，
+            // 确保进度走字与扬声器真实出声毫秒级完美同步；正常协议进度包则以当前物理时钟对齐。
+            lastAnchorClockMs = if (isFirstPlayAtZero) clockMs() + 100L else clockMs()
         }
 
         val needTicker = next.activeProtocol == StreamProtocol.AIRPLAY_1 &&

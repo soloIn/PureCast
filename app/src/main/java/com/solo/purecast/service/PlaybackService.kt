@@ -27,12 +27,20 @@ import androidx.lifecycle.lifecycleScope
 import com.solo.purecast.R
 import com.solo.purecast.airplay.AirPlayServerManager
 import com.solo.purecast.core.audio.AudioFocusManager
+import com.solo.purecast.core.lyrics.LyricsTriggerManager
 import com.solo.purecast.core.session.HardwareFastPathController
 import com.solo.purecast.core.session.PlaybackSessionCoordinator
 import com.solo.purecast.core.session.ProtocolResumeReopenResult
 import com.solo.purecast.core.usb.UsbDeviceManager
 import com.solo.purecast.data.SettingsRepository
+import com.solo.purecast.data.lyrics.LyricsCacheRepository
+import com.solo.purecast.data.lyrics.LyricsWaterfallFetcher
+import com.solo.purecast.data.lyrics.remote.AmllDataSource
+import com.solo.purecast.data.lyrics.remote.DefaultLyricsHttpClient
+import com.solo.purecast.data.lyrics.remote.LrclibDataSource
+import com.solo.purecast.data.lyrics.remote.NeteaseDataSource
 import com.solo.purecast.model.ErrorCode
+import com.solo.purecast.model.LyricUiState
 import com.solo.purecast.model.PlaybackStatus
 import com.solo.purecast.model.PlayerSessionSnapshot
 import com.solo.purecast.model.SeekCapability
@@ -73,6 +81,7 @@ class PlaybackService : LifecycleService() {
     private lateinit var settingsRepository: SettingsRepository
     private lateinit var coordinator: PlaybackSessionCoordinator
     private lateinit var sessionHost: PlaybackServiceSessionHost
+    private lateinit var lyricsTriggerManager: LyricsTriggerManager
 
     private val fastPath = HardwareFastPathController.default
 
@@ -248,10 +257,37 @@ class PlaybackService : LifecycleService() {
             clockMs = { SystemClock.elapsedRealtime() }
         )
 
-        // 💡 单向发布不可变全局快照，必须在发起硬件扫描前启动观察
+        // 💡 初始化歌词多源检索与生命周期防抖触发器 (U4, U7)
+        val lyricsCacheRepo = LyricsCacheRepository(
+            diskCacheDir = java.io.File(cacheDir, "lyrics")
+        )
+        val lyricsHttpClient = DefaultLyricsHttpClient()
+        val amllSource = AmllDataSource(lyricsHttpClient)
+        val lrclibSource = LrclibDataSource(lyricsHttpClient)
+        val neteaseSource = NeteaseDataSource(lyricsHttpClient)
+        val waterfallFetcher = LyricsWaterfallFetcher(
+            cacheRepository = lyricsCacheRepo,
+            amllDataSource = amllSource,
+            lrclibDataSource = lrclibSource,
+            neteaseDataSource = neteaseSource
+        )
+        lyricsTriggerManager = LyricsTriggerManager(
+            scope = lifecycleScope,
+            cacheRepository = lyricsCacheRepo,
+            waterfallFetcher = waterfallFetcher
+        )
+
+        lifecycleScope.launch {
+            lyricsTriggerManager.lyricUiState.collect { state ->
+                _lyricsUiState.value = state
+            }
+        }
+
+        // 💡 单向发布不可变全局快照与驱动歌词生命周期，必须在发起硬件扫描前启动观察
         lifecycleScope.launch {
             coordinator.snapshot.collect { snap ->
                 _sessionSnapshot.value = snap
+                lyricsTriggerManager.onSessionSnapshotChanged(snap)
             }
         }
         sessionHost.startObserving()
@@ -861,6 +897,9 @@ class PlaybackService : LifecycleService() {
         if (::audioFocusManager.isInitialized) {
             audioFocusManager.abandonFocus()
         }
+        if (::lyricsTriggerManager.isInitialized) {
+            lyricsTriggerManager.reset()
+        }
         if (::usbDeviceManager.isInitialized) {
             usbDeviceManager.destroy()
         }
@@ -904,6 +943,9 @@ class PlaybackService : LifecycleService() {
 
         private val _sessionSnapshot = MutableStateFlow(PlayerSessionSnapshot())
         val sessionSnapshot: StateFlow<PlayerSessionSnapshot> = _sessionSnapshot.asStateFlow()
+
+        private val _lyricsUiState = MutableStateFlow<LyricUiState>(LyricUiState.Idle)
+        val lyricsUiState: StateFlow<LyricUiState> = _lyricsUiState.asStateFlow()
 
         fun start(context: Context, attachedUsbDevice: UsbDevice? = null) {
             val intent = Intent(context, PlaybackService::class.java).apply {

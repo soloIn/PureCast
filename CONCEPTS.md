@@ -73,3 +73,29 @@ A flow control degradation pattern in network audio jitter buffers where, under 
 ### Sequence Number Re-anchoring
 A resynchronization procedure in real-time UDP audio receivers where, following an extended pause exceeding the 16-bit sequence difference boundary ($2^{15} = 32768$ packets), the jitter buffer is explicitly reset upon the arrival of the first non-silent audio packet to establish a new monotonic sequence baseline (`first_packet_ = true`), preventing signed integer overflow (`int16_t` wrapping negative) from discarding valid incoming stream packets as out-of-order drops.
 *Aliases: 序号重锚定, 时钟基准重置*
+
+### Strict Waterfall Lyrics Fallback
+A sequential network retrieval hierarchy for lyric metadata that queries L1 memory cache, L2 disk cache, AMLL TTML DB (1.5s timeout), LRCLIB exact match (1.5s timeout), and LRCLIB fuzzy search (2.0s timeout) strictly one stage at a time, minimizing TV network connection load and thread exhaustion while maintaining syllable-level TTML quality prioritization.
+*Aliases: 严格瀑布流歌词降级, 阶梯式多源歌词检索*
+
+### Monotonic Clock Frame Interpolation
+A high-frequency rendering clock synchronization algorithm for big-screen lyric displays that bridges low-frequency player progress updates (500ms~1000ms) with 60fps/120fps VSYNC frame presentation by linearly extrapolating elapsed time using `SystemClock.elapsedRealtime()`, capped by a protective upper limit to eliminate line-scroll stutter and enable smooth syllable-level karaoke sweeping.
+*Aliases: 单调时钟帧间平滑插值, 歌词高频时钟外推*
+
+### Seek Deadband Suppressor
+A temporal hysteresis gate in lyric rendering time synchronization that establishes a 250ms deadband window immediately following a coarse seek or timestamp jump ($|\Delta t| > 1500\text{ms}$), suppressing backward-sliding jitter packets caused by network buffering readjustments and preventing visual oscillation or text bouncing.
+*Aliases: 寻道回弹抑制死区, 时间戳跳变滞后滤波*
+
+### Immersive Lyrics Screen Expansion
+A 10-Foot UI presentation paradigm adapted from Apple Music for Android TV, where a dedicated subtitle/lyrics control button in the primary playback controls initiates a spring-animated transition between the standard 42%/58% cover-dominant screen and a 35%/65% lyrics-dominant view featuring active line enlargement, dynamic syllable sweep, and dual-language secondary translation.
+*Aliases: Apple Music TV 风格大屏歌词展开, 沉浸式双模歌词交互*
+
+### Golden Ratio Lyrics Viewport
+A 10-Foot UI viewing ergonomics rule in Android TV lyric streams that anchors the currently sung lyric line at exactly 38% from the top of the viewport rather than 50% dead center, aligning with the human eye's natural rest angle on large elevated displays (65-85 inch TV at a 2.5-4m viewing distance) and dynamically adjusting `LazyColumn` contentPadding (`targetCenterY - halfItemHeight`) to ensure edge lines scroll smoothly to the anchor without hitting rigid scroll boundaries.
+*Aliases: 38% 黄金视线分割点, 歌词黄金视线锚定*
+
+### Zero-Recomposition Syllable Sweep
+A 60fps/120fps hardware-accelerated text rendering architecture for syllable-level karaoke lyrics in Compose TV. It completely bypasses Compose layout and recomposition cycles during continuous time updates by deferring timeline querying to the `drawWithContent` phase (`currentTimeProvider`), segmenting multi-line wrapped text by visual layout lines (`layoutResult.getLineForOffset`), and applying zero-allocation direct rectangle fill (`drawRect(color)`) or single-pass horizontal gradient brushes purely in the native GPU rendering pipeline.
+*Aliases: 纯 Draw 阶段零重组逐字扫光, 无分配卡拉OK扫光*
+
+

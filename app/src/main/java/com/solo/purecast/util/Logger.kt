@@ -40,4 +40,5 @@ object Logger {
     val airplay = Category("AirPlay")
     val service = Category("Service")
     val ui = Category("UI")
+    val lyrics = Category("Lyrics")
 }

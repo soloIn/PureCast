@@ -719,17 +719,21 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
                                 const long jitter_delay_ms = static_cast<long>(rtp_.buffered_jitter_packets() * 352 * 1000ULL / rate);
                                 const long total_latency_ms = ring_delay_ms + jitter_delay_ms;
 
+                                // 💡 AirPlay 预充时钟契约：
+                                // 在 AirPlay 1 协议中，iOS 会在上一曲即将结束前提前约 2 秒开始通过 RTP 传输新曲目并下发 SET_PARAMETER progress。
+                                // 此时 start_ts 为未来实际开播时间点，呈现 curr_ts < start_ts (is_initial_queueing = true)。
+                                // 若此时上报 0ms，会导致 Kotlin UI 层的进度条和歌词时钟在上一曲尚未唱完时被瞬间拉回 0ms 造成严重闪退与跳跃。
+                                // 跨层通信契约：当 is_initial_queueing 为真时，显式向 JNI 回调传递 pos_ms = -1L；
+                                // Kotlin 端 AirPlayNativeEventDispatcher 依据 positionMs >= 0L 守卫仅记录总时长 dur_ms，
+                                // 严格忽略 positionMs 更新，保护上一曲平稳播毕，实现毫秒级无缝切曲衔接！
                                 const bool is_initial_queueing = (curr_ts < start_ts);
                                 const long raw_pos_ms = is_initial_queueing ? 0L : static_cast<long>((curr_ts - start_ts) * 1000ULL / rate);
 
-                                // 💡 修复 Finding 5: 当 curr_ts < start_ts 或 raw_pos_ms < total_latency_ms 时，
-                                // 说明首帧尚在本地缓冲区排队尚未出声。此时上报 pos_ms = -1L 仅校准总时长 dur_ms，绝不覆写当前走字进度
-                                const long pos_ms = (is_initial_queueing || raw_pos_ms < total_latency_ms)
-                                    ? -1L
-                                    : (raw_pos_ms - total_latency_ms);
+                                // 💡 直接对齐 iPhone 下发的 SET_PARAMETER progress 绝对呈现时间，杜绝重复扣除硬件时延导致的进度落后与跳变
+                                const long pos_ms = is_initial_queueing ? -1L : std::max(0L, raw_pos_ms);
 
-                                LOGD("AirPlay %s进度实时校准: raw_pos=%ld ms, latency=%ld ms (ring=%ld, jitter=%ld), pos=%ld ms, dur=%ld ms (RTP: %s)",
-                                     has_valid_duration ? "" : "直播流", raw_pos_ms, total_latency_ms, ring_delay_ms, jitter_delay_ms, pos_ms, dur_ms, prog_val.c_str());
+                                LOGD("AirPlay %s进度实时校准: raw_pos=%ld ms, pos=%ld ms, dur=%ld ms (RTP: %s)",
+                                     has_valid_duration ? "" : "直播流", raw_pos_ms, pos_ms, dur_ms, prog_val.c_str());
                                 rtp_.update_track_progress(pos_ms, dur_ms);
                                 if (progress_cb_) {
                                     progress_cb_(active_session_id_.load(std::memory_order_acquire), next_seq(), pos_ms, dur_ms);

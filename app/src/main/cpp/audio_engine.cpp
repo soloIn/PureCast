@@ -812,7 +812,9 @@ int64_t AudioEngine::reconfigure_audio_format(int sample_rate, int bit_depth, in
     }
 
     LOGI("开始 UAC 原位三元组切频: %dHz/%dbit/%dch -> %dHz/%dbit/%dch",
-         current_sample_rate_, current_bit_depth_, current_channels_,
+         current_sample_rate_.load(std::memory_order_relaxed),
+         current_bit_depth_.load(std::memory_order_relaxed),
+         current_channels_.load(std::memory_order_relaxed),
          sample_rate, bit_depth, channels);
 
     const uac::AudioEndpointInfo prev_endpoint = endpoint_info_;
@@ -1330,7 +1332,34 @@ size_t AudioEngine::get_buffer_capacity() const {
 
 size_t AudioEngine::get_available_read() const {
     ScopedActiveWriter writer_guard(active_writers_);
-    return (is_running_.load(std::memory_order_seq_cst) && ring_buffer_) ? ring_buffer_->available_read() : 0;
+    if (!is_running_.load(std::memory_order_seq_cst) || !ring_buffer_) {
+        return 0;
+    }
+    // 💡 修复 FLUSH 后跨线程读取旧流残留水位：仅保留消费端世代追平判断，移除 is_flushing_until_reroll()。
+    // 杜绝开播首包写入后由于 flushing_until_reroll_ 为 true 而被误判返回 0 导致进度时钟来回回跳与倒退。
+    if (consumed_epoch_.load(std::memory_order_acquire) != get_current_buffer_epoch()) {
+        return 0;
+    }
+    return ring_buffer_->available_read();
+}
+
+int64_t AudioEngine::get_ring_buffer_delay_ms() const {
+    const size_t unconsumed_bytes = get_available_read();
+    if (unconsumed_bytes == 0) {
+        return 0;
+    }
+    const int sr = current_sample_rate_.load(std::memory_order_acquire);
+    const int ch = current_channels_.load(std::memory_order_acquire);
+    const int bd = current_bit_depth_.load(std::memory_order_acquire);
+    if (sr <= 0 || ch <= 0 || bd <= 0) {
+        return 0;
+    }
+    const size_t bytes_per_sample = static_cast<size_t>(bd / 8);
+    const size_t bytes_per_sec = static_cast<size_t>(sr) * static_cast<size_t>(ch) * bytes_per_sample;
+    if (bytes_per_sec == 0) {
+        return 0;
+    }
+    return static_cast<int64_t>((unconsumed_bytes * 1000ULL) / bytes_per_sec);
 }
 
 } // namespace purecast

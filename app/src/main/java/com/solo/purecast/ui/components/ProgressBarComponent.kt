@@ -28,9 +28,12 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.key.onPreviewKeyEvent
@@ -55,9 +58,15 @@ internal sealed interface ProgressRightLabelMode {
 
 /**
  * 💡 PureCast 纤细圆角进度条与时间轴组件 (ProgressBarComponent)
- * 1. 轨道高度默认为 4dp，纯展示状态指示，完全禁用焦点捕获与点击/Seek 交互。
+ * 1. 轨道高度默认为 4dp，纯展示状态指示，完全运行于 GPU Draw 阶段 (0 Layout 测量开销)。
  * 2. 悬浮对比度保护：轨道底槽采用高透半白 [Color(0x40FFFFFF)]，填充条使用高纯亮白 [Color.White]，在任意流光背景下清晰可见。
  * 3. 左侧展示当前播放时间 (mm:ss)，右侧依据 [DurationState] 展示总时长、"等待投屏接入"、"--:--" 或实时流 "LIVE / 实时直通" 状态。
+ * 4. 兼容性提示：[onSeek], [onSeekImmediate], [focusRequester], [onPlayPauseClick] 为历史交互留存形参，当前统一由遥控器主控区接管。
+ * @param seekCapability [已废弃] ProgressBar 已降级为纯展示绘制控件，交互由 PlaybackControls 接管
+ * @param onSeek [已废弃] 交互由 PlaybackControls 接管
+ * @param onSeekImmediate [已废弃] 交互由 PlaybackControls 接管
+ * @param focusRequester [已废弃] 不再请求焦点
+ * @param onPlayPauseClick [已废弃] 交互由 PlaybackControls 接管
  */
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
@@ -72,7 +81,8 @@ fun ProgressBarComponent(
     hasDarkBackground: Boolean = true,
     focusRequester: FocusRequester? = null,
     onPlayPauseClick: (() -> Unit)? = null,
-    playbackStatus: PlaybackStatus = PlaybackStatus.IDLE
+    playbackStatus: PlaybackStatus = PlaybackStatus.IDLE,
+    progressFractionProvider: (() -> Float)? = null
 ) {
     val isIdle = playbackStatus == PlaybackStatus.IDLE || playbackStatus == PlaybackStatus.STOPPED
     val rightLabelMode = resolveProgressRightLabel(
@@ -89,7 +99,8 @@ fun ProgressBarComponent(
 
     val trackHeight = 4.dp
 
-    val progressFraction = calculateProgressFraction(
+    // 💡 静态计算进度兜底值
+    val fallbackFraction = calculateProgressFraction(
         currentPositionMs = currentPositionMs,
         totalDurationMs = totalDurationMs,
         durationState = durationState,
@@ -101,29 +112,33 @@ fun ProgressBarComponent(
             .fillMaxWidth()
             .padding(vertical = 2.dp)
     ) {
-        // 进度条轨道容器 (纯展示，无交互)
+        // 进度条轨道容器 (纯展示，无交互；0 Layout 重新测量，100% 运行于 GPU Draw 阶段)
         Box(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(vertical = 3.dp),
             contentAlignment = Alignment.CenterStart
         ) {
-            // 背景槽（未播放部分）
+            // 背景槽与高亮进度：完全在 Draw 阶段合成圆角填充，跳过 Compose Layout 重新测量与 double-interpolation 延迟
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(trackHeight)
                     .clip(RoundedCornerShape(trackHeight / 2))
                     .background(trackBgColor)
-            )
-
-            // 高亮填充条（已播放部分）
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth(progressFraction)
-                    .height(trackHeight)
-                    .clip(RoundedCornerShape(trackHeight / 2))
-                    .background(progressFillColor)
+                    .drawWithContent {
+                        drawContent()
+                        val fraction = progressFractionProvider?.invoke() ?: fallbackFraction
+                        val fillWidth = size.width * fraction.coerceIn(0f, 1f)
+                        if (fillWidth > 0f) {
+                            val radius = size.height / 2f
+                            drawRoundRect(
+                                color = progressFillColor,
+                                size = Size(fillWidth, size.height),
+                                cornerRadius = CornerRadius(radius, radius)
+                            )
+                        }
+                    }
             )
         }
 
@@ -135,9 +150,12 @@ fun ProgressBarComponent(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            // 左侧已播放时间
+            // 左侧已播放时间 (基于秒级变化隔离重组，稳态下每秒仅重组 1 次)
+            val formattedCurrentTime = remember(currentPositionMs / 1000L) {
+                formatTimeMs(currentPositionMs)
+            }
             Text(
-                text = formatTimeMs(currentPositionMs),
+                text = formattedCurrentTime,
                 fontSize = 12.sp,
                 fontWeight = FontWeight.Medium,
                 color = currentTimeColor

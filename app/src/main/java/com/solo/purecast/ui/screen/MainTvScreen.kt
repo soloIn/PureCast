@@ -1,10 +1,21 @@
 package com.solo.purecast.ui.screen
 
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.AnimatedVisibilityScope
 import androidx.compose.animation.Crossfade
+import androidx.compose.animation.ExperimentalSharedTransitionApi
+import androidx.compose.animation.SharedTransitionLayout
+import androidx.compose.animation.SharedTransitionScope
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -19,7 +30,6 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -27,8 +37,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -36,28 +46,29 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.scale
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.tv.material3.ExperimentalTvMaterial3Api
 import androidx.tv.material3.Text
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
+import com.solo.purecast.core.lyrics.LyricsSyncClock
 import com.solo.purecast.data.SettingsRepository
 import com.solo.purecast.model.AudioPathState
 import com.solo.purecast.model.BusinessSessionState
 import com.solo.purecast.model.DurationState
 import com.solo.purecast.model.ErrorCode
 import com.solo.purecast.model.HardwarePipelineState
+import com.solo.purecast.model.LyricUiState
 import com.solo.purecast.model.PlaybackStatus
 import com.solo.purecast.ui.background.FluidQuality
 import com.solo.purecast.model.PlayerSessionSnapshot
@@ -67,7 +78,9 @@ import com.solo.purecast.service.PlaybackService
 import com.solo.purecast.ui.components.FluidBackground
 import com.solo.purecast.ui.components.PlaybackControls
 import com.solo.purecast.ui.components.ProgressBarComponent
+import com.solo.purecast.ui.components.calculateProgressFraction
 import com.solo.purecast.ui.components.SignalPathPill
+import com.solo.purecast.ui.screen.LyricsScreen
 import com.solo.purecast.ui.theme.AppPalette
 import com.solo.purecast.util.Logger
 import com.solo.purecast.util.PermissionHelper
@@ -78,8 +91,6 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import kotlin.math.roundToInt
-import kotlin.math.sin
 
 /**
  * 💡 界面顶部告警严重度分级：硬故障醒目红色条 vs 软故障温和提示条
@@ -181,7 +192,11 @@ internal fun PlayerSessionSnapshot.toMainTvUiState(): MainTvUiState = MainTvUiSt
  * 3. 控制栏与进度条常驻显示，永不自动淡出；
  * 4. 42% / 58% Apple TV 黄金比例布局 + OLED 微像素平移保护。
  */
-@OptIn(ExperimentalTvMaterial3Api::class, ExperimentalFoundationApi::class)
+@OptIn(
+    ExperimentalTvMaterial3Api::class,
+    ExperimentalFoundationApi::class,
+    ExperimentalSharedTransitionApi::class
+)
 @Composable
 fun MainTvScreen(
     onTogglePlayPause: () -> Unit,
@@ -210,34 +225,57 @@ fun MainTvScreen(
 
     val playPauseFocusRequester = remember { FocusRequester() }
     val settingsFocusRequester = remember { FocusRequester() }
+    val lyricsFocusRequester = remember { FocusRequester() }
     val coroutineScope = rememberCoroutineScope()
 
-    // ==========================================
-    // 1. OLED 防烧屏引擎: 微像素平滑微移 (每 10 秒平滑移动 2~3 像素，3秒线性插值杜绝生硬抽动)
-    // ==========================================
-    var pixelShiftX by remember { mutableFloatStateOf(0f) }
-    var pixelShiftY by remember { mutableFloatStateOf(0f) }
+    // 💡 歌词 UI 状态与 60fps/120fps 帧间平滑同步时钟 (U5, U6, U7)
+    val lyricUiState by remember { PlaybackService.lyricsUiState }.collectAsState()
+    var isLyricsExpanded by remember { mutableStateOf(false) }
+    val lyricsSyncClock = remember {
+        LyricsSyncClock(
+            ringBufferDelayMsProvider = {
+                try {
+                    com.solo.purecast.core.nativebridge.NativeAudioEngine.getRingBufferDelayMs()
+                } catch (_: Throwable) {
+                    0L
+                }
+            }
+        )
+    }
 
-    LaunchedEffect(Unit) {
-        var tick = 0.0
-        while (true) {
-            delay(10_000)
-            tick += 0.2
-            pixelShiftX = (sin(tick) * 3).toFloat()
-            pixelShiftY = (sin(tick * 0.7) * 2).toFloat()
+    val currentServiceSnapshot by remember { PlaybackService.sessionSnapshot }.collectAsState()
+    var lastObservedTrackGen by remember { mutableLongStateOf(0L) }
+    LaunchedEffect(
+        currentServiceSnapshot.trackGeneration,
+        currentServiceSnapshot.progressPositionMs,
+        currentServiceSnapshot.playbackStatus,
+        currentServiceSnapshot.businessState
+    ) {
+        // 💡 Finding 14 修复：TRANSITIONING 缓冲期间扬声器尚未真实出声，必须保持 playing = false 冻结时钟，防止歌词抢跑 1~2 秒
+        val isTrulyPlaying = currentServiceSnapshot.businessState == BusinessSessionState.PLAYING &&
+            currentServiceSnapshot.playbackStatus == PlaybackStatus.PLAYING
+
+        if (currentServiceSnapshot.trackGeneration != lastObservedTrackGen) {
+            lastObservedTrackGen = currentServiceSnapshot.trackGeneration
+            // 💡 切歌换代：坚决瞬时排空旧代时钟并硬对齐目标进度，杜绝上一首歌残留时间对新歌产生干扰
+            lyricsSyncClock.hardAlign(
+                targetPositionMs = currentServiceSnapshot.progressPositionMs,
+                playing = isTrulyPlaying
+            )
+        } else {
+            lyricsSyncClock.updatePosition(
+                newPositionMs = currentServiceSnapshot.progressPositionMs,
+                playing = isTrulyPlaying
+            )
         }
     }
 
-    val animatedShiftX by animateFloatAsState(
-        targetValue = pixelShiftX,
-        animationSpec = tween(durationMillis = 3000, easing = LinearEasing),
-        label = "pixelShiftXAnim"
-    )
-    val animatedShiftY by animateFloatAsState(
-        targetValue = pixelShiftY,
-        animationSpec = tween(durationMillis = 3000, easing = LinearEasing),
-        label = "pixelShiftYAnim"
-    )
+    LaunchedEffect(uiState.isIdle) {
+        if (uiState.isIdle) {
+            isLyricsExpanded = false
+            lyricsSyncClock.reset()
+        }
+    }
 
     // 💡 首次开机/权限自检向导显示状态
     var showOnboarding by remember { mutableStateOf(false) }
@@ -356,201 +394,273 @@ fun MainTvScreen(
             )
         }
 
-        // 2. 主体 42% / 58% Apple TV 黄金比例布局 (向导展示时禁用底层获焦，彻底隔离焦点)
-        Row(
-            modifier = Modifier
-                .fillMaxSize()
-                .focusProperties { canFocus = !showOnboarding }
-                .offset { IntOffset(animatedShiftX.roundToInt(), animatedShiftY.roundToInt()) }
-                .padding(horizontal = 72.dp, vertical = 48.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            // 左侧 42% 封面区
-            Box(
-                modifier = Modifier
-                    .weight(0.42f)
-                    .fillMaxHeight(),
-                contentAlignment = Alignment.Center
-            ) {
-                val coverShape = RoundedCornerShape(16.dp)
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth(0.88f)
-                        .aspectRatio(1f)
-                        .scale(coverScale)
-                        .shadow(
-                            elevation = 28.dp,
-                            shape = coverShape,
-                            spotColor = if (hasDarkBackground) Color(0x80000000) else Color(0x20000000)
-                        )
-                        .clip(coverShape)
-                        .background(if (hasDarkBackground) Color(0xFF161822) else Color.White)
-                        .then(
-                            if (!hasDarkBackground) {
-                                Modifier.border(1.dp, Color(0xFFE5E5EA), coverShape)
-                            } else Modifier
-                        ),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Crossfade(
-                        targetState = persistentCoverHash to persistentCover,
-                        animationSpec = tween(300),
-                        label = "coverCrossfade"
-                    ) { (_, resolvedCover) ->
-                        if (resolvedCover != null) {
-                            val coverRequest = remember(context, resolvedCover) {
-                                ImageRequest.Builder(context)
-                                    .data(resolvedCover)
-                                    .build()
+        // 2. 主体展示层：支持标准 42%/58% 主屏与 Apple Music TV 歌词全屏展开空间层次过渡
+        SharedTransitionLayout {
+            AnimatedContent(
+                targetState = isLyricsExpanded,
+                transitionSpec = {
+                    if (targetState) {
+                        (slideInHorizontally(animationSpec = tween(400, easing = FastOutSlowInEasing)) { it / 6 } +
+                            fadeIn(animationSpec = tween(350))) togetherWith
+                        (slideOutHorizontally(animationSpec = tween(400, easing = FastOutSlowInEasing)) { -it / 6 } +
+                            fadeOut(animationSpec = tween(250)))
+                    } else {
+                        (slideInHorizontally(animationSpec = tween(400, easing = FastOutSlowInEasing)) { -it / 6 } +
+                            fadeIn(animationSpec = tween(350))) togetherWith
+                        (slideOutHorizontally(animationSpec = tween(400, easing = FastOutSlowInEasing)) { it / 6 } +
+                            fadeOut(animationSpec = tween(250)))
+                    }
+                },
+                label = "lyricsScreenExpansionTransition"
+            ) { expanded ->
+                if (expanded) {
+                    LyricsScreen(
+                        lyricUiState = lyricUiState,
+                        syncClock = lyricsSyncClock,
+                        metadata = metadata,
+                        playbackStatus = playbackStatus,
+                        coverData = persistentCover,
+                        coverHash = persistentCoverHash,
+                        hasDarkBackground = hasDarkBackground,
+                        onPlayPauseClick = onTogglePlayPause,
+                        onPreviousClick = onPreviousTrack,
+                        onNextClick = onNextTrack,
+                        onClose = {
+                            isLyricsExpanded = false
+                            coroutineScope.launch {
+                                delay(150)
+                                try {
+                                    lyricsFocusRequester.requestFocus()
+                                } catch (_: Exception) {}
                             }
-                            AsyncImage(
-                                model = coverRequest,
-                                contentDescription = "Album Cover",
-                                contentScale = ContentScale.Crop,
-                                modifier = Modifier.fillMaxSize(),
-                                onError = {
-                                    // 💡 封面网络 404 或解码失败时立即清理 persistentCover，回退默认卡片并修正浅色模式背景与文字对比度
-                                    persistentCover = null
-                                    persistentCoverHash = 0
+                        },
+                        sharedTransitionScope = this@SharedTransitionLayout,
+                        animatedVisibilityScope = this@AnimatedContent
+                    )
+                } else {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .focusProperties { canFocus = !showOnboarding }
+                            .padding(horizontal = 72.dp, vertical = 48.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        // 左侧 42% 封面区
+                        Box(
+                            modifier = Modifier
+                                .weight(0.42f)
+                                .fillMaxHeight(),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            val coverShape = RoundedCornerShape(16.dp)
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth(0.88f)
+                                    .aspectRatio(1f)
+                                    .sharedElement(
+                                        state = rememberSharedContentState(key = "album_cover"),
+                                        animatedVisibilityScope = this@AnimatedContent
+                                    )
+                                    .graphicsLayer {
+                                        scaleX = coverScale
+                                        scaleY = coverScale
+                                    }
+                                    .shadow(
+                                        elevation = 28.dp,
+                                        shape = coverShape,
+                                        spotColor = if (hasDarkBackground) Color(0x80000000) else Color(0x20000000)
+                                    )
+                                    .clip(coverShape)
+                                    .background(if (hasDarkBackground) Color(0xFF161822) else Color.White)
+                                    .then(
+                                        if (!hasDarkBackground) {
+                                            Modifier.border(1.dp, Color(0xFFE5E5EA), coverShape)
+                                        } else Modifier
+                                    ),
+                                contentAlignment = Alignment.Center
+                            ) {
+                            Crossfade(
+                                targetState = persistentCoverHash to persistentCover,
+                                animationSpec = tween(300),
+                                label = "coverCrossfade"
+                            ) { (_, resolvedCover) ->
+                                if (resolvedCover != null) {
+                                    val coverRequest = remember(context, resolvedCover, persistentCoverHash) {
+                                        val cacheKey = if (persistentCoverHash != 0) "cover_$persistentCoverHash" else null
+                                        ImageRequest.Builder(context)
+                                            .data(resolvedCover)
+                                            .apply {
+                                                if (cacheKey != null) {
+                                                    memoryCacheKey(cacheKey)
+                                                    placeholderMemoryCacheKey(cacheKey)
+                                                }
+                                            }
+                                            .crossfade(false)
+                                            .build()
+                                    }
+                                    AsyncImage(
+                                        model = coverRequest,
+                                        contentDescription = "Album Cover",
+                                        contentScale = ContentScale.Crop,
+                                        modifier = Modifier.fillMaxSize(),
+                                        onError = {
+                                            persistentCover = null
+                                            persistentCoverHash = 0
+                                        }
+                                    )
+                                } else {
+                                    DefaultCoverCard(
+                                        isPlaying = isPlaying,
+                                        album = metadata.album,
+                                        hasDarkBackground = hasDarkBackground
+                                    )
                                 }
-                            )
-                        } else {
-                            DefaultCoverCard(
-                                isPlaying = isPlaying,
-                                album = metadata.album,
-                                hasDarkBackground = hasDarkBackground
-                            )
+                            }
                         }
                     }
-                }
-            }
 
-            Spacer(modifier = Modifier.width(48.dp))
+                    Spacer(modifier = Modifier.width(48.dp))
 
-            // 右侧 58% 控制与元数据区 (直接通透悬浮于背景之上，无任何死板 Dock)
-            Column(
-                modifier = Modifier
-                    .weight(0.58f)
-                    .fillMaxHeight(),
-                verticalArrangement = Arrangement.Center
-            ) {
-                // 分级异常告警条（不可获焦，严禁抢夺 D-Pad 当前焦点；恢复后随快照自动消除）
-                if (visibleErrorBanner != null) {
-                    val isBlocking = visibleErrorBanner.severity == BannerSeverity.WARNING_BLOCKING
-                    val bannerBg = if (isBlocking) {
-                        Color(0xFF8B0000).copy(alpha = 0.88f)
-                    } else {
-                        Color(0xFF3A2E00).copy(alpha = 0.85f)
-                    }
-                    val bannerBorder = if (isBlocking) {
-                        Color(0xFFFF6961).copy(alpha = 0.45f)
-                    } else {
-                        Color(0xFFFFD60A).copy(alpha = 0.45f)
-                    }
-                    val prefix = if (isBlocking) "⚠️" else "ℹ️"
-                    Box(
+                    // 右侧 58% 控制与元数据区 (直接通透悬浮于背景之上，无任何死板 Dock)
+                    Column(
                         modifier = Modifier
-                            .padding(bottom = 12.dp)
-                            .clip(RoundedCornerShape(8.dp))
-                            .background(bannerBg)
-                            .border(1.dp, bannerBorder, RoundedCornerShape(8.dp))
-                            .padding(horizontal = 12.dp, vertical = 6.dp)
+                            .weight(0.58f)
+                            .fillMaxHeight(),
+                        verticalArrangement = Arrangement.Center
                     ) {
-                        Text(
-                            text = "$prefix ${visibleErrorBanner.message}",
-                            color = Color.White,
-                            fontSize = 13.sp,
-                            fontWeight = FontWeight.Medium
+                        // 分级异常告警条（不可获焦，严禁抢夺 D-Pad 当前焦点；恢复后随快照自动消除）
+                        if (visibleErrorBanner != null) {
+                            val isBlocking = visibleErrorBanner.severity == BannerSeverity.WARNING_BLOCKING
+                            val bannerBg = if (isBlocking) {
+                                Color(0xFF8B0000).copy(alpha = 0.88f)
+                            } else {
+                                Color(0xFF3A2E00).copy(alpha = 0.85f)
+                            }
+                            val bannerBorder = if (isBlocking) {
+                                Color(0xFFFF6961).copy(alpha = 0.45f)
+                            } else {
+                                Color(0xFFFFD60A).copy(alpha = 0.45f)
+                            }
+                            val prefix = if (isBlocking) "⚠️" else "ℹ️"
+                            Box(
+                                modifier = Modifier
+                                    .padding(bottom = 12.dp)
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(bannerBg)
+                                    .border(1.dp, bannerBorder, RoundedCornerShape(8.dp))
+                                    .padding(horizontal = 12.dp, vertical = 6.dp)
+                            ) {
+                                Text(
+                                    text = "$prefix ${visibleErrorBanner.message}",
+                                    color = Color.White,
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.Medium
+                                )
+                            }
+                        }
+
+                        // 纯色彩语义的实时音频品质胶囊 (格式: 协议 · 音频格式 | 设备名 + 软过渡提示)
+                        SignalPathPill(
+                            audioState = audioPathState,
+                            hardwareState = uiState.hardwareState,
+                            isIdle = isIdle,
+                            hasDarkBackground = hasDarkBackground
+                        )
+
+                        Spacer(modifier = Modifier.height(20.dp))
+
+                        // 歌曲标题与艺术家容器（移除 sharedElement，消除异构空间几何形变）
+                        Column(
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            val displayTitle = if (isIdle) "等待音频投屏接入" else metadata.title
+
+                            // 歌曲标题：推流时纯白高亮，待机浅色时纯黑；平滑跑马灯永不截断
+                            Text(
+                                text = displayTitle,
+                                fontSize = 40.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = if (hasDarkBackground) Color.White else AppPalette.primaryText,
+                                maxLines = 1,
+                                lineHeight = 48.sp,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .basicMarquee(
+                                        initialDelayMillis = 2000,
+                                        repeatDelayMillis = 1500
+                                    )
+                            )
+
+                            Spacer(modifier = Modifier.height(8.dp))
+
+                            // 艺术家 / 待机投屏引导：次级色彩自适应
+                            val airPlayGuide = PlaybackService.formatAirPlayName(friendlyName)
+                            val upnpGuide = PlaybackService.formatUpnpName(friendlyName)
+                            val displayArtist = if (isIdle) {
+                                "AirPlay: $airPlayGuide  ·  UPnP: $upnpGuide"
+                            } else {
+                                metadata.artist
+                            }
+
+                            Text(
+                                text = displayArtist,
+                                fontSize = if (isIdle) 18.sp else 24.sp,
+                                fontWeight = FontWeight.Medium,
+                                color = if (hasDarkBackground) Color.White.copy(alpha = 0.70f) else AppPalette.secondaryText,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+
+                            // 专辑名称 (若存在且非待机)
+                            if (!isIdle && metadata.album.isNotEmpty()) {
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(
+                                    text = metadata.album,
+                                    fontSize = 16.sp,
+                                    color = if (hasDarkBackground) Color.White.copy(alpha = 0.50f) else AppPalette.secondaryText.copy(alpha = 0.70f),
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(32.dp))
+
+                        IsolatedProgressBar(
+                            syncClock = lyricsSyncClock,
+                            totalDurationMs = metadata.durationMs,
+                            durationState = metadata.durationState,
+                            seekCapability = metadata.seekCapability,
+                            playbackStatus = playbackStatus,
+                            hasDarkBackground = hasDarkBackground,
+                            onPlayPauseClick = onTogglePlayPause,
+                            onSeekTo = onSeekTo
+                        )
+
+                        Spacer(modifier = Modifier.height(16.dp))
+
+                        // 💡 纯几何图标交互控制按钮组 (上一曲 / 播放暂停 / 下一曲 / 歌词 / 设置，共享元素绑定)
+                        PlaybackControls(
+                            playbackStatus = playbackStatus,
+                            hasDarkBackground = hasDarkBackground,
+                            lyricState = lyricUiState,
+                            isLyricsExpanded = isLyricsExpanded,
+                            onLyricsClick = {
+                                isLyricsExpanded = !isLyricsExpanded
+                            },
+                            onPlayPauseClick = onTogglePlayPause,
+                            onPreviousClick = onPreviousTrack,
+                            onNextClick = onNextTrack,
+                            onSettingsClick = onOpenSettings,
+                            playPauseFocusRequester = playPauseFocusRequester,
+                            settingsFocusRequester = settingsFocusRequester,
+                            lyricsFocusRequester = lyricsFocusRequester,
+                            modifier = Modifier
                         )
                     }
                 }
-
-                // 纯色彩语义的实时音频品质胶囊 (格式: 协议 · 音频格式 | 设备名 + 软过渡提示)
-                SignalPathPill(
-                    audioState = audioPathState,
-                    hardwareState = uiState.hardwareState,
-                    isIdle = isIdle,
-                    hasDarkBackground = hasDarkBackground
-                )
-
-                Spacer(modifier = Modifier.height(20.dp))
-
-                val displayTitle = if (isIdle) "等待音频投屏接入" else metadata.title
-
-                // 歌曲标题：推流时纯白高亮，待机浅色时纯黑；平滑跑马灯永不截断
-                Text(
-                    text = displayTitle,
-                    fontSize = 40.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = if (hasDarkBackground) Color.White else AppPalette.primaryText,
-                    maxLines = 1,
-                    lineHeight = 48.sp,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .basicMarquee(
-                            initialDelayMillis = 2000,
-                            delayMillis = 1500
-                        )
-                )
-
-                Spacer(modifier = Modifier.height(8.dp))
-
-                // 艺术家 / 待机投屏引导：次级色彩自适应
-                val airPlayGuide = PlaybackService.formatAirPlayName(friendlyName)
-                val upnpGuide = PlaybackService.formatUpnpName(friendlyName)
-                val displayArtist = if (isIdle) {
-                    "AirPlay: $airPlayGuide  ·  UPnP: $upnpGuide"
-                } else {
-                    metadata.artist
-                }
-
-                Text(
-                    text = displayArtist,
-                    fontSize = if (isIdle) 18.sp else 24.sp,
-                    fontWeight = FontWeight.Medium,
-                    color = if (hasDarkBackground) Color.White.copy(alpha = 0.70f) else AppPalette.secondaryText,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-
-                // 专辑名称 (若存在且非待机)
-                if (!isIdle && metadata.album.isNotEmpty()) {
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        text = metadata.album,
-                        fontSize = 16.sp,
-                        color = if (hasDarkBackground) Color.White.copy(alpha = 0.50f) else AppPalette.secondaryText.copy(alpha = 0.70f),
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                }
-
-                Spacer(modifier = Modifier.height(32.dp))
-
-                IsolatedProgressBar(
-                    totalDurationMs = metadata.durationMs,
-                    durationState = metadata.durationState,
-                    seekCapability = metadata.seekCapability,
-                    playbackStatus = playbackStatus,
-                    hasDarkBackground = hasDarkBackground,
-                    onPlayPauseClick = onTogglePlayPause,
-                    onSeekTo = onSeekTo
-                )
-
-                Spacer(modifier = Modifier.height(16.dp))
-
-                // 💡 纯几何图标交互控制按钮组 (上一曲 / 播放暂停 / 下一曲 / 设置，绝对居中自适应深浅)
-                PlaybackControls(
-                    playbackStatus = playbackStatus,
-                    hasDarkBackground = hasDarkBackground,
-                    onPlayPauseClick = onTogglePlayPause,
-                    onPreviousClick = onPreviousTrack,
-                    onNextClick = onNextTrack,
-                    onSettingsClick = onOpenSettings,
-                    playPauseFocusRequester = playPauseFocusRequester,
-                    settingsFocusRequester = settingsFocusRequester
-                )
             }
+        }
         }
 
         // 3. 首次开机/权限自检向导
@@ -574,10 +684,12 @@ fun MainTvScreen(
 }
 
 /**
- * 💡 辅助组件：隔离 500ms 高频播放进度重组范围至叶子组件，避免触发主屏幕全量重绘
+ * 💡 辅助组件：主屏进度条组件，接入 LyricsSyncClock 单调高频插值 (60fps)，杜绝 500ms 离散跳动并与歌词大屏毫秒级完全对齐
+ * 优化 1：完全隔离秒级文本重组与 60fps GPU 进度填充绘制，实现 1 次/秒低频重组与 0 Layout 重新测量
  */
 @Composable
 private fun IsolatedProgressBar(
+    syncClock: LyricsSyncClock,
     totalDurationMs: Long,
     durationState: DurationState,
     seekCapability: SeekCapability,
@@ -586,17 +698,52 @@ private fun IsolatedProgressBar(
     onPlayPauseClick: () -> Unit,
     onSeekTo: (Long) -> Unit = {}
 ) {
+    var drawTrigger by remember { mutableLongStateOf(0L) }
+    var displaySecondMs by remember { mutableLongStateOf(0L) }
+    val isPlaying = playbackStatus == PlaybackStatus.PLAYING
     val currentSnapshot by remember { PlaybackService.sessionSnapshot }.collectAsState()
-    val servicePositionMs = currentSnapshot.progressPositionMs
+    val isIdle = playbackStatus == PlaybackStatus.IDLE || playbackStatus == PlaybackStatus.STOPPED
 
-    val clampedPosition = if (totalDurationMs > 0) servicePositionMs.coerceIn(0L, totalDurationMs) else servicePositionMs
+    LaunchedEffect(isPlaying) {
+        if (isPlaying) {
+            while (true) {
+                withFrameNanos { frameNanos ->
+                    drawTrigger = frameNanos
+                    val currentMs = syncClock.getCurrentInterpolatedTimeMs(frameNanos)
+                    val clamped = if (totalDurationMs > 0) currentMs.coerceIn(0L, totalDurationMs) else currentMs
+                    val sec = (clamped / 1000L) * 1000L
+                    if (sec != displaySecondMs) {
+                        displaySecondMs = sec
+                    }
+                }
+            }
+        } else {
+            val clamped = if (totalDurationMs > 0) currentSnapshot.progressPositionMs.coerceIn(0L, totalDurationMs) else currentSnapshot.progressPositionMs
+            displaySecondMs = (clamped / 1000L) * 1000L
+        }
+    }
+
+    val progressFractionProvider = remember(totalDurationMs, durationState, isIdle, isPlaying) {
+        {
+            // 💡 仅在 Draw 阶段读取 drawTrigger，注册每帧重绘，彻底跳过 Composition 与 Layout 阶段
+            drawTrigger.let { }
+            val currentMs = if (isPlaying) syncClock.getCurrentInterpolatedTimeMs() else currentSnapshot.progressPositionMs
+            calculateProgressFraction(
+                currentPositionMs = currentMs,
+                totalDurationMs = totalDurationMs,
+                durationState = durationState,
+                isIdle = isIdle
+            )
+        }
+    }
 
     ProgressBarComponent(
-        currentPositionMs = clampedPosition,
+        currentPositionMs = displaySecondMs,
         totalDurationMs = totalDurationMs,
         durationState = durationState,
         playbackStatus = playbackStatus,
-        hasDarkBackground = hasDarkBackground
+        hasDarkBackground = hasDarkBackground,
+        progressFractionProvider = progressFractionProvider
     )
 }
 

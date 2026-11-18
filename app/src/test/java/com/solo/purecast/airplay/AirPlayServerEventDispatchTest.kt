@@ -207,6 +207,24 @@ class AirPlayServerEventDispatchTest {
     }
 
     @Test
+    fun `initial queueing progress with negative positionMs patches duration without resetting progress`() {
+        val (dispatcher, events) = createDispatcher()
+        dispatcher.onStreamRequested(1L, 1L, 44100, 16, 2, "ALAC", "10.0.0.1", "", "", "", "", 0)
+        dispatcher.onMetadataReceived(1L, 2L, "晴天", "周杰伦", "叶惠美", 0L, null)
+
+        // 模拟已正常走字至 50 秒
+        dispatcher.onProgressUpdated(1L, 3L, 50_000L, 240_000L)
+        val countBeforeQueueing = events.size
+
+        // iOS 在连续播放前提前传输下一首并下发 SET_PARAMETER progress: curr_ts < start_ts (pos_ms = -1L, dur_ms = 240_000L)
+        dispatcher.onProgressUpdated(1L, 4L, -1L, 240_000L)
+
+        // 验证：绝对不能发射 ProgressUpdateEvent 将正在走字的进度抹除或倒退为 0
+        val newProgressEvents = events.drop(countBeforeQueueing).map { it.payload }.filterIsInstance<ProgressUpdateEvent>()
+        assertTrue("负向 positionMs (排队态) 绝不得发射 ProgressUpdateEvent 抹零进度", newProgressEvents.isEmpty())
+    }
+
+    @Test
     fun markPendingSeekSetsIsSeekFlushOnTrackSwitchFlushed() {
         val (dispatcher, events) = createDispatcher()
         dispatcher.onStreamRequested(1L, 1L, 44100, 16, 2, "ALAC", "10.0.0.1", "", "", "", "", 0)

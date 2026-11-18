@@ -96,6 +96,7 @@ dependencies {
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.lifecycle.service)
     implementation(libs.androidx.activity.compose)
+    implementation(libs.androidx.compose.animation)
 
     // Compose for TV
     implementation(libs.androidx.tv.material)
@@ -112,6 +113,9 @@ dependencies {
     implementation(libs.ktor.client.core)
     implementation(libs.ktor.client.cio)
     implementation(libs.jmdns)
+
+    // NLP & String Similarity
+    implementation(libs.fuzzywuzzy)
 
     // Testing
     testImplementation(libs.junit)
