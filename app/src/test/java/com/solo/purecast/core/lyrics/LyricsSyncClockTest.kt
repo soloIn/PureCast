@@ -241,4 +241,95 @@ class LyricsSyncClockTest {
         val t = clockWithDelay.getCurrentInterpolatedTimeMs(baseNano + 500_000_000L)
         assertEquals(10_300L, t)
     }
+
+    @Test
+    fun `intro period activates first line at startMs minus leadInMs`() {
+        val timeline = LyricTimeline(
+            source = "test",
+            format = LyricFormat.LRC_LINE_SYNC,
+            lines = listOf(
+                LyricLine(lineIndex = 0, startMs = 15_000L, endMs = 25_000L, mainText = "First Line"),
+                LyricLine(lineIndex = 1, startMs = 25_000L, endMs = 35_000L, mainText = "Second Line")
+            )
+        )
+
+        // 前奏期提前量门限为 15_000L - 280L = 14_720L
+        // 14_700ms 处于前奏未就绪状态
+        val preState = syncClock.calculateActiveLineState(timeline, 14_700L)
+        assertEquals(-1, preState.lineIndex)
+
+        // 14_720ms 到达提前先导时刻，第 1 行提前激活并启动平滑滚动与居中放大
+        val leadInState = syncClock.calculateActiveLineState(timeline, 14_720L)
+        assertEquals(0, leadInState.lineIndex)
+        assertEquals(0f, leadInState.lineProgressFraction, 0.001f)
+    }
+
+    @Test
+    fun `standard LRC line switches slightly early within leadInMs window`() {
+        val timeline = LyricTimeline(
+            source = "test",
+            format = LyricFormat.LRC_LINE_SYNC,
+            lines = listOf(
+                LyricLine(lineIndex = 0, startMs = 5_000L, endMs = 10_000L, mainText = "Line 0"),
+                LyricLine(lineIndex = 1, startMs = 10_000L, endMs = 15_000L, mainText = "Line 1")
+            )
+        )
+
+        // 第 2 行在 10_000L - 280L = 9_720L 前为第 0 行激活
+        val state0 = syncClock.calculateActiveLineState(timeline, 9_700L)
+        assertEquals(0, state0.lineIndex)
+
+        // 9_720L 进入第 1 行提前先导窗口，第 1 行提前激活
+        val state1 = syncClock.calculateActiveLineState(timeline, 9_720L)
+        assertEquals(1, state1.lineIndex)
+        assertEquals(0f, state1.lineProgressFraction, 0.001f)
+
+        // 10_000L 人声正式响起，已完成滚动与居中，进度开始推进
+        val stateAtVocal = syncClock.calculateActiveLineState(timeline, 10_000L)
+        assertEquals(1, stateAtVocal.lineIndex)
+        assertEquals(0f, stateAtVocal.lineProgressFraction, 0.001f)
+
+        val stateMiddle = syncClock.calculateActiveLineState(timeline, 12_500L)
+        assertEquals(1, stateMiddle.lineIndex)
+        assertEquals(0.5f, stateMiddle.lineProgressFraction, 0.01f)
+    }
+
+    @Test
+    fun `word-sync karaoke line with tight gap waits for previous line vocals before activating`() {
+        val timeline = LyricTimeline(
+            source = "test",
+            format = LyricFormat.TTML_SYLLABLE,
+            lines = listOf(
+                LyricLine(
+                    lineIndex = 0,
+                    startMs = 5_000L,
+                    endMs = 10_000L,
+                    mainText = "Line 0",
+                    words = listOf(LyricWord("Hello", 5_000L, 9_900L))
+                ),
+                LyricLine(
+                    lineIndex = 1,
+                    startMs = 10_000L,
+                    endMs = 15_000L,
+                    mainText = "Line 1",
+                    words = listOf(LyricWord("World", 10_000L, 14_000L))
+                )
+            )
+        )
+
+        // 9_800ms：上一行人声仍在唱（结束于 9_900ms），绝不因提前量截断上一行
+        val stateHolding = syncClock.calculateActiveLineState(timeline, 9_800L)
+        assertEquals(0, stateHolding.lineIndex)
+
+        // 9_900ms：上一行唱完，立即激活下一行 (提前 100ms 预先准备)
+        val stateSwitched = syncClock.calculateActiveLineState(timeline, 9_900L)
+        assertEquals(1, stateSwitched.lineIndex)
+        assertEquals(0f, stateSwitched.lineProgressFraction, 0.001f)
+        assertEquals(-1, stateSwitched.activeWordIndex) // 下一行音节尚未开唱，处于未点亮暗色就绪态
+
+        // 10_000ms：下一行正式开唱
+        val stateSinging = syncClock.calculateActiveLineState(timeline, 10_000L)
+        assertEquals(1, stateSinging.lineIndex)
+        assertEquals(0, stateSinging.activeWordIndex)
+    }
 }

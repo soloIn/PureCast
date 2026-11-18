@@ -18,7 +18,8 @@ import kotlin.math.abs
 class LyricsSyncClock(
     private val maxExtrapolationMs: Long = DEFAULT_MAX_EXTRAPOLATION_MS,
     private val jumpThresholdMs: Long = DEFAULT_JUMP_THRESHOLD_MS,
-    private val ringBufferDelayMsProvider: () -> Long = { 0L }
+    private val ringBufferDelayMsProvider: () -> Long = { 0L },
+    private val lineLeadInMs: Long = DEFAULT_LINE_LEAD_IN_MS
 ) {
 
     data class ActiveLineState(
@@ -153,30 +154,72 @@ class LyricsSyncClock(
     }
 
     /**
+     * 💡 计算某行歌词应当被激活（高亮/滚动）的生效时间戳 (毫秒)
+     * 支持基于 Apple TV 规范的行预先激活机制 (Lead-in / Anticipation)：
+     * 1. 首行歌词在前奏期结束前 leadInMs 提前激活并居中放大，为用户提供视线先导；
+     * 2. 无逐字时间戳的普通行歌词：提前 leadInMs 进行高亮与滚动，对齐动画过渡时长；
+     * 3. 含逐字时间戳的卡拉OK行歌词：若与上一行间距充足 (>= leadInMs)，提前 leadInMs 激活并处于暗色就绪态；
+     *    若与上一行间距紧凑 (< leadInMs)，严格等待上一行最后音节扫光完毕后再激活下一行，绝不提前截断前一句人声。
+     */
+    fun getEffectiveStartMs(
+        index: Int,
+        lines: List<LyricLine>,
+        leadInMs: Long = lineLeadInMs
+    ): Long {
+        if (index !in lines.indices) return 0L
+        val line = lines[index]
+        if (leadInMs <= 0L) return line.startMs
+
+        if (index == 0) {
+            return (line.startMs - leadInMs).coerceAtLeast(0L)
+        }
+
+        val prev = lines[index - 1]
+        val prevWords = prev.words
+        return if (!prevWords.isNullOrEmpty()) {
+            val prevVocalsEnd = prevWords.last().endMs
+            if (line.startMs > prevVocalsEnd) {
+                // 上一行有逐字时间戳且已唱完：确保不截断上一行最后音节的扫光
+                val earlyStart = line.startMs - leadInMs
+                maxOf(prevVocalsEnd, earlyStart)
+            } else {
+                // 存在和声或交叠行
+                (line.startMs - leadInMs).coerceAtLeast(0L)
+            }
+        } else {
+            // 无逐字时间戳的普通行歌词：允许提前 leadInMs 激活，与平滑滚动动画时长无缝衔接
+            (line.startMs - leadInMs).coerceAtLeast(0L)
+        }
+    }
+
+    /**
      * 💡 针对当前推演时间检索当前高亮行并计算逐字/逐行进度比例
      */
     fun calculateActiveLineState(
         timeline: LyricTimeline,
-        currentTimeMs: Long
+        currentTimeMs: Long,
+        leadInMs: Long = lineLeadInMs
     ): ActiveLineState {
         val lines = timeline.lines
         if (lines.isEmpty()) {
             return ActiveLineState(lineIndex = -1, lineProgressFraction = 0f)
         }
 
-        // 前奏期判定 —— 若当前时间尚未到达第一句歌词的起始时间，明确返回 -1
-        if (currentTimeMs < lines[0].startMs) {
+        // 前奏期判定 —— 若当前时间尚未到达第一句歌词的提前起始时间，明确返回 -1
+        val firstEffectiveStart = getEffectiveStartMs(0, lines, leadInMs)
+        if (currentTimeMs < firstEffectiveStart) {
             return ActiveLineState(lineIndex = -1, lineProgressFraction = 0f)
         }
 
-        // 基于单调递增的 startMs 进行二分搜索，找到最后一个 startMs <= currentTimeMs 的行
+        // 基于单调递增的 effectiveStartMs 进行二分搜索，找到最后一个 effectiveStartMs <= currentTimeMs 的行
         var low = 0
         var high = lines.size - 1
         var candidateIndex = 0
 
         while (low <= high) {
             val mid = (low + high) ushr 1
-            if (lines[mid].startMs <= currentTimeMs) {
+            val effectiveStart = getEffectiveStartMs(mid, lines, leadInMs)
+            if (effectiveStart <= currentTimeMs) {
                 candidateIndex = mid
                 low = mid + 1
             } else {
@@ -184,15 +227,22 @@ class LyricsSyncClock(
             }
         }
 
-        // 检查是否有交叠行或和声行，若存在优先选取精确包含 currentTimeMs 的行
         var activeIndex = candidateIndex
-        for (offset in -1..1) {
-            val testIdx = candidateIndex + offset
-            if (testIdx in lines.indices) {
-                val l = lines[testIdx]
-                if (currentTimeMs in l.startMs..l.endMs) {
-                    activeIndex = testIdx
-                    break
+
+        // 💡 检查是否有交叠行或和声行：
+        // 仅在当前候选行已经开始（currentTimeMs >= candidateLine.startMs）且已超出其 endMs 时，
+        // 检查相邻行是否精确包含 currentTimeMs；若处于候选行的提前预卷期 (currentTimeMs < candidateLine.startMs)，
+        // 则严格保持候选行为激活行，绝不回退至前一行而破坏提前量！
+        val candidateLine = lines[candidateIndex]
+        if (currentTimeMs >= candidateLine.startMs && currentTimeMs > candidateLine.endMs) {
+            for (offset in -1..1) {
+                val testIdx = candidateIndex + offset
+                if (testIdx in lines.indices && testIdx != candidateIndex) {
+                    val l = lines[testIdx]
+                    if (currentTimeMs in l.startMs..l.endMs) {
+                        activeIndex = testIdx
+                        break
+                    }
                 }
             }
         }
@@ -252,5 +302,12 @@ class LyricsSyncClock(
         private const val TAG = "LyricsSyncClock"
         const val DEFAULT_MAX_EXTRAPOLATION_MS = 1000L
         const val DEFAULT_JUMP_THRESHOLD_MS = 350L
+        /**
+         * 💡 歌词行提前高亮/滚动视线先导时间 (Lead-in Time):
+         * 符合 Apple TV 10-Foot UI 规范与人体工学视线先导习惯。
+         * 提前 280ms 触发下一行激活与平滑滚动 (配合 480ms 阻尼曲线)，使文字在开唱前夕完成居中与 1.08x 弹性放大，
+         * 彻底消除“唱出来了界面才开始缓慢移动”的滞后感。
+         */
+        const val DEFAULT_LINE_LEAD_IN_MS = 280L
     }
 }

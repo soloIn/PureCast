@@ -374,8 +374,8 @@ private fun LyricsStreamView(
     var activeLineIndex by remember { mutableIntStateOf(-1) }
 
     // 💡 优化 1：按歌词格式按需降频。
-    // 当非逐字格式时，无需在每帧 VSYNC 更新时间戳，仅需每 80ms 低频监测 activeLineIndex 变化；
-    // 稳态下全列表重组开销降至 0 次/秒！
+    // 当非逐字格式时，无需在每帧 VSYNC 更新时间戳，仅需每 33ms (~30Hz) 监测 activeLineIndex 变化；
+    // 兼顾极低 CPU 负载与毫秒级高亮提前量 (280ms Lead-in) 的精准响应，稳态下全列表重组开销降至 0 次/秒！
     LaunchedEffect(timeline, isWordSync) {
         if (isWordSync) {
             while (true) {
@@ -394,7 +394,7 @@ private fun LyricsStreamView(
                 if (state.lineIndex != activeLineIndex) {
                     activeLineIndex = state.lineIndex
                 }
-                delay(80L)
+                delay(33L)
             }
         }
     }
@@ -654,7 +654,7 @@ private fun WordSyncKaraokeText(
                 frameTrigger.let { }
 
                 val now = currentTimeProvider()
-                val unlitColor = primaryColor.copy(alpha = 0.38f)
+                val unlitColor = primaryColor.copy(alpha = 0.45f)
                 val feather = 10.dp.toPx()
                 val lineCount = lr.lineCount
 
