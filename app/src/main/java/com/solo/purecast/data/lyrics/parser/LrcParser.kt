@@ -97,28 +97,8 @@ object LrcParser {
             }
 
             if (rawEntries.isEmpty()) {
-                // 💡 纯文本无时间戳歌词平滑降级 (Finding 6)
-                val nonBlankLines = lines.map {
-                    TIME_TAG_REGEX.matcher(META_TAG_REGEX.matcher(it.trim()).replaceAll("")).replaceAll("").trim()
-                }.filter {
-                    it.isNotEmpty() && !it.equals("null", ignoreCase = true)
-                }
-                if (nonBlankLines.isEmpty()) return null
-                val plainLines = nonBlankLines.mapIndexed { idx, text ->
-                    LyricLine(
-                        lineIndex = idx,
-                        startMs = 0L,
-                        endMs = 0L,
-                        mainText = ChineseConverter.toSimplified(text)
-                    )
-                }
-                return LyricTimeline(
-                    source = sourceName,
-                    format = LyricFormat.PLAIN_TEXT,
-                    isInstrumental = false,
-                    lines = plainLines,
-                    durationMs = if (metaLengthMs > 0L) metaLengthMs else expectedDurationMs
-                )
+                // 💡 瀑布流分级调度优化：彻底屏蔽无时间戳纯文本歌词。大屏滚动与逐字高亮必须依赖时间戳，无时间戳歌词无渲染价值，直接返回 null
+                return null
             }
 
             // 3. 按时间戳升序排序

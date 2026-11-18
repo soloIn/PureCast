@@ -107,8 +107,6 @@ class LyricsWaterfallFetcher(
             }
         }
 
-        var fallbackPlainTimeline: LyricTimeline? = null
-
         // 阶梯 Step 2: LRCLIB 精确匹配四元组 (硬超时 1.5s，需已知歌手)
         if (cleanArtist.isNotBlank()) {
             try {
@@ -118,16 +116,11 @@ class LyricsWaterfallFetcher(
                     durationMs = durationMs,
                     album = album
                 )
-                if (lrclibExactHit != null) {
-                    if (lrclibExactHit.format != LyricFormat.PLAIN_TEXT || lrclibExactHit.isInstrumental) {
-                        Logger.lyrics.i(TAG, "阶梯 Step 2 (LRCLIB /api/get) 精确命中时间戳歌词: $cleanArtist - $cleanTitle")
-                        val enriched = enrichWithTranslation(lrclibExactHit, cleanArtist, cleanTitle, durationMs)
-                        cacheRepository.put(cacheKey, enriched)
-                        return enriched
-                    } else {
-                        Logger.lyrics.d(TAG, "阶梯 Step 2 命中纯文本无时间戳歌词，暂存并继续寻找时间戳歌词: $cleanArtist - $cleanTitle")
-                        fallbackPlainTimeline = lrclibExactHit
-                    }
+                if (lrclibExactHit != null && (lrclibExactHit.format != LyricFormat.PLAIN_TEXT || lrclibExactHit.isInstrumental)) {
+                    Logger.lyrics.i(TAG, "阶梯 Step 2 (LRCLIB /api/get) 精确命中时间戳歌词: $cleanArtist - $cleanTitle")
+                    val enriched = enrichWithTranslation(lrclibExactHit, cleanArtist, cleanTitle, durationMs)
+                    cacheRepository.put(cacheKey, enriched)
+                    return enriched
                 }
             } catch (e: Exception) {
                 Logger.lyrics.w(TAG, "LRCLIB 精确匹配异常，平滑降级至 Step 3", e)
@@ -142,15 +135,11 @@ class LyricsWaterfallFetcher(
                 album = album,
                 durationMs = durationMs
             )
-            if (lrclibFuzzyHit != null) {
-                if (lrclibFuzzyHit.format != LyricFormat.PLAIN_TEXT || lrclibFuzzyHit.isInstrumental) {
-                    Logger.lyrics.i(TAG, "阶梯 Step 3 (LRCLIB /api/search) 模糊命中时间戳歌词: $cleanArtist - $cleanTitle")
-                    val enriched = enrichWithTranslation(lrclibFuzzyHit, cleanArtist, cleanTitle, durationMs)
-                    cacheRepository.put(cacheKey, enriched)
-                    return enriched
-                } else if (fallbackPlainTimeline == null) {
-                    fallbackPlainTimeline = lrclibFuzzyHit
-                }
+            if (lrclibFuzzyHit != null && (lrclibFuzzyHit.format != LyricFormat.PLAIN_TEXT || lrclibFuzzyHit.isInstrumental)) {
+                Logger.lyrics.i(TAG, "阶梯 Step 3 (LRCLIB /api/search) 模糊命中时间戳歌词: $cleanArtist - $cleanTitle")
+                val enriched = enrichWithTranslation(lrclibFuzzyHit, cleanArtist, cleanTitle, durationMs)
+                cacheRepository.put(cacheKey, enriched)
+                return enriched
             }
         } catch (e: Exception) {
             Logger.lyrics.w(TAG, "LRCLIB 模糊搜索异常，降级至网易云源", e)
@@ -160,7 +149,7 @@ class LyricsWaterfallFetcher(
         if (neteaseDataSource != null) {
             try {
                 val neteaseHit = neteaseDataSource.fetch(cleanArtist, cleanTitle, durationMs)
-                if (neteaseHit != null) {
+                if (neteaseHit != null && (neteaseHit.format != LyricFormat.PLAIN_TEXT || neteaseHit.isInstrumental)) {
                     Logger.lyrics.i(TAG, "阶梯 Step 4 (网易云音乐) 命中带翻译歌词: $cleanArtist - $cleanTitle")
                     cacheRepository.put(cacheKey, neteaseHit)
                     return neteaseHit
@@ -170,15 +159,7 @@ class LyricsWaterfallFetcher(
             }
         }
 
-        // 💡 若时间戳歌词全链路未命中，降级采纳暂存的纯文本无时间戳歌词兜底
-        if (fallbackPlainTimeline != null) {
-            Logger.lyrics.i(TAG, "时间戳歌词全链路未命中，降级采纳纯文本歌词: $cleanArtist - $cleanTitle")
-            val enriched = enrichWithTranslation(fallbackPlainTimeline, cleanArtist, cleanTitle, durationMs)
-            cacheRepository.put(cacheKey, enriched)
-            return enriched
-        }
-
-        Logger.lyrics.w(TAG, "阶梯瀑布流全链路未命中有效歌词: $cleanArtist - $cleanTitle")
+        Logger.lyrics.w(TAG, "阶梯瀑布流全链路未命中有效时间戳歌词: $cleanArtist - $cleanTitle")
         return null
     }
 

@@ -206,4 +206,39 @@ class LyricsSyncClockTest {
         val frozenTime = syncClock.getCurrentInterpolatedTimeMs(baseNano + 500_000_000L)
         assertEquals(30_000L, frozenTime)
     }
+
+    @Test
+    fun `initial warmup delayed progress packet within 3500ms does not pull back clock`() {
+        val baseNano = 1_000_000_000L
+        // 开播硬对齐至 0ms (带 100ms 预充)
+        syncClock.hardAlign(targetPositionMs = 0L, playing = true, nowNanoTime = baseNano)
+
+        // 走字 1000ms (预充 100ms 扣除后推演到达 900ms)
+        val t1 = syncClock.getCurrentInterpolatedTimeMs(baseNano + 1_000_000_000L)
+        assertEquals(900L, t1)
+
+        // 此时推流端 iPhone 下发了首包迟到的极小进度 131ms (|900 - 131| = 769ms > 350ms)
+        syncClock.updatePosition(131L, playing = true, nowNanoTime = baseNano + 1_000_000_000L)
+
+        // 验证开播防倒拉保护生效：绝不触发向后 Seek 重置为 131ms，维持单调推演继续前进 (900ms + 100ms = 1000ms)
+        val t2 = syncClock.getCurrentInterpolatedTimeMs(baseNano + 1_100_000_000L)
+        assertEquals(1000L, t2)
+    }
+
+    @Test
+    fun `ringBufferDelayMsProvider accurately subtracts hardware latency from interpolated clock`() {
+        var mockDelay = 200L
+        val clockWithDelay = LyricsSyncClock(
+            maxExtrapolationMs = 1200L,
+            jumpThresholdMs = 350L,
+            ringBufferDelayMsProvider = { mockDelay }
+        )
+
+        val baseNano = 1_000_000_000L
+        clockWithDelay.updatePosition(10_000L, playing = true, nowNanoTime = baseNano)
+
+        // 经过 500ms，原始推演时间为 10500ms，扣除 200ms 硬件延迟后应为 10300ms
+        val t = clockWithDelay.getCurrentInterpolatedTimeMs(baseNano + 500_000_000L)
+        assertEquals(10_300L, t)
+    }
 }

@@ -17,7 +17,8 @@ import kotlin.math.abs
  */
 class LyricsSyncClock(
     private val maxExtrapolationMs: Long = DEFAULT_MAX_EXTRAPOLATION_MS,
-    private val jumpThresholdMs: Long = DEFAULT_JUMP_THRESHOLD_MS
+    private val jumpThresholdMs: Long = DEFAULT_JUMP_THRESHOLD_MS,
+    private val ringBufferDelayMsProvider: () -> Long = { 0L }
 ) {
 
     data class ActiveLineState(
@@ -69,6 +70,20 @@ class LyricsSyncClock(
 
         val jumpDelta = abs(newPositionMs - currentEstimatedTime)
 
+        // 💡 修复开播初期 iPhone 迟到的极小进度上报误判为 Seek 倒退的缺陷：
+        // 切歌开播初始 3.5 秒内，若新上报的进度极小 (<= 1500ms) 且落后于当前已平滑推演的时钟，
+        // 判定为推流端未就绪的延迟校准包，绝不触发向后 Seek 硬重置；将推演基准重设为当前推演时间，维持单调平滑推进，根除永久滞后 1.5 秒的根因！
+        val isInitialWarmupLag = currentEstimatedTime <= 3500L && newPositionMs <= 1500L && newPositionMs < currentEstimatedTime
+        if (isInitialWarmupLag) {
+            Logger.lyrics.d(
+                TAG,
+                "开播初期推流端进度滞后 (currentEst=${currentEstimatedTime}ms, incoming=${newPositionMs}ms)，重设基准为当前推演时间，维持单调平滑推进"
+            )
+            reportedPositionMs = currentEstimatedTime
+            anchorNanoTime = nowNanoTime
+            return
+        }
+
         // 1. 检测进度跳变 (iPhone 拖动寻道，无论是向前还是向后拖动超过阈值)
         if (jumpDelta > jumpThresholdMs) {
             Logger.lyrics.i(
@@ -119,17 +134,20 @@ class LyricsSyncClock(
 
         // 💡 nowNanoTime 可能早于 anchorNanoTime (当处于 100ms 硬件预充期时)，此时推演增量钳制为 0
         val elapsedNano = nowNanoTime - anchorNanoTime
-        if (elapsedNano <= 0L) {
-            val monotonic = maxOf(lastInterpolatedTimeMs, reportedPositionMs)
-            lastInterpolatedTimeMs = monotonic
-            return monotonic
+        val rawTimeMs = if (elapsedNano <= 0L) {
+            reportedPositionMs
+        } else {
+            val elapsedMs = elapsedNano / 1_000_000L
+            val extrapolatedMs = elapsedMs.coerceIn(0L, maxExtrapolationMs)
+            reportedPositionMs + extrapolatedMs
         }
-        val elapsedMs = elapsedNano / 1_000_000L
-        val extrapolatedMs = elapsedMs.coerceIn(0L, maxExtrapolationMs)
-        val calculated = reportedPositionMs + extrapolatedMs
 
-        // 💡 保证非寻道期间推演时钟绝对单调不倒退：当底层上报因调度略微落后时，原地微等几十毫秒待其追平，绝不逆向回跳
-        val monotonic = maxOf(lastInterpolatedTimeMs, calculated)
+        // 💡 精准扣除 USB 环形缓冲区未消费数据物理延迟 (通常为 100ms~250ms)，确保 UI 高亮与扬声器声音毫秒级咬合
+        val ringDelayMs = ringBufferDelayMsProvider().coerceIn(0L, 500L)
+        val hardwareAdjustedTime = (rawTimeMs - ringDelayMs).coerceAtLeast(0L)
+
+        // 💡 保证推演时钟绝对单调不倒退：当底层上报因调度略微落后时，原地微等几十毫秒待其追平，绝不逆向回跳
+        val monotonic = maxOf(lastInterpolatedTimeMs, hardwareAdjustedTime)
         lastInterpolatedTimeMs = monotonic
         return monotonic
     }

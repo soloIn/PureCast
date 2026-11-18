@@ -131,11 +131,15 @@ class LrclibDataSource(
                 val syncedLrc = item.optCleanString("syncedLyrics")
                 val plainLrc = item.optCleanString("plainLyrics")
 
+                // 💡 瀑布流分级择优调度：彻底屏蔽无时间戳纯文本歌词候选，不予打分采纳
+                if (!isInst && syncedLrc.isNullOrBlank()) {
+                    continue
+                }
+
                 val candFormat = when {
                     syncedLrc != null && syncedLrc.contains("<") -> LyricFormat.LRC_WORD_SYNC
                     syncedLrc != null && syncedLrc.isNotBlank() -> LyricFormat.LRC_LINE_SYNC
-                    plainLrc != null && plainLrc.isNotBlank() -> LyricFormat.PLAIN_TEXT
-                    else -> LyricFormat.PLAIN_TEXT
+                    else -> LyricFormat.LRC_LINE_SYNC
                 }
 
                 val scoreResult = LyricCandidateScorer.evaluate(
@@ -160,8 +164,6 @@ class LrclibDataSource(
                         )
                     } else if (!syncedLrc.isNullOrBlank()) {
                         LrcParser.parse(syncedLrc, sourceName = "LRCLIB", expectedDurationMs = candDurationMs)
-                    } else if (!plainLrc.isNullOrBlank()) {
-                        LrcParser.parse(plainLrc, sourceName = "LRCLIB", expectedDurationMs = candDurationMs)
                     } else null
 
                     if (timeline != null) {
@@ -190,22 +192,21 @@ class LrclibDataSource(
             val candDurationSec = json.optDouble("duration", 0.0)
             val candDurationMs = (candDurationSec * 1000).toLong()
             val syncedLrc = json.optCleanString("syncedLyrics")
-            val plainLrc = json.optCleanString("plainLyrics")
 
             if (isInst) {
                 return LyricTimeline(
                     source = "LRCLIB",
-                    format = LyricFormat.PLAIN_TEXT,
+                    format = LyricFormat.LRC_LINE_SYNC,
                     isInstrumental = true,
                     lines = emptyList(),
                     durationMs = candDurationMs
                 )
             }
 
-            val lrcContent = syncedLrc ?: plainLrc
-            if (lrcContent.isNullOrBlank()) return null
+            // 💡 严格要求有效时间戳歌词，纯文本直接返回 null 以便瀑布流继续降级至网易云或下一级
+            if (syncedLrc.isNullOrBlank()) return null
 
-            LrcParser.parse(lrcContent, sourceName = "LRCLIB", expectedDurationMs = candDurationMs)
+            LrcParser.parse(syncedLrc, sourceName = "LRCLIB", expectedDurationMs = candDurationMs)
         } catch (e: Exception) {
             Logger.lyrics.w(TAG, "解析 LRCLIB 条目异常", e)
             null

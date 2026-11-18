@@ -683,6 +683,14 @@ internal object TriStateTransitionMatrix {
                 if (ev.trackGeneration > 0L && ev.trackGeneration != snap.trackGeneration) {
                     return TransitionOutput(ctx, emptyList())
                 }
+                // 💡 防倒流保护：若处于同代开播初始 3.5 秒内且协议上报了滞后的小值 (<= 1500ms)，杜绝将已走字进度逆向倒拉
+                if (snap.businessState == BusinessSessionState.PLAYING &&
+                    snap.progressPositionMs in 1L..3500L &&
+                    ev.positionMs in 0L..1500L &&
+                    ev.positionMs < snap.progressPositionMs
+                ) {
+                    return TransitionOutput(ctx, emptyList())
+                }
                 val clampedDuration = if (ev.durationMs > 0L) ev.durationMs else snap.progressDurationMs
                 val clampedPosition = if (clampedDuration > 0L) {
                     ev.positionMs.coerceIn(0L, clampedDuration)

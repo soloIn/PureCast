@@ -231,7 +231,17 @@ fun MainTvScreen(
     // 💡 歌词 UI 状态与 60fps/120fps 帧间平滑同步时钟 (U5, U6, U7)
     val lyricUiState by remember { PlaybackService.lyricsUiState }.collectAsState()
     var isLyricsExpanded by remember { mutableStateOf(false) }
-    val lyricsSyncClock = remember { LyricsSyncClock() }
+    val lyricsSyncClock = remember {
+        LyricsSyncClock(
+            ringBufferDelayMsProvider = {
+                try {
+                    com.solo.purecast.core.nativebridge.NativeAudioEngine.getRingBufferDelayMs()
+                } catch (_: Throwable) {
+                    0L
+                }
+            }
+        )
+    }
 
     val currentServiceSnapshot by remember { PlaybackService.sessionSnapshot }.collectAsState()
     var lastObservedTrackGen by remember { mutableLongStateOf(0L) }

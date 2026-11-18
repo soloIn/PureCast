@@ -409,13 +409,24 @@ class PlaybackServiceSessionHost(
         val isFirstPlayAtZero = prev?.businessState != next.businessState &&
             next.businessState == BusinessSessionState.PLAYING &&
             next.progressPositionMs == 0L
-        if (prev == null ||
+
+        // 💡 开播保护：在当前曲目开播前 3.5 秒内，若协议上报的极小进度 (<= 1500ms) 比当前服务已走字进度落后，不得逆向倒拉锚点
+        val currentServiceElapsed = (nowMs - lastAnchorClockMs).coerceAtLeast(0L)
+        val currentServicePos = lastAnchorPosMs + currentServiceElapsed
+        val isInitialProtocolLag = prev != null &&
+            prev.trackGeneration == next.trackGeneration &&
+            prev.businessState == BusinessSessionState.PLAYING &&
+            currentServicePos in 1L..3500L &&
+            next.progressPositionMs in 0L..1500L &&
+            next.progressPositionMs < currentServicePos
+
+        if (!isInitialProtocolLag && (prev == null ||
             prev.sessionId != next.sessionId ||
             prev.trackGeneration != next.trackGeneration ||
             prev.businessState != next.businessState ||
             isFirstPlayAtZero ||
             (isProtocolProgressUpdate && (prev.progressPositionMs != next.progressPositionMs || next.progressPositionMs == 0L))
-        ) {
+        )) {
             lastAnchorPosMs = next.progressPositionMs
             // 💡 修复 FirstDataPacketEvent 早于 DAC 真实出声 100ms：
             // 首帧写入环形缓冲区触发 PLAYING 时，声卡正处于 100ms 预充阶段，将时钟锚点精准推迟 100ms，

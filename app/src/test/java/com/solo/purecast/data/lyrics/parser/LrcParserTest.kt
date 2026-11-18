@@ -79,7 +79,7 @@ class LrcParserTest {
     }
 
     @Test
-    fun `plain text without timestamps falls back to plain text format`() {
+    fun `plain text without timestamps returns null`() {
         val plainText = """
             这是第一行歌词
             这是第二行歌词
@@ -87,10 +87,7 @@ class LrcParserTest {
 
         val timeline = LrcParser.parse(plainText, "LRCLIB")
 
-        assertNotNull(timeline)
-        assertEquals(LyricFormat.PLAIN_TEXT, timeline?.format)
-        assertEquals(2, timeline?.lines?.size)
-        assertEquals("这是第一行歌词", timeline?.lines?.get(0)?.mainText)
+        assertNull(timeline)
     }
 
     @Test
