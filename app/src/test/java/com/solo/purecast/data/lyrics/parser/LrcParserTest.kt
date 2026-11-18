@@ -63,6 +63,32 @@ class LrcParserTest {
     }
 
     @Test
+    fun `parse enhanced LRC with leading text before first sync tag preserves leading word`() {
+        val enhancedLrc = """
+            [01:23.45]Hello <01:24.00>world <01:25.50>
+        """.trimIndent()
+
+        val timeline = LrcParser.parse(enhancedLrc, "LRCLIB")
+
+        assertNotNull(timeline)
+        assertEquals(LyricFormat.LRC_WORD_SYNC, timeline?.format)
+        val line = timeline!!.lines[0]
+        assertEquals("Hello world ", line.mainText)
+        assertEquals(2, line.words?.size)
+
+        // 验证引导词 Hello 不被静默丢弃，且继承行起始时间 83450ms
+        val word0 = line.words!![0]
+        assertEquals("Hello ", word0.text)
+        assertEquals(83450L, word0.startMs)
+        assertEquals(84000L, word0.endMs)
+
+        val word1 = line.words!![1]
+        assertEquals("world ", word1.text)
+        assertEquals(84000L, word1.startMs)
+        assertEquals(85500L, word1.endMs)
+    }
+
+    @Test
     fun `parse multi timestamp lines expands to sorted separate entries`() {
         val multiTimeLrc = """
             [00:10.00][00:30.00]副歌重复句

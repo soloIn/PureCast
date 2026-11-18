@@ -176,7 +176,7 @@ class LyricsSyncClock(
 
         val prev = lines[index - 1]
         val prevWords = prev.words
-        return if (!prevWords.isNullOrEmpty()) {
+        val rawEffectiveStart = if (!prevWords.isNullOrEmpty()) {
             val prevVocalsEnd = prevWords.last().endMs
             if (line.startMs > prevVocalsEnd) {
                 // 上一行有逐字时间戳且已唱完：确保不截断上一行最后音节的扫光
@@ -187,9 +187,21 @@ class LyricsSyncClock(
                 (line.startMs - leadInMs).coerceAtLeast(0L)
             }
         } else {
-            // 无逐字时间戳的普通行歌词：允许提前 leadInMs 激活，与平滑滚动动画时长无缝衔接
-            (line.startMs - leadInMs).coerceAtLeast(0L)
+            // 普通行：检查两句间距是否小于提前量 (紧凑行间距)
+            val lineGap = line.startMs - prev.startMs
+            if (lineGap > 0L && lineGap < leadInMs) {
+                // 💡 修复 Finding 1: 紧凑行间距下两句相隔过短 (< leadInMs)，禁止提前过激吞噬上一行
+                // 延迟至当前行实际起始时间 (line.startMs) 切换，确保上一句获得完整展示
+                line.startMs
+            } else {
+                // 两句间距充足，正常提前 leadInMs 激活以配合平滑滚动动画
+                (line.startMs - leadInMs).coerceAtLeast(0L)
+            }
         }
+
+        // 💡 修复 Finding 1: 严格硬约束下一行激活时间绝不能早于上一行开唱时间 (prev.startMs)
+        // 当两句相距极近 (< leadInMs) 时，防止下一行倒挂提前激活而彻底吞噬跳过上一行显示
+        return maxOf(prev.startMs, rawEffectiveStart)
     }
 
     /**

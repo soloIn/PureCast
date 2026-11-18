@@ -812,7 +812,9 @@ int64_t AudioEngine::reconfigure_audio_format(int sample_rate, int bit_depth, in
     }
 
     LOGI("开始 UAC 原位三元组切频: %dHz/%dbit/%dch -> %dHz/%dbit/%dch",
-         current_sample_rate_, current_bit_depth_, current_channels_,
+         current_sample_rate_.load(std::memory_order_relaxed),
+         current_bit_depth_.load(std::memory_order_relaxed),
+         current_channels_.load(std::memory_order_relaxed),
          sample_rate, bit_depth, channels);
 
     const uac::AudioEndpointInfo prev_endpoint = endpoint_info_;
@@ -1346,9 +1348,9 @@ int64_t AudioEngine::get_ring_buffer_delay_ms() const {
     if (unconsumed_bytes == 0) {
         return 0;
     }
-    const int sr = current_sample_rate_;
-    const int ch = current_channels_;
-    const int bd = current_bit_depth_;
+    const int sr = current_sample_rate_.load(std::memory_order_acquire);
+    const int ch = current_channels_.load(std::memory_order_acquire);
+    const int bd = current_bit_depth_.load(std::memory_order_acquire);
     if (sr <= 0 || ch <= 0 || bd <= 0) {
         return 0;
     }

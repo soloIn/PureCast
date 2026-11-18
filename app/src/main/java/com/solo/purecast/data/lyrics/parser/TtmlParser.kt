@@ -140,16 +140,24 @@ object TtmlParser {
                             }
                             val translationText = currentTranslationBuilder.toString().trim().takeIf { it.isNotEmpty() }
 
-                            if (mainText.isNotEmpty() || translationText != null) {
+                            // 💡 修复 Finding 6: 若原词为空但含翻译，以翻译作为主原词；若二者均为空则丢弃，杜绝生成空行
+                            val resolvedMain = when {
+                                mainText.isNotEmpty() -> mainText
+                                translationText != null -> translationText
+                                else -> ""
+                            }
+                            val resolvedTrans = if (mainText.isNotEmpty()) translationText else null
+
+                            if (resolvedMain.isNotEmpty()) {
                                 val resolvedEndMs = if (pEndMs > pStartMs) {
                                     pEndMs
                                 } else {
                                     currentWords.lastOrNull()?.endMs?.takeIf { it > pStartMs } ?: (pStartMs + 3000L)
                                 }
 
-                                val simplifiedMain = ChineseConverter.toSimplified(mainText)
-                                val simplifiedTrans = translationText?.let { ChineseConverter.toSimplified(it) }
-                                val wordsList = if (currentWords.isNotEmpty()) {
+                                val simplifiedMain = ChineseConverter.toSimplified(resolvedMain)
+                                val simplifiedTrans = resolvedTrans?.let { ChineseConverter.toSimplified(it) }
+                                val wordsList = if (currentWords.isNotEmpty() && mainText.isNotEmpty()) {
                                     currentWords.map { w -> w.copy(text = ChineseConverter.toSimplified(w.text)) }
                                 } else null
 

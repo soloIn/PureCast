@@ -16,11 +16,13 @@ import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.gestures.animateScrollBy
+import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.background
 import androidx.compose.foundation.basicMarquee
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -399,49 +401,9 @@ private fun LyricsStreamView(
         }
     }
 
-    // 💡 滚动曲线定制与垂直中间偏上对齐 (38% 黄金视线分割点)
-    // 动态计算目标行物理中心与视口 38% 高度差值，通过 animateScrollBy 配合 FastOutSlowInEasing，获得更具阻尼感的 Apple TV 级平滑滚动体验
-    var lastScrolledLineIndex by remember { mutableIntStateOf(-1) }
-    LaunchedEffect(activeLineIndex) {
-        if (activeLineIndex in timeline.lines.indices) {
-            val delta = abs(activeLineIndex - lastScrolledLineIndex)
-            lastScrolledLineIndex = activeLineIndex
-            val viewportHeight = listState.layoutInfo.viewportSize.height
-            val targetCenterY = if (viewportHeight > 0) (viewportHeight * 0.38f) else with(density) { 240.dp.toPx() }
-
-            if (delta > 2) {
-                // 💡 跨行寻道 (Seek) 或切歌大跨度跳变：立即瞬时定位对齐，杜绝缓慢滑行造成的滞后感
-                val topPaddingPx = with(density) { 180.dp.roundToPx() }
-                val scrollOffsetPx = (topPaddingPx - targetCenterY.toInt()).coerceAtLeast(0)
-                listState.scrollToItem(
-                    index = activeLineIndex,
-                    scrollOffset = scrollOffsetPx
-                )
-            } else {
-                // 💡 正常逐句推进：高阻尼平滑动画过渡，动态将高亮行物理中心平移对齐至垂直中间偏上 (38%)
-                val visibleItem = listState.layoutInfo.visibleItemsInfo.firstOrNull { it.index == activeLineIndex }
-                if (visibleItem != null) {
-                    val currentCenter = visibleItem.offset + visibleItem.size / 2
-                    val scrollDelta = currentCenter - targetCenterY
-                    listState.animateScrollBy(
-                        value = scrollDelta,
-                        animationSpec = tween(durationMillis = 480, easing = FastOutSlowInEasing)
-                    )
-                } else {
-                    val topPaddingPx = with(density) { 180.dp.roundToPx() }
-                    val scrollOffsetPx = (topPaddingPx - targetCenterY.toInt()).coerceAtLeast(0)
-                    listState.animateScrollToItem(
-                        index = activeLineIndex,
-                        scrollOffset = scrollOffsetPx
-                    )
-                }
-            }
-        }
-    }
-
     val primaryTextColor = if (hasDarkBackground) Color.White else Color(0xFF1C1C1E)
 
-    Box(
+    BoxWithConstraints(
         modifier = modifier
             .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
             .drawWithContent {
@@ -467,9 +429,67 @@ private fun LyricsStreamView(
                 )
             }
     ) {
+        val viewportHeightPx = constraints.maxHeight.toFloat()
+        val targetRatio = 0.38f // 💡 38% 黄金视线分割点（垂直中间偏上）
+        val targetCenterY = viewportHeightPx * targetRatio
+
+        // 💡 动态计算首尾内容填充，确保首行与末行均能精准对齐至 38% 黄金视线分割点
+        val halfItemHeightPx = with(density) { 36.dp.toPx() }
+        val topPaddingPx = (targetCenterY - halfItemHeightPx).coerceAtLeast(0f)
+        val bottomPaddingPx = (viewportHeightPx - targetCenterY - halfItemHeightPx).coerceAtLeast(0f)
+        val topPaddingDp = with(density) { topPaddingPx.toDp() }
+        val bottomPaddingDp = with(density) { bottomPaddingPx.toDp() }
+
+        // 💡 滚动曲线定制与垂直中间偏上对齐 (38% 黄金视线分割点)
+        // 动态计算目标行物理中心与视口 38% 高度差值，通过 animateScrollBy 配合 FastOutSlowInEasing，获得更具阻尼感的 Apple TV 级平滑滚动体验
+        var lastScrolledLineIndex by remember { mutableIntStateOf(-1) }
+        LaunchedEffect(activeLineIndex) {
+            if (activeLineIndex in timeline.lines.indices) {
+                val delta = abs(activeLineIndex - lastScrolledLineIndex)
+                lastScrolledLineIndex = activeLineIndex
+
+                if (delta > 2) {
+                    // 💡 跨行寻道 (Seek) 或切歌大跨度跳变：立即瞬时定位对齐，杜绝缓慢滑行造成的滞后感
+                    // 由于 topPadding 已精确设为 targetCenterY - halfItemHeight，scrollToItem(activeLineIndex, 0)
+                    // 瞬间将目标行定位于 38% 黄金视线附近
+                    listState.scrollToItem(index = activeLineIndex, scrollOffset = 0)
+
+                    val postItem = listState.layoutInfo.visibleItemsInfo.firstOrNull { it.index == activeLineIndex }
+                    if (postItem != null) {
+                        val currentCenter = postItem.offset + postItem.size / 2f
+                        val fineDelta = currentCenter - targetCenterY
+                        if (abs(fineDelta) > 1f) {
+                            listState.scrollBy(fineDelta)
+                        }
+                    }
+                } else {
+                    // 💡 正常逐句推进：高阻尼平滑动画过渡，动态将高亮行物理中心平移对齐至垂直中间偏上 (38%)
+                    val visibleItem = listState.layoutInfo.visibleItemsInfo.firstOrNull { it.index == activeLineIndex }
+                    if (visibleItem != null) {
+                        val currentCenter = visibleItem.offset + visibleItem.size / 2f
+                        val scrollDelta = currentCenter - targetCenterY
+                        listState.animateScrollBy(
+                            value = scrollDelta,
+                            animationSpec = tween(durationMillis = 480, easing = FastOutSlowInEasing)
+                        )
+                    } else {
+                        listState.scrollToItem(index = activeLineIndex, scrollOffset = 0)
+                        val postItem = listState.layoutInfo.visibleItemsInfo.firstOrNull { it.index == activeLineIndex }
+                        if (postItem != null) {
+                            val currentCenter = postItem.offset + postItem.size / 2f
+                            val fineDelta = currentCenter - targetCenterY
+                            if (abs(fineDelta) > 1f) {
+                                listState.scrollBy(fineDelta)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         LazyColumn(
             state = listState,
-            contentPadding = PaddingValues(start = 0.dp, top = 180.dp, end = 0.dp, bottom = 220.dp),
+            contentPadding = PaddingValues(start = 0.dp, top = topPaddingDp, end = 0.dp, bottom = bottomPaddingDp),
             verticalArrangement = Arrangement.spacedBy(28.dp),
             modifier = Modifier.fillMaxSize()
         ) {
@@ -547,7 +567,7 @@ private fun SmoothLyricLineRow(
 
     Column(
         modifier = modifier
-            .fillMaxWidth(0.925f) // 💡 预留 7.5% 物理余量 (0.925 * 1.08 = 0.999)，确保 1.08x 放大时文字右侧绝不超出视口被裁剪，且多容纳 2~3 个大号汉字
+            .fillMaxWidth(0.96f) // 💡 预留 4% 物理余量 (0.96 * 1.08 ≈ 1.037，外层已有 padding)，确保 1.08x 放大时文字右侧不超出视口，且大幅提升单行容字量避免英文/长中文提前折行
             .graphicsLayer {
                 scaleX = animatedScale
                 scaleY = animatedScale
@@ -573,10 +593,10 @@ private fun SmoothLyricLineRow(
         } else {
             Text(
                 text = line.mainText,
-                fontSize = 34.sp,
+                fontSize = 31.sp,
                 fontWeight = if (isActive) FontWeight.Bold else FontWeight.SemiBold,
                 color = primaryColor,
-                lineHeight = 44.sp,
+                lineHeight = 40.sp,
                 modifier = Modifier.fillMaxWidth()
             )
         }
@@ -638,9 +658,9 @@ private fun WordSyncKaraokeText(
 
     Text(
         text = fullText,
-        fontSize = 34.sp,
+        fontSize = 31.sp,
         fontWeight = FontWeight.Bold,
-        lineHeight = 44.sp,
+        lineHeight = 40.sp,
         onTextLayout = { layoutResult = it },
         color = Color.White,
         modifier = modifier

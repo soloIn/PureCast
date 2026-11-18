@@ -19,6 +19,7 @@ object MetadataNormalizer {
     // 全角转半角映射表或替换字符（增加省略号、连续句点、单双引号）
     private val PUNCTUATION_REGEX = Regex("""[·・•,，:：;；/／\-_—~～\(\)\[\]【】（）"“”'‘’`\.\.…]+""")
     private val MULTI_SPACE_REGEX = Regex("""\s+""")
+    private val FEAT_REGEX = Regex("""\s*(feat\.?|ft\.?|featuring)\s+.*$""", RegexOption.IGNORE_CASE)
 
     // 占位歌手识别集合
     private val PLACEHOLDER_ARTISTS = setOf(
@@ -64,8 +65,7 @@ object MetadataNormalizer {
         if (result.isEmpty()) return ""
 
         // 移除 feat / ft
-        val featRegex = Regex("""\s*(feat\.?|ft\.?|featuring)\s+.*$""", RegexOption.IGNORE_CASE)
-        result = featRegex.replace(result, "")
+        result = FEAT_REGEX.replace(result, "")
 
         // 将斜杠、逗号合作者统一切换为标准空格
         result = PUNCTUATION_REGEX.replace(result, " ")

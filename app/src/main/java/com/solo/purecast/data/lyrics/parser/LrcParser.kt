@@ -160,6 +160,28 @@ object LrcParser {
                     val textBuilder = StringBuilder()
                     val lineTimeDelta = curr.startMs - (curr.originalTimestampMs + offsetMs)
 
+                    // 💡 修复 Finding 2: 捕获首个逐字时间标签前的引导原词 (如 [01:23.45]Hello <01:24.00>world)
+                    val firstMatchStart = wordMatches.first().start()
+                    if (firstMatchStart > 0) {
+                        val leadingText = mainText.substring(0, firstMatchStart)
+                        val firstWm = wordMatches.first()
+                        val fwMin = firstWm.group(1)?.toLongOrNull() ?: 0L
+                        val fwSec = firstWm.group(2)?.toLongOrNull() ?: 0L
+                        val fwFrac = parseFractionMs(firstWm.group(3))
+                        val firstWordStartMs = (fwMin * 60 * 1000L) + (fwSec * 1000L) + fwFrac + offsetMs + lineTimeDelta
+
+                        if (leadingText.isNotBlank()) {
+                            wordList.add(
+                                LyricWord(
+                                    text = leadingText,
+                                    startMs = curr.startMs,
+                                    endMs = firstWordStartMs.coerceAtLeast(curr.startMs)
+                                )
+                            )
+                        }
+                        textBuilder.append(leadingText)
+                    }
+
                     for (j in wordMatches.indices) {
                         val wm = wordMatches[j]
                         val wMin = wm.group(1)?.toLongOrNull() ?: 0L

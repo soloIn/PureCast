@@ -162,13 +162,12 @@ class NeteaseDataSource(
     private fun parseTranslationLines(tlyricStr: String): List<Pair<Long, String>> {
         val result = mutableListOf<Pair<Long, String>>()
         val lines = tlyricStr.lines()
-        val timeRegex = Regex("""\[(\d{1,2}):(\d{2})(?:\.(\d{1,3}))?]""")
 
         for (line in lines) {
             val trimmed = line.trim()
             if (trimmed.isEmpty()) continue
 
-            val match = timeRegex.find(trimmed) ?: continue
+            val match = TIME_REGEX.find(trimmed) ?: continue
             val min = match.groupValues[1].toLongOrNull() ?: 0L
             val sec = match.groupValues[2].toLongOrNull() ?: 0L
             val fracStr = match.groupValues[3]
@@ -214,5 +213,6 @@ class NeteaseDataSource(
         private const val SEARCH_API_URL = "https://music.163.com/api/search/get"
         private const val LYRIC_API_URL = "https://music.163.com/api/song/lyric"
         private const val TIMEOUT_MS = 2500
+        private val TIME_REGEX = Regex("""\[(\d{1,2}):(\d{2})(?:\.(\d{1,3}))?]""")
     }
 }

@@ -312,12 +312,5 @@ class LyricsTriggerManager(
             "audio cast",
             "bluetooth"
         )
-
-        private val PLACEHOLDER_ARTISTS = setOf(
-            "purecast",
-            "purecast tv",
-            "unknown",
-            "unknown artist"
-        )
     }
 }

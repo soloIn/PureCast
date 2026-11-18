@@ -1,15 +1,18 @@
 package com.solo.purecast.data.lyrics
 
-import android.util.LruCache
 import com.solo.purecast.model.LyricFormat
 import com.solo.purecast.model.LyricLine
 import com.solo.purecast.model.LyricTimeline
 import com.solo.purecast.model.LyricWord
 import com.solo.purecast.util.Logger
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.security.MessageDigest
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * 💡 歌词两级缓存仓库（L1 内存 LRU + L2 本地磁盘文件缓存）
@@ -29,6 +32,9 @@ class LyricsCacheRepository(
             return shouldRemove
         }
     }
+
+    private val writeCount = AtomicInteger(0)
+    private val ioScope = CoroutineScope(Dispatchers.IO)
 
     init {
         if (!diskCacheDir.exists()) {
@@ -114,8 +120,12 @@ class LyricsCacheRepository(
                 }
             }
 
-            // 💡 异步检查是否需要淘汰磁盘文件
-            trimDiskCacheIfNeeded()
+            // 💡 修复 Finding 5: 节流并在后台 IO 线程异步执行磁盘淘汰检查，杜绝主调用线程 I/O 阻塞
+            if (writeCount.incrementAndGet() % TRIM_CHECK_INTERVAL == 0) {
+                ioScope.launch {
+                    trimDiskCacheIfNeeded()
+                }
+            }
         } catch (e: Exception) {
             Logger.lyrics.e(TAG, "写入 L2 磁盘歌词失败: key=$key", e)
         }
@@ -261,5 +271,6 @@ class LyricsCacheRepository(
         private const val TAG = "LyricsCacheRepo"
         const val DEFAULT_MAX_MEMORY_ENTRIES = 50
         const val DEFAULT_MAX_DISK_ENTRIES = 1000
+        const val TRIM_CHECK_INTERVAL = 20
     }
 }

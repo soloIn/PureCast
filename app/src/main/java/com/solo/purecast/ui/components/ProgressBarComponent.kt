@@ -58,9 +58,15 @@ internal sealed interface ProgressRightLabelMode {
 
 /**
  * 💡 PureCast 纤细圆角进度条与时间轴组件 (ProgressBarComponent)
- * 1. 轨道高度默认为 4dp，纯展示状态指示，完全禁用焦点捕获与点击/Seek 交互。
+ * 1. 轨道高度默认为 4dp，纯展示状态指示，完全运行于 GPU Draw 阶段 (0 Layout 测量开销)。
  * 2. 悬浮对比度保护：轨道底槽采用高透半白 [Color(0x40FFFFFF)]，填充条使用高纯亮白 [Color.White]，在任意流光背景下清晰可见。
  * 3. 左侧展示当前播放时间 (mm:ss)，右侧依据 [DurationState] 展示总时长、"等待投屏接入"、"--:--" 或实时流 "LIVE / 实时直通" 状态。
+ * 4. 兼容性提示：[onSeek], [onSeekImmediate], [focusRequester], [onPlayPauseClick] 为历史交互留存形参，当前统一由遥控器主控区接管。
+ * @param seekCapability [已废弃] ProgressBar 已降级为纯展示绘制控件，交互由 PlaybackControls 接管
+ * @param onSeek [已废弃] 交互由 PlaybackControls 接管
+ * @param onSeekImmediate [已废弃] 交互由 PlaybackControls 接管
+ * @param focusRequester [已废弃] 不再请求焦点
+ * @param onPlayPauseClick [已废弃] 交互由 PlaybackControls 接管
  */
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable

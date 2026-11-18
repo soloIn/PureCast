@@ -332,4 +332,41 @@ class LyricsSyncClockTest {
         assertEquals(1, stateSinging.lineIndex)
         assertEquals(0, stateSinging.activeWordIndex)
     }
+
+    @Test
+    fun `tight line spacing preserves previous line when effective start would invert order`() {
+        // 测试紧凑间距行（例如第 0 行 5000ms 开唱，第 1 行 5100ms 开唱）
+        // 验证 getEffectiveStartMs 不会倒挂早于上一行 5000ms，导致第 0 行被直接跳过
+        val timeline = LyricTimeline(
+            source = "test",
+            format = LyricFormat.LRC_LINE_SYNC,
+            lines = listOf(
+                LyricLine(
+                    lineIndex = 0,
+                    startMs = 5_000L,
+                    endMs = 5_100L,
+                    mainText = "Quick line 0"
+                ),
+                LyricLine(
+                    lineIndex = 1,
+                    startMs = 5_100L,
+                    endMs = 8_000L,
+                    mainText = "Line 1"
+                )
+            )
+        )
+
+        // 4_900ms：处于前奏期，第 0 行因 leadIn (280ms) 提前激活
+        val state4900 = syncClock.calculateActiveLineState(timeline, 4_900L)
+        assertEquals(0, state4900.lineIndex)
+
+        // 5_020ms：第 0 行正在唱（5000ms~5100ms），第 1 行的 effectiveStart 不能早于 5000ms
+        // 第 0 行必须能够获得焦点展示，不能被下一行倒挂提前抢占
+        val state5020 = syncClock.calculateActiveLineState(timeline, 5_020L)
+        assertEquals(0, state5020.lineIndex)
+
+        // 5_100ms：第 0 行唱完，切换至第 1 行
+        val state5100 = syncClock.calculateActiveLineState(timeline, 5_100L)
+        assertEquals(1, state5100.lineIndex)
+    }
 }

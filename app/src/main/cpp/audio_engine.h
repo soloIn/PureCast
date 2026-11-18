@@ -194,9 +194,9 @@ private:
     std::atomic<bool> feedback_locked_{false};   // 是否已成功完成首次硬件时钟锁定
     uint32_t phase_accumulator_{0};              // 16.16 相位累加器 (仅消费线程修改)
 
-    int current_sample_rate_{44100};
-    int current_bit_depth_{16};
-    int current_channels_{2};
+    std::atomic<int> current_sample_rate_{44100};
+    std::atomic<int> current_bit_depth_{16};
+    std::atomic<int> current_channels_{2};
     size_t packet_size_{0};
 
     // 💡 Bresenham 时钟步进参数 (仅消费线程与 pipeline 初始化边界修改)
