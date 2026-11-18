@@ -90,3 +90,12 @@ A temporal hysteresis gate in lyric rendering time synchronization that establis
 A 10-Foot UI presentation paradigm adapted from Apple Music for Android TV, where a dedicated subtitle/lyrics control button in the primary playback controls initiates a spring-animated transition between the standard 42%/58% cover-dominant screen and a 35%/65% lyrics-dominant view featuring active line enlargement, dynamic syllable sweep, and dual-language secondary translation.
 *Aliases: Apple Music TV 风格大屏歌词展开, 沉浸式双模歌词交互*
 
+### Golden Ratio Lyrics Viewport
+A 10-Foot UI viewing ergonomics rule in Android TV lyric streams that anchors the currently sung lyric line at exactly 38% from the top of the viewport rather than 50% dead center, aligning with the human eye's natural rest angle on large elevated displays (65-85 inch TV at a 2.5-4m viewing distance) and dynamically adjusting `LazyColumn` contentPadding (`targetCenterY - halfItemHeight`) to ensure edge lines scroll smoothly to the anchor without hitting rigid scroll boundaries.
+*Aliases: 38% 黄金视线分割点, 歌词黄金视线锚定*
+
+### Zero-Recomposition Syllable Sweep
+A 60fps/120fps hardware-accelerated text rendering architecture for syllable-level karaoke lyrics in Compose TV. It completely bypasses Compose layout and recomposition cycles during continuous time updates by deferring timeline querying to the `drawWithContent` phase (`currentTimeProvider`), segmenting multi-line wrapped text by visual layout lines (`layoutResult.getLineForOffset`), and applying zero-allocation direct rectangle fill (`drawRect(color)`) or single-pass horizontal gradient brushes purely in the native GPU rendering pipeline.
+*Aliases: 纯 Draw 阶段零重组逐字扫光, 无分配卡拉OK扫光*
+
+
