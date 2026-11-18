@@ -11,13 +11,13 @@ object MetadataNormalizer {
 
     // 匹配各类常见的版本、现场、混音、官方标签模式
     private val VERSION_AND_EXTRA_PATTERNS = listOf(
-        Regex("""\s*[\(\[\{（【].*?(feat\.?|ft\.?|featuring|live|remaster(?:ed)?|remix|version|deluxe|edition|edit|ost|官方|无损|伴奏|伴奏版|纯音乐).*?[\)\]\}）】]""", RegexOption.IGNORE_CASE),
-        Regex("""\s*[-–—]\s*(feat\.?|ft\.?|live|remaster(?:ed)?|remix|version|ost).*$""", RegexOption.IGNORE_CASE),
+        Regex("""\s*[\(\[\{（【].*?(feat\.?|ft\.?|featuring|live|remaster(?:ed)?|(?:re)?mix|version|deluxe|edition|edit|ost|官方|无损|伴奏|伴奏版|纯音乐).*?[\)\]\}）】]""", RegexOption.IGNORE_CASE),
+        Regex("""\s*[-–—]\s*(feat\.?|ft\.?|live|remaster(?:ed)?|(?:re)?mix|version|ost).*$""", RegexOption.IGNORE_CASE),
         Regex("""\s*(feat\.?|ft\.?|featuring)\s+.*$""", RegexOption.IGNORE_CASE)
     )
 
-    // 全角转半角映射表或替换字符（增加省略号、连续句点、单双引号）
-    private val PUNCTUATION_REGEX = Regex("""[·・•,，:：;；/／\-_—~～\(\)\[\]【】（）"“”'‘’`\.\.…]+""")
+    // 全角转半角映射表或替换字符（增加省略号、连续句点、单双引号、合唱连接符 & ＆）
+    private val PUNCTUATION_REGEX = Regex("""[·・•,，:：;；/／&＆\-_—~～\(\)\[\]【】（）"“”'‘’`\.\.…]+""")
     private val MULTI_SPACE_REGEX = Regex("""\s+""")
     private val FEAT_REGEX = Regex("""\s*(feat\.?|ft\.?|featuring)\s+.*$""", RegexOption.IGNORE_CASE)
 
