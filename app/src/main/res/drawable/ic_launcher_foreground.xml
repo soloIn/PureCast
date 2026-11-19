@@ -1,0 +1,118 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- 💡 [Cast 投射微波] 左侧向外扩散的三重无线波束 (清晰粗度) -->
+    <path
+        android:strokeWidth="1.8"
+        android:strokeColor="#251D1D1F"
+        android:strokeLineCap="round"
+        android:pathData="M16,40 C12,45 10,49.5 10,54 C10,58.5 12,63 16,68"/>
+    <path
+        android:strokeWidth="2.2"
+        android:strokeColor="#501D1D1F"
+        android:strokeLineCap="round"
+        android:pathData="M19,43 C16,46.5 14.5,50 14.5,54 C14.5,58 16,61.5 19,65"/>
+    <path
+        android:strokeWidth="2.6"
+        android:strokeColor="#851D1D1F"
+        android:strokeLineCap="round"
+        android:pathData="M22,46.5 C20,49 19,51.5 19,54 C19,56.5 20,59 22,61.5"/>
+
+    <!-- 💡 [Master Clock 时钟微点] 右侧时钟锁相微点阵 -->
+    <path
+        android:fillColor="#501D1D1F"
+        android:pathData="M89,48a1.6,1.6 0 1,0 0.001,0z"/>
+    <path
+        android:fillColor="#1D1D1F"
+        android:pathData="M92.5,54a2.2,2.2 0 1,0 0.001,0z"/>
+    <path
+        android:fillColor="#501D1D1F"
+        android:pathData="M89,60a1.6,1.6 0 1,0 0.001,0z"/>
+
+    <!-- 💡 [莫比乌斯环·底层带] (Under Strand): 从右下经后侧穿行至左上 -->
+    <path
+        android:strokeWidth="10.5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M72,72 C81,72 88,64 88,54 C88,44 81,36 72,36 C63,36 60.5,45.5 56.5,49.5">
+        <aapt:attr name="android:strokeColor">
+            <gradient
+                android:type="linear"
+                android:startX="88"
+                android:startY="36"
+                android:endX="56"
+                android:endY="50">
+                <item android:offset="0.0" android:color="#2C2C2E"/>
+                <item android:offset="1.0" android:color="#48484A"/>
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <path
+        android:strokeWidth="10.5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M51.5,58 C47.5,62 45,72 36,72 C27,72 20,64 20,54 C20,44 27,36 36,36 C44,36 47.5,44 50.5,48">
+        <aapt:attr name="android:strokeColor">
+            <gradient
+                android:type="linear"
+                android:startX="20"
+                android:startY="54"
+                android:endX="51"
+                android:endY="58">
+                <item android:offset="0.0" android:color="#1D1D1F"/>
+                <item android:offset="1.0" android:color="#3A3A3C"/>
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- 💡 [3D 穿插阴影] 增强空间叠压深度 -->
+    <path
+        android:strokeWidth="13"
+        android:strokeColor="#25000000"
+        android:strokeLineCap="round"
+        android:pathData="M48,60 C51,57 57,51 60,48"/>
+
+    <!-- 💡 [莫比乌斯环·顶层高亮带] (Over Strand): 从左下直通右上 (主视觉带) -->
+    <path
+        android:strokeWidth="10.5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M42,69.5 C47.5,69.5 50.5,61.5 54,54 C57.5,46.5 60.5,38.5 66,38.5 C70,38.5 72,36 72,36">
+        <aapt:attr name="android:strokeColor">
+            <gradient
+                android:type="linear"
+                android:startX="42"
+                android:startY="70"
+                android:endX="72"
+                android:endY="36">
+                <item android:offset="0.0" android:color="#1D1D1F"/>
+                <item android:offset="0.5" android:color="#3A3A3C"/>
+                <item android:offset="1.0" android:color="#2C2C2E"/>
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- 💡 [中轴纯白正弦光脉冲] (Pure White Sine Ray): 苹果纯白光带，极大增强对比度与精致度 -->
+    <path
+        android:strokeWidth="2.0"
+        android:strokeColor="#FFFFFF"
+        android:strokeLineCap="round"
+        android:pathData="M72,72 C81,72 88,64 88,54 C88,44 81,36 72,36 C63,36 60.5,45.5 56.5,49.5"/>
+    <path
+        android:strokeWidth="2.0"
+        android:strokeColor="#FFFFFF"
+        android:strokeLineCap="round"
+        android:pathData="M51.5,58 C47.5,62 45,72 36,72 C27,72 20,64 20,54 C20,44 27,36 36,36 C44,36 47.5,44 50.5,48"/>
+    <path
+        android:strokeWidth="2.2"
+        android:strokeColor="#FFFFFF"
+        android:strokeLineCap="round"
+        android:pathData="M42,69.5 C47.5,69.5 50.5,61.5 54,54 C57.5,46.5 60.5,38.5 66,38.5 C70,38.5 72,36 72,36"/>
+
+</vector>

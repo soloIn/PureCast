@@ -1,0 +1,106 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="144dp"
+    android:height="40dp"
+    android:viewportWidth="144"
+    android:viewportHeight="40">
+
+    <!-- 左侧莫比乌斯微标 (Center X: 20, Y: 20, scale 0.6) -->
+    <group
+        android:translateX="20"
+        android:translateY="20"
+        android:scaleX="0.65"
+        android:scaleY="0.65">
+        
+        <!-- 底层带 -->
+        <path
+            android:strokeWidth="6"
+            android:strokeLineCap="round"
+            android:pathData="M16,16 C23,16 28,11 28,4 C28,-3 23,-8 16,-8 C9,-8 7.5,-1.5 2.5,2.5">
+            <aapt:attr name="android:strokeColor">
+                <gradient
+                    android:type="linear"
+                    android:startX="28"
+                    android:startY="-8"
+                    android:endX="2.5"
+                    android:endY="2.5">
+                    <item android:offset="0.0" android:color="#30D158"/>
+                    <item android:offset="1.0" android:color="#1A8B55"/>
+                </gradient>
+            </aapt:attr>
+        </path>
+        <path
+            android:strokeWidth="6"
+            android:strokeLineCap="round"
+            android:pathData="M-2.5,6 C-7.5,10 -9,16 -16,16 C-23,16 -28,11 -28,4 C-28,-3 -23,-8 -16,-8 C-10,-8 -7.5,-2.5 -3.5,1.5">
+            <aapt:attr name="android:strokeColor">
+                <gradient
+                    android:type="linear"
+                    android:startX="-28"
+                    android:startY="4"
+                    android:endX="-2.5"
+                    android:endY="6">
+                    <item android:offset="0.0" android:color="#0A84FF"/>
+                    <item android:offset="1.0" android:color="#5E5CE6"/>
+                </gradient>
+            </aapt:attr>
+        </path>
+        
+        <!-- 3D 阴影 -->
+        <path
+            android:strokeWidth="7.5"
+            android:strokeColor="#90080A0F"
+            android:strokeLineCap="round"
+            android:pathData="M-5,9 C-2,6 2,2 5,-1"/>
+
+        <!-- 顶层带 -->
+        <path
+            android:strokeWidth="6"
+            android:strokeLineCap="round"
+            android:pathData="M-11,13.5 C-6,13.5 -3,7.5 0,4 C3,0.5 6,-5.5 11,-5.5 C14.5,-5.5 16,-8 16,-8">
+            <aapt:attr name="android:strokeColor">
+                <gradient
+                    android:type="linear"
+                    android:startX="-11"
+                    android:startY="14"
+                    android:endX="16"
+                    android:endY="-8">
+                    <item android:offset="0.0" android:color="#0A84FF"/>
+                    <item android:offset="0.5" android:color="#3A80F5"/>
+                    <item android:offset="1.0" android:color="#30D158"/>
+                </gradient>
+            </aapt:attr>
+        </path>
+
+        <!-- 光脉冲白线 -->
+        <path
+            android:strokeWidth="1.2"
+            android:strokeColor="#FFFFFFFF"
+            android:strokeLineCap="round"
+            android:pathData="M-11,13.5 C-6,13.5 -3,7.5 0,4 C3,0.5 6,-5.5 11,-5.5 C14.5,-5.5 16,-8 16,-8"/>
+    </group>
+
+    <!-- 右侧 PureCast 文字排印 (X: 44, Y: 20) -->
+    <!-- P -->
+    <path android:fillColor="#FFFFFF" android:pathData="M44,13 h5.5 c2.6,0 4.2,1.4 4.2,3.5 c0,2.1 -1.6,3.5 -4.2,3.5 h-3.4 v4.2 h-2.1 z M46.1,14.9 v2.8 h3.2 c1.4,0 2.2,-0.7 2.2,-1.4 c0,-0.7 -0.8,-1.4 -2.2,-1.4 z"/>
+    <!-- U -->
+    <path android:fillColor="#FFFFFF" android:pathData="M55.5,13 h2.1 v6.6 c0,2.0 1.3,3.2 3.0,3.2 c1.7,0 3.0,-1.2 3.0,-3.2 v-6.6 h2.1 v6.5 c0,3.1 -2.1,5.0 -5.1,5.0 c-3.0,0 -5.1,-1.9 -5.1,-5.0 z"/>
+    <!-- R -->
+    <path android:fillColor="#FFFFFF" android:pathData="M68,13 h5.4 c2.6,0 4.2,1.4 4.2,3.3 c0,1.6 -1.0,2.7 -2.7,3.1 l3.0,4.8 h-2.4 l-2.7,-4.5 h-2.7 v4.5 h-2.1 z M70.1,14.8 v2.7 h3.2 c1.4,0 2.2,-0.6 2.2,-1.3 c0,-0.7 -0.8,-1.3 -2.2,-1.3 z"/>
+    <!-- E -->
+    <path android:fillColor="#FFFFFF" android:pathData="M79.5,13 h8.4 v1.9 h-6.3 v2.9 h5.4 v1.8 h-5.4 v3.0 h6.5 v1.9 h-8.6 z"/>
+
+    <!-- CAST (电光蓝渐变) -->
+    <!-- C -->
+    <path android:fillColor="#0A84FF" android:pathData="M99.5,15.5 l-1.6,1.2 c-1.0,-1.3 -2.1,-1.9 -3.5,-1.9 c-2.7,0 -4.5,2.1 -4.5,4.9 c0,2.8 1.8,4.9 4.5,4.9 c1.4,0 2.5,-0.6 3.5,-1.9 l1.6,1.2 c-1.3,1.8 -3.0,2.6 -5.1,2.6 c-3.9,0 -6.6,-2.9 -6.6,-6.8 c0,-3.9 2.7,-6.8 6.6,-6.8 c2.1,0 3.8,0.9 5.1,2.6 z"/>
+    <!-- A -->
+    <path android:fillColor="#0A84FF" android:pathData="M106.5,13 h2.1 l4.8,11.2 h-2.2 l-1.2,-2.9 h-4.8 l-1.2,2.9 h-2.2 z M105.9,19.4 h3.4 l-1.7,-4.2 z"/>
+    <!-- S -->
+    <path android:fillColor="#0A84FF" android:pathData="M121.5,15.1 l-1.7,1.2 c-0.9,-1.0 -1.9,-1.4 -3.0,-1.4 c-1.3,0 -2.1,0.6 -2.1,1.5 c0,0.9 0.6,1.3 2.2,1.8 l1.4,0.4 c2.5,0.8 3.6,1.9 3.6,3.8 c0,2.3 -1.8,3.8 -4.5,3.8 c-1.9,0 -3.5,-0.8 -4.6,-2.2 l1.6,-1.3 c0.9,1.0 1.8,1.5 3.0,1.5 c1.4,0 2.2,-0.7 2.2,-1.7 c0,-1.0 -0.6,-1.4 -2.4,-1.9 l-1.3,-0.4 c-2.3,-0.7 -3.4,-1.8 -3.4,-3.6 c0,-2.2 1.7,-3.6 4.2,-3.6 c1.8,0 3.3,0.7 4.3,2.1 z"/>
+    <!-- T -->
+    <path android:fillColor="#0A84FF" android:pathData="M123.5,13 h8.8 v1.9 h-3.4 v9.3 h-2.1 v-9.3 h-3.3 z"/>
+
+    <!-- Bit-Perfect 荧光绿标志圆点 (X: 135, Y: 22) -->
+    <path android:fillColor="#30D158" android:pathData="M136,22a1.8,1.8 0 1,0 0.001,0z"/>
+</vector>

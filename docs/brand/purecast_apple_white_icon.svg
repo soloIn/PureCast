@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 108 108" width="100%" height="100%">
+  <defs>
+    <radialGradient id="wBgGrad" cx="50%" cy="45%" r="65%">
+      <stop offset="0%" stop-color="#FFFFFF"/>
+      <stop offset="65%" stop-color="#F7F7F9"/>
+      <stop offset="100%" stop-color="#E9E9EE"/>
+    </radialGradient>
+    <linearGradient id="wUnderGrad" x1="88" y1="36" x2="56" y2="50" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#2C2C2E"/>
+      <stop offset="100%" stop-color="#48484A"/>
+    </linearGradient>
+    <linearGradient id="wOverGrad" x1="42" y1="70" x2="72" y2="36" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#1D1D1F"/>
+      <stop offset="50%" stop-color="#3A3A3C"/>
+      <stop offset="100%" stop-color="#2C2C2E"/>
+    </linearGradient>
+    <filter id="softShadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="4" stdDeviation="3" flood-color="#000000" flood-opacity="0.12"/>
+    </filter>
+  </defs>
+
+  <!-- Background -->
+  <rect width="108" height="108" fill="url(#wBgGrad)"/>
+  <rect x="0.5" y="0.5" width="107" height="107" fill="none" stroke="#000000" stroke-opacity="0.08" stroke-width="1"/>
+
+  <!-- Lathe Micro-Circles -->
+  <circle cx="54" cy="54" r="34" fill="none" stroke="#000000" stroke-width="0.5" stroke-opacity="0.05"/>
+  <circle cx="54" cy="54" r="46" fill="none" stroke="#000000" stroke-width="0.5" stroke-opacity="0.03"/>
+
+  <g filter="url(#softShadow)">
+    <!-- Cast Waves (Left) -->
+    <path d="M16,40 C12,45 10,49.5 10,54 C10,58.5 12,63 16,68" fill="none" stroke="#1D1D1F" stroke-width="1.8" stroke-linecap="round" stroke-opacity="0.25"/>
+    <path d="M19,43 C16,46.5 14.5,50 14.5,54 C14.5,58 16,61.5 19,65" fill="none" stroke="#1D1D1F" stroke-width="2.2" stroke-linecap="round" stroke-opacity="0.50"/>
+    <path d="M22,46.5 C20,49 19,51.5 19,54 C19,56.5 20,59 22,61.5" fill="none" stroke="#1D1D1F" stroke-width="2.6" stroke-linecap="round" stroke-opacity="0.85"/>
+
+    <!-- Master Clock Dots (Right) -->
+    <circle cx="89" cy="48" r="1.6" fill="#1D1D1F" fill-opacity="0.5"/>
+    <circle cx="92.5" cy="54" r="2.2" fill="#1D1D1F"/>
+    <circle cx="89" cy="60" r="1.6" fill="#1D1D1F" fill-opacity="0.5"/>
+
+    <!-- Under Strand -->
+    <path d="M72,72 C81,72 88,64 88,54 C88,44 81,36 72,36 C63,36 60.5,45.5 56.5,49.5" fill="none" stroke="url(#wUnderGrad)" stroke-width="10.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M51.5,58 C47.5,62 45,72 36,72 C27,72 20,64 20,54 C20,44 27,36 36,36 C44,36 47.5,44 50.5,48" fill="none" stroke="#1D1D1F" stroke-width="10.5" stroke-linecap="round" stroke-linejoin="round"/>
+
+    <!-- 3D Shadow -->
+    <path d="M48,60 C51,57 57,51 60,48" fill="none" stroke="#000000" stroke-width="13" stroke-linecap="round" stroke-opacity="0.22"/>
+
+    <!-- Over Strand -->
+    <path d="M42,69.5 C47.5,69.5 50.5,61.5 54,54 C57.5,46.5 60.5,38.5 66,38.5 C70,38.5 72,36 72,36" fill="none" stroke="url(#wOverGrad)" stroke-width="10.5" stroke-linecap="round" stroke-linejoin="round"/>
+
+    <!-- Pure White Central Sine Ray -->
+    <path d="M72,72 C81,72 88,64 88,54 C88,44 81,36 72,36 C63,36 60.5,45.5 56.5,49.5" fill="none" stroke="#FFFFFF" stroke-width="2.0" stroke-linecap="round"/>
+    <path d="M51.5,58 C47.5,62 45,72 36,72 C27,72 20,64 20,54 C20,44 27,36 36,36 C44,36 47.5,44 50.5,48" fill="none" stroke="#FFFFFF" stroke-width="2.0" stroke-linecap="round"/>
+    <path d="M42,69.5 C47.5,69.5 50.5,61.5 54,54 C57.5,46.5 60.5,38.5 66,38.5 C70,38.5 72,36 72,36" fill="none" stroke="#FFFFFF" stroke-width="2.2" stroke-linecap="round"/>
+  </g>
+</svg>
