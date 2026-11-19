@@ -38,8 +38,12 @@ fun SmoothLyricLineRow(
     currentTimeProvider: () -> Long,
     syncClock: LyricsSyncClock,
     primaryColor: Color,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    isPlaying: Boolean = true
 ) {
+    val words = line.words
+    val hasWordSync = !words.isNullOrEmpty()
+
     // 💡 1. 缩放动画 (Spring 曲线，优雅弹性，平滑缩放 1.0f -> 1.08f)
     val animatedScale by animateFloatAsState(
         targetValue = if (isActive) 1.08f else 1.0f,
@@ -51,11 +55,7 @@ fun SmoothLyricLineRow(
     )
 
     // 💡 2. 透明度动画 (针对激活行 1.0f 与非激活行平滑过渡，消除生硬突变)
-    val targetAlpha = if (isActive) {
-        1.0f
-    } else {
-        (0.42f - (distanceFromActive - 1) * 0.08f).coerceIn(0.18f, 0.42f)
-    }
+    val targetAlpha = LyricsRenderingMath.calculateLineTargetAlpha(isActive, distanceFromActive)
     val animatedAlpha by animateFloatAsState(
         targetValue = targetAlpha,
         animationSpec = tween(durationMillis = 350, easing = FastOutSlowInEasing),
@@ -79,7 +79,6 @@ fun SmoothLyricLineRow(
             .graphicsLayer {
                 scaleX = animatedScale
                 scaleY = animatedScale
-                alpha = animatedAlpha
                 // 💡 优化 2：直接在 graphicsLayer 内部转换 dp.toPx()，彻底跳过 Composition 与 Layout 阶段
                 translationY = animatedTranslationY.dp.toPx()
                 // 💡 锚定左侧居中，确保大屏文字放大时左边界平齐不抖动
@@ -87,25 +86,29 @@ fun SmoothLyricLineRow(
             },
         verticalArrangement = Arrangement.spacedBy(6.dp)
     ) {
-        val words = line.words
         val translation = line.translationText
 
         // 💡 逐字歌词或普通整行歌词渲染
-        if (isActive && !words.isNullOrEmpty()) {
+        if (isActive && hasWordSync) {
+            // 💡 Finding 4: 逐字主歌词 WordSyncKaraokeText 保持纯净 1.0f（由其内部独立负责 0.45f -> 1.0f 纯净扫光），不受 animatedAlpha 乘算变暗
             WordSyncKaraokeText(
                 line = line,
                 syncClock = syncClock,
                 currentTimeProvider = currentTimeProvider,
-                primaryColor = primaryColor
+                primaryColor = primaryColor,
+                isPlaying = isPlaying
             )
         } else {
             Text(
                 text = line.mainText,
                 fontSize = 31.sp,
-                fontWeight = if (isActive) FontWeight.Bold else FontWeight.SemiBold,
+                // 💡 Finding 10: 主歌词行统一固定为 FontWeight.Bold，完全由 scale (1.0f -> 1.08f) 和 alpha 区分激活层级，消除字重跳变引发的重新排版与重绘
+                fontWeight = FontWeight.Bold,
                 color = primaryColor,
                 lineHeight = 40.sp,
-                modifier = Modifier.fillMaxWidth()
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .graphicsLayer { alpha = animatedAlpha }
             )
         }
 
@@ -115,9 +118,12 @@ fun SmoothLyricLineRow(
                 text = translation,
                 fontSize = 20.sp,
                 fontWeight = FontWeight.Normal,
-                color = primaryColor.copy(alpha = if (isActive) 0.75f else 0.55f),
+                // 💡 Finding 4: 中文翻译行 Text 独立享受 animatedAlpha (0.42f -> 1.0f) 的 350ms 丝滑淡入淡出动画，不再受外层逐字 1.0f 阻断
+                color = primaryColor.copy(alpha = LyricsRenderingMath.TRANSLATION_ALPHA),
                 lineHeight = 28.sp,
-                modifier = Modifier.fillMaxWidth()
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .graphicsLayer { alpha = animatedAlpha }
             )
         }
     }

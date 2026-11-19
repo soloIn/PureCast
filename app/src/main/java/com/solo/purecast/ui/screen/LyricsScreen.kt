@@ -2,11 +2,13 @@ package com.solo.purecast.ui.screen
 
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibilityScope
+import androidx.compose.animation.Crossfade
 import androidx.compose.animation.ExperimentalSharedTransitionApi
 import androidx.compose.animation.SharedTransitionScope
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.basicMarquee
@@ -60,6 +62,7 @@ import com.solo.purecast.ui.lyrics.InstrumentalStateView
 import com.solo.purecast.ui.lyrics.LoadingShimmerView
 import com.solo.purecast.ui.lyrics.LyricsStreamView
 import com.solo.purecast.ui.lyrics.NotFoundStateView
+import com.solo.purecast.util.Logger
 import kotlinx.coroutines.delay
 
 /**
@@ -80,10 +83,12 @@ fun LyricsScreen(
     coverData: Any?,
     coverHash: Int = 0,
     hasDarkBackground: Boolean,
+    isCoverExpanded: Boolean = true,
     onPlayPauseClick: () -> Unit,
     onPreviousClick: () -> Unit,
     onNextClick: () -> Unit,
     onClose: () -> Unit,
+    isForeground: Boolean = true,
     modifier: Modifier = Modifier,
     sharedTransitionScope: SharedTransitionScope? = null,
     animatedVisibilityScope: AnimatedVisibilityScope? = null
@@ -95,7 +100,7 @@ fun LyricsScreen(
         onClose()
     }
 
-    val isPlaying = playbackStatus == PlaybackStatus.PLAYING
+    val isPlaying = (playbackStatus == PlaybackStatus.PLAYING) && isForeground
     val playPauseFocusRequester = remember { FocusRequester() }
 
     LaunchedEffect(Unit) {
@@ -103,15 +108,29 @@ fun LyricsScreen(
         delay(120L)
         try {
             playPauseFocusRequester.requestFocus()
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            Logger.hotkey.w("LyricsScreen", "Failed to restore play/pause focus: ${e.message}", e)
+        }
     }
 
-    // 💡 优化 4：左栏封面动效统一，与 MainTvScreen 共享 1.0f <-> 0.94f 播放态缩放弹簧动画
+    // 💡 Finding #6: 当从设置页返回全屏歌词 (isForeground == true) 时，主动调用 requestFocus 还原焦点至播放控制键，杜绝焦点丢失死锁
+    LaunchedEffect(isForeground) {
+        if (isForeground) {
+            delay(50L)
+            try {
+                playPauseFocusRequester.requestFocus()
+            } catch (e: Exception) {
+                Logger.hotkey.w("LyricsScreen", "Failed to restore play/pause focus: ${e.message}", e)
+            }
+        }
+    }
+
+    // 💡 Finding 7 & 16：左栏封面动效与 MainTvScreen 严格统一，共享 1.0f <-> 0.94f 缩放与 spring(dampingRatio = 0.8f, stiffness = 300f) 弹簧参数
     val coverScale by animateFloatAsState(
-        targetValue = if (isPlaying) 1.0f else 0.94f,
+        targetValue = if (isCoverExpanded) 1.0f else 0.94f,
         animationSpec = spring(
-            dampingRatio = Spring.DampingRatioLowBouncy,
-            stiffness = Spring.StiffnessLow
+            dampingRatio = 0.8f,
+            stiffness = 300f
         ),
         label = "lyricsCoverScaleAnim"
     )
@@ -165,33 +184,41 @@ fun LyricsScreen(
                     ),
                 contentAlignment = Alignment.Center
             ) {
-                if (coverData != null) {
-                    val coverRequest = remember(context, coverData, coverHash) {
-                        val cacheKey = if (coverHash != 0) "cover_$coverHash" else null
-                        ImageRequest.Builder(context)
-                            .data(coverData)
-                            .apply {
-                                if (cacheKey != null) {
-                                    memoryCacheKey(cacheKey)
-                                    placeholderMemoryCacheKey(cacheKey)
+                // 💡 Finding #10：使用 (resolvedHash, resolvedCover) 解构，使用局部 resolvedHash 构造缓存键，
+                // 并在 remember 中传入局部 resolvedHash，杜绝闭包捕获外部可变 state 导致切歌动画期间缓存键错乱
+                Crossfade(
+                    targetState = coverHash to coverData,
+                    animationSpec = tween(300),
+                    label = "lyricsCoverCrossfade"
+                ) { (resolvedHash, resolvedCover) ->
+                    if (resolvedCover != null) {
+                        val coverRequest = remember(context, resolvedCover, resolvedHash) {
+                            val cacheKey = if (resolvedHash != 0) "cover_$resolvedHash" else null
+                            ImageRequest.Builder(context)
+                                .data(resolvedCover)
+                                .apply {
+                                    if (cacheKey != null) {
+                                        memoryCacheKey(cacheKey)
+                                        placeholderMemoryCacheKey(cacheKey)
+                                    }
                                 }
-                            }
-                            .crossfade(false)
-                            .build()
+                                .crossfade(false)
+                                .build()
+                        }
+                        AsyncImage(
+                            model = coverRequest,
+                            contentDescription = "Cover",
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier.fillMaxSize()
+                        )
+                    } else {
+                        Icon(
+                            painter = painterResource(id = R.drawable.ic_waveform),
+                            contentDescription = "Music Placeholder",
+                            tint = if (hasDarkBackground) Color.White.copy(alpha = 0.6f) else Color(0xFF1C1C1E).copy(alpha = 0.6f),
+                            modifier = Modifier.size(64.dp)
+                        )
                     }
-                    AsyncImage(
-                        model = coverRequest,
-                        contentDescription = "Cover",
-                        contentScale = ContentScale.Crop,
-                        modifier = Modifier.fillMaxSize()
-                    )
-                } else {
-                    Icon(
-                        painter = painterResource(id = R.drawable.ic_waveform),
-                        contentDescription = "Music Placeholder",
-                        tint = if (hasDarkBackground) Color.White.copy(alpha = 0.6f) else Color(0xFF1C1C1E).copy(alpha = 0.6f),
-                        modifier = Modifier.size(64.dp)
-                    )
                 }
             }
 
@@ -299,7 +326,8 @@ fun LyricsScreen(
                         timeline = lyricUiState.timeline,
                         syncClock = syncClock,
                         hasDarkBackground = hasDarkBackground,
-                        modifier = Modifier.fillMaxSize()
+                        modifier = Modifier.fillMaxSize(),
+                        isPlaying = isPlaying
                     )
                 }
 

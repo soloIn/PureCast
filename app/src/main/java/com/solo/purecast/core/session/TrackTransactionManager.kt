@@ -61,7 +61,7 @@ class TrackTransactionManager {
         currentTrackKey = event.trackKey
         // 💡 R8: 切歌边界保留现有封面 coverBytes，只刷新新境界初始时长与寻道能力
         currentMetadata = currentMetadata.copy(
-            durationMs = 0L,
+            durationMs = if (event.initialDurationMs > 0L) event.initialDurationMs else 0L,
             durationState = event.initialDurationState,
             seekCapability = event.seekCapability,
             trackUri = event.trackUri

@@ -35,6 +35,13 @@ class SettingsRepository(context: Context) {
     private val _fluidQualityFlow = MutableStateFlow(getFluidQuality())
     val fluidQualityFlow: StateFlow<FluidQuality> = _fluidQualityFlow.asStateFlow()
 
+    // 💡 补充暴露内存 StateFlow，彻底消除设置页 300ms 转场首帧磁盘同步读取
+    private val _idleTimeoutFlow = MutableStateFlow(getIdleTimeoutSeconds())
+    val idleTimeoutFlow: StateFlow<Int> = _idleTimeoutFlow.asStateFlow()
+
+    private val _onboardingCompletedFlow = MutableStateFlow(isOnboardingCompleted())
+    val onboardingCompletedFlow: StateFlow<Boolean> = _onboardingCompletedFlow.asStateFlow()
+
     /**
      * 获取 UPnP 设备局域网广播名，默认 "PureCast TV"
      */
@@ -65,6 +72,7 @@ class SettingsRepository(context: Context) {
     fun setIdleTimeoutSeconds(seconds: Int) {
         Logger.service.i(TAG, "更新声卡空闲让渡超时时间: ${seconds}秒")
         prefs.edit().putInt(KEY_IDLE_TIMEOUT_SECONDS, seconds).apply()
+        _idleTimeoutFlow.value = seconds
     }
 
     /**
@@ -112,6 +120,7 @@ class SettingsRepository(context: Context) {
     fun setOnboardingCompleted(completed: Boolean) {
         Logger.service.i(TAG, "更新开箱自检完成标记: $completed")
         prefs.edit().putBoolean(KEY_ONBOARDING_COMPLETED, completed).apply()
+        _onboardingCompletedFlow.value = completed
     }
 
     /**

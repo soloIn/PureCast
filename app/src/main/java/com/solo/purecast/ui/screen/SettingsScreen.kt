@@ -38,6 +38,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -110,7 +111,7 @@ enum class SettingsCategory(val title: String, val subtitle: String) {
  *    - 彻底消灭浅色模式下变黄绿色的恶性视觉割裂；
  * 4. 自适应内边距与换行防护：分段按钮文字横向完全包裹，杜绝“✏️ 自定义”折行。
  */
-@OptIn(ExperimentalTvMaterial3Api::class)
+@OptIn(ExperimentalTvMaterial3Api::class, androidx.compose.ui.ExperimentalComposeUiApi::class)
 @Composable
 fun SettingsScreen(
     audioState: AudioPathState,
@@ -140,28 +141,30 @@ fun SettingsScreen(
 
     val coroutineScope = rememberCoroutineScope()
 
-    // 1. 设备广播名与外观状态
+    // 1. 设备广播名与外观状态 (统一使用 collectAsState 读取内存 Flow，消除设置页首帧磁盘同步读取)
     var currentThemeMode by remember { mutableStateOf(AppPalette.mode) }
-    var friendlyName by remember { mutableStateOf(settingsRepo.getFriendlyName()) }
+    val friendlyName by settingsRepo.friendlyNameFlow.collectAsState()
     var isEditingCustomName by remember { mutableStateOf(false) }
     var customNameInput by remember { mutableStateOf(friendlyName) }
-    var currentFluidQuality by remember { mutableStateOf(settingsRepo.getFluidQuality()) }
+    val currentFluidQuality by settingsRepo.fluidQualityFlow.collectAsState()
     val customNameFocusRequester = remember { FocusRequester() }
     val customEditButtonFocusRequester = remember { FocusRequester() }
     var isTextFieldFocused by remember { mutableStateOf(false) }
-    var isAirPlayEnabled by remember { mutableStateOf(settingsRepo.isAirPlayEnabled()) }
-    var isUpnpEnabled by remember { mutableStateOf(settingsRepo.isUpnpEnabled()) }
-    var idleTimeoutSeconds by remember { mutableIntStateOf(settingsRepo.getIdleTimeoutSeconds()) }
+    val isAirPlayEnabled by settingsRepo.airPlayEnabledFlow.collectAsState()
+    val isUpnpEnabled by settingsRepo.upnpEnabledFlow.collectAsState()
+    val idleTimeoutSeconds by settingsRepo.idleTimeoutFlow.collectAsState()
 
-    // 💡 退出自定义名称编辑并平滑请求焦点至“✏️ 自定义”按钮，防止大屏丢失焦点失灵
-    fun exitCustomNameEditing() {
+    // 💡 退出自定义名称编辑；若 restoreFocusToButton == true 则请求焦点至“✏️ 自定义”按钮，若已导航至左侧则严禁抢夺焦点 (Finding 2)
+    fun exitCustomNameEditing(restoreFocusToButton: Boolean = true) {
         isEditingCustomName = false
-        coroutineScope.launch {
-            delay(50)
-            try {
-                customEditButtonFocusRequester.requestFocus()
-            } catch (e: Exception) {
-                Logger.ui.w(TAG, "退出自定义名称编辑后请求焦点异常", e)
+        if (restoreFocusToButton) {
+            coroutineScope.launch {
+                delay(50)
+                try {
+                    customEditButtonFocusRequester.requestFocus()
+                } catch (e: Exception) {
+                    Logger.ui.w(TAG, "退出自定义名称编辑后请求焦点异常", e)
+                }
             }
         }
     }
@@ -312,6 +315,9 @@ fun SettingsScreen(
                                 val target = categoryFirstFocusRequesters[cat]
                                 if (target != null) {
                                     right = target
+                                } else {
+                                    // 💡 针对 HARDWARE_MONITOR 等纯监控展示分类（无右侧可获焦项），禁止向右导航失焦
+                                    right = FocusRequester.Cancel
                                 }
                             }
                             .onFocusChanged {
@@ -320,7 +326,7 @@ fun SettingsScreen(
                                     selectedCategory = cat
                                     isFocusInRightContent = false
                                     if (isEditingCustomName) {
-                                        exitCustomNameEditing()
+                                        exitCustomNameEditing(restoreFocusToButton = false)
                                     }
                                 }
                             },
@@ -350,7 +356,7 @@ fun SettingsScreen(
             LaunchedEffect(selectedCategory) {
                 scrollState.scrollTo(0)
                 if (isEditingCustomName) {
-                    exitCustomNameEditing()
+                    exitCustomNameEditing(restoreFocusToButton = false)
                 }
             }
             Column(
@@ -435,7 +441,6 @@ fun SettingsScreen(
                                             leftNavFocusRequester = if (pIdx == 0) navFocusRequesters[selectedCategory.ordinal] else null,
                                             onClick = {
                                                 isEditingCustomName = false
-                                                friendlyName = preset
                                                 settingsRepo.setFriendlyName(preset)
                                                 PlaybackService.instance?.updateFriendlyName(preset)
                                                 Toast.makeText(context, "已更新设备名为: $preset", Toast.LENGTH_SHORT).show()
@@ -489,7 +494,6 @@ fun SettingsScreen(
                                                     onDone = {
                                                         val t = customNameInput.trim()
                                                         if (t.isNotEmpty()) {
-                                                            friendlyName = t
                                                             settingsRepo.setFriendlyName(t)
                                                             PlaybackService.instance?.updateFriendlyName(t)
                                                             exitCustomNameEditing()
@@ -510,7 +514,6 @@ fun SettingsScreen(
                                             onClick = {
                                                 val t = customNameInput.trim()
                                                 if (t.isNotEmpty()) {
-                                                    friendlyName = t
                                                     settingsRepo.setFriendlyName(t)
                                                     PlaybackService.instance?.updateFriendlyName(t)
                                                     exitCustomNameEditing()
@@ -547,7 +550,6 @@ fun SettingsScreen(
                                             isSelected = currentFluidQuality == quality,
                                             leftNavFocusRequester = if (qIdx == 0) navFocusRequesters[selectedCategory.ordinal] else null,
                                             onClick = {
-                                                currentFluidQuality = quality
                                                 settingsRepo.setFluidQuality(quality)
                                                 Toast.makeText(context, "已设置流光画质: $label", Toast.LENGTH_SHORT).show()
                                             }
@@ -609,7 +611,6 @@ fun SettingsScreen(
                                             isSelected = isSelected,
                                             leftNavFocusRequester = if (optIdx == 0) navFocusRequesters[selectedCategory.ordinal] else null,
                                             onClick = {
-                                                idleTimeoutSeconds = sec
                                                 settingsRepo.setIdleTimeoutSeconds(sec)
                                                 PlaybackService.instance?.setIdleTimeoutSeconds(sec)
                                                 Toast.makeText(context, "已设置让渡超时为: $label", Toast.LENGTH_SHORT).show()
@@ -633,7 +634,7 @@ fun SettingsScreen(
                                     leftNavFocusRequester = navFocusRequesters[selectedCategory.ordinal],
                                     onToggle = {
                                         val target = !isAirPlayEnabled
-                                        isAirPlayEnabled = target
+                                        settingsRepo.setAirPlayEnabled(target)
                                         PlaybackService.instance?.setAirPlayEnabled(target)
                                     }
                                 )
@@ -650,7 +651,7 @@ fun SettingsScreen(
                                     leftNavFocusRequester = navFocusRequesters[selectedCategory.ordinal],
                                     onToggle = {
                                         val target = !isUpnpEnabled
-                                        isUpnpEnabled = target
+                                        settingsRepo.setUpnpEnabled(target)
                                         PlaybackService.instance?.setUpnpEnabled(target)
                                     }
                                 )

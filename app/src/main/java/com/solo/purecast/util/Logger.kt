@@ -41,4 +41,5 @@ object Logger {
     val service = Category("Service")
     val ui = Category("UI")
     val lyrics = Category("Lyrics")
+    val hotkey = Category("Hotkey")
 }

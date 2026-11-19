@@ -18,6 +18,8 @@ fun FluidBackground(
     quality: FluidQuality = FluidQuality.STANDARD,
     primaryColor: Color = Color(0xFF1E2A38),
     secondaryColor: Color = Color(0xFF141A29),
+    coverHash: Int = 0,
+    isForeground: Boolean = true,
     modifier: Modifier = Modifier
 ) {
     MacBackground(
@@ -25,6 +27,8 @@ fun FluidBackground(
         quality = quality,
         playing = isPlaying,
         isIdle = isIdle,
+        coverHash = coverHash,
+        isForeground = isForeground,
         modifier = modifier
     )
 }
