@@ -65,6 +65,9 @@ internal class AirPlayNativeEventDispatcher(
     private var postFlushProgressDurationMs: Long = 0L
 
     @Volatile
+    private var postFlushProgressPositionMs: Long = -1L
+
+    @Volatile
     private var lastTrackSwitchFlushedTimestampMs: Long = 0L
 
     @Volatile
@@ -84,6 +87,7 @@ internal class AirPlayNativeEventDispatcher(
         lastStateSequenceByNative.clear()
         lastSeekTimestampMs.set(0L)
         postFlushProgressDurationMs = 0L
+        postFlushProgressPositionMs = -1L
         lastTrackSwitchFlushedTimestampMs = 0L
         pendingOrphanCoverBytes = null
         pendingOrphanCoverTimestampMs = 0L
@@ -245,6 +249,7 @@ internal class AirPlayNativeEventDispatcher(
             } else {
                 lastTrackSwitchFlushedTimestampMs = clockMs()
                 postFlushProgressDurationMs = 0L // 💡 切歌换代重置已知时长缓存，防止旧曲目时长泄漏
+                postFlushProgressPositionMs = -1L // 💡 切歌换代重置已知初始进度缓存
             }
             emitLocked(
                 sessionId = globalSid,
@@ -321,11 +326,16 @@ internal class AirPlayNativeEventDispatcher(
                 (trimmedTitle != currentTrackTitle ||
                     (trimmedArtist.isNotEmpty() && currentTrackArtist.isNotEmpty() && trimmedArtist != currentTrackArtist))
 
-            // 💡 P0-3: 若切歌 FLUSH 后收到了 progress 报文，继承该时长防止新歌时长被抹零；使用后立即清空避免污染后续曲目
+            // 💡 P0-3: 若切歌 FLUSH 后收到了 progress 报文，继承该时长与非零开播进度防止新歌被抹零；使用后立即清空避免污染后续曲目
             val effectiveDurationMs = if (durationMs > 0L) {
                 durationMs
             } else if (postFlushProgressDurationMs > 0L) {
                 postFlushProgressDurationMs
+            } else {
+                0L
+            }
+            val effectivePositionMs = if (postFlushProgressPositionMs >= 0L) {
+                postFlushProgressPositionMs
             } else {
                 0L
             }
@@ -335,16 +345,23 @@ internal class AirPlayNativeEventDispatcher(
                 currentTrackGeneration = nextTxGen
                 currentTrackDurationFixed = effectiveDurationMs > 0L
                 currentTrackMarkedLive = false
+                Logger.airplay.i(
+                    TAG,
+                    "确立新曲目边界: gen=$nextTxGen, title=$trimmedTitle, artist=$trimmedArtist, initialPos=${effectivePositionMs}ms, initialDur=${effectiveDurationMs}ms"
+                )
                 emitLocked(
                     sessionId = globalSid,
                     payload = TrackBoundaryEvent(
                         trackGeneration = nextTxGen,
                         trackKey = "$trimmedTitle|$trimmedArtist",
                         initialDurationState = if (effectiveDurationMs > 0L) DurationState.FIXED else DurationState.UNKNOWN,
-                        seekCapability = if (effectiveDurationMs > 0L) SeekCapability.SEEKABLE else SeekCapability.UNKNOWN
+                        seekCapability = if (effectiveDurationMs > 0L) SeekCapability.SEEKABLE else SeekCapability.UNKNOWN,
+                        initialPositionMs = effectivePositionMs,
+                        initialDurationMs = effectiveDurationMs
                     )
                 )
                 postFlushProgressDurationMs = 0L // 💡 消费后清空
+                postFlushProgressPositionMs = -1L // 💡 消费后清空
                 lastTrackSwitchFlushedTimestampMs = 0L
                 // 💡 修复 Finding 4: 切歌边界彻底清空上一曲残留的孤立封面缓存，杜绝无封面歌曲误继承旧封面
                 pendingOrphanCoverBytes = null
@@ -426,9 +443,19 @@ internal class AirPlayNativeEventDispatcher(
             } else {
                 -1L
             }
-            if (timeSinceFlush in 0L..4000L && durationMs > 0L) {
-                postFlushProgressDurationMs = durationMs
+            if (timeSinceFlush in 0L..4000L) {
+                if (durationMs > 0L) {
+                    postFlushProgressDurationMs = durationMs
+                }
+                if (positionMs >= 0L) {
+                    postFlushProgressPositionMs = positionMs
+                }
             }
+
+            Logger.airplay.d(
+                TAG,
+                "AirPlay 进度上报: pos=${positionMs}ms, dur=${durationMs}ms, trackGen=$currentTrackGeneration, timeSinceFlush=$timeSinceFlush"
+            )
 
             if (durationMs > 0L) {
                 // 💡 同步更新活跃会话快照中的时长与寻道能力

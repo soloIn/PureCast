@@ -113,6 +113,7 @@ internal class MacRenderer(private val context: Context, private val clock: MacC
         GL.glDisable(GL.GL_DEPTH_TEST)
         GL.glDisable(GL.GL_BLEND)
         GL.glDisable(GL.GL_DITHER)
+        GL.glClearColor(0f, 0f, 0f, 1f)
         Logger.ui.i("MacRenderer", "初始化 GLES2 成功: highp=$highp, meshIndex=${clock.meshIndex}")
         checkGl()
     }
@@ -198,7 +199,6 @@ internal class MacRenderer(private val context: Context, private val clock: MacC
 
         // 1. 三层旋转采样混叠
         use(rotation, a!!)
-        GL.glClearColor(0f, 0f, 0f, 1f)
         GL.glClear(GL.GL_COLOR_BUFFER_BIT)
         rotation.texture("u_texture", image)
         rotation.texture("u_old", if (outgoing == 0) image else outgoing, 1)
@@ -231,26 +231,45 @@ internal class MacRenderer(private val context: Context, private val clock: MacC
         GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, 0)
         GL.glViewport(0, 0, outputWidth, outputHeight)
         GL.glUseProgram(meshProgram.id)
-        GL.glClearColor(0f, 0f, 0f, 1f)
-        GL.glClear(GL.GL_COLOR_BUFFER_BIT)
         meshProgram.texture("u_texture", c!!.texture)
         meshProgram.float("u_warpMix", MacScene.warpMix(clock.time))
         meshProgram.float("u_dark", 1f)
         meshProgram.float("u_luma", 0.5f)
-        disableAttributes()
+
+        // 💡 修复 Finding #2: 修复 drawMesh 中的顶点属性泄漏
+        // 在 drawMesh 执行 glDrawElements 前，确保禁用之前 drawQuad 开启的额外属性（特别是 quadPosLoc 与 quadTexLoc），
+        // 避免绘制 41x41 (1681 顶点) 大网格时属性仍绑定在 6 顶点的 quad 小 buffer 上引发 GPU 越界读取或段错误。
+        val quadPosLoc = gaussian.attr("a_position")
+        val quadTexLoc = gaussian.attr("a_texCoord")
+        val rotPosLoc = rotation.attr("a_position")
+        val rotTexLoc = rotation.attr("a_texCoord")
         val texLoc = meshProgram.attr("a_texCoord")
+        val fromLoc = meshProgram.attr("a_from")
+        val toLoc = meshProgram.attr("a_to")
+
+        if (quadPosLoc >= 0 && quadPosLoc != texLoc && quadPosLoc != fromLoc && quadPosLoc != toLoc) {
+            GL.glDisableVertexAttribArray(quadPosLoc)
+        }
+        if (quadTexLoc >= 0 && quadTexLoc != texLoc && quadTexLoc != fromLoc && quadTexLoc != toLoc) {
+            GL.glDisableVertexAttribArray(quadTexLoc)
+        }
+        if (rotPosLoc >= 0 && rotPosLoc != texLoc && rotPosLoc != fromLoc && rotPosLoc != toLoc && rotPosLoc != quadPosLoc) {
+            GL.glDisableVertexAttribArray(rotPosLoc)
+        }
+        if (rotTexLoc >= 0 && rotTexLoc != texLoc && rotTexLoc != fromLoc && rotTexLoc != toLoc && rotTexLoc != quadTexLoc) {
+            GL.glDisableVertexAttribArray(rotTexLoc)
+        }
+
         if (texLoc >= 0) {
             mesh.vertexBuffer.position(0)
             GL.glEnableVertexAttribArray(texLoc)
             GL.glVertexAttribPointer(texLoc, 2, GL.GL_FLOAT, false, 24, mesh.vertexBuffer)
         }
-        val fromLoc = meshProgram.attr("a_from")
         if (fromLoc >= 0) {
             mesh.vertexBuffer.position(2)
             GL.glEnableVertexAttribArray(fromLoc)
             GL.glVertexAttribPointer(fromLoc, 2, GL.GL_FLOAT, false, 24, mesh.vertexBuffer)
         }
-        val toLoc = meshProgram.attr("a_to")
         if (toLoc >= 0) {
             mesh.vertexBuffer.position(4)
             GL.glEnableVertexAttribArray(toLoc)
@@ -258,12 +277,16 @@ internal class MacRenderer(private val context: Context, private val clock: MacC
         }
         mesh.indexBuffer.position(0)
         GL.glDrawElements(GL.GL_TRIANGLES, mesh.indices.size, GL.GL_UNSIGNED_SHORT, mesh.indexBuffer)
+
+        // 💡 修复 Finding #2: 在 drawMesh 绘制完毕后，成对禁用网格所使用的全部属性，防止状态污染
+        if (texLoc >= 0) GL.glDisableVertexAttribArray(texLoc)
+        if (fromLoc >= 0) GL.glDisableVertexAttribArray(fromLoc)
+        if (toLoc >= 0) GL.glDisableVertexAttribArray(toLoc)
         checkGl()
         return true
     }
 
     private fun drawQuad(p: Program) {
-        disableAttributes()
         val posLoc = p.attr("a_position")
         if (posLoc >= 0) {
             quad.position(0)
@@ -277,10 +300,6 @@ internal class MacRenderer(private val context: Context, private val clock: MacC
             GL.glVertexAttribPointer(texLoc, 2, GL.GL_FLOAT, false, 16, quad)
         }
         GL.glDrawArrays(GL.GL_TRIANGLES, 0, 6)
-    }
-
-    private fun disableAttributes() {
-        for (i in 0..7) GL.glDisableVertexAttribArray(i)
     }
 
     private fun use(p: Program, t: Target) {

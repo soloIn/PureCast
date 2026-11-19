@@ -7,8 +7,10 @@ import android.view.WindowManager
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.compose.animation.Crossfade
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.LaunchedEffect
@@ -44,6 +46,7 @@ class MainActivity : ComponentActivity() {
     // 💡 遥控器 MENU 键全局触发器 (以时间戳驱动 Compose 响应)
     private val menuKeyTrigger = mutableLongStateOf(0L)
     private var currentNavScreen: TvNavScreen = TvNavScreen.PLAYBACK
+    private var isOnboardingShowing: Boolean = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -85,41 +88,45 @@ class MainActivity : ComponentActivity() {
                     updateKeepScreenOn()
                 }
 
-                // 物理 MENU 键响应：在播放页与设置页之间平滑切换
+                // 物理 MENU 键响应：在播放页与设置页之间平滑切换 (向导展示期间拦截)
                 LaunchedEffect(menuKeyTrigger.longValue) {
-                    if (menuKeyTrigger.longValue > 0L) {
+                    if (menuKeyTrigger.longValue > 0L && !isOnboardingShowing) {
                         currentScreen = if (currentScreen == TvNavScreen.PLAYBACK) TvNavScreen.SETTINGS else TvNavScreen.PLAYBACK
                     }
                 }
 
-                Crossfade(
-                    targetState = currentScreen,
-                    animationSpec = tween(300),
-                    label = "PageNavigation"
-                ) { screen ->
-                    // 💡 Crossfade 动画淡入淡出期间隔离焦点，严禁未激活页面竞争抢夺焦点导致 D-Pad 失焦
+                // 💡 Finding 8 & 14 修复：
+                // 1. 保持 MainTvScreen 常驻底层，设置页打开时通过 AnimatedVisibility 叠加 SettingsScreen；
+                // 2. 为底层 MainTvScreen 挂载 Modifier.focusProperties { canFocus = (currentScreen == TvNavScreen.PLAYBACK) } 冻结主屏焦点；
+                // 3. 彻底避免 Crossfade 销毁 MainTvScreen 带来的 EGL 黑闪、丢失歌词展开态以及丢失焦点问题！
+                val isPlaybackForeground = (currentScreen == TvNavScreen.PLAYBACK)
+
+                Box(modifier = Modifier.fillMaxSize()) {
                     Box(
                         modifier = Modifier
                             .fillMaxSize()
-                            .focusProperties { canFocus = (screen == currentScreen) }
+                            .focusProperties { canFocus = isPlaybackForeground }
                     ) {
-                        when (screen) {
-                            TvNavScreen.PLAYBACK -> {
-                                MainTvScreen(
-                                    onTogglePlayPause = { togglePlayPause() },
-                                    onPreviousTrack = { handlePreviousTrack() },
-                                    onNextTrack = { handleNextTrack() },
-                                    onOpenSettings = { currentScreen = TvNavScreen.SETTINGS },
-                                    onSeekTo = { posMs -> PlaybackService.instance?.seekTo(posMs) }
-                                )
-                            }
-                            TvNavScreen.SETTINGS -> {
-                                SettingsScreen(
-                                    audioState = audioPathState,
-                                    onDismiss = { currentScreen = TvNavScreen.PLAYBACK }
-                                )
-                            }
-                        }
+                        MainTvScreen(
+                            onTogglePlayPause = { togglePlayPause() },
+                            onPreviousTrack = { handlePreviousTrack() },
+                            onNextTrack = { handleNextTrack() },
+                            onOpenSettings = { currentScreen = TvNavScreen.SETTINGS },
+                            onSeekTo = { posMs -> PlaybackService.instance?.seekTo(posMs) },
+                            onOnboardingVisibilityChanged = { isShowing -> isOnboardingShowing = isShowing },
+                            isForeground = isPlaybackForeground
+                        )
+                    }
+
+                    AnimatedVisibility(
+                        visible = currentScreen == TvNavScreen.SETTINGS,
+                        enter = fadeIn(animationSpec = tween(300)),
+                        exit = fadeOut(animationSpec = tween(300))
+                    ) {
+                        SettingsScreen(
+                            audioState = audioPathState,
+                            onDismiss = { currentScreen = TvNavScreen.PLAYBACK }
+                        )
                     }
                 }
             }
@@ -204,8 +211,12 @@ class MainActivity : ComponentActivity() {
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
         Logger.ui.d(TAG, "收到遥控器按键事件: keyCode=$keyCode")
         when (keyCode) {
-            // 💡 拦截遥控器 MENU 键呼出/关闭设置侧边栏抽屉
+            // 💡 拦截遥控器 MENU 键呼出/关闭设置侧边栏抽屉 (开机向导显示期间禁用)
             KeyEvent.KEYCODE_MENU -> {
+                if (isOnboardingShowing) {
+                    Logger.ui.i(TAG, "开机自检向导展示期间，禁用 KEYCODE_MENU 跳转设置页")
+                    return true
+                }
                 Logger.ui.i(TAG, "遥控器触发: KEYCODE_MENU 呼出全功能设置侧边栏")
                 menuKeyTrigger.longValue = System.currentTimeMillis()
                 return true

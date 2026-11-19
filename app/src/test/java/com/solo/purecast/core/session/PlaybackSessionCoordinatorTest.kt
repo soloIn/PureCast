@@ -1510,6 +1510,44 @@ class PlaybackSessionCoordinatorTest {
         assertEquals("曲目代数应推进为 2", 2L, c.snapshot.value.trackGeneration)
     }
 
+    @Test
+    fun `TrackBoundaryEvent adopts initialPositionMs when non-zero on track generation change`() = runTest(StandardTestDispatcher()) {
+        val hw = FakeSessionHardwareBridge()
+        val c = createCoordinator(this, hw)
+
+        c.dispatch(env(c, EventOrigin.USB_HARDWARE, 0L, HardwareAttachedEvent("Sony ZX300A", hasPermission = true), deviceGen = 1L))
+        runCurrent()
+
+        val s1 = c.allocateSessionId()
+        c.dispatch(env(c, EventOrigin.AIRPLAY, s1, StreamSetupEvent(StreamProtocol.AIRPLAY_1, 44100, 16, 2, "ALAC", 10L)))
+        c.dispatch(env(c, EventOrigin.AIRPLAY, s1, TrackBoundaryEvent(trackGeneration = 1L, trackKey = "Song1", initialDurationState = DurationState.FIXED, seekCapability = SeekCapability.SEEKABLE, trackUri = null)))
+        // 模拟已播放 2000ms
+        c.dispatch(env(c, EventOrigin.AIRPLAY, s1, ProgressUpdateEvent(positionMs = 2000L, durationMs = 180000L)))
+        runCurrent()
+        assertEquals(2000L, c.snapshot.value.progressPositionMs)
+
+        // 切歌 (TrackSwitchEvent FLUSH)
+        c.dispatch(env(c, EventOrigin.AIRPLAY, s1, TrackSwitchEvent(FlushReason.FLUSH_SWITCH, 11L, null, isSeekFlush = false)))
+        runCurrent()
+
+        // 新歌边界到来，带有非零初始进度 (例如播客或非开头播放 160800ms / 209722ms)
+        c.dispatch(env(c, EventOrigin.AIRPLAY, s1, TrackBoundaryEvent(
+            trackGeneration = 2L,
+            trackKey = "Song2",
+            initialDurationState = DurationState.FIXED,
+            seekCapability = SeekCapability.SEEKABLE,
+            trackUri = null,
+            initialPositionMs = 160_800L,
+            initialDurationMs = 209_722L
+        )))
+        runCurrent()
+
+        // 验证：新曲目必须精准采纳 160800ms 作为起始进度与 209722ms 作为时长，不得被抹零
+        assertEquals("新曲目显式初始进度必须被精准采纳", 160_800L, c.snapshot.value.progressPositionMs)
+        assertEquals("新曲目显式初始时长必须被精准采纳", 209_722L, c.snapshot.value.progressDurationMs)
+        assertEquals("曲目代数应推进为 2", 2L, c.snapshot.value.trackGeneration)
+    }
+
     private fun <T : SessionEventPayload> matrixEnv(
         payload: T,
         sessionId: Long = 1L,

@@ -301,4 +301,46 @@ class AirPlayServerEventDispatchTest {
         assertEquals("无封面新歌", patchNoCover.title)
         assertNull("孤立封面消费后必须清空，后续无封面歌曲严禁误继承旧封面", patchNoCover.coverBytes)
     }
+
+    @Test
+    fun `track switch with progress arriving between flush and dmap carries non-zero initial position and duration`() {
+        var mockClock = 1000L
+        val events = mutableListOf<SessionEventEnvelope<SessionEventPayload>>()
+        val globalSessionGen = AtomicLong(100L)
+        val seqGen = AtomicLong(0L)
+        val dispatcher = AirPlayNativeEventDispatcher(
+            dispatchEvent = { events += it },
+            allocateSessionId = { globalSessionGen.incrementAndGet() },
+            allocateSequence = { seqGen.incrementAndGet() },
+            onAcquireHardwareForStream = { _, _, _, _ -> 11L },
+            onDecryptAndInjectCryptoKey = { _, _ -> },
+            onUpdateDacpTarget = { _, _, _, _ -> },
+            onSolveChallenge = { "mock-resp" },
+            clockMs = { mockClock }
+        )
+
+        // 1. 初始化会话与第一首歌
+        dispatcher.onStreamRequested(1L, 1L, 44100, 16, 2, "ALAC", "10.0.0.1", "", "", "", "", 0)
+        dispatcher.onMetadataReceived(1L, 2L, "Track 1", "Artist 1", "Album 1", 200_000L, null)
+
+        // 2. 切歌：iOS 发送 FLUSH
+        mockClock = 2000L
+        dispatcher.onTrackSwitchFlushed(1L, 3L, 12L)
+
+        // 3. 在 DMAP 到达前 200ms，iOS 发送新歌曲目进度 (例如播客从 160800ms / 209722ms 开始播)
+        mockClock = 2200L
+        dispatcher.onProgressUpdated(1L, 4L, 160_800L, 209_722L)
+
+        // 4. iOS DMAP 元数据到达
+        mockClock = 2400L
+        dispatcher.onMetadataReceived(1L, 5L, "Track 2", "Artist 2", "Album 2", 0L, null)
+
+        // 验证：生成的 TrackBoundaryEvent 必须携带非零的 initialPositionMs 和 initialDurationMs
+        val boundary = events.map { it.payload }.filterIsInstance<TrackBoundaryEvent>().last()
+        assertEquals("Track 2|Artist 2", boundary.trackKey)
+        assertEquals(160_800L, boundary.initialPositionMs)
+        assertEquals(209_722L, boundary.initialDurationMs)
+        assertEquals(DurationState.FIXED, boundary.initialDurationState)
+        assertEquals(SeekCapability.SEEKABLE, boundary.seekCapability)
+    }
 }

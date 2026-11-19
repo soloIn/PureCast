@@ -31,6 +31,7 @@ import coil.request.ImageRequest
 import coil.request.SuccessResult
 import com.solo.purecast.ui.theme.AppPalette
 import com.solo.purecast.util.Logger
+import kotlin.math.roundToInt
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.currentCoroutineContext
@@ -44,7 +45,7 @@ private data class MacArtworkFrame(val source: Bitmap, val fallback: Bitmap)
  * 深度移植 Apple Music for TV 原生渲染架构：
  * 1. 采用 assets/macfluid/mesh.bin 烘焙材质网格，在顶点着色器中完成几何流动插值；
  * 2. 离屏 FBO 渲染分辨率为 128~192px，GPU 开销 < 1%，彻底杜绝安卓低端芯片掉帧；
- * 3. 伴随封面异步加载呈现 CPU 预渲染静态首帧 (MacStaticFrame)，并在 EGL 异常时优雅降级。
+ * 3. 伴随封面异步加载呈现快速盒式模糊静态首帧，并在 EGL 异常时优雅降级。
  */
 @Composable
 fun MacBackground(
@@ -54,6 +55,8 @@ fun MacBackground(
     isIdle: Boolean = false,
     reduceMotion: Boolean = false,
     lowPower: Boolean = false,
+    coverHash: Int = 0,
+    isForeground: Boolean = true,
     modifier: Modifier = Modifier
 ) {
     val sceneClock = remember { MacClock() }
@@ -73,7 +76,7 @@ fun MacBackground(
 
     var artwork by remember { mutableStateOf<MacArtworkFrame?>(null) }
 
-    LaunchedEffect(coverData, isIdle, sceneClock.meshIndex) {
+    LaunchedEffect(coverData, isIdle, sceneClock.meshIndex, coverHash) {
         if (isIdle || coverData == null) {
             // 💡 待机空闲或确定无封面态：彻底释放已有 artwork 位图与离屏渲染资源，优雅回退至自适应纯净背景，杜绝浅色模式文字对比度崩溃
             artwork = null
@@ -81,8 +84,16 @@ fun MacBackground(
         }
         try {
             val result = withContext(Dispatchers.IO) {
+                // 💡 修复 Finding #11: 背景专用的 256x256 模糊图缓存键与前台全分辨率封面彻底隔离，
+                // 避免 Coil 全局缓存命中 256x256 低清图导致 4K TV 主屏大封面分辨率降级变模糊
+                val cacheKey = if (coverHash != 0) "cover_bg_$coverHash" else null
                 val req = ImageRequest.Builder(context)
                     .data(coverData)
+                    .apply {
+                        if (cacheKey != null) {
+                            memoryCacheKey(cacheKey)
+                        }
+                    }
                     .size(256, 256)
                     .allowHardware(false)
                     .bitmapConfig(Bitmap.Config.ARGB_8888)
@@ -143,8 +154,8 @@ fun MacBackground(
                     update = { view ->
                         view.update(
                             bitmap = frame.source,
-                            state = FluidRenderState(quality = effectiveQuality, playing = playing),
-                            foreground = foreground
+                            state = FluidRenderState(quality = effectiveQuality, playing = playing && isForeground),
+                            foreground = foreground && isForeground
                         )
                     }
                 )
@@ -221,6 +232,24 @@ private fun fastBoxBlur(src: Bitmap, radius: Int = 6): Bitmap {
                 bSum += (cBot and 0xFF) - (cTop and 0xFF)
             }
         }
+    }
+
+    // 💡 修复 Finding 13: 同步应用与 MacShaders.MESH 完全一致的饱和度增强 (1.5x) 与暗化系数 (* 0.73 且钳制在 [18, 220])，
+    // 消除“静态磨砂 (FluidQuality.STATIC)”或无障碍减弱动态效果下纯白/浅色封面导致的前景白色文字对比度吞噬问题，
+    // 确保静态帧 fallback 与 GLES2 渲染画面的明度与色调完全对齐。
+    for (i in 0 until w * h) {
+        val c = pix[i]
+        val r = (c shr 16) and 0xFF
+        val g = (c shr 8) and 0xFF
+        val b = c and 0xFF
+        val gray = 0.3f * r + 0.59f * g + 0.11f * b
+        val satR = gray + (r - gray) * 1.5f
+        val satG = gray + (g - gray) * 1.5f
+        val satB = gray + (b - gray) * 1.5f
+        val finalR = (satR * 0.73f).roundToInt().coerceIn(18, 220)
+        val finalG = (satG * 0.73f).roundToInt().coerceIn(18, 220)
+        val finalB = (satB * 0.73f).roundToInt().coerceIn(18, 220)
+        pix[i] = (-0x1000000) or (finalR shl 16) or (finalG shl 8) or finalB
     }
 
     return Bitmap.createBitmap(pix, w, h, Bitmap.Config.ARGB_8888)

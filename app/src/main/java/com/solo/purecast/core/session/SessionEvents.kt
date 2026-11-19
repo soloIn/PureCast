@@ -150,13 +150,17 @@ data class StreamTeardownEvent(
 
 /**
  * 显式曲目边界事件：通知 TrackTransactionManager 递增曲目代数 [trackGeneration]
+ * @property initialPositionMs 💡 新曲目起始播放进度（如切歌开播携带的非零进度或播客断点），<=0L 表示从头播放
+ * @property initialDurationMs 💡 新曲目初始已知时长，<=0L 表示尚未解析
  */
 data class TrackBoundaryEvent(
     val trackKey: String,
     val trackGeneration: Long,
     val initialDurationState: DurationState = DurationState.UNKNOWN,
     val seekCapability: SeekCapability = SeekCapability.UNKNOWN,
-    val trackUri: String? = null
+    val trackUri: String? = null,
+    val initialPositionMs: Long = 0L,
+    val initialDurationMs: Long = 0L
 ) : SessionEventPayload
 
 /**

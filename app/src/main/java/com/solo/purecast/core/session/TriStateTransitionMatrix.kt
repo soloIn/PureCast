@@ -639,20 +639,29 @@ internal object TriStateTransitionMatrix {
 
             is TrackBoundaryEvent -> {
                 val result = trackManager.onTrackBoundary(ev)
-                // 💡 修复 Finding 8: 跨曲目边界进度严格归零。
-                // 仅在首曲开播冷启动（snap.trackGeneration == 0L）且音频已先于元数据走字 (1L..3000L) 时才保留当前微小进度；
-                // 只要此前已有活跃曲目（snap.trackGeneration > 0L）发生切歌换代，新曲目进度必须坚决归零 (0L)，彻底杜绝前序曲目残存早期进度继承给新歌！
+                // 💡 修复：非开头播放歌曲进度精准继承与跨曲目残存隔离。
+                // 1. 若当前曲目边界显式携带了真实初始进度 (ev.initialPositionMs > 0L)，优先采纳，支持非开头开播/切歌；
+                // 2. 否则，仅在首曲开播冷启动（snap.trackGeneration == 0L）且音频已先于元数据走字 (1L..3000L) 时才保留当前微小进度；
+                // 3. 跨曲目切歌换代且未显式指定初始进度时坚决归零 (0L)，彻底杜绝前序曲目残存旧进度泄漏给新歌！
                 val nextPosMs = if (result.accepted) {
-                    val pos = snap.progressPositionMs
-                    if (snap.trackGeneration == 0L && pos in 1L..3000L) pos else 0L
+                    if (ev.initialPositionMs > 0L) {
+                        ev.initialPositionMs
+                    } else {
+                        val pos = snap.progressPositionMs
+                        if (snap.trackGeneration == 0L && pos in 1L..3000L) pos else 0L
+                    }
                 } else {
                     snap.progressPositionMs
                 }
+                val nextDurMs = if (result.accepted) {
+                    if (ev.initialDurationMs > 0L) ev.initialDurationMs else 0L
+                } else snap.progressDurationMs
+
                 val nextSnap = snap.copy(
                     trackGeneration = result.activeGeneration,
                     metadata = result.metadata,
                     progressPositionMs = nextPosMs,
-                    progressDurationMs = if (result.accepted) 0L else snap.progressDurationMs
+                    progressDurationMs = nextDurMs
                 )
                 if (result.accepted) {
                     effects += TransitionEffect.ScheduleCoverGraceTimeout(ev.trackGeneration)

@@ -369,4 +369,164 @@ class LyricsSyncClockTest {
         val state5100 = syncClock.calculateActiveLineState(timeline, 5_100L)
         assertEquals(1, state5100.lineIndex)
     }
+
+    @Test
+    fun `ringBufferDelayMsProvider caches within 16ms frame window reducing redundant JNI calls`() {
+        var callCount = 0
+        val clock = LyricsSyncClock(
+            ringBufferDelayMsProvider = {
+                callCount++
+                200L
+            }
+        )
+        val baseNano = 1_000_000_000L
+        clock.updatePosition(10_000L, playing = true, nowNanoTime = baseNano)
+        // updatePosition 内部触发 hardAlign，执行了首次采样
+        val initialCalls = callCount
+        assertTrue("初始化至少采样 1 次: callCount=$initialCalls", initialCalls >= 1)
+
+        // 在同一 16ms 帧内进行 15 次连续高频读取 (模拟 Compose TV 多组件重绘)
+        for (offsetMs in 1..15) {
+            val t = clock.getCurrentInterpolatedTimeMs(baseNano + offsetMs * 1_000_000L)
+            assertTrue(t >= 9800L)
+        }
+        // 验证 16ms 窗口内全部命中缓存，底层 Provider 未发生额外调用
+        assertEquals("16ms 帧内应复用缓存，不产生额外 JNI 调用", initialCalls, callCount)
+
+        // 超过 16ms 跨帧（17ms）后读取，触发新的一帧重新采样
+        clock.getCurrentInterpolatedTimeMs(baseNano + 17_000_000L)
+        assertEquals("跨帧后应触发第 2 次采样", initialCalls + 1, callCount)
+    }
+
+    @Test
+    fun `ringBufferDelayMsProvider applies exponential moving average to filter high frequency sawtooth`() {
+        var delayValue = 200L
+        val clock = LyricsSyncClock(
+            ringBufferDelayMsProvider = { delayValue }
+        )
+        val baseNano = 1_000_000_000L
+        clock.updatePosition(10_000L, playing = true, nowNanoTime = baseNano)
+
+        // 经过 500ms，当前基准延迟已初始化为 200ms
+        // 此时声卡 URB 发生突发读取排队，延迟瞬时突变为 300ms (+100ms 锯齿阶跃)
+        delayValue = 300L
+        val nowNano = baseNano + 500_000_000L
+        val t = clock.getCurrentInterpolatedTimeMs(nowNano)
+
+        // rawTimeMs = 10_000 + 500 = 10_500ms
+        // 若无 EMA，直接扣减 300ms 将得到 10_200ms (导致倒退或剧烈顿挫)
+        // 经 EMA (alpha = 0.15) 滤波后：filteredDelay = 0.15 * 300 + 0.85 * 200 = 215ms
+        // hardwareAdjustedTime = 10_500 - 215 = 10_285ms
+        assertEquals(10_285L, t)
+    }
+
+    @Test
+    fun `pausing maintains exact last interpolated time without jumping forward by ringDelay`() {
+        val clock = LyricsSyncClock(
+            ringBufferDelayMsProvider = { 200L }
+        )
+        val baseNano = 1_000_000_000L
+        clock.updatePosition(10_000L, playing = true, nowNanoTime = baseNano)
+
+        // 推进 500ms，推演时间应为 10_000 + 500 - 200 = 10_300ms
+        val playingTime = clock.getCurrentInterpolatedTimeMs(baseNano + 500_000_000L)
+        assertEquals(10_300L, playingTime)
+
+        // 此时暂停，播放器上报当前音频流位置 10_500ms (扬声器实际才播到 10_300ms)
+        clock.updatePosition(10_500L, playing = false, nowNanoTime = baseNano + 500_000_000L)
+
+        // 验证暂停态冻结值严格保持为暂停瞬间的 10_300ms，绝不向前跳变 +200ms 到 10_500ms
+        val pausedTime = clock.getCurrentInterpolatedTimeMs(baseNano + 800_000_000L)
+        assertEquals(10_300L, pausedTime)
+    }
+
+    @Test
+    fun `resuming from pause smoothly continues from paused position without forward jump`() {
+        val clock = LyricsSyncClock(
+            ringBufferDelayMsProvider = { 200L }
+        )
+        val baseNano = 1_000_000_000L
+        clock.updatePosition(10_000L, playing = true, nowNanoTime = baseNano)
+        val tBeforePause = clock.getCurrentInterpolatedTimeMs(baseNano + 500_000_000L)
+        assertEquals(10_300L, tBeforePause)
+
+        // 暂停：时间冻结在 10_300ms
+        clock.updatePosition(10_500L, playing = false, nowNanoTime = baseNano + 500_000_000L)
+        assertEquals(10_300L, clock.getCurrentInterpolatedTimeMs(baseNano + 600_000_000L))
+
+        // 暂停 1 秒后恢复播放：播放器继续从 10_500ms 推流
+        val resumeNano = baseNano + 1_500_000_000L
+        clock.updatePosition(10_500L, playing = true, nowNanoTime = resumeNano)
+
+        // 恢复瞬间 (elapsed 0ms)：扣除 200ms 环形延迟后恰好对齐 10_300ms
+        val tResume = clock.getCurrentInterpolatedTimeMs(resumeNano)
+        assertEquals(10_300L, tResume)
+
+        // 经过 16ms 渲染帧：平滑单调推演至 10_316ms，无跳变无冻结断层
+        val tFrame1 = clock.getCurrentInterpolatedTimeMs(resumeNano + 16_000_000L)
+        assertEquals(10_316L, tFrame1)
+    }
+
+    @Test
+    fun `seek while paused immediately updates frozen clock`() {
+        val clock = LyricsSyncClock(
+            ringBufferDelayMsProvider = { 200L }
+        )
+        val baseNano = 1_000_000_000L
+        clock.updatePosition(10_000L, playing = false, nowNanoTime = baseNano)
+        // 初始暂停冻结在 10_000 - 200 = 9_800ms
+        assertEquals(9_800L, clock.getCurrentInterpolatedTimeMs(baseNano))
+
+        // 暂停状态下拖动进度条寻道到 45_000ms (|45000 - 10000| > 350ms)
+        clock.updatePosition(45_000L, playing = false, nowNanoTime = baseNano + 100_000_000L)
+
+        // 验证暂停态寻道立即刷新冻结时钟基准为 45_000 - 200 = 44_800ms
+        val seekTime = clock.getCurrentInterpolatedTimeMs(baseNano + 200_000_000L)
+        assertEquals(44_800L, seekTime)
+    }
+
+    @Test
+    fun `mutationVersion increments on hardAlign, seek jump, state change, and reset, but NOT on steady state ticks`() {
+        val clock = LyricsSyncClock(
+            maxExtrapolationMs = 1200L,
+            jumpThresholdMs = 350L
+        )
+        val baseNano = 1_000_000_000L
+        assertEquals(0L, clock.mutationVersion)
+
+        // 1. hardAlign 显式硬对齐：自增 mutationVersion
+        clock.hardAlign(targetPositionMs = 10_000L, playing = true, nowNanoTime = baseNano)
+        assertEquals(1L, clock.mutationVersion)
+
+        // 2. 稳态播放连续推进 (常规 500ms 离散上报，无跳变，playing 保持 true)：严禁自增 mutationVersion！
+        clock.updatePosition(newPositionMs = 10_500L, playing = true, nowNanoTime = baseNano + 500_000_000L)
+        assertEquals("稳态 500ms updatePosition 绝不能递增 mutationVersion (杜绝 2Hz 重组与动画重启)", 1L, clock.mutationVersion)
+
+        clock.updatePosition(newPositionMs = 11_000L, playing = true, nowNanoTime = baseNano + 1_000_000_000L)
+        assertEquals("稳态下版本号保持稳定", 1L, clock.mutationVersion)
+
+        // 3. 状态切换：播放 -> 暂停，应该自增 mutationVersion
+        clock.updatePosition(newPositionMs = 11_200L, playing = false, nowNanoTime = baseNano + 1_200_000_000L)
+        assertEquals(2L, clock.mutationVersion)
+
+        // 暂停稳态持续上报微小波动 (playing 保持 false，无大幅跳变)：不自增
+        clock.updatePosition(newPositionMs = 11_200L, playing = false, nowNanoTime = baseNano + 1_700_000_000L)
+        assertEquals(2L, clock.mutationVersion)
+
+        // 4. 暂停态下 Seek 进度大幅跳变 (|45000 - 11200| > 350ms)：应该自增 mutationVersion
+        clock.updatePosition(newPositionMs = 45_000L, playing = false, nowNanoTime = baseNano + 1_800_000_000L)
+        assertEquals(3L, clock.mutationVersion)
+
+        // 5. 状态切换：暂停 -> 播放，应该自增 mutationVersion
+        clock.updatePosition(newPositionMs = 45_000L, playing = true, nowNanoTime = baseNano + 2_000_000_000L)
+        assertEquals(4L, clock.mutationVersion)
+
+        // 6. 播放态下 Seek 进度大幅跳变 (|80000 - 45000| > 350ms)：应该自增 mutationVersion
+        clock.updatePosition(newPositionMs = 80_000L, playing = true, nowNanoTime = baseNano + 2_500_000_000L)
+        assertEquals(5L, clock.mutationVersion)
+
+        // 7. reset 必须补上自增 mutationVersion
+        clock.reset()
+        assertEquals(6L, clock.mutationVersion)
+    }
 }

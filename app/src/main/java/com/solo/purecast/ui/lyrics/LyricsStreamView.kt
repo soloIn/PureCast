@@ -43,7 +43,8 @@ fun LyricsStreamView(
     timeline: LyricTimeline,
     syncClock: LyricsSyncClock,
     hasDarkBackground: Boolean,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    isPlaying: Boolean = true
 ) {
     val density = LocalDensity.current
     val listState = rememberLazyListState()
@@ -51,10 +52,11 @@ fun LyricsStreamView(
     val isWordSync = timeline.format == LyricFormat.TTML_SYLLABLE || timeline.format == LyricFormat.LRC_WORD_SYNC
     var activeLineIndex by remember { mutableIntStateOf(-1) }
 
-    // 💡 优化 1：按歌词格式按需降频。
-    // 当非逐字格式时，无需在每帧 VSYNC 更新时间戳，仅需每 33ms (~30Hz) 监测 activeLineIndex 变化；
-    // 兼顾极低 CPU 负载与毫秒级高亮提前量的精准响应，稳态下全列表重组开销降至 0 次/秒！
-    LaunchedEffect(timeline, isWordSync) {
+    // 💡 Finding #4: 播放态主循环由 (timeline, isWordSync, isPlaying) 驱动，移除 syncClock.mutationVersion！
+    // 播放期间由 isPlaying 与 withFrameNanos / 33ms 驱动，彻底杜绝稳态播放下动画重启与 2Hz 重组
+    LaunchedEffect(timeline, isWordSync, isPlaying) {
+        if (!isPlaying) return@LaunchedEffect
+
         if (isWordSync) {
             while (true) {
                 withFrameNanos {
@@ -73,6 +75,24 @@ fun LyricsStreamView(
                     activeLineIndex = state.lineIndex
                 }
                 delay(33L)
+            }
+        }
+    }
+
+    // 💡 Finding #1 & #4: 暂停态副作用绑定 (isPlaying, timeline)，彻底从 key 列表中移除 syncClock.mutationVersion（消除 key 重启与 Flow collect 双重触发），同时确保异步歌词到达或切歌时捕获最新 timeline
+    LaunchedEffect(isPlaying, timeline) {
+        if (!isPlaying) {
+            val nowTimeMs = syncClock.getCurrentInterpolatedTimeMs()
+            val state = syncClock.calculateActiveLineState(timeline, nowTimeMs)
+            if (state.lineIndex != activeLineIndex) {
+                activeLineIndex = state.lineIndex
+            }
+            syncClock.mutationVersionFlow.collect {
+                val seekTimeMs = syncClock.getCurrentInterpolatedTimeMs()
+                val seekState = syncClock.calculateActiveLineState(timeline, seekTimeMs)
+                if (seekState.lineIndex != activeLineIndex) {
+                    activeLineIndex = seekState.lineIndex
+                }
             }
         }
     }
@@ -123,9 +143,16 @@ fun LyricsStreamView(
         var lastScrolledLineIndex by remember { mutableIntStateOf(-1) }
 
         LaunchedEffect(activeLineIndex, timeline) {
-            if (activeLineIndex in timeline.lines.indices) {
-                val isNewTimeline = (timeline != lastScrolledTimeline)
+            // 💡 修复 Finding 3: 优先处理新歌时间轴切换归零。
+            // 无论当前处于前奏期 (activeLineIndex == -1) 还是首行开唱，切歌换曲时立即将滚动列表归零对齐顶部，彻底杜绝残留旧歌偏移与开唱瞬间跳动
+            val isNewTimeline = (timeline != lastScrolledTimeline)
+            if (isNewTimeline) {
                 lastScrolledTimeline = timeline
+                lastScrolledLineIndex = -1
+                listState.scrollToItem(0, 0)
+            }
+
+            if (activeLineIndex in timeline.lines.indices) {
                 val delta = if (isNewTimeline) Int.MAX_VALUE else abs(activeLineIndex - lastScrolledLineIndex)
                 lastScrolledLineIndex = activeLineIndex
 
@@ -135,8 +162,13 @@ fun LyricsStreamView(
 
                     val postItem = listState.layoutInfo.visibleItemsInfo.firstOrNull { it.index == activeLineIndex }
                     if (postItem != null) {
-                        val currentCenter = postItem.offset + postItem.size / 2f
-                        val fineDelta = currentCenter - targetCenterY
+                        // 💡 Finding #3: visibleItem.offset 已经是相对于视口容器的坐标，不加 topPaddingPx 杜绝双倍偏移
+                        val fineDelta = LyricsRenderingMath.calculateViewportScrollDelta(
+                            itemOffsetInViewport = postItem.offset.toFloat(),
+                            itemSize = postItem.size.toFloat(),
+                            viewportHeightPx = viewportHeightPx,
+                            targetRatio = targetRatio
+                        )
                         if (abs(fineDelta) > 1f) {
                             listState.scrollBy(fineDelta)
                         }
@@ -145,8 +177,13 @@ fun LyricsStreamView(
                     // 💡 正常逐句推进：高阻尼平滑动画过渡，动态将高亮行物理中心平移对齐至垂直中间偏上 (38%)
                     val visibleItem = listState.layoutInfo.visibleItemsInfo.firstOrNull { it.index == activeLineIndex }
                     if (visibleItem != null) {
-                        val currentCenter = visibleItem.offset + visibleItem.size / 2f
-                        val scrollDelta = currentCenter - targetCenterY
+                        // 💡 Finding #3: visibleItem.offset 已经是相对于视口物理坐标，直接与 targetCenterY 比较
+                        val scrollDelta = LyricsRenderingMath.calculateViewportScrollDelta(
+                            itemOffsetInViewport = visibleItem.offset.toFloat(),
+                            itemSize = visibleItem.size.toFloat(),
+                            viewportHeightPx = viewportHeightPx,
+                            targetRatio = targetRatio
+                        )
                         listState.animateScrollBy(
                             value = scrollDelta,
                             animationSpec = tween(durationMillis = 480, easing = FastOutSlowInEasing)
@@ -155,8 +192,12 @@ fun LyricsStreamView(
                         listState.scrollToItem(index = activeLineIndex, scrollOffset = 0)
                         val postItem = listState.layoutInfo.visibleItemsInfo.firstOrNull { it.index == activeLineIndex }
                         if (postItem != null) {
-                            val currentCenter = postItem.offset + postItem.size / 2f
-                            val fineDelta = currentCenter - targetCenterY
+                            val fineDelta = LyricsRenderingMath.calculateViewportScrollDelta(
+                                itemOffsetInViewport = postItem.offset.toFloat(),
+                                itemSize = postItem.size.toFloat(),
+                                viewportHeightPx = viewportHeightPx,
+                                targetRatio = targetRatio
+                            )
                             if (abs(fineDelta) > 1f) {
                                 listState.scrollBy(fineDelta)
                             }
@@ -186,7 +227,8 @@ fun LyricsStreamView(
                     distanceFromActive = distance,
                     currentTimeProvider = { syncClock.getCurrentInterpolatedTimeMs() },
                     syncClock = syncClock,
-                    primaryColor = primaryTextColor
+                    primaryColor = primaryTextColor,
+                    isPlaying = isPlaying
                 )
             }
         }

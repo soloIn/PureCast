@@ -42,6 +42,7 @@ import androidx.compose.runtime.withFrameNanos
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -190,7 +191,7 @@ internal fun PlayerSessionSnapshot.toMainTvUiState(): MainTvUiState = MainTvUiSt
  *    - 进度条与播放按钮直接通透漂浮，没有任何生硬的底色补丁；
  *    - 背景层覆盖柔和的高透保护遮罩，杜绝任何背景高亮对文字的对比度污染；
  * 3. 控制栏与进度条常驻显示，永不自动淡出；
- * 4. 42% / 58% Apple TV 黄金比例布局 + OLED 微像素平移保护。
+ * 4. 42% / 58% Apple TV 黄金比例布局。
  */
 @OptIn(
     ExperimentalTvMaterial3Api::class,
@@ -204,6 +205,8 @@ fun MainTvScreen(
     onNextTrack: () -> Unit,
     onOpenSettings: () -> Unit,
     onSeekTo: (Long) -> Unit = {},
+    onOnboardingVisibilityChanged: (Boolean) -> Unit = {},
+    isForeground: Boolean = true,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -230,7 +233,24 @@ fun MainTvScreen(
 
     // 💡 歌词 UI 状态与 60fps/120fps 帧间平滑同步时钟 (U5, U6, U7)
     val lyricUiState by remember { PlaybackService.lyricsUiState }.collectAsState()
-    var isLyricsExpanded by remember { mutableStateOf(false) }
+    // 💡 Finding 8：使用 rememberSaveable 持久化 isLyricsExpanded，确保进出设置页时歌词大屏展开态不丢失
+    var isLyricsExpanded by rememberSaveable { mutableStateOf(false) }
+
+    // 💡 焦点恢复 (Finding #6)：从设置页返回主屏且未展开全屏歌词时，精准还原焦点至“⚙ 设置”或播放键，杜绝全屏歌词模式下误抢焦点与死锁
+    LaunchedEffect(isForeground) {
+        if (isForeground && !isLyricsExpanded) {
+            delay(50)
+            try {
+                if (uiState.isIdle) {
+                    settingsFocusRequester.requestFocus()
+                } else {
+                    playPauseFocusRequester.requestFocus()
+                }
+            } catch (e: Exception) {
+                Logger.ui.w("MainTvScreen", "返回主屏请求焦点异常", e)
+            }
+        }
+    }
     val lyricsSyncClock = remember {
         LyricsSyncClock(
             ringBufferDelayMsProvider = {
@@ -243,30 +263,28 @@ fun MainTvScreen(
         )
     }
 
-    val currentServiceSnapshot by remember { PlaybackService.sessionSnapshot }.collectAsState()
-    var lastObservedTrackGen by remember { mutableLongStateOf(0L) }
-    LaunchedEffect(
-        currentServiceSnapshot.trackGeneration,
-        currentServiceSnapshot.progressPositionMs,
-        currentServiceSnapshot.playbackStatus,
-        currentServiceSnapshot.businessState
-    ) {
-        // 💡 Finding 14 修复：TRANSITIONING 缓冲期间扬声器尚未真实出声，必须保持 playing = false 冻结时钟，防止歌词抢跑 1~2 秒
-        val isTrulyPlaying = currentServiceSnapshot.businessState == BusinessSessionState.PLAYING &&
-            currentServiceSnapshot.playbackStatus == PlaybackStatus.PLAYING
+    // 💡 Finding 1 修复：彻底移除顶层 sessionSnapshot 的 collectAsState，采用非重组协程流 collect 驱动时钟，
+    // 彻底阻断每 500ms 进度推送击穿 MainTvScreen 重组隔离！
+    LaunchedEffect(lyricsSyncClock) {
+        var lastObservedTrackGen = 0L
+        PlaybackService.sessionSnapshot.collect { snapshot ->
+            // 💡 Finding 14 修复：TRANSITIONING 缓冲期间扬声器尚未真实出声，必须保持 playing = false 冻结时钟，防止歌词抢跑 1~2 秒
+            val isTrulyPlaying = snapshot.businessState == BusinessSessionState.PLAYING &&
+                snapshot.playbackStatus == PlaybackStatus.PLAYING
 
-        if (currentServiceSnapshot.trackGeneration != lastObservedTrackGen) {
-            lastObservedTrackGen = currentServiceSnapshot.trackGeneration
-            // 💡 切歌换代：坚决瞬时排空旧代时钟并硬对齐目标进度，杜绝上一首歌残留时间对新歌产生干扰
-            lyricsSyncClock.hardAlign(
-                targetPositionMs = currentServiceSnapshot.progressPositionMs,
-                playing = isTrulyPlaying
-            )
-        } else {
-            lyricsSyncClock.updatePosition(
-                newPositionMs = currentServiceSnapshot.progressPositionMs,
-                playing = isTrulyPlaying
-            )
+            if (snapshot.trackGeneration != lastObservedTrackGen) {
+                lastObservedTrackGen = snapshot.trackGeneration
+                // 💡 切歌换代：坚决瞬时排空旧代时钟并硬对齐目标进度，杜绝上一首歌残留时间对新歌产生干扰
+                lyricsSyncClock.hardAlign(
+                    targetPositionMs = snapshot.progressPositionMs,
+                    playing = isTrulyPlaying
+                )
+            } else {
+                lyricsSyncClock.updatePosition(
+                    newPositionMs = snapshot.progressPositionMs,
+                    playing = isTrulyPlaying
+                )
+            }
         }
     }
 
@@ -286,6 +304,11 @@ fun MainTvScreen(
         if (shouldShow) {
             showOnboarding = true
         }
+    }
+
+    // 💡 向上层通知开机向导展示状态，以便在向导存在时拦截遥控器 MENU 键
+    LaunchedEffect(showOnboarding) {
+        onOnboardingVisibilityChanged(showOnboarding)
     }
 
     // 💡 焦点路由：从待机空闲 (IDLE/STOPPED) 首次进入活跃播放时，自动聚焦到“播放/暂停”；
@@ -382,7 +405,9 @@ fun MainTvScreen(
             coverData = persistentCover,
             isPlaying = isPlaying,
             isIdle = isIdle,
-            quality = fluidQuality
+            quality = fluidQuality,
+            coverHash = persistentCoverHash,
+            isForeground = isForeground
         )
 
         // 💡 柔和暗化层：仅在推流播放动态流光背景时启用，防止高饱和流光吞没文字；待机时关闭以呈现原汁原味的深/浅主题
@@ -422,6 +447,7 @@ fun MainTvScreen(
                         coverData = persistentCover,
                         coverHash = persistentCoverHash,
                         hasDarkBackground = hasDarkBackground,
+                        isCoverExpanded = uiState.isCoverExpanded,
                         onPlayPauseClick = onTogglePlayPause,
                         onPreviousClick = onPreviousTrack,
                         onNextClick = onNextTrack,
@@ -434,6 +460,7 @@ fun MainTvScreen(
                                 } catch (_: Exception) {}
                             }
                         },
+                        isForeground = isForeground,
                         sharedTransitionScope = this@SharedTransitionLayout,
                         animatedVisibilityScope = this@AnimatedContent
                     )
@@ -479,14 +506,16 @@ fun MainTvScreen(
                                     ),
                                 contentAlignment = Alignment.Center
                             ) {
+                            // 💡 Finding #10：使用 (resolvedHash, resolvedCover) 解构，使用局部 resolvedHash 构造缓存键，
+                            // 并在 remember 中传入局部 resolvedHash，杜绝闭包捕获外部可变 state 导致切歌动画期间缓存键错乱
                             Crossfade(
                                 targetState = persistentCoverHash to persistentCover,
                                 animationSpec = tween(300),
                                 label = "coverCrossfade"
-                            ) { (_, resolvedCover) ->
+                            ) { (resolvedHash, resolvedCover) ->
                                 if (resolvedCover != null) {
-                                    val coverRequest = remember(context, resolvedCover, persistentCoverHash) {
-                                        val cacheKey = if (persistentCoverHash != 0) "cover_$persistentCoverHash" else null
+                                    val coverRequest = remember(context, resolvedCover, resolvedHash) {
+                                        val cacheKey = if (resolvedHash != 0) "cover_$resolvedHash" else null
                                         ImageRequest.Builder(context)
                                             .data(resolvedCover)
                                             .apply {
@@ -633,6 +662,7 @@ fun MainTvScreen(
                             seekCapability = metadata.seekCapability,
                             playbackStatus = playbackStatus,
                             hasDarkBackground = hasDarkBackground,
+                            isForeground = isForeground,
                             onPlayPauseClick = onTogglePlayPause,
                             onSeekTo = onSeekTo
                         )
@@ -648,10 +678,18 @@ fun MainTvScreen(
                             onLyricsClick = {
                                 isLyricsExpanded = !isLyricsExpanded
                             },
-                            onPlayPauseClick = onTogglePlayPause,
-                            onPreviousClick = onPreviousTrack,
-                            onNextClick = onNextTrack,
-                            onSettingsClick = onOpenSettings,
+                            onPlayPauseClick = {
+                                onTogglePlayPause()
+                            },
+                            onPreviousClick = {
+                                onPreviousTrack()
+                            },
+                            onNextClick = {
+                                onNextTrack()
+                            },
+                            onSettingsClick = {
+                                onOpenSettings()
+                            },
                             playPauseFocusRequester = playPauseFocusRequester,
                             settingsFocusRequester = settingsFocusRequester,
                             lyricsFocusRequester = lyricsFocusRequester,
@@ -695,17 +733,20 @@ private fun IsolatedProgressBar(
     seekCapability: SeekCapability,
     playbackStatus: PlaybackStatus,
     hasDarkBackground: Boolean = true,
+    isForeground: Boolean = true,
     onPlayPauseClick: () -> Unit,
     onSeekTo: (Long) -> Unit = {}
 ) {
     var drawTrigger by remember { mutableLongStateOf(0L) }
     var displaySecondMs by remember { mutableLongStateOf(0L) }
     val isPlaying = playbackStatus == PlaybackStatus.PLAYING
-    val currentSnapshot by remember { PlaybackService.sessionSnapshot }.collectAsState()
     val isIdle = playbackStatus == PlaybackStatus.IDLE || playbackStatus == PlaybackStatus.STOPPED
 
-    LaunchedEffect(isPlaying) {
-        if (isPlaying) {
+    // 💡 播放态：以 60fps/120fps VSYNC 高频驱动 drawTrigger 与秒级文本量化
+    // 当处于前台且播放时才运行高频 VSYNC；设置页打开或后台时立即停止空转 (Finding 1)
+    val shouldRunVsync = isPlaying && isForeground
+    LaunchedEffect(shouldRunVsync) {
+        if (shouldRunVsync) {
             while (true) {
                 withFrameNanos { frameNanos ->
                     drawTrigger = frameNanos
@@ -717,9 +758,24 @@ private fun IsolatedProgressBar(
                     }
                 }
             }
-        } else {
-            val clamped = if (totalDurationMs > 0) currentSnapshot.progressPositionMs.coerceIn(0L, totalDurationMs) else currentSnapshot.progressPositionMs
+        }
+    }
+
+    // 💡 Finding 6 & Finding #1/#8: 消除与顶层 sessionSnapshot 的双协程竞态与重复订阅。
+    // 在非播放态或后台挂起时直接绑定 (isPlaying, isForeground, totalDurationMs)，精简 key 列表（彻底移除 mutationVersion 防止重启与 Flow collect 双重触发），
+    // 并监听 mutationVersionFlow，确保暂停寻道/硬对齐时立即平滑刷新进度显示与绘制
+    LaunchedEffect(isPlaying, isForeground, totalDurationMs) {
+        if (!isPlaying || !isForeground) {
+            val currentMs = syncClock.getCurrentInterpolatedTimeMs()
+            val clamped = if (totalDurationMs > 0) currentMs.coerceIn(0L, totalDurationMs) else currentMs
             displaySecondMs = (clamped / 1000L) * 1000L
+            drawTrigger = System.nanoTime()
+            syncClock.mutationVersionFlow.collect {
+                val updatedMs = syncClock.getCurrentInterpolatedTimeMs()
+                val updatedClamped = if (totalDurationMs > 0) updatedMs.coerceIn(0L, totalDurationMs) else updatedMs
+                displaySecondMs = (updatedClamped / 1000L) * 1000L
+                drawTrigger = System.nanoTime()
+            }
         }
     }
 
@@ -727,7 +783,7 @@ private fun IsolatedProgressBar(
         {
             // 💡 仅在 Draw 阶段读取 drawTrigger，注册每帧重绘，彻底跳过 Composition 与 Layout 阶段
             drawTrigger.let { }
-            val currentMs = if (isPlaying) syncClock.getCurrentInterpolatedTimeMs() else currentSnapshot.progressPositionMs
+            val currentMs = syncClock.getCurrentInterpolatedTimeMs()
             calculateProgressFraction(
                 currentPositionMs = currentMs,
                 totalDurationMs = totalDurationMs,
