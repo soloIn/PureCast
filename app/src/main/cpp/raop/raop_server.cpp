@@ -703,37 +703,61 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
                         if (start_ts == 0 && curr_ts == 0 && end_ts == 0) {
                             LOGI("AirPlay 收到暂停/未就绪时间戳 (progress: 0/0/0)，忽略以防进度冲刷归零");
                         } else {
-                            const uint32_t rate = current_params_.sample_rate > 0 ? current_params_.sample_rate : 44100;
-                            const bool has_valid_duration = end_ts > start_ts;
-                            const bool is_live_progress = (end_ts == 0 && curr_ts >= start_ts && start_ts > 0);
+                            const uint32_t rate = current_params_.sample_rate > 0 ? static_cast<uint32_t>(current_params_.sample_rate) : 44100U;
+                            // 💡 使用有符号 32-bit 模差，彻底兼容 RFC 3550 32-bit RTP 时间戳回绕
+                            const uint32_t start32 = static_cast<uint32_t>(start_ts);
+                            const uint32_t curr32 = static_cast<uint32_t>(curr_ts);
+                            const uint32_t end32 = static_cast<uint32_t>(end_ts);
+                            const int32_t dur_samples = static_cast<int32_t>(end32 - start32);
+                            const int32_t curr_diff_samples = static_cast<int32_t>(curr32 - start32);
+                            const bool has_valid_duration = (end_ts != 0 && dur_samples > 0);
+                            const bool is_live_progress = (end_ts == 0 && start_ts > 0 && curr_diff_samples >= 0);
+
                             if (has_valid_duration || is_live_progress) {
                                 const long dur_ms = has_valid_duration
-                                    ? static_cast<long>((end_ts - start_ts) * 1000ULL / rate)
-                                    : 0;
+                                    ? static_cast<long>(static_cast<int64_t>(dur_samples) * 1000LL / rate)
+                                    : 0L;
 
-                                // 💡 扣除 PureCast 本机二级缓冲水位 (AudioEngine 环形缓冲 + JitterBuffer 延迟)，确保大屏进度条与扬声器声音及 iPhone 完全同步
-                                const size_t ring_bytes = AudioEngine::instance().get_available_read();
-                                const uint32_t bytes_per_sec = rate * (current_params_.channels > 0 ? current_params_.channels : 2) *
-                                    ((current_params_.bit_depth > 0 ? current_params_.bit_depth : 16) / 8);
-                                const long ring_delay_ms = (bytes_per_sec > 0) ? static_cast<long>(ring_bytes * 1000ULL / bytes_per_sec) : 0;
-                                const long jitter_delay_ms = static_cast<long>(rtp_.buffered_jitter_packets() * 352 * 1000ULL / rate);
-                                const long total_latency_ms = ring_delay_ms + jitter_delay_ms;
+                                // 💡 扬声器真实出声位置校准：
+                                // iOS AirPlay 1 默认接收端缓存 2.0s (max-latency: 88200)，其下发的 curr_ts 恒落后于发送端实时 RTP ~2.0s；
+                                // PureCast 仅缓冲 ~200ms 即直通 USB DAC 出声。利用 RaopRtp 写入环形缓冲的最新 RTP 尾时间戳减去环形缓冲未消费采样，
+                                // 直接得出此刻扬声器真实出声的 speaker_ts，消除暂停恢复与 Seek 后的 1.8~2.0s 固定滞后！
+                                uint32_t written_ts = 0;
+                                uint32_t ref_ts = curr32;
+                                bool used_speaker_ts = false;
+                                if (rtp_.get_last_written_rtp_ts(written_ts)) {
+                                    const uint32_t ch = current_params_.channels > 0 ? static_cast<uint32_t>(current_params_.channels) : 2U;
+                                    const uint32_t bps = (current_params_.bit_depth > 0 ? static_cast<uint32_t>(current_params_.bit_depth) : 16U) / 8U;
+                                    const uint32_t bytes_per_frame = ch * (bps > 0 ? bps : 2U);
+                                    const size_t ring_bytes = AudioEngine::instance().get_available_read();
+                                    const uint32_t ring_unplayed_samples = (bytes_per_frame > 0)
+                                        ? static_cast<uint32_t>(ring_bytes / bytes_per_frame)
+                                        : 0U;
+                                    const uint32_t speaker_ts = written_ts - ring_unplayed_samples;
+                                    const int32_t speaker_ahead_samples = static_cast<int32_t>(speaker_ts - curr32);
+                                    const int32_t min_valid = -static_cast<int32_t>(rate / 2U);      // -500ms
+                                    const int32_t max_valid = static_cast<int32_t>(rate * 7U / 2U);  // +3500ms
+                                    if (speaker_ahead_samples >= min_valid && speaker_ahead_samples <= max_valid) {
+                                        ref_ts = speaker_ts;
+                                        used_speaker_ts = true;
+                                    }
+                                }
 
                                 // 💡 AirPlay 预充时钟契约：
-                                // 在 AirPlay 1 协议中，iOS 会在上一曲即将结束前提前约 2 秒开始通过 RTP 传输新曲目并下发 SET_PARAMETER progress。
-                                // 此时 start_ts 为未来实际开播时间点，呈现 curr_ts < start_ts (is_initial_queueing = true)。
-                                // 若此时上报 0ms，会导致 Kotlin UI 层的进度条和歌词时钟在上一曲尚未唱完时被瞬间拉回 0ms 造成严重闪退与跳跃。
-                                // 跨层通信契约：当 is_initial_queueing 为真时，显式向 JNI 回调传递 pos_ms = -1L；
-                                // Kotlin 端 AirPlayNativeEventDispatcher 依据 positionMs >= 0L 守卫仅记录总时长 dur_ms，
-                                // 严格忽略 positionMs 更新，保护上一曲平稳播毕，实现毫秒级无缝切曲衔接！
-                                const bool is_initial_queueing = (curr_ts < start_ts);
-                                const long raw_pos_ms = is_initial_queueing ? 0L : static_cast<long>((curr_ts - start_ts) * 1000ULL / rate);
+                                // 当 ref_ts 仍早于 start32（新曲目尚未到达扬声器）时返回 pos_ms = -1L，仅同步总时长而不拉偏上一曲进度。
+                                const int32_t ref_diff_samples = static_cast<int32_t>(ref_ts - start32);
+                                const bool is_initial_queueing = (ref_diff_samples < 0);
+                                const long raw_pos_ms = is_initial_queueing
+                                    ? 0L
+                                    : static_cast<long>(static_cast<int64_t>(ref_diff_samples) * 1000LL / rate);
+                                long pos_ms = is_initial_queueing ? -1L : std::max(0L, raw_pos_ms);
+                                if (!is_initial_queueing && has_valid_duration && dur_ms > 0L && pos_ms > dur_ms) {
+                                    pos_ms = dur_ms;
+                                }
 
-                                // 💡 直接对齐 iPhone 下发的 SET_PARAMETER progress 绝对呈现时间，杜绝重复扣除硬件时延导致的进度落后与跳变
-                                const long pos_ms = is_initial_queueing ? -1L : std::max(0L, raw_pos_ms);
-
-                                LOGD("AirPlay %s进度实时校准: raw_pos=%ld ms, pos=%ld ms, dur=%ld ms (RTP: %s)",
-                                     has_valid_duration ? "" : "直播流", raw_pos_ms, pos_ms, dur_ms, prog_val.c_str());
+                                LOGD("AirPlay %s进度实时校准: pos=%ld ms, dur=%ld ms (used_speaker_ts=%d, ref_ts=%u, curr_ts=%u, RTP: %s)",
+                                     has_valid_duration ? "" : "直播流", pos_ms, dur_ms, used_speaker_ts ? 1 : 0,
+                                     ref_ts, curr32, prog_val.c_str());
                                 rtp_.update_track_progress(pos_ms, dur_ms);
                                 if (progress_cb_) {
                                     progress_cb_(active_session_id_.load(std::memory_order_acquire), next_seq(), pos_ms, dur_ms);

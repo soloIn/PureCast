@@ -289,6 +289,8 @@ data class PlayerSessionSnapshot(
     val audioPath: AudioPathState = AudioPathState(),
     val progressPositionMs: Long = 0L,
     val progressDurationMs: Long = 0L,
+    val progressRevision: Long = 0L,
+    val lastProgressFromUserSeek: Boolean = false,
     val errors: Map<ErrorCode, PlaybackError> = emptyMap(),
     val uiProtectionActive: Boolean = false,
     val volumePercent: Int = 100,

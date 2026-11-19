@@ -23,6 +23,8 @@ void RaopJitterBuffer::reset() {
     head_seq_ = 0;
     max_seq_seen_ = 0;
     first_packet_ = true;
+    last_popped_timestamp_ = 0;
+    has_popped_timestamp_ = false;
     is_buffering_.store(true, std::memory_order_release);
     buffered_count_.store(0, std::memory_order_relaxed);
     lost_packets_.store(0, std::memory_order_relaxed);
@@ -135,8 +137,12 @@ void RaopJitterBuffer::push(uint16_t seq, uint32_t timestamp, std::vector<uint8_
     }
 }
 
-bool RaopJitterBuffer::pop(std::vector<uint8_t>& out_pcm) {
+bool RaopJitterBuffer::pop(std::vector<uint8_t>& out_pcm, uint32_t* out_timestamp, bool* out_has_timestamp) {
     std::lock_guard<std::mutex> lock(mutex_);
+
+    if (out_has_timestamp) {
+        *out_has_timestamp = false;
+    }
 
     if (is_buffering_.load(std::memory_order_relaxed) || first_packet_) {
         return false;
@@ -145,6 +151,15 @@ bool RaopJitterBuffer::pop(std::vector<uint8_t>& out_pcm) {
     size_t index = head_seq_ % BUFFER_SIZE;
     if (slots_[index].valid && slots_[index].seq_num == head_seq_) {
         // 顺序匹配命中
+        const uint32_t ts = slots_[index].timestamp;
+        last_popped_timestamp_ = ts;
+        has_popped_timestamp_ = true;
+        if (out_timestamp) {
+            *out_timestamp = ts;
+        }
+        if (out_has_timestamp) {
+            *out_has_timestamp = true;
+        }
         out_pcm = std::move(slots_[index].pcm);
         slots_[index].valid = false;
         slots_[index].pcm.clear();
@@ -158,6 +173,15 @@ bool RaopJitterBuffer::pop(std::vector<uint8_t>& out_pcm) {
     if (diff > MAX_REORDER_TOLERANCE) {
         // 丢包确认，生成全 0 静音补偿帧保持物理晶振时钟对齐
         out_pcm.assign(frame_bytes_, 0);
+        if (has_popped_timestamp_) {
+            last_popped_timestamp_ += 352U;
+            if (out_timestamp) {
+                *out_timestamp = last_popped_timestamp_;
+            }
+            if (out_has_timestamp) {
+                *out_has_timestamp = true;
+            }
+        }
         lost_packets_.fetch_add(1, std::memory_order_relaxed);
         LOGW("RTP 丢包补偿: 丢失帧 seq=%u (最新已收 seq=%u, 超差 %d 帧)，插入 8ms 静音保真帧",
              head_seq_, max_seq_seen_, diff);

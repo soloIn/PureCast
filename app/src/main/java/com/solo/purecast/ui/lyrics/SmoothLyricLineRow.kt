@@ -44,27 +44,27 @@ fun SmoothLyricLineRow(
     val words = line.words
     val hasWordSync = !words.isNullOrEmpty()
 
-    // 💡 1. 缩放动画 (Spring 曲线，优雅弹性，平滑缩放 1.0f -> 1.08f)
-    val animatedScale by animateFloatAsState(
+    // 💡 1. 缩放动画 (使用 State 延迟在 graphicsLayer 读取，滚动期间 Composition 重组次数降为 0)
+    val scaleState = animateFloatAsState(
         targetValue = if (isActive) 1.08f else 1.0f,
         animationSpec = spring(
-            dampingRatio = 0.82f,
-            stiffness = 220f
+            dampingRatio = 0.85f,
+            stiffness = 200f
         ),
         label = "lyricScale"
     )
 
-    // 💡 2. 透明度动画 (针对激活行 1.0f 与非激活行平滑过渡，消除生硬突变)
+    // 💡 2. 透明度动画 (使用 State 延迟在 graphicsLayer 读取，消除全列表 600次/秒重组卡顿)
     val targetAlpha = LyricsRenderingMath.calculateLineTargetAlpha(isActive, distanceFromActive)
-    val animatedAlpha by animateFloatAsState(
+    val alphaState = animateFloatAsState(
         targetValue = targetAlpha,
         animationSpec = tween(durationMillis = 350, easing = FastOutSlowInEasing),
         label = "lyricAlpha"
     )
 
-    // 💡 3. 微距位移动画 (第一句入场或行激活时平滑上浮 3dp，呈现沉浸层次感)
+    // 💡 3. 微距位移动画 (使用 State 延迟在 graphicsLayer 读取，零重组零重新布局)
     val targetTranslationY = if (isActive) -3f else 0f
-    val animatedTranslationY by animateFloatAsState(
+    val translationYState = animateFloatAsState(
         targetValue = targetTranslationY,
         animationSpec = spring(
             dampingRatio = Spring.DampingRatioNoBouncy,
@@ -75,40 +75,40 @@ fun SmoothLyricLineRow(
 
     Column(
         modifier = modifier
-            .fillMaxWidth(0.96f) // 💡 预留 4% 物理余量 (0.96 * 1.08 ≈ 1.037，外层已有 padding)，确保 1.08x 放大时文字右侧不超出视口，且大幅提升单行容字量避免英文/长中文提前折行
+            .fillMaxWidth(0.96f) // 💡 预留 4% 物理余量，确保 1.08x 放大时文字右侧不超出视口
             .graphicsLayer {
-                scaleX = animatedScale
-                scaleY = animatedScale
-                // 💡 优化 2：直接在 graphicsLayer 内部转换 dp.toPx()，彻底跳过 Composition 与 Layout 阶段
-                translationY = animatedTranslationY.dp.toPx()
-                // 💡 锚定左侧居中，确保大屏文字放大时左边界平齐不抖动
+                val s = scaleState.value
+                scaleX = s
+                scaleY = s
+                translationY = translationYState.value.dp.toPx()
                 transformOrigin = TransformOrigin(0f, 0.5f)
             },
         verticalArrangement = Arrangement.spacedBy(6.dp)
     ) {
         val translation = line.translationText
 
-        // 💡 逐字歌词或普通整行歌词渲染
-        if (isActive && hasWordSync) {
-            // 💡 Finding 4: 逐字主歌词 WordSyncKaraokeText 保持纯净 1.0f（由其内部独立负责 0.45f -> 1.0f 纯净扫光），不受 animatedAlpha 乘算变暗
+        // 💡 消除切句首帧 Text ⇄ WordSyncKaraokeText 销毁重建：
+        // 只要该行具备逐字时间戳 (hasWordSync)，始终保持单一稳定 WordSyncKaraokeText 节点，仅原位切换 isActive！
+        if (hasWordSync) {
             WordSyncKaraokeText(
                 line = line,
                 syncClock = syncClock,
                 currentTimeProvider = currentTimeProvider,
                 primaryColor = primaryColor,
-                isPlaying = isPlaying
+                isPlaying = isPlaying,
+                isActive = isActive,
+                inactiveAlphaState = alphaState
             )
         } else {
             Text(
                 text = line.mainText,
                 fontSize = 31.sp,
-                // 💡 Finding 10: 主歌词行统一固定为 FontWeight.Bold，完全由 scale (1.0f -> 1.08f) 和 alpha 区分激活层级，消除字重跳变引发的重新排版与重绘
                 fontWeight = FontWeight.Bold,
                 color = primaryColor,
                 lineHeight = 40.sp,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .graphicsLayer { alpha = animatedAlpha }
+                    .graphicsLayer { alpha = alphaState.value }
             )
         }
 
@@ -118,12 +118,11 @@ fun SmoothLyricLineRow(
                 text = translation,
                 fontSize = 20.sp,
                 fontWeight = FontWeight.Normal,
-                // 💡 Finding 4: 中文翻译行 Text 独立享受 animatedAlpha (0.42f -> 1.0f) 的 350ms 丝滑淡入淡出动画，不再受外层逐字 1.0f 阻断
                 color = primaryColor.copy(alpha = LyricsRenderingMath.TRANSLATION_ALPHA),
                 lineHeight = 28.sp,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .graphicsLayer { alpha = animatedAlpha }
+                    .graphicsLayer { alpha = alphaState.value }
             )
         }
     }

@@ -170,7 +170,7 @@ class UpnpRendererServer(
 
         Logger.upnp.i(TAG, "UPnP 友好名称变更: $friendlyName -> $trimmed")
         scope.launch(Dispatchers.IO) {
-            sendSsdpByebye()
+            sendSsdpByebye(waitForCompletion = true)
             friendlyName = trimmed
             deviceUuid = "uuid:" + UUID.nameUUIDFromBytes(trimmed.toByteArray()).toString()
             sendSsdpAlive()
@@ -495,10 +495,13 @@ class UpnpRendererServer(
 
     fun stop() {
         Logger.upnp.i(TAG, "停止 UPnP MediaRenderer 服务...")
+        val wasRunning = ssdpJob != null || multicastSocket != null || serverSocket != null
         demuxer?.stop()
         demuxer = null
 
-        sendSsdpByebye()
+        if (wasRunning) {
+            sendSsdpByebye(waitForCompletion = false)
+        }
 
         ssdpJob?.cancel()
         ssdpJob = null
@@ -1323,28 +1326,72 @@ class UpnpRendererServer(
         }
     }
 
-    private fun sendSsdpByebye() {
+    private fun sendSsdpByebye(waitForCompletion: Boolean = false) {
         val uuid = deviceUuid
-        // 💡 防御 B-5: 采用独立后台线程发送下线通知，彻底杜绝主线程调用 (如 Service.onDestroy) 触发 NetworkOnMainThreadException
+        // 💡 按 UPnP 规范覆盖全部已宣告的 NT/USN 组合（含根设备、UUID 自身、MediaRenderer 与 AVTransport），
+        // 显式绑定局域网网卡、设置 TTL=4，并连续发送 3 轮（间隔 100ms）以抵御 Wi-Fi 组播丢包。
+        val ntUsnPairs = listOf(
+            "upnp:rootdevice" to "$uuid::upnp:rootdevice",
+            uuid to uuid,
+            "urn:schemas-upnp-org:device:MediaRenderer:1" to "$uuid::urn:schemas-upnp-org:device:MediaRenderer:1",
+            "urn:schemas-upnp-org:service:AVTransport:1" to "$uuid::urn:schemas-upnp-org:service:AVTransport:1"
+        )
+        val activeInterface = getActiveNetworkInterface()
+        // 💡 防御 B-5: 采用独立后台线程发送下线通知，既避免主线程 NetworkOnMainThreadException，也不受 lifecycleScope 取消影响
         val thread = Thread {
+            var sock: MulticastSocket? = null
             try {
                 val group = InetAddress.getByName("239.255.255.250")
-                val notify = "NOTIFY * HTTP/1.1\r\n" +
-                        "HOST: 239.255.255.250:1900\r\n" +
-                        "NT: urn:schemas-upnp-org:device:MediaRenderer:1\r\n" +
-                        "NTS: ssdp:byebye\r\n" +
-                        "USN: $uuid::urn:schemas-upnp-org:device:MediaRenderer:1\r\n\r\n"
-                val bytes = notify.toByteArray(Charsets.UTF_8)
-                val packet = DatagramPacket(bytes, bytes.size, group, 1900)
-                val sock = MulticastSocket()
-                sock.send(packet)
-                sock.close()
+                sock = MulticastSocket().apply {
+                    timeToLive = 4
+                    if (activeInterface != null) {
+                        try {
+                            networkInterface = activeInterface
+                        } catch (e: Exception) {
+                            Logger.upnp.w(TAG, "SSDP byebye 绑定网卡 ${activeInterface.name} 失败，回退默认网卡: ${e.message}")
+                        }
+                    }
+                }
+                for (round in 0 until 3) {
+                    for ((nt, usn) in ntUsnPairs) {
+                        val notify = "NOTIFY * HTTP/1.1\r\n" +
+                                "HOST: 239.255.255.250:1900\r\n" +
+                                "NT: $nt\r\n" +
+                                "NTS: ssdp:byebye\r\n" +
+                                "USN: $usn\r\n\r\n"
+                        val bytes = notify.toByteArray(Charsets.UTF_8)
+                        val packet = DatagramPacket(bytes, bytes.size, group, 1900)
+                        sock.send(packet)
+                    }
+                    if (round < 2) {
+                        try {
+                            Thread.sleep(100L)
+                        } catch (_: InterruptedException) {
+                            Thread.currentThread().interrupt()
+                            break
+                        }
+                    }
+                }
+                Logger.upnp.i(TAG, "已完成 3 轮 SSDP ssdp:byebye 下线广播 (UUID=$uuid)")
             } catch (e: Exception) {
-                // ignore
+                Logger.upnp.w(TAG, "发送 SSDP ssdp:byebye 异常: ${e.message}")
+            } finally {
+                try {
+                    sock?.close()
+                } catch (_: Exception) {
+                    // ignore
+                }
             }
         }
         thread.name = "SSDP-ByeBye"
         thread.start()
+        if (waitForCompletion) {
+            try {
+                thread.join(1000L)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+        }
     }
 
     private fun getActiveNetworkInterface(): NetworkInterface? {

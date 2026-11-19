@@ -54,9 +54,11 @@ public:
     /**
      * 按时钟序列出队下一帧 PCM
      * @param out_pcm 输出的 PCM 帧
+     * @param out_timestamp 可选输出该帧对应的 RTP 时间戳（用于计算扬声器真实出声位置）
+     * @param out_has_timestamp 可选输出该时间戳是否有效（丢包首帧尚未出队过有效包时为 false）
      * @return true 成功获取到音频帧或静音补偿帧；false 处于预充或等待后续包到达
      */
-    bool pop(std::vector<uint8_t>& out_pcm);
+    bool pop(std::vector<uint8_t>& out_pcm, uint32_t* out_timestamp = nullptr, bool* out_has_timestamp = nullptr);
 
     /**
      * 💡 修复 Finding 5: 探查下一待出队帧的字节尺寸，不弹出数据亦不改变游标与有效状态
@@ -91,6 +93,8 @@ private:
     uint16_t head_seq_{0};
     uint16_t max_seq_seen_{0};
     bool first_packet_{true};
+    uint32_t last_popped_timestamp_{0};
+    bool has_popped_timestamp_{false};
 
     std::atomic<bool> is_buffering_{true};
     std::atomic<size_t> buffered_count_{0};

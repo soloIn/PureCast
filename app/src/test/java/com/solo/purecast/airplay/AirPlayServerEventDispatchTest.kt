@@ -343,4 +343,72 @@ class AirPlayServerEventDispatchTest {
         assertEquals(DurationState.FIXED, boundary.initialDurationState)
         assertEquals(SeekCapability.SEEKABLE, boundary.seekCapability)
     }
+
+    @Test
+    fun `mid-song casting without flush inherits progress position when dmap arrives after progress`() {
+        var mockClock = 1000L
+        val events = mutableListOf<SessionEventEnvelope<SessionEventPayload>>()
+        val globalSessionGen = AtomicLong(100L)
+        val seqGen = AtomicLong(0L)
+        val dispatcher = AirPlayNativeEventDispatcher(
+            dispatchEvent = { events += it },
+            allocateSessionId = { globalSessionGen.incrementAndGet() },
+            allocateSequence = { seqGen.incrementAndGet() },
+            onAcquireHardwareForStream = { _, _, _, _ -> 11L },
+            onDecryptAndInjectCryptoKey = { _, _ -> },
+            onUpdateDacpTarget = { _, _, _, _ -> },
+            onSolveChallenge = { "mock-resp" },
+            clockMs = { mockClock }
+        )
+
+        // 1. 任意位置首次投屏：SETUP -> RECORD（无 FLUSH）
+        dispatcher.onStreamRequested(1L, 1L, 44100, 16, 2, "ALAC", "10.0.0.1", "", "", "", "", 0)
+
+        // 2. progress 报文先于 DMAP 到达，指示当前从 01:30 (90_000ms) 开始播，总长 04:00 (240_000ms)
+        mockClock = 1200L
+        dispatcher.onProgressUpdated(1L, 2L, 90_000L, 240_000L)
+
+        // 3. 100ms 后 DMAP 真实元数据到达，从占位标题切换到真实歌名
+        mockClock = 1300L
+        dispatcher.onMetadataReceived(1L, 3L, "七里香", "周杰伦", "七里香", 0L, null)
+
+        val boundary = events.map { it.payload }.filterIsInstance<TrackBoundaryEvent>().last()
+        assertEquals("七里香|周杰伦", boundary.trackKey)
+        assertEquals(90_100L, boundary.initialPositionMs)
+        assertEquals(240_000L, boundary.initialDurationMs)
+    }
+
+    @Test
+    fun `track switch without flush does not leak previous track progress into new track`() {
+        var mockClock = 1000L
+        val events = mutableListOf<SessionEventEnvelope<SessionEventPayload>>()
+        val globalSessionGen = AtomicLong(100L)
+        val seqGen = AtomicLong(0L)
+        val dispatcher = AirPlayNativeEventDispatcher(
+            dispatchEvent = { events += it },
+            allocateSessionId = { globalSessionGen.incrementAndGet() },
+            allocateSequence = { seqGen.incrementAndGet() },
+            onAcquireHardwareForStream = { _, _, _, _ -> 11L },
+            onDecryptAndInjectCryptoKey = { _, _ -> },
+            onUpdateDacpTarget = { _, _, _, _ -> },
+            onSolveChallenge = { "mock-resp" },
+            clockMs = { mockClock }
+        )
+
+        dispatcher.onStreamRequested(1L, 1L, 44100, 16, 2, "ALAC", "10.0.0.1", "", "", "", "", 0)
+        dispatcher.onMetadataReceived(1L, 2L, "Mr. Kite", "The Beatles", "Sgt. Pepper", 157_000L, null)
+
+        // 上一首歌在切歌前刚上报过进度 (11_000ms, dur=157_000ms)
+        mockClock = 2000L
+        dispatcher.onProgressUpdated(1L, 3L, 11_000L, 157_000L)
+
+        // 900ms 后无 FLUSH 切到新歌 (dur=304_714ms)，绝不能继承上一曲的 11_900ms
+        mockClock = 2900L
+        dispatcher.onMetadataReceived(1L, 4L, "Within You Without You", "The Beatles", "Sgt. Pepper", 304_714L, null)
+
+        val boundary = events.map { it.payload }.filterIsInstance<TrackBoundaryEvent>().last()
+        assertEquals("Within You Without You|The Beatles", boundary.trackKey)
+        assertEquals(0L, boundary.initialPositionMs)
+        assertEquals(304_714L, boundary.initialDurationMs)
+    }
 }

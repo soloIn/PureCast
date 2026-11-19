@@ -237,6 +237,26 @@ class LyricsRenderingTest {
         )
         // (374.4 + 60) - 410.4 = 24.0f
         assertEquals(24f, tallDelta, 0.001f)
+
+        // 场景 C：Compose LazyColumn 带 contentPadding(top = 374.4f) 时，viewportStartOffset == -374.4f，首行 offset == 0f
+        val paddedItem0Delta = LyricsRenderingMath.calculateViewportScrollDelta(
+            itemOffsetInViewport = 0f,
+            itemSize = 72f,
+            viewportHeightPx = viewportHeightPx,
+            targetRatio = 0.38f,
+            viewportStartOffset = -374.4f
+        )
+        assertEquals(0f, paddedItem0Delta, 0.001f)
+
+        // 第 2 行相对内容区 offset = 100f -> 应向下滚动 100f 将其移至 38% 中心
+        val paddedItem1Delta = LyricsRenderingMath.calculateViewportScrollDelta(
+            itemOffsetInViewport = 100f,
+            itemSize = 72f,
+            viewportHeightPx = viewportHeightPx,
+            targetRatio = 0.38f,
+            viewportStartOffset = -374.4f
+        )
+        assertEquals(100f, paddedItem1Delta, 0.001f)
     }
 
     // ==========================================

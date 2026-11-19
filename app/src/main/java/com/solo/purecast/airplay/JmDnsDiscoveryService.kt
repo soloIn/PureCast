@@ -185,18 +185,45 @@ class JmDnsDiscoveryService(private val context: Context) {
         }
     }
 
+    /**
+     * 在不受调用方 CoroutineScope 生命周期取消影响的独立线程上执行 mDNS 下线注销，
+     * 确保 Service.onDestroy() 或禁用协议时能够完整发出 RFC 6762 Goodbye 包后再关闭套接字。
+     */
+    fun stopBroadcastDetached() {
+        Thread({
+            try {
+                kotlinx.coroutines.runBlocking {
+                    stopBroadcast()
+                }
+            } catch (e: Exception) {
+                Logger.service.w(TAG, "独立线程注销 JmDNS 广播异常: ${e.message}")
+            }
+        }, "AirPlay-mDNS-Goodbye").start()
+    }
+
     private fun stopBroadcastInternal() {
-        if (!isBroadcasting && jmdns == null) return
+        val dns = jmdns
+        if (!isBroadcasting && dns == null) return
 
         Logger.service.i(TAG, "正在停止 JmDNS 广播并注销 Bonjour 服务...")
         try {
-            dacpListener?.let { jmdns?.removeServiceListener(DACP_SERVICE_TYPE, it) }
+            dacpListener?.let { dns?.removeServiceListener(DACP_SERVICE_TYPE, it) }
             dacpListener = null
             clearDacpTarget()
-            airPlayServiceInfo?.let { jmdns?.unregisterService(it) }
-            raopServiceInfo?.let { jmdns?.unregisterService(it) }
-            jmdns?.unregisterAllServices()
-            jmdns?.close()
+            val hadRegisteredService = airPlayServiceInfo != null || raopServiceInfo != null || isBroadcasting
+            airPlayServiceInfo?.let { dns?.unregisterService(it) }
+            raopServiceInfo?.let { dns?.unregisterService(it) }
+            dns?.unregisterAllServices()
+            if (dns != null && hadRegisteredService) {
+                // 💡 JmDNS 的 unregisterService 通过后台 Canceler 异步发送 3 次 RFC 6762 TTL=0 Goodbye 包（间隔约 250ms），
+                // 必须在 close() 与释放 MulticastLock 前留出完整发送窗口，否则 iOS mDNSResponder 只能等缓存自然过期。
+                try {
+                    Thread.sleep(750L)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                }
+            }
+            dns?.close()
         } catch (e: Exception) {
             Logger.service.w(TAG, "注销 JmDNS 服务时发生异常: ${e.message}")
         } finally {

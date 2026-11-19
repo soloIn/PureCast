@@ -105,7 +105,7 @@ class PlaybackServiceSessionHost(
     private var lastAnchorClockMs: Long = 0L
 
     @Volatile
-    private var lastTickerEmittedPosMs: Long = -1L
+    private var anchoredProgressRevision: Long = -1L
 
     fun startObserving() {
         if (snapshotObserverJob?.isActive == true) return
@@ -296,7 +296,6 @@ class PlaybackServiceSessionHost(
         val targetPos = positionMs.coerceAtLeast(0L)
         lastAnchorPosMs = targetPos
         lastAnchorClockMs = clockMs()
-        lastTickerEmittedPosMs = targetPos
         dispatchEnvelope(
             origin = EventOrigin.USER_ACTION,
             sessionId = snap.sessionId,
@@ -405,15 +404,17 @@ class PlaybackServiceSessionHost(
         }
 
         // 💡 AirPlay 1 在 PLAYING 期间维护单调时钟平滑进度推进，补偿 iOS 不周期推 Progress 包的特性
-        val isProtocolProgressUpdate = next.progressPositionMs != lastTickerEmittedPosMs
+        val hasAuthoritativeRevisionChange = prev == null || prev.progressRevision != next.progressRevision
         val isFirstPlayAtZero = prev?.businessState != next.businessState &&
             next.businessState == BusinessSessionState.PLAYING &&
             next.progressPositionMs == 0L
 
-        // 💡 开播保护：在当前曲目开播前 3.5 秒内，若协议上报的极小进度 (<= 1500ms) 比当前服务已走字进度落后，不得逆向倒拉锚点
+        // 💡 开播保护：在当前曲目开播前 3.5 秒内，若协议上报了滞后小值 (0..1500ms)，不得逆向倒拉锚点；
+        // 仅用户显式寻道 (lastProgressFromUserSeek) 放行归零重播
         val currentServiceElapsed = (nowMs - lastAnchorClockMs).coerceAtLeast(0L)
         val currentServicePos = lastAnchorPosMs + currentServiceElapsed
-        val isInitialProtocolLag = prev != null &&
+        val isInitialProtocolLag = !next.lastProgressFromUserSeek &&
+            prev != null &&
             prev.trackGeneration == next.trackGeneration &&
             prev.businessState == BusinessSessionState.PLAYING &&
             currentServicePos in 1L..3500L &&
@@ -425,13 +426,17 @@ class PlaybackServiceSessionHost(
             prev.trackGeneration != next.trackGeneration ||
             prev.businessState != next.businessState ||
             isFirstPlayAtZero ||
-            (isProtocolProgressUpdate && (prev.progressPositionMs != next.progressPositionMs || next.progressPositionMs == 0L))
+            hasAuthoritativeRevisionChange
         )) {
             lastAnchorPosMs = next.progressPositionMs
             // 💡 修复 FirstDataPacketEvent 早于 DAC 真实出声 100ms：
             // 首帧写入环形缓冲区触发 PLAYING 时，声卡正处于 100ms 预充阶段，将时钟锚点精准推迟 100ms，
             // 确保进度走字与扬声器真实出声毫秒级完美同步；正常协议进度包则以当前物理时钟对齐。
             lastAnchorClockMs = if (isFirstPlayAtZero) clockMs() + 100L else clockMs()
+            anchoredProgressRevision = next.progressRevision
+        } else if (hasAuthoritativeRevisionChange) {
+            // 即使被开播防倒流拦截，也同步更新已观察版本号，防止 ticker 永久停摆
+            anchoredProgressRevision = next.progressRevision
         }
 
         val needTicker = next.activeProtocol == StreamProtocol.AIRPLAY_1 &&
@@ -442,7 +447,6 @@ class PlaybackServiceSessionHost(
         } else {
             airPlayTickerJob?.cancel()
             airPlayTickerJob = null
-            lastTickerEmittedPosMs = -1L
         }
     }
 
@@ -458,6 +462,11 @@ class PlaybackServiceSessionHost(
                 ) {
                     break
                 }
+                // 💡 若协调器已收到新协议 Seek/进度而当前协程尚未刷新锚点，直接跳过本拍，严禁用旧锚点覆盖新进度！
+                val anchorRev = anchoredProgressRevision
+                if (snap.progressRevision != anchorRev) {
+                    continue
+                }
                 val elapsed = (clockMs() - lastAnchorClockMs).coerceAtLeast(0L)
                 var pos = lastAnchorPosMs + elapsed
                 val dur = snap.progressDurationMs
@@ -465,7 +474,6 @@ class PlaybackServiceSessionHost(
                     pos = dur
                 }
                 if (pos != snap.progressPositionMs) {
-                    lastTickerEmittedPosMs = pos
                     dispatchEnvelope(
                         origin = EventOrigin.SERVICE, // 💡 P0-1: 内部进度平滑轮询使用 SERVICE，避免与协议事件竞争导致乱序丢包
                         sessionId = sessionId,
@@ -473,7 +481,8 @@ class PlaybackServiceSessionHost(
                         payload = ProgressUpdateEvent(
                             positionMs = pos,
                             durationMs = dur,
-                            trackGeneration = snap.trackGeneration
+                            trackGeneration = snap.trackGeneration,
+                            expectedProgressRevision = anchorRev
                         )
                     )
                 }

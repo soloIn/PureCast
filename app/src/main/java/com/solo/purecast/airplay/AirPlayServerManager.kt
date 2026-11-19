@@ -130,9 +130,9 @@ class AirPlayServerManager(
         Logger.airplay.i(TAG, "正在停止 AirPlay 1 服务...")
         nativeDispatcher.resetSessions()
         broadcastJob?.cancel()
-        broadcastJob = scope.launch(Dispatchers.IO) {
-            jmdnsDiscoveryService.stopBroadcast()
-        }
+        broadcastJob = null
+        // 💡 使用独立于 lifecycleScope 的下线线程发送 mDNS Goodbye 包，避免 Service.onDestroy() 取消协程导致下线广播被中断
+        jmdnsDiscoveryService.stopBroadcastDetached()
         NativeAudioEngine.stopAirPlayServer()
         dacpClient.clearSession()
         isRunning = false

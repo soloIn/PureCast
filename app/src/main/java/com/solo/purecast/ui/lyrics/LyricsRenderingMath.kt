@@ -87,7 +87,10 @@ object LyricsRenderingMath {
     /**
      * 💡 Finding 3: 38% 黄金视线垂直滚动偏移量计算
      * 计算视口中列表项物理中心相对目标视线位置 (默认 38%) 的滚动位移差。
-     * [itemOffsetInViewport] 为相对于 LazyColumn 视口顶部的物理偏移 (无需额外累加 topPadding)
+     * 在 Compose LazyColumn 中，设置 contentPadding(top = topPaddingPx) 时：
+     * - `visibleItem.offset` 相对于 contentPadding 之后的内容区起点；
+     * - `layoutInfo.viewportStartOffset == -topPaddingPx`；
+     * 因此元素相对视口顶部的真实物理 Y 坐标为 `itemOffsetInViewport - viewportStartOffset`。
      *
      * @return 需滚动的偏移量 delta (像素)，正数表示需向下滚动使元素上移，负数反之
      */
@@ -95,10 +98,12 @@ object LyricsRenderingMath {
         itemOffsetInViewport: Float,
         itemSize: Float,
         viewportHeightPx: Float,
-        targetRatio: Float = 0.38f
+        targetRatio: Float = 0.38f,
+        viewportStartOffset: Float = 0f
     ): Float {
         val targetCenterY = viewportHeightPx * targetRatio
-        val currentScreenCenterY = itemOffsetInViewport + itemSize * 0.5f
+        val itemTopInViewport = itemOffsetInViewport - viewportStartOffset
+        val currentScreenCenterY = itemTopInViewport + itemSize * 0.5f
         return currentScreenCenterY - targetCenterY
     }
 

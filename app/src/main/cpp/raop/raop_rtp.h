@@ -94,9 +94,23 @@ public:
     bool is_running() const { return is_running_.load(std::memory_order_relaxed); }
 
     /**
-     * 重置 Jitter 缓冲状态
+     * 重置 Jitter 缓冲状态与已写入 RTP 时间戳游标
      */
-    void reset_buffer() { jitter_buffer_.reset(); }
+    void reset_buffer() {
+        jitter_buffer_.reset();
+        has_written_rtp_ts_.store(false, std::memory_order_release);
+    }
+
+    /**
+     * 获取最新已写入 AudioEngine 环形缓冲的音频帧尾部 RTP 时间戳
+     */
+    bool get_last_written_rtp_ts(uint32_t& out_ts) const {
+        if (!has_written_rtp_ts_.load(std::memory_order_acquire)) {
+            return false;
+        }
+        out_ts = last_written_rtp_ts_.load(std::memory_order_acquire);
+        return true;
+    }
 
     /**
      * 💡 设置客户端控制端口端点，用于发送 RAOP 丢包重传请求 (0xd5)
@@ -283,6 +297,8 @@ private:
     std::atomic<float> current_volume_db_{0.0f};
     std::atomic<int64_t> track_duration_ms_{0};
     std::atomic<int64_t> track_position_ms_{0};
+    std::atomic<uint32_t> last_written_rtp_ts_{0};
+    std::atomic<bool> has_written_rtp_ts_{false};
 };
 
 } // namespace purecast::raop

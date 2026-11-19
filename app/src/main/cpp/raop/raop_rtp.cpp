@@ -165,6 +165,8 @@ void RaopRtp::stop() {
     emitted_first_epoch_.store(0ULL, std::memory_order_release);
     track_duration_ms_.store(0, std::memory_order_release);
     track_position_ms_.store(0, std::memory_order_release);
+    last_written_rtp_ts_.store(0, std::memory_order_release);
+    has_written_rtp_ts_.store(false, std::memory_order_release);
     {
         std::lock_guard<std::mutex> lock(crypto_mutex_);
         aes_key_.clear();
@@ -253,12 +255,30 @@ void RaopRtp::drain_jitter_buffer_locked() {
     }
     size_t next_frame_size = 0;
     std::vector<uint8_t> ready_frame;
+    uint32_t frame_ts = 0;
+    bool has_frame_ts = false;
     while (jitter_buffer_.peek_size(next_frame_size) &&
            AudioEngine::instance().get_buffer_available() >= next_frame_size &&
-           jitter_buffer_.pop(ready_frame)) {
+           jitter_buffer_.pop(ready_frame, &frame_ts, &has_frame_ts)) {
         const uint64_t cur_epoch = active_epoch_.load(std::memory_order_acquire);
         int written = AudioEngine::instance().write_pcm(ready_frame.data(), ready_frame.size(), cur_epoch);
         if (written > 0) {
+            if (has_frame_ts) {
+                int ch = 2;
+                int bits = 16;
+                {
+                    std::lock_guard<std::mutex> flock(format_mutex_);
+                    if (format_channels_ > 0) ch = format_channels_;
+                    if (format_bit_depth_ > 0) bits = format_bit_depth_;
+                }
+                const uint32_t bytes_per_frame = static_cast<uint32_t>(ch * (bits / 8));
+                const uint32_t written_samples = (bytes_per_frame > 0)
+                    ? static_cast<uint32_t>(static_cast<size_t>(written) / bytes_per_frame)
+                    : 352U;
+                last_written_rtp_ts_.store(frame_ts + written_samples, std::memory_order_release);
+                has_written_rtp_ts_.store(true, std::memory_order_release);
+            }
+
             uint64_t prev_emitted = emitted_first_epoch_.load(std::memory_order_acquire);
             if (prev_emitted != cur_epoch &&
                 emitted_first_epoch_.compare_exchange_strong(prev_emitted, cur_epoch, std::memory_order_acq_rel)) {

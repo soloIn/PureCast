@@ -108,7 +108,9 @@ class LyricsSyncClock(
     fun updatePosition(
         newPositionMs: Long,
         playing: Boolean,
-        nowNanoTime: Long = System.nanoTime()
+        nowNanoTime: Long = System.nanoTime(),
+        isUserSeek: Boolean = false,
+        allowSeekJump: Boolean = true
     ) {
         val currentEstimatedTime = if (isPlaying && anchorNanoTime > 0L) {
             val elapsedMs = (nowNanoTime - anchorNanoTime).coerceAtLeast(0L) / 1_000_000L
@@ -120,9 +122,9 @@ class LyricsSyncClock(
         val jumpDelta = abs(newPositionMs - currentEstimatedTime)
 
         // 💡 修复开播初期 iPhone 迟到的极小进度上报误判为 Seek 倒退的缺陷：
-        // 切歌开播初始 3.5 秒内，若新上报的进度极小 (<= 1500ms) 且落后于当前已平滑推演的时钟，
-        // 判定为推流端未就绪的延迟校准包，绝不触发向后 Seek 硬重置；将推演基准重设为当前推演时间，维持单调平滑推进，根除永久滞后 1.5 秒的根因！
-        val isInitialWarmupLag = currentEstimatedTime <= 3500L && newPositionMs <= 1500L && newPositionMs < currentEstimatedTime
+        // 切歌开播初始 3.5 秒内，若协议上报的进度极小 (0..1500ms) 且落后于当前已平滑推演的时钟，
+        // 判定为推流端未就绪的延迟校准包，绝不触发向后 Seek 硬重置；仅用户显式寻道 (isUserSeek = true) 放行归零重播。
+        val isInitialWarmupLag = !isUserSeek && currentEstimatedTime <= 3500L && newPositionMs <= 1500L && newPositionMs < currentEstimatedTime
         if (isInitialWarmupLag) {
             Logger.lyrics.d(
                 TAG,
@@ -133,8 +135,8 @@ class LyricsSyncClock(
             return
         }
 
-        // 1. 检测进度跳变 (iPhone 拖动寻道，无论是向前还是向后拖动超过阈值)
-        if (jumpDelta > jumpThresholdMs) {
+        // 1. 检测进度跳变 (iPhone 拖动寻道，无论是向前还是向后拖动超过阈值；纯 500ms 内部 ticker 心跳禁止触发假 Seek 跳变)
+        if (allowSeekJump && jumpDelta > jumpThresholdMs) {
             Logger.lyrics.i(
                 TAG,
                 "进度跳变寻道 (Seek): $currentEstimatedTime -> $newPositionMs (delta=${newPositionMs - currentEstimatedTime}ms)"

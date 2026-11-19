@@ -252,25 +252,22 @@ fun MainTvScreen(
         }
     }
     val lyricsSyncClock = remember {
-        LyricsSyncClock(
-            ringBufferDelayMsProvider = {
-                try {
-                    com.solo.purecast.core.nativebridge.NativeAudioEngine.getRingBufferDelayMs()
-                } catch (_: Throwable) {
-                    0L
-                }
-            }
-        )
+        // 💡 AirPlay 1 (C++ raop_server.cpp 已按 speaker_rtp_ts = written_ts - ring_unplayed 校准) 与
+        // UPnP (StreamDemuxer 已扣除环形缓冲未消费采样) 均直接上报扬声器真实出声位置，此处不再重复扣除硬件延迟
+        LyricsSyncClock(ringBufferDelayMsProvider = { 0L })
     }
 
     // 💡 Finding 1 修复：彻底移除顶层 sessionSnapshot 的 collectAsState，采用非重组协程流 collect 驱动时钟，
     // 彻底阻断每 500ms 进度推送击穿 MainTvScreen 重组隔离！
     LaunchedEffect(lyricsSyncClock) {
         var lastObservedTrackGen = 0L
+        var lastObservedProgressRevision = -1L
         PlaybackService.sessionSnapshot.collect { snapshot ->
             // 💡 Finding 14 修复：TRANSITIONING 缓冲期间扬声器尚未真实出声，必须保持 playing = false 冻结时钟，防止歌词抢跑 1~2 秒
             val isTrulyPlaying = snapshot.businessState == BusinessSessionState.PLAYING &&
                 snapshot.playbackStatus == PlaybackStatus.PLAYING
+            val isAuthoritativeProgress = snapshot.progressRevision != lastObservedProgressRevision
+            lastObservedProgressRevision = snapshot.progressRevision
 
             if (snapshot.trackGeneration != lastObservedTrackGen) {
                 lastObservedTrackGen = snapshot.trackGeneration
@@ -282,7 +279,9 @@ fun MainTvScreen(
             } else {
                 lyricsSyncClock.updatePosition(
                     newPositionMs = snapshot.progressPositionMs,
-                    playing = isTrulyPlaying
+                    playing = isTrulyPlaying,
+                    isUserSeek = snapshot.lastProgressFromUserSeek,
+                    allowSeekJump = isAuthoritativeProgress
                 )
             }
         }

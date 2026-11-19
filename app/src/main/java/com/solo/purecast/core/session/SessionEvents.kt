@@ -226,7 +226,8 @@ class MetadataPatchEvent(
 data class ProgressUpdateEvent(
     val positionMs: Long,
     val durationMs: Long,
-    val trackGeneration: Long = 0L
+    val trackGeneration: Long = 0L,
+    val expectedProgressRevision: Long = -1L
 ) : SessionEventPayload
 
 /**

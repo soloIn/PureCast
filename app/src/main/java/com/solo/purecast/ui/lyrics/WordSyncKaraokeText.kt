@@ -8,6 +8,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.tv.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.State
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -33,9 +34,9 @@ import com.solo.purecast.model.LyricLine
 
 /**
  * 💡 逐字歌词（Karaoke Word-Sync）视觉与排版开销优化组件：
- * 1. 主歌词文本保持为不可变 String，使 TextLayoutResult 在整句生命周期内 100% 缓存复用，排版 CPU 开销降为 0；
+ * 1. 常驻单一稳定节点（传入 isActive），彻底消除切句首帧 Text ⇄ WordSyncKaraokeText 销毁重建与 TextLayout 重排卡顿；
  * 2. 0 重组纯 Draw 阶段渲染：完全隔离在 drawWithContent 内部读取时间，重组次数彻底归 0；
- * 3. 视觉行分段裁切 (clipRect)：针对换行多行歌词，按视觉行分段绘制与渐变，根除跨行染色串色 Bug；
+ * 3. 非激活态自动关闭 Offscreen FBO 与 VSYNC 循环，仅在 isActive == true 时激活单行扫光离屏混合；
  * 4. 零堆内存分配优化：复用预分配的 LinearGradient、Matrix 与 Native Paint，彻底消除 60fps 下每帧临时 Brush 堆内存分配；
  * 5. 实现真正的 Apple Music 卡拉 OK 逐像素平滑扫光与抗锯齿羽化边缘。
  */
@@ -46,15 +47,18 @@ fun WordSyncKaraokeText(
     currentTimeProvider: () -> Long,
     primaryColor: Color,
     modifier: Modifier = Modifier,
-    isPlaying: Boolean = true
+    isPlaying: Boolean = true,
+    isActive: Boolean = true,
+    inactiveAlphaState: State<Float>? = null
 ) {
     val words = line.words ?: return
     val fullText = line.mainText
 
-    // 💡 Finding 3: 仅在播放态启动 60fps VSYNC 驱动循环；暂停时立即停止空转，CPU 负载降为 0
+    // 💡 仅在激活且播放态启动 60fps VSYNC 驱动循环；非激活或暂停时立即停止空转，CPU 负载降为 0
     var frameTrigger by remember { mutableLongStateOf(0L) }
-    LaunchedEffect(isPlaying) {
-        if (!isPlaying) return@LaunchedEffect
+    val shouldAnimate = isActive && isPlaying
+    LaunchedEffect(shouldAnimate) {
+        if (!shouldAnimate) return@LaunchedEffect
         while (true) {
             withFrameNanos { frameNanos ->
                 frameTrigger = frameNanos
@@ -62,9 +66,9 @@ fun WordSyncKaraokeText(
         }
     }
 
-    // 💡 Finding #1 & #4 & #5: 暂停态副作用精简 key 为 LaunchedEffect(isPlaying)，移除 mutationVersion，避免 key 重启与 collect 双重触发
-    LaunchedEffect(isPlaying) {
-        if (!isPlaying) {
+    // 💡 激活但暂停态监听时钟离散变更（如 Seek / 硬对齐），立即重绘扫光位置
+    LaunchedEffect(isActive, isPlaying) {
+        if (isActive && !isPlaying) {
             frameTrigger = System.nanoTime()
             syncClock.mutationVersionFlow.collect {
                 frameTrigger = System.nanoTime()
@@ -89,7 +93,7 @@ fun WordSyncKaraokeText(
     val feather = with(density) { 10.dp.toPx() }
     val unlitColor = remember(primaryColor) { primaryColor.copy(alpha = 0.45f) }
 
-    // 💡 Finding 3: 单一预分配 LinearGradient 与 Matrix 平移复用机制
+    // 💡 单一预分配 LinearGradient 与 Matrix 平移复用机制
     // 杜绝在 Draw 阶段每帧分配 Brush.horizontalGradient、ColorStops、List 等高频临时堆对象
     val sweepMatrix = remember { Matrix() }
     val sweepShader = remember(primaryColor, unlitColor, feather) {
@@ -113,13 +117,18 @@ fun WordSyncKaraokeText(
         fontWeight = FontWeight.Bold,
         lineHeight = 40.sp,
         onTextLayout = { layoutResult = it },
-        color = Color.White,
+        color = if (isActive) Color.White else primaryColor,
         modifier = modifier
             .fillMaxWidth()
-            .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
+            .graphicsLayer {
+                compositingStrategy = if (isActive) CompositingStrategy.Offscreen else CompositingStrategy.Auto
+                alpha = if (isActive) 1.0f else (inactiveAlphaState?.value ?: 0.42f)
+            }
             .drawWithContent {
-                val lr = layoutResult ?: return@drawWithContent
                 drawContent()
+                if (!isActive) return@drawWithContent
+
+                val lr = layoutResult ?: return@drawWithContent
 
                 // 💡 Finding #7: 头部快速返回保护，处理空文本或空词列表
                 if (fullText.isEmpty() || words.isNullOrEmpty()) {

@@ -223,6 +223,14 @@ class LyricsSyncClockTest {
         // 验证开播防倒拉保护生效：绝不触发向后 Seek 重置为 131ms，维持单调推演继续前进 (900ms + 100ms = 1000ms)
         val t2 = syncClock.getCurrentInterpolatedTimeMs(baseNano + 1_100_000_000L)
         assertEquals(1000L, t2)
+
+        // 协议层在开播前 3.5 秒内补发 0ms 仍应拦截，不拉偏时钟
+        syncClock.updatePosition(0L, playing = true, nowNanoTime = baseNano + 1_300_000_000L, isUserSeek = false)
+        assertTrue(syncClock.getCurrentInterpolatedTimeMs(baseNano + 1_300_000_000L) >= 1000L)
+
+        // 但若用户在前 3.5 秒内显式拖动回开头 0ms (isUserSeek = true)，必须放行硬对齐至 0ms
+        syncClock.updatePosition(0L, playing = true, nowNanoTime = baseNano + 1_500_000_000L, isUserSeek = true)
+        assertEquals(0L, syncClock.getCurrentInterpolatedTimeMs(baseNano + 1_500_000_000L))
     }
 
     @Test

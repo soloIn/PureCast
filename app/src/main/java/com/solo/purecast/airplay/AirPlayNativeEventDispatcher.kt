@@ -70,6 +70,16 @@ internal class AirPlayNativeEventDispatcher(
     @Volatile
     private var lastTrackSwitchFlushedTimestampMs: Long = 0L
 
+    // 💡 记录最近一次无 FLUSH 场景（任意位置首次投屏 / 自然自动切歌）到达的协议进度，防止紧随其后的 DMAP 边界事件误归零
+    @Volatile
+    private var recentProgressPositionMs: Long = -1L
+
+    @Volatile
+    private var recentProgressDurationMs: Long = 0L
+
+    @Volatile
+    private var recentProgressTimestampMs: Long = 0L
+
     @Volatile
     private var pendingOrphanCoverBytes: ByteArray? = null
 
@@ -89,6 +99,9 @@ internal class AirPlayNativeEventDispatcher(
         postFlushProgressDurationMs = 0L
         postFlushProgressPositionMs = -1L
         lastTrackSwitchFlushedTimestampMs = 0L
+        recentProgressPositionMs = -1L
+        recentProgressDurationMs = 0L
+        recentProgressTimestampMs = 0L
         pendingOrphanCoverBytes = null
         pendingOrphanCoverTimestampMs = 0L
         lastActiveMetadata = null
@@ -179,6 +192,11 @@ internal class AirPlayNativeEventDispatcher(
             currentTrackArtist = initialMetadata.artist
             currentTrackDurationFixed = initialMetadata.durationMs > 0L
             currentTrackMarkedLive = false
+            if (!isResuming) {
+                recentProgressPositionMs = -1L
+                recentProgressDurationMs = 0L
+                recentProgressTimestampMs = 0L
+            }
             emitLocked(
                 sessionId = globalSessionId,
                 payload = StreamSetupEvent(
@@ -250,6 +268,9 @@ internal class AirPlayNativeEventDispatcher(
                 lastTrackSwitchFlushedTimestampMs = clockMs()
                 postFlushProgressDurationMs = 0L // 💡 切歌换代重置已知时长缓存，防止旧曲目时长泄漏
                 postFlushProgressPositionMs = -1L // 💡 切歌换代重置已知初始进度缓存
+                recentProgressPositionMs = -1L
+                recentProgressDurationMs = 0L
+                recentProgressTimestampMs = 0L
             }
             emitLocked(
                 sessionId = globalSid,
@@ -321,23 +342,38 @@ internal class AirPlayNativeEventDispatcher(
                 null
             }
 
+            val isPlaceholderTitle = currentTrackTitle == "AirPlay 音频直通"
             val isBoundarySwitch = trimmedTitle.isNotEmpty() &&
                 currentTrackTitle.isNotEmpty() &&
                 (trimmedTitle != currentTrackTitle ||
                     (trimmedArtist.isNotEmpty() && currentTrackArtist.isNotEmpty() && trimmedArtist != currentTrackArtist))
 
-            // 💡 P0-3: 若切歌 FLUSH 后收到了 progress 报文，继承该时长与非零开播进度防止新歌被抹零；使用后立即清空避免污染后续曲目
-            val effectiveDurationMs = if (durationMs > 0L) {
-                durationMs
-            } else if (postFlushProgressDurationMs > 0L) {
-                postFlushProgressDurationMs
-            } else {
-                0L
+            val recentElapsedMs = if (recentProgressTimestampMs > 0L) (now - recentProgressTimestampMs) else -1L
+            val recentProgressFresh = recentElapsedMs in 0L..4000L
+            // 💡 严禁在无 FLUSH 切歌时把上一首歌的旧进度（如 11908ms）泄漏给新歌：
+            // 仅在冷启动占位标题（首次中途投屏）或先到的 progress 时长与新曲 DMAP 时长精确匹配（±2s）时才允许继承！
+            val durationMatchesIncomingDmap = durationMs > 0L && recentProgressDurationMs > 0L &&
+                kotlin.math.abs(recentProgressDurationMs - durationMs) <= 2000L
+            val canInheritRecentProgressOnNoFlush = recentProgressFresh && recentProgressPositionMs >= 0L && (
+                isPlaceholderTitle ||
+                durationMatchesIncomingDmap
+            )
+
+            // 💡 支持 FLUSH 切歌与无 FLUSH 场景（任意位置首次投屏 / 自然连播自动切歌）继承先到的真实时长与开播进度，
+            // 并在继承无 FLUSH 进度时补偿到达至今的流逝时间，避免 DMAP 晚到 1~2 秒后将进度倒拉回旧快照
+            val effectiveDurationMs = when {
+                durationMs > 0L -> durationMs
+                postFlushProgressDurationMs > 0L -> postFlushProgressDurationMs
+                canInheritRecentProgressOnNoFlush && recentProgressDurationMs > 0L -> recentProgressDurationMs
+                else -> 0L
             }
-            val effectivePositionMs = if (postFlushProgressPositionMs >= 0L) {
-                postFlushProgressPositionMs
-            } else {
-                0L
+            val effectivePositionMs = when {
+                postFlushProgressPositionMs >= 0L -> postFlushProgressPositionMs
+                canInheritRecentProgressOnNoFlush -> {
+                    val advanced = recentProgressPositionMs + recentElapsedMs.coerceAtLeast(0L)
+                    if (effectiveDurationMs > 0L) advanced.coerceAtMost(effectiveDurationMs) else advanced
+                }
+                else -> 0L
             }
 
             if (isBoundarySwitch) {
@@ -362,6 +398,9 @@ internal class AirPlayNativeEventDispatcher(
                 )
                 postFlushProgressDurationMs = 0L // 💡 消费后清空
                 postFlushProgressPositionMs = -1L // 💡 消费后清空
+                recentProgressPositionMs = -1L
+                recentProgressDurationMs = 0L
+                recentProgressTimestampMs = 0L
                 lastTrackSwitchFlushedTimestampMs = 0L
                 // 💡 修复 Finding 4: 切歌边界彻底清空上一曲残留的孤立封面缓存，杜绝无封面歌曲误继承旧封面
                 pendingOrphanCoverBytes = null
@@ -450,6 +489,15 @@ internal class AirPlayNativeEventDispatcher(
                 if (positionMs >= 0L) {
                     postFlushProgressPositionMs = positionMs
                 }
+            }
+            if (positionMs >= 0L || durationMs > 0L) {
+                if (positionMs >= 0L) {
+                    recentProgressPositionMs = positionMs
+                }
+                if (durationMs > 0L) {
+                    recentProgressDurationMs = durationMs
+                }
+                recentProgressTimestampMs = clockMs()
             }
 
             Logger.airplay.d(
