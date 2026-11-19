@@ -414,4 +414,112 @@ class LyricsRenderingTest {
 
         collectJob.cancel()
     }
+
+    // ==========================================
+    // AMLL / Apple Music 逐行弹簧波浪参数与长间奏静息判定
+    // ==========================================
+
+    @Test
+    fun `calculateWaveSpringParams adapts stiffness and stagger by inter-line gap`() {
+        // 1. 首行或空行兜底：返回标准中速参数
+        val defaultParams = LyricsRenderingMath.calculateWaveSpringParams(prevLine = null, currentLine = null)
+        assertEquals(380f, defaultParams.stiffness, 0.001f)
+        assertEquals(26L, defaultParams.staggerStepMs)
+
+        // 2. 快歌/密集连唱 (startGapMs < 1500ms)：更紧致弹簧与更短错峰
+        val fastPrev = LyricLine(lineIndex = 0, startMs = 10_000L, endMs = 11_000L, mainText = "Fast 1")
+        val fastCurr = LyricLine(lineIndex = 1, startMs = 11_000L, endMs = 12_000L, mainText = "Fast 2")
+        val fastParams = LyricsRenderingMath.calculateWaveSpringParams(fastPrev, fastCurr)
+        assertEquals(520f, fastParams.stiffness, 0.001f)
+        assertEquals(18L, fastParams.staggerStepMs)
+
+        // 3. 标准 LRC 常规节奏 (startGapMs = 2800ms, endMs == next.startMs 导致 vocalGapMs == 0)：
+        //    严禁误判为快歌，必须落入常规档位
+        val lrcPrev = LyricLine(lineIndex = 0, startMs = 10_000L, endMs = 12_800L, mainText = "LRC 1")
+        val lrcCurr = LyricLine(lineIndex = 1, startMs = 12_800L, endMs = 15_600L, mainText = "LRC 2")
+        val normalParams = LyricsRenderingMath.calculateWaveSpringParams(lrcPrev, lrcCurr)
+        assertEquals(380f, normalParams.stiffness, 0.001f)
+        assertEquals(26L, normalParams.staggerStepMs)
+
+        // 4. 抒情慢歌 (startGapMs > 4500ms) 或明显人声停顿 (vocalGapMs >= 1500ms)：更舒缓弹性
+        val balladPrev = LyricLine(
+            lineIndex = 0,
+            startMs = 20_000L,
+            endMs = 22_000L,
+            mainText = "Ballad 1",
+            words = listOf(LyricWord(startMs = 20_000L, endMs = 21_500L, text = "Ballad 1"))
+        )
+        val balladCurr = LyricLine(lineIndex = 1, startMs = 23_200L, endMs = 26_000L, mainText = "Ballad 2")
+        val balladParams = LyricsRenderingMath.calculateWaveSpringParams(balladPrev, balladCurr)
+        assertEquals(300f, balladParams.stiffness, 0.001f)
+        assertEquals(32L, balladParams.staggerStepMs)
+    }
+
+    @Test
+    fun `calculateLineTargetBlurDp scales progressively with distance from active line`() {
+        assertEquals(0f, LyricsRenderingMath.calculateLineTargetBlurDp(isActive = true, distanceFromActive = 0), 0.001f)
+        assertEquals(1.2f, LyricsRenderingMath.calculateLineTargetBlurDp(isActive = false, distanceFromActive = 1), 0.001f)
+        assertEquals(2.0f, LyricsRenderingMath.calculateLineTargetBlurDp(isActive = false, distanceFromActive = 2), 0.001f)
+        assertEquals(2.8f, LyricsRenderingMath.calculateLineTargetBlurDp(isActive = false, distanceFromActive = 5), 0.001f)
+    }
+
+    @Test
+    fun `isInInterludeRest detects long interludes and outro without false positives on short gaps or standard LRC`() {
+        val wordSyncTimeline = LyricTimeline(
+            source = "test",
+            format = LyricFormat.TTML_SYLLABLE,
+            lines = listOf(
+                LyricLine(
+                    lineIndex = 0,
+                    startMs = 1_000L,
+                    endMs = 3_000L,
+                    mainText = "Short gap line",
+                    words = listOf(LyricWord(startMs = 1_000L, endMs = 2_800L, text = "Short gap line"))
+                ),
+                LyricLine(
+                    lineIndex = 1,
+                    startMs = 4_500L,
+                    endMs = 7_000L,
+                    mainText = "Before long interlude",
+                    words = listOf(LyricWord(startMs = 4_500L, endMs = 6_500L, text = "Before long interlude"))
+                ),
+                LyricLine(
+                    lineIndex = 2,
+                    startMs = 12_000L,
+                    endMs = 15_000L,
+                    mainText = "Final outro line",
+                    words = listOf(LyricWord(startMs = 12_000L, endMs = 14_500L, text = "Final outro line"))
+                )
+            )
+        )
+
+        // 越界索引（前奏 -1 / 超界）返回 false
+        assertEquals(false, LyricsRenderingMath.isInInterludeRest(wordSyncTimeline, -1, 500L))
+        assertEquals(false, LyricsRenderingMath.isInInterludeRest(wordSyncTimeline, 99, 500L))
+
+        // 短间隙 (4500 - 2800 = 1700ms < 2500ms)：始终 false
+        assertEquals(false, LyricsRenderingMath.isInInterludeRest(wordSyncTimeline, 0, 3_500L))
+
+        // 长间奏 (12000 - 6500 = 5500ms >= 2500ms)：
+        // 唱完后 500ms 内 (6900ms) 不静息；7000ms 起持续静息直至切入下一句 (index = 2)，绝不在 index = 1 期间提前退静息导致上一行回亮
+        assertEquals(false, LyricsRenderingMath.isInInterludeRest(wordSyncTimeline, 1, 6_900L))
+        assertEquals(true, LyricsRenderingMath.isInInterludeRest(wordSyncTimeline, 1, 7_000L))
+        assertEquals(true, LyricsRenderingMath.isInInterludeRest(wordSyncTimeline, 1, 11_500L))
+        assertEquals(false, LyricsRenderingMath.isInInterludeRest(wordSyncTimeline, 2, 11_800L))
+
+        // 歌曲尾奏：末句唱完 1500ms 后进入静息 (14500 + 1500 = 16000ms)
+        assertEquals(false, LyricsRenderingMath.isInInterludeRest(wordSyncTimeline, 2, 15_900L))
+        assertEquals(true, LyricsRenderingMath.isInInterludeRest(wordSyncTimeline, 2, 16_000L))
+
+        // 标准 LRC (line.endMs == nextLine.startMs)：曲中间奏保守返回 false，不误熄灭长拖音
+        val lrcTimeline = LyricTimeline(
+            source = "lrc",
+            format = LyricFormat.LRC_LINE_SYNC,
+            lines = listOf(
+                LyricLine(lineIndex = 0, startMs = 1_000L, endMs = 15_000L, mainText = "Held LRC line"),
+                LyricLine(lineIndex = 1, startMs = 15_000L, endMs = 20_000L, mainText = "Next LRC line")
+            )
+        )
+        assertEquals(false, LyricsRenderingMath.isInInterludeRest(lrcTimeline, 0, 10_000L))
+    }
 }

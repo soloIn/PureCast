@@ -1,5 +1,8 @@
 package com.solo.purecast.ui.lyrics
 
+import com.solo.purecast.model.LyricLine
+import com.solo.purecast.model.LyricTimeline
+
 /**
  * 💡 歌词渲染与动态扫光几何数学计算工具类
  * 抽取纯函数便于生产复用与单元测试覆盖，杜绝越界异常与异常扫光闪烁。
@@ -125,5 +128,82 @@ object LyricsRenderingMath {
      */
     fun calculateEffectiveTranslationAlpha(outerAlpha: Float): Float {
         return TRANSLATION_ALPHA * outerAlpha
+    }
+
+    /**
+     * 💡 景深虚化半径计算 (dp)：
+     * 激活行保持 0dp 锐利对焦；非激活行随距高亮行行距递增轻微高斯虚化（1.2dp -> 2.0dp -> 2.8dp），
+     * 营造 Apple Music TV 标志性的焦点景深层次。
+     */
+    fun calculateLineTargetBlurDp(isActive: Boolean, distanceFromActive: Int): Float {
+        if (isActive) return 0f
+        return when {
+            distanceFromActive <= 1 -> 1.2f
+            distanceFromActive == 2 -> 2.0f
+            else -> 2.8f
+        }
+    }
+
+    /**
+     * 💡 AMLL / Apple Music 同款逐行弹簧波浪参数：
+     * 根据上下行歌词时间间隙动态调节每行独立弹簧刚度、阻尼与级联错峰延迟。
+     */
+    data class WaveSpringParams(
+        val stiffness: Float,
+        val dampingRatio: Float,
+        val staggerStepMs: Long
+    )
+
+    fun calculateWaveSpringParams(prevLine: LyricLine?, currentLine: LyricLine?): WaveSpringParams {
+        if (prevLine == null || currentLine == null) {
+            return WaveSpringParams(
+                stiffness = 380f,
+                dampingRatio = 0.90f,
+                staggerStepMs = 26L
+            )
+        }
+        val startGapMs = (currentLine.startMs - prevLine.startMs).coerceAtLeast(0L)
+        val prevVocalEndMs = prevLine.words?.lastOrNull()?.endMs ?: prevLine.endMs
+        val vocalGapMs = (currentLine.startMs - prevVocalEndMs).coerceAtLeast(0L)
+        return when {
+            startGapMs < 1500L -> WaveSpringParams(
+                stiffness = 520f,
+                dampingRatio = 0.92f,
+                staggerStepMs = 18L
+            )
+            startGapMs > 4500L || vocalGapMs >= 1500L -> WaveSpringParams(
+                stiffness = 300f,
+                dampingRatio = 0.90f,
+                staggerStepMs = 32L
+            )
+            else -> WaveSpringParams(
+                stiffness = 380f,
+                dampingRatio = 0.90f,
+                staggerStepMs = 26L
+            )
+        }
+    }
+
+    /**
+     * 💡 长间奏/尾奏呼吸静息判定：
+     * 当上一句人声唱完且距离下一句还有足够长的间奏（总间隙 >= 2500ms，且已过唱完点 500ms），
+     * 或歌曲尾奏（末句唱完 1500ms 后）时，让当前行优雅去高亮并恢复至 0.95f，并持续保持静息直到 activeLineIndex 真正切入下一句，
+     * 杜绝间奏 `• • •` 提前退出导致上一行歌词重新亮起的回闪 Bug。
+     * 注：无逐字时间戳的标准 LRC 若解析器将 line.endMs 填为 nextLine.startMs，则 gapMs == 0 不会在曲中误熄灭长拖音，
+     * 仅在 TTML/逐字歌词、含显式结束时间的 LRC 或歌曲尾奏触发。
+     */
+    fun isInInterludeRest(timeline: LyricTimeline, activeLineIndex: Int, currentTimeMs: Long): Boolean {
+        val lines = timeline.lines
+        if (activeLineIndex !in lines.indices) return false
+        val line = lines[activeLineIndex]
+        val vocalEndMs = line.words?.lastOrNull()?.endMs ?: line.endMs
+        if (vocalEndMs <= line.startMs) return false
+        val nextStartMs = lines.getOrNull(activeLineIndex + 1)?.startMs
+        return if (nextStartMs != null) {
+            val gapMs = nextStartMs - vocalEndMs
+            gapMs >= 2500L && currentTimeMs >= vocalEndMs + 500L
+        } else {
+            currentTimeMs >= vocalEndMs + 1500L
+        }
     }
 }

@@ -113,9 +113,9 @@ fun WordSyncKaraokeText(
 
     Text(
         text = fullText,
-        fontSize = 31.sp,
+        fontSize = 33.sp,
         fontWeight = FontWeight.Bold,
-        lineHeight = 40.sp,
+        lineHeight = 42.sp,
         onTextLayout = { layoutResult = it },
         color = if (isActive) Color.White else primaryColor,
         modifier = modifier

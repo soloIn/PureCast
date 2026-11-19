@@ -643,16 +643,14 @@ internal object TriStateTransitionMatrix {
                 val result = trackManager.onTrackBoundary(ev)
                 // 💡 修复：任意位置投屏、自动切歌与跨曲目残存隔离：
                 // 1. 若当前曲目边界显式携带了真实初始进度 (ev.initialPositionMs > 0L)，优先采纳；
-                // 2. 若上一状态为冷启动占位标题（如 "AirPlay 音频直通" / 默认占位）且已有先到的有效进度，保留该进度，杜绝歌曲中途投屏被 DMAP 归零；
+                // 2. 若上一状态为 AirPlay 冷启动占位标题 ("AirPlay 音频直通") 且已有先到的有效进度，保留该进度，杜绝歌曲中途投屏被 DMAP 归零；
                 // 3. 否则，仅在首曲冷启动 (snap.trackGeneration == 0L) 且音频已先于元数据走字 (1L..3000L) 时保留微小进度；
                 // 4. 真实跨曲目切歌换代且未显式指定初始进度时坚决归零 (0L)，彻底杜绝前序曲目残存旧进度泄漏给新歌。
-                val isPlaceholderTitle = snap.metadata.title == com.solo.purecast.model.TrackMetadata.DEFAULT_TITLE ||
-                    snap.metadata.title == "AirPlay 音频直通" ||
-                    snap.metadata.title.isBlank()
+                val isAirPlayColdStartPlaceholder = snap.metadata.title == "AirPlay 音频直通"
                 val nextPosMs = if (result.accepted) {
                     if (ev.initialPositionMs > 0L) {
                         ev.initialPositionMs
-                    } else if (isPlaceholderTitle && snap.progressPositionMs > 0L) {
+                    } else if (isAirPlayColdStartPlaceholder && snap.progressPositionMs > 0L) {
                         snap.progressPositionMs
                     } else {
                         val pos = snap.progressPositionMs
@@ -662,7 +660,7 @@ internal object TriStateTransitionMatrix {
                     snap.progressPositionMs
                 }
                 val nextDurMs = if (result.accepted) {
-                    if (ev.initialDurationMs > 0L) ev.initialDurationMs else if (isPlaceholderTitle && snap.progressDurationMs > 0L) snap.progressDurationMs else 0L
+                    if (ev.initialDurationMs > 0L) ev.initialDurationMs else if (isAirPlayColdStartPlaceholder && snap.progressDurationMs > 0L) snap.progressDurationMs else 0L
                 } else snap.progressDurationMs
 
                 // 💡 修复 TV 遥控器切歌卡在 TRANSITIONING 5 秒的致命缺陷：
