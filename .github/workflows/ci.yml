@@ -1,0 +1,112 @@
+name: CI & Build
+
+on:
+  push:
+    branches: [ "main" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-tests:
+    name: Native C++ Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Configure Linux Kernel Settings for Sanitizers
+        # 针对现代 Linux 内核修复 ASan 在较高虚拟内存地址随机化 (mmap_rnd_bits) 下的初始化冲突
+        run: sudo sysctl vm.mmap_rnd_bits=28 || true
+
+      - name: Configure CMake
+        run: cmake -B app/src/main/cpp/tests/build -S app/src/main/cpp/tests
+
+      - name: Build Native Tests (ASan + TSan)
+        run: cmake --build app/src/main/cpp/tests/build --parallel
+
+      - name: Run CTest
+        run: ctest --test-dir app/src/main/cpp/tests/build --output-on-failure
+
+  android-build:
+    name: Android Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Accept Android SDK Licenses & Install NDK/CMake
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;26.3.11579264" "cmake;3.22.1"
+
+      - name: Grant Execute Permission for Gradlew
+        run: chmod +x gradlew
+
+      - name: Run Android Unit Tests
+        run: ./gradlew testDebugUnitTest
+
+      - name: Build Debug & ReleaseLocal APKs
+        run: ./gradlew assembleDebug assembleReleaseLocal
+
+      - name: Upload Debug APK
+        if: success() || failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: PureCast-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload ReleaseLocal APK
+        if: success() || failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: PureCast-releaseLocal-apk
+          path: app/build/outputs/apk/releaseLocal/*.apk
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload Unit Test Reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-reports
+          path: app/build/reports/tests/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [ native-tests, android-build ]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download APK Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: apks/
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: apks/*.apk
+          generate_release_notes: true
+          draft: false
+          prerelease: false
