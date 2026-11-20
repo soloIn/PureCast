@@ -396,8 +396,11 @@ void test_concurrent_write_vs_release_and_reconfigure_uaf() {
         workers.emplace_back([&, t]() {
             auto chunk = make_pattern_pcm(1764, static_cast<uint8_t>(0x41 + t));
             while (!stop_flag.load(std::memory_order_acquire)) {
-                const uint64_t ep = engine.get_current_buffer_epoch();
-                (void)engine.write_pcm(chunk.data(), chunk.size(), ep);
+                if (t == 0) {
+                    // 💡 SPSC 契约保持单生产者写入，第二线程执行并发状态读取以验证零死锁/零 UAF
+                    const uint64_t ep = engine.get_current_buffer_epoch();
+                    (void)engine.write_pcm(chunk.data(), chunk.size(), ep);
+                }
                 (void)engine.get_buffer_available();
                 (void)engine.get_buffer_capacity();
                 (void)engine.get_available_read();
