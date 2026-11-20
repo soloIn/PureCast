@@ -3,23 +3,18 @@ package com.solo.purecast.ui.screen
 import android.Manifest
 import android.app.Activity
 import android.content.Context
-import android.content.pm.PackageManager
 import android.hardware.usb.UsbConstants
 import android.hardware.usb.UsbManager
-import android.os.PowerManager
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
-import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
-import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -60,10 +55,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.core.content.ContextCompat
 import androidx.tv.material3.Border
-import androidx.tv.material3.Button
-import androidx.tv.material3.ButtonDefaults
 import androidx.tv.material3.ClickableSurfaceDefaults
 import androidx.tv.material3.ExperimentalTvMaterial3Api
 import androidx.tv.material3.Glow
@@ -80,9 +72,11 @@ import com.solo.purecast.ui.theme.AppPalette
 import com.solo.purecast.ui.theme.ThemeMode
 import com.solo.purecast.util.Logger
 import com.solo.purecast.util.PermissionHelper
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import java.util.Locale
+import kotlinx.coroutines.withContext
 
 private const val TAG = "SettingsScreen"
 
@@ -97,6 +91,17 @@ enum class SettingsCategory(val title: String, val subtitle: String) {
     HEALTH_CHECK("系统权限健康", "USB 权限、后台电池白名单与保活自检")
 }
 
+private fun checkUsbPermission(ctx: Context): Boolean {
+    return runCatching {
+        val usbManager = ctx.getSystemService(Context.USB_SERVICE) as? UsbManager ?: return@runCatching false
+        usbManager.deviceList.values.any { device ->
+            val isAudio = device.deviceClass == UsbConstants.USB_CLASS_AUDIO ||
+                (0 until device.interfaceCount).any { device.getInterface(it).interfaceClass == UsbConstants.USB_CLASS_AUDIO }
+            isAudio && usbManager.hasPermission(device)
+        }
+    }.getOrDefault(false)
+}
+
 /**
  * 💡 PureCast 全屏双栏 Apple TV 系统级设置界面 (SettingsScreen)
  * 严格按照 Apple TV HIG 与 Android TV 双栏导航规范重构：
@@ -109,7 +114,9 @@ enum class SettingsCategory(val title: String, val subtitle: String) {
  *    - 深色模式获焦：纯白底 (Color.White) + 纯黑字；
  *    - 浅色模式获焦：纯黑底 (Color(0xFF1C1C1E)) + 纯白字；
  *    - 彻底消灭浅色模式下变黄绿色的恶性视觉割裂；
- * 4. 自适应内边距与换行防护：分段按钮文字横向完全包裹，杜绝“✏️ 自定义”折行。
+ * 4. 自适应内边距与换行防护：分段按钮文字横向完全包裹，杜绝“✏️ 自定义”折行；
+ * 5. 性能优化：5 大分类独立拆分子 Composable（消除 4.3MB 单函数 JIT 尖峰），
+ *    权限 Binder IPC 与 1 秒硬件 JNI 轮询下沉至对应子页并异步执行。
  */
 @OptIn(ExperimentalTvMaterial3Api::class, androidx.compose.ui.ExperimentalComposeUiApi::class)
 @Composable
@@ -119,10 +126,11 @@ fun SettingsScreen(
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
-    val settingsRepo = remember { SettingsRepository(context) }
+    val settingsRepo = remember { SettingsRepository.getInstance(context) }
 
     var selectedCategory by remember { mutableStateOf(SettingsCategory.APPEARANCE_AND_GENERAL) }
     var isFocusInRightContent by remember { mutableStateOf(false) }
+    var isEditingCustomName by remember { mutableStateOf(false) }
 
     // 左侧导航栏各项的 FocusRequester
     val navFocusRequesters = remember {
@@ -139,20 +147,8 @@ fun SettingsScreen(
         )
     }
 
-    val coroutineScope = rememberCoroutineScope()
-
-    // 1. 设备广播名与外观状态 (统一使用 collectAsState 读取内存 Flow，消除设置页首帧磁盘同步读取)
-    var currentThemeMode by remember { mutableStateOf(AppPalette.mode) }
-    val friendlyName by settingsRepo.friendlyNameFlow.collectAsState()
-    var isEditingCustomName by remember { mutableStateOf(false) }
-    var customNameInput by remember { mutableStateOf(friendlyName) }
-    val currentFluidQuality by settingsRepo.fluidQualityFlow.collectAsState()
-    val customNameFocusRequester = remember { FocusRequester() }
     val customEditButtonFocusRequester = remember { FocusRequester() }
-    var isTextFieldFocused by remember { mutableStateOf(false) }
-    val isAirPlayEnabled by settingsRepo.airPlayEnabledFlow.collectAsState()
-    val isUpnpEnabled by settingsRepo.upnpEnabledFlow.collectAsState()
-    val idleTimeoutSeconds by settingsRepo.idleTimeoutFlow.collectAsState()
+    val coroutineScope = rememberCoroutineScope()
 
     // 💡 退出自定义名称编辑；若 restoreFocusToButton == true 则请求焦点至“✏️ 自定义”按钮，若已导航至左侧则严禁抢夺焦点 (Finding 2)
     fun exitCustomNameEditing(restoreFocusToButton: Boolean = true) {
@@ -165,18 +161,6 @@ fun SettingsScreen(
                 } catch (e: Exception) {
                     Logger.ui.w(TAG, "退出自定义名称编辑后请求焦点异常", e)
                 }
-            }
-        }
-    }
-
-    // 💡 自定义输入框展开时，主动将遥控器焦点请求至 BasicTextField，避免落入焦点陷阱
-    LaunchedEffect(isEditingCustomName) {
-        if (isEditingCustomName) {
-            delay(150)
-            try {
-                customNameFocusRequester.requestFocus()
-            } catch (e: Exception) {
-                Logger.ui.w(TAG, "展开输入框请求焦点异常", e)
             }
         }
     }
@@ -206,63 +190,6 @@ fun SettingsScreen(
         onDismiss()
     }
 
-    // 2. 硬件缓冲区与时钟动态监控状态 (每秒轮询一次)
-    var bufferCapacity by remember { mutableIntStateOf(65536) }
-    var bufferAvailableRead by remember { mutableIntStateOf(0) }
-    var libusbVer by remember { mutableStateOf("1.0.27") }
-
-    fun checkUsbPermission(ctx: Context): Boolean {
-        val usbManager = ctx.getSystemService(Context.USB_SERVICE) as UsbManager
-        return usbManager.deviceList.values.any { device ->
-            val isAudio = device.deviceClass == UsbConstants.USB_CLASS_AUDIO ||
-                (0 until device.interfaceCount).any { device.getInterface(it).interfaceClass == UsbConstants.USB_CLASS_AUDIO }
-            isAudio && usbManager.hasPermission(device)
-        }
-    }
-
-    var isUsbGranted by remember { mutableStateOf(checkUsbPermission(context)) }
-
-    LaunchedEffect(Unit) {
-        while (true) {
-            try {
-                bufferCapacity = NativeAudioEngine.getBufferCapacity().coerceAtLeast(1)
-                bufferAvailableRead = NativeAudioEngine.getAvailableRead()
-                libusbVer = NativeAudioEngine.getLibusbVersion()
-                isUsbGranted = checkUsbPermission(context)
-            } catch (e: Exception) {
-                Logger.ui.w(TAG, "获取底层驱动信息异常", e)
-            }
-            delay(1000)
-        }
-    }
-
-    // 3. 权限自检计算
-    var isRecordAudioGranted by remember {
-        mutableStateOf(PermissionHelper.isRecordAudioGranted(context))
-    }
-    var isIgnoringBattery by remember {
-        mutableStateOf(PermissionHelper.isBatteryOptimizationIgnored(context))
-    }
-    var isOverlayGranted by remember {
-        mutableStateOf(PermissionHelper.isOverlayGranted(context))
-    }
-
-    val lifecycleOwner = androidx.compose.ui.platform.LocalLifecycleOwner.current
-    androidx.compose.runtime.DisposableEffect(lifecycleOwner) {
-        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
-            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
-                isUsbGranted = checkUsbPermission(context)
-                isRecordAudioGranted = PermissionHelper.isRecordAudioGranted(context)
-                isIgnoringBattery = PermissionHelper.isBatteryOptimizationIgnored(context)
-                isOverlayGranted = PermissionHelper.isOverlayGranted(context)
-            }
-        }
-        lifecycleOwner.lifecycle.addObserver(observer)
-        onDispose {
-            lifecycleOwner.lifecycle.removeObserver(observer)
-        }
-    }
-
     // 页面进入时聚焦左侧第 1 项
     LaunchedEffect(Unit) {
         delay(120)
@@ -288,66 +215,19 @@ fun SettingsScreen(
             // ==========================================
             // 左侧：纯粹的固定 300dp 分类导航栏 (彻底去除底部突兀长条)
             // ==========================================
-            Column(
-                modifier = Modifier
-                    .width(300.dp)
-                    .fillMaxHeight(),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Text(
-                    text = "⚙ 设置与硬件",
-                    fontSize = 28.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = AppPalette.primaryText,
-                    modifier = Modifier.padding(bottom = 16.dp, start = 8.dp)
-                )
-
-                SettingsCategory.entries.forEachIndexed { index, cat ->
-                    val isSelected = selectedCategory == cat
-                    var isCatFocused by remember { mutableStateOf(false) }
-
-                    Surface(
-                        onClick = { selectedCategory = cat },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .focusRequester(navFocusRequesters[index])
-                            .focusProperties {
-                                val target = categoryFirstFocusRequesters[cat]
-                                if (target != null) {
-                                    right = target
-                                } else {
-                                    // 💡 针对 HARDWARE_MONITOR 等纯监控展示分类（无右侧可获焦项），禁止向右导航失焦
-                                    right = FocusRequester.Cancel
-                                }
-                            }
-                            .onFocusChanged {
-                                isCatFocused = it.isFocused
-                                if (it.isFocused) {
-                                    selectedCategory = cat
-                                    isFocusInRightContent = false
-                                    if (isEditingCustomName) {
-                                        exitCustomNameEditing(restoreFocusToButton = false)
-                                    }
-                                }
-                            },
-                        scale = ClickableSurfaceDefaults.scale(scale = 1.0f, focusedScale = 1.05f),
-                        shape = ClickableSurfaceDefaults.shape(RoundedCornerShape(12.dp)),
-                        colors = ClickableSurfaceDefaults.colors(
-                            containerColor = if (isSelected) AppPalette.surfaceSecondary else Color.Transparent,
-                            focusedContainerColor = AppPalette.accent,
-                            contentColor = if (isSelected) AppPalette.primaryText else AppPalette.secondaryText,
-                            focusedContentColor = Color.White
-                        )
-                    ) {
-                        Text(
-                            text = cat.title,
-                            fontSize = 15.sp,
-                            fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal,
-                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)
-                        )
+            SettingsSidebar(
+                selectedCategory = selectedCategory,
+                navFocusRequesters = navFocusRequesters,
+                categoryFirstFocusRequesters = categoryFirstFocusRequesters,
+                onSelectCategory = { cat -> selectedCategory = cat },
+                onCategoryFocused = { cat ->
+                    selectedCategory = cat
+                    isFocusInRightContent = false
+                    if (isEditingCustomName) {
+                        exitCustomNameEditing(restoreFocusToButton = false)
                     }
                 }
-            }
+            )
 
             // ==========================================
             // 右侧：遵循 HIG 分组列表的配置区域
@@ -386,373 +266,602 @@ fun SettingsScreen(
                     )
                 }
 
+                val currentLeftNavRequester = navFocusRequesters[selectedCategory.ordinal]
                 when (selectedCategory) {
                     SettingsCategory.APPEARANCE_AND_GENERAL -> {
-                        // 1. 界面外观深浅模式
-                        SettingsSection(title = "界面主题模式") {
-                            SettingTieredRow(
-                                title = "外观色彩模式",
-                                subtitle = "支持跟随系统动态自适应或强制深浅主题"
-                            ) {
-                                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                                    SegmentOptionButton(
-                                        label = "⚡️ 自动 (跟随系统)",
-                                        isSelected = currentThemeMode == ThemeMode.AUTO,
-                                        focusRequester = categoryFirstFocusRequesters[SettingsCategory.APPEARANCE_AND_GENERAL],
-                                        leftNavFocusRequester = navFocusRequesters[selectedCategory.ordinal],
-                                        onClick = {
-                                            currentThemeMode = ThemeMode.AUTO
-                                            AppPalette.setThemeMode(context, ThemeMode.AUTO)
-                                        }
-                                    )
-                                    SegmentOptionButton(
-                                        label = "🌙 深色模式",
-                                        isSelected = currentThemeMode == ThemeMode.DARK,
-                                        onClick = {
-                                            currentThemeMode = ThemeMode.DARK
-                                            AppPalette.setThemeMode(context, ThemeMode.DARK)
-                                        }
-                                    )
-                                    SegmentOptionButton(
-                                        label = "☀️ 浅色模式",
-                                        isSelected = currentThemeMode == ThemeMode.LIGHT,
-                                        onClick = {
-                                            currentThemeMode = ThemeMode.LIGHT
-                                            AppPalette.setThemeMode(context, ThemeMode.LIGHT)
-                                        }
-                                    )
-                                }
-                            }
-                        }
-
-                        // 2. 局域网广播名称
-                        SettingsSection(title = "局域网广播设备标识") {
-                            SettingTieredRow(
-                                title = "设备广播发现名称",
-                                subtitle = "当前网络标识: \"$friendlyName\" (用于 AirPlay 1 与 UPnP 广播)"
-                            ) {
-                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                    val presets = listOf("PureCast TV", "客厅 Hi-Fi", "影音室 TV")
-                                    presets.forEachIndexed { pIdx, preset ->
-                                        val isCur = friendlyName == preset && !isEditingCustomName
-                                        SegmentOptionButton(
-                                            label = preset,
-                                            isSelected = isCur,
-                                            leftNavFocusRequester = if (pIdx == 0) navFocusRequesters[selectedCategory.ordinal] else null,
-                                            onClick = {
-                                                isEditingCustomName = false
-                                                settingsRepo.setFriendlyName(preset)
-                                                PlaybackService.instance?.updateFriendlyName(preset)
-                                                Toast.makeText(context, "已更新设备名为: $preset", Toast.LENGTH_SHORT).show()
-                                            }
-                                        )
-                                    }
-                                    val isCustomSelected = isEditingCustomName || friendlyName !in presets
-                                    val customLabel = if (!isEditingCustomName && friendlyName !in presets) "✏️ $friendlyName" else "✏️ 自定义"
-                                    SegmentOptionButton(
-                                        label = customLabel,
-                                        isSelected = isCustomSelected,
-                                        focusRequester = customEditButtonFocusRequester,
-                                        onClick = {
-                                            customNameInput = friendlyName
-                                            isEditingCustomName = !isEditingCustomName
-                                        }
-                                    )
-                                }
-                            }
-
-                            if (isEditingCustomName) {
-                                SettingDivider()
-                                SettingTieredRow(
-                                    title = "编辑自定义设备名",
-                                    subtitle = "输入新的设备发现名称并确认保存"
-                                ) {
-                                    Row(
-                                        verticalAlignment = Alignment.CenterVertically,
-                                        horizontalArrangement = Arrangement.spacedBy(10.dp)
-                                    ) {
-                                        Box(
-                                            modifier = Modifier
-                                                .width(260.dp)
-                                                .clip(RoundedCornerShape(8.dp))
-                                                .background(AppPalette.surfaceSecondary)
-                                                .border(
-                                                    width = if (isTextFieldFocused) 2.dp else 1.dp,
-                                                    color = if (isTextFieldFocused) AppPalette.accent else Color.Transparent,
-                                                    shape = RoundedCornerShape(8.dp)
-                                                )
-                                                .padding(horizontal = 14.dp, vertical = 8.dp)
-                                        ) {
-                                            BasicTextField(
-                                                value = customNameInput,
-                                                onValueChange = { customNameInput = it },
-                                                singleLine = true,
-                                                textStyle = TextStyle(color = AppPalette.primaryText, fontSize = 14.sp),
-                                                cursorBrush = SolidColor(AppPalette.primaryText),
-                                                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
-                                                keyboardActions = KeyboardActions(
-                                                    onDone = {
-                                                        val t = customNameInput.trim()
-                                                        if (t.isNotEmpty()) {
-                                                            settingsRepo.setFriendlyName(t)
-                                                            PlaybackService.instance?.updateFriendlyName(t)
-                                                            exitCustomNameEditing()
-                                                            Toast.makeText(context, "已保存广播名为: $t", Toast.LENGTH_SHORT).show()
-                                                        }
-                                                    }
-                                                ),
-                                                modifier = Modifier
-                                                    .fillMaxWidth()
-                                                    .focusRequester(customNameFocusRequester)
-                                                    .focusProperties { left = navFocusRequesters[selectedCategory.ordinal] }
-                                                    .onFocusChanged { isTextFieldFocused = it.isFocused }
-                                            )
-                                        }
-                                        SegmentOptionButton(
-                                            label = "保存",
-                                            isSelected = true,
-                                            onClick = {
-                                                val t = customNameInput.trim()
-                                                if (t.isNotEmpty()) {
-                                                    settingsRepo.setFriendlyName(t)
-                                                    PlaybackService.instance?.updateFriendlyName(t)
-                                                    exitCustomNameEditing()
-                                                    Toast.makeText(context, "已保存广播名为: $t", Toast.LENGTH_SHORT).show()
-                                                }
-                                            }
-                                        )
-                                        SegmentOptionButton(
-                                            label = "取消",
-                                            isSelected = false,
-                                            onClick = { exitCustomNameEditing() }
-                                        )
-                                    }
-                                }
-                            }
-                        }
-
-                        // 3. 动态流光背景画质
-                        SettingsSection(title = "动态流光背景画质") {
-                            SettingTieredRow(
-                                title = "GLES2 着色器渲染档位",
-                                subtitle = "根据电视芯片性能调节流光分辨率与帧率节拍 (高配推荐极佳/标准，低配推荐省电或静态)"
-                            ) {
-                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                    listOf(
-                                        FluidQuality.HIGH_QUALITY to "极佳 (60fps)",
-                                        FluidQuality.STANDARD to "标准 (20fps)",
-                                        FluidQuality.POWER_SAVE to "省电 (20fps · 低清)",
-                                        FluidQuality.STATIC to "静态磨砂",
-                                        FluidQuality.OFF to "关闭"
-                                    ).forEachIndexed { qIdx, (quality, label) ->
-                                        SegmentOptionButton(
-                                            label = label,
-                                            isSelected = currentFluidQuality == quality,
-                                            leftNavFocusRequester = if (qIdx == 0) navFocusRequesters[selectedCategory.ordinal] else null,
-                                            onClick = {
-                                                settingsRepo.setFluidQuality(quality)
-                                                Toast.makeText(context, "已设置流光画质: $label", Toast.LENGTH_SHORT).show()
-                                            }
-                                        )
-                                    }
-                                }
-                            }
-                        }
+                        AppearanceAndGeneralSettingsContent(
+                            settingsRepo = settingsRepo,
+                            isEditingCustomName = isEditingCustomName,
+                            onEditingCustomNameChange = { isEditingCustomName = it },
+                            onExitCustomNameEditing = { exitCustomNameEditing() },
+                            firstFocusRequester = categoryFirstFocusRequesters[SettingsCategory.APPEARANCE_AND_GENERAL],
+                            leftNavFocusRequester = currentLeftNavRequester,
+                            customEditButtonFocusRequester = customEditButtonFocusRequester
+                        )
                     }
 
                     SettingsCategory.USB_DAC -> {
-                        SettingsSection(title = "USB DAC 硬件独占接管") {
-                            SettingInlineRow(
-                                title = "声卡端点与驱动状态",
-                                subtitle = if (audioState.isExclusive) "已解绑 Linux snd-usb-audio 内核驱动，直通 UAC 音频硬件 (绕过 48kHz SRC)" else "声卡处于待机让渡或系统共享状态"
-                            ) {
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(12.dp)
-                                ) {
-                                    Text(
-                                        text = audioState.dacName,
-                                        fontSize = 14.sp,
-                                        fontWeight = FontWeight.SemiBold,
-                                        color = if (audioState.isExclusive) AppPalette.success else AppPalette.warning
-                                    )
-                                    SegmentOptionButton(
-                                        label = if (audioState.isExclusive) "🔄 让渡声卡" else "⚡ 独占接管",
-                                        isSelected = !audioState.isExclusive,
-                                        focusRequester = categoryFirstFocusRequesters[SettingsCategory.USB_DAC],
-                                        leftNavFocusRequester = navFocusRequesters[selectedCategory.ordinal],
-                                        onClick = {
-                                            if (audioState.isExclusive) {
-                                                PlaybackService.instance?.releaseUsbExclusiveManually()
-                                                Toast.makeText(context, "已释放独占，声卡已归还系统", Toast.LENGTH_SHORT).show()
-                                            } else {
-                                                if (context is Activity) {
-                                                    PlaybackService.instance?.claimUsbExclusiveManually(context) { _, msg ->
-                                                        Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    )
-                                }
-                            }
-
-                            SettingDivider()
-
-                            SettingTieredRow(
-                                title = "空闲自动让渡时机",
-                                subtitle = "停止播放后，等待指定秒数自动解除声卡独占并归还系统"
-                            ) {
-                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                    listOf(Pair(5, "5秒"), Pair(10, "10秒 (推荐)"), Pair(30, "30秒"), Pair(0, "常驻独占")).forEachIndexed { optIdx, (sec, label) ->
-                                        val isSelected = idleTimeoutSeconds == sec
-                                        SegmentOptionButton(
-                                            label = label,
-                                            isSelected = isSelected,
-                                            leftNavFocusRequester = if (optIdx == 0) navFocusRequesters[selectedCategory.ordinal] else null,
-                                            onClick = {
-                                                settingsRepo.setIdleTimeoutSeconds(sec)
-                                                PlaybackService.instance?.setIdleTimeoutSeconds(sec)
-                                                Toast.makeText(context, "已设置让渡超时为: $label", Toast.LENGTH_SHORT).show()
-                                            }
-                                        )
-                                    }
-                                }
-                            }
-                        }
+                        UsbDacSettingsContent(
+                            audioState = audioState,
+                            settingsRepo = settingsRepo,
+                            firstFocusRequester = categoryFirstFocusRequesters[SettingsCategory.USB_DAC],
+                            leftNavFocusRequester = currentLeftNavRequester
+                        )
                     }
 
                     SettingsCategory.PROTOCOLS -> {
-                        SettingsSection(title = "本地网络音频流服务") {
-                            SettingInlineRow(
-                                title = "AirPlay 1 (AirTunes / RAOP)",
-                                subtitle = "支持 iOS / macOS / iTunes 纯音频低延迟推流，ALAC 44.1kHz 源码直通"
-                            ) {
-                                ToggleSwitchButton(
-                                    isEnabled = isAirPlayEnabled,
-                                    focusRequester = categoryFirstFocusRequesters[SettingsCategory.PROTOCOLS],
-                                    leftNavFocusRequester = navFocusRequesters[selectedCategory.ordinal],
-                                    onToggle = {
-                                        val target = !isAirPlayEnabled
-                                        settingsRepo.setAirPlayEnabled(target)
-                                        PlaybackService.instance?.setAirPlayEnabled(target)
-                                    }
-                                )
-                            }
-
-                            SettingDivider()
-
-                            SettingInlineRow(
-                                title = "UPnP / DLNA (MediaRenderer 2.0)",
-                                subtitle = "支持 QQ音乐、网易云等 App 投播，支持 192kHz / 24bit Hi-Res 源码直通"
-                            ) {
-                                ToggleSwitchButton(
-                                    isEnabled = isUpnpEnabled,
-                                    leftNavFocusRequester = navFocusRequesters[selectedCategory.ordinal],
-                                    onToggle = {
-                                        val target = !isUpnpEnabled
-                                        settingsRepo.setUpnpEnabled(target)
-                                        PlaybackService.instance?.setUpnpEnabled(target)
-                                    }
-                                )
-                            }
-                        }
+                        ProtocolsSettingsContent(
+                            settingsRepo = settingsRepo,
+                            firstFocusRequester = categoryFirstFocusRequesters[SettingsCategory.PROTOCOLS],
+                            leftNavFocusRequester = currentLeftNavRequester
+                        )
                     }
 
                     SettingsCategory.HARDWARE_MONITOR -> {
-                        SettingsSection(title = "SPSC 无锁环形缓冲与时钟仪表盘") {
-                            val formatSpec = if (audioState.protocol != StreamProtocol.NONE && audioState.sampleRate > 0) {
-                                "${formatSampleRate(audioState.sampleRate)} / ${audioState.bitDepth}-bit (${audioState.channels} 声道)"
-                            } else {
-                                "待机无推流"
-                            }
-
-                            val bufferUsagePercent = if (bufferCapacity > 0) {
-                                (bufferAvailableRead * 100L / bufferCapacity).toInt()
-                            } else 0
-
-                            val bufferAvailableKb = bufferAvailableRead / 1024
-                            val bufferCapacityKb = bufferCapacity / 1024
-                            val effectiveSampleRate = if (audioState.sampleRate > 0) audioState.sampleRate else 44100
-                            val effectiveChannels = if (audioState.channels > 0) audioState.channels else 2
-                            val effectiveBits = if (audioState.bitDepth > 0) audioState.bitDepth else 16
-                            val bytesPerSec = effectiveSampleRate * effectiveChannels * (effectiveBits / 8)
-                            val bufferMs = if (bytesPerSec > 0) (bufferAvailableRead * 1000L / bytesPerSec) else 0L
-
-                            MetricDataRow(label = "当前实时采样率与位深", value = formatSpec)
-                            SettingDivider()
-                            MetricDataRow(
-                                label = "SPSC 环形缓冲区",
-                                value = "${bufferAvailableKb} KB / ${bufferCapacityKb} KB (${bufferMs}ms / $bufferUsagePercent% 水位)"
-                            )
-                            SettingDivider()
-                            MetricDataRow(label = "UAC 物理时钟锁定", value = if (audioState.isExclusive) "UAC1/UAC2 异步/显式反馈闭环物理时钟 (SOF 同步)" else "让渡共享时钟")
-                            SettingDivider()
-                            MetricDataRow(label = "底层驱动与内核通信", value = "libusb-$libusbVer (usbfs 根权限包装)")
-                        }
+                        HardwareMonitorSettingsContent(audioState = audioState)
                     }
 
                     SettingsCategory.HEALTH_CHECK -> {
-                        SettingsSection(title = "Android 权限与系统保活自检") {
-                            PermissionCheckRow(
-                                label = "USB 硬件直接访问权限",
-                                description = "直通 UAC 音频时钟与 Linux usbfs 底层声卡驱动",
-                                isGranted = isUsbGranted,
-                                focusRequester = categoryFirstFocusRequesters[SettingsCategory.HEALTH_CHECK],
-                                leftNavFocusRequester = navFocusRequesters[selectedCategory.ordinal],
-                                onClick = {
-                                    val act = context as? Activity
-                                    if (act != null) {
-                                        PlaybackService.instance?.requestUsbPermission(act)
-                                    } else {
-                                        PermissionHelper.openAppDetailsSettings(context)
-                                    }
-                                }
-                            )
-                            SettingDivider()
-                            PermissionCheckRow(
-                                label = "后台无限制与电池优化白名单",
-                                description = "防止大屏熄屏或空闲时系统清理后台推流服务",
-                                isGranted = isIgnoringBattery,
-                                leftNavFocusRequester = navFocusRequesters[selectedCategory.ordinal],
-                                onClick = {
-                                    PermissionHelper.openBatteryOptimizationSettings(context)
-                                }
-                            )
-                            SettingDivider()
-                            PermissionCheckRow(
-                                label = "核心录音权限 (RECORD_AUDIO)",
-                                description = "仅用于系统免弹窗接管，工程绝不调用录音硬件",
-                                isGranted = isRecordAudioGranted,
-                                leftNavFocusRequester = navFocusRequesters[selectedCategory.ordinal],
-                                onClick = {
-                                    val act = context as? Activity
-                                    if (act != null && !isRecordAudioGranted) {
-                                        androidx.core.app.ActivityCompat.requestPermissions(
-                                            act,
-                                            arrayOf(Manifest.permission.RECORD_AUDIO),
-                                            1001
-                                        )
-                                    } else {
-                                        PermissionHelper.openAppDetailsSettings(context)
-                                    }
-                                }
-                            )
-                            SettingDivider()
-                            PermissionCheckRow(
-                                label = "悬浮窗与前台拉起权限 (OVERLAY)",
-                                description = "支持局域网接收推流时自动拉起大屏播放界面",
-                                isGranted = isOverlayGranted,
-                                leftNavFocusRequester = navFocusRequesters[selectedCategory.ordinal],
-                                onClick = {
-                                    PermissionHelper.openOverlaySettings(context)
-                                }
-                            )
-                        }
+                        HealthCheckSettingsContent(
+                            firstFocusRequester = categoryFirstFocusRequesters[SettingsCategory.HEALTH_CHECK],
+                            leftNavFocusRequester = currentLeftNavRequester
+                        )
                     }
                 }
             }
         }
+    }
+}
+
+@OptIn(ExperimentalTvMaterial3Api::class, androidx.compose.ui.ExperimentalComposeUiApi::class)
+@Composable
+private fun SettingsSidebar(
+    selectedCategory: SettingsCategory,
+    navFocusRequesters: Array<FocusRequester>,
+    categoryFirstFocusRequesters: Map<SettingsCategory, FocusRequester>,
+    onSelectCategory: (SettingsCategory) -> Unit,
+    onCategoryFocused: (SettingsCategory) -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .width(300.dp)
+            .fillMaxHeight(),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        Text(
+            text = "⚙ 设置与硬件",
+            fontSize = 28.sp,
+            fontWeight = FontWeight.Bold,
+            color = AppPalette.primaryText,
+            modifier = Modifier.padding(bottom = 16.dp, start = 8.dp)
+        )
+
+        SettingsCategory.entries.forEachIndexed { index, cat ->
+            val isSelected = selectedCategory == cat
+
+            Surface(
+                onClick = { onSelectCategory(cat) },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .focusRequester(navFocusRequesters[index])
+                    .focusProperties {
+                        val target = categoryFirstFocusRequesters[cat]
+                        if (target != null) {
+                            right = target
+                        } else {
+                            // 💡 针对 HARDWARE_MONITOR 等纯监控展示分类（无右侧可获焦项），禁止向右导航失焦
+                            right = FocusRequester.Cancel
+                        }
+                    }
+                    .onFocusChanged {
+                        if (it.isFocused) {
+                            onCategoryFocused(cat)
+                        }
+                    },
+                scale = ClickableSurfaceDefaults.scale(scale = 1.0f, focusedScale = 1.05f),
+                shape = ClickableSurfaceDefaults.shape(RoundedCornerShape(12.dp)),
+                colors = ClickableSurfaceDefaults.colors(
+                    containerColor = if (isSelected) AppPalette.surfaceSecondary else Color.Transparent,
+                    focusedContainerColor = AppPalette.accent,
+                    contentColor = if (isSelected) AppPalette.primaryText else AppPalette.secondaryText,
+                    focusedContentColor = Color.White
+                )
+            ) {
+                Text(
+                    text = cat.title,
+                    fontSize = 15.sp,
+                    fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal,
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun AppearanceAndGeneralSettingsContent(
+    settingsRepo: SettingsRepository,
+    isEditingCustomName: Boolean,
+    onEditingCustomNameChange: (Boolean) -> Unit,
+    onExitCustomNameEditing: () -> Unit,
+    firstFocusRequester: FocusRequester?,
+    leftNavFocusRequester: FocusRequester,
+    customEditButtonFocusRequester: FocusRequester
+) {
+    val context = LocalContext.current
+    var currentThemeMode by remember { mutableStateOf(AppPalette.mode) }
+    val friendlyName by settingsRepo.friendlyNameFlow.collectAsState()
+    val currentFluidQuality by settingsRepo.fluidQualityFlow.collectAsState()
+    var customNameInput by remember { mutableStateOf(friendlyName) }
+    val customNameFocusRequester = remember { FocusRequester() }
+    var isTextFieldFocused by remember { mutableStateOf(false) }
+
+    // 💡 自定义输入框展开时，主动将遥控器焦点请求至 BasicTextField，避免落入焦点陷阱
+    LaunchedEffect(isEditingCustomName) {
+        if (isEditingCustomName) {
+            delay(150)
+            try {
+                customNameFocusRequester.requestFocus()
+            } catch (e: Exception) {
+                Logger.ui.w(TAG, "展开输入框请求焦点异常", e)
+            }
+        }
+    }
+
+    // 1. 界面外观深浅模式
+    SettingsSection(title = "界面主题模式") {
+        SettingTieredRow(
+            title = "外观色彩模式",
+            subtitle = "支持跟随系统动态自适应或强制深浅主题"
+        ) {
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                SegmentOptionButton(
+                    label = "⚡️ 自动 (跟随系统)",
+                    isSelected = currentThemeMode == ThemeMode.AUTO,
+                    focusRequester = firstFocusRequester,
+                    leftNavFocusRequester = leftNavFocusRequester,
+                    onClick = {
+                        currentThemeMode = ThemeMode.AUTO
+                        AppPalette.setThemeMode(context, ThemeMode.AUTO)
+                    }
+                )
+                SegmentOptionButton(
+                    label = "🌙 深色模式",
+                    isSelected = currentThemeMode == ThemeMode.DARK,
+                    onClick = {
+                        currentThemeMode = ThemeMode.DARK
+                        AppPalette.setThemeMode(context, ThemeMode.DARK)
+                    }
+                )
+                SegmentOptionButton(
+                    label = "☀️ 浅色模式",
+                    isSelected = currentThemeMode == ThemeMode.LIGHT,
+                    onClick = {
+                        currentThemeMode = ThemeMode.LIGHT
+                        AppPalette.setThemeMode(context, ThemeMode.LIGHT)
+                    }
+                )
+            }
+        }
+    }
+
+    // 2. 局域网广播名称
+    SettingsSection(title = "局域网广播设备标识") {
+        SettingTieredRow(
+            title = "设备广播发现名称",
+            subtitle = "当前网络标识: \"$friendlyName\" (用于 AirPlay 1 与 UPnP 广播)"
+        ) {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                val presets = listOf("PureCast TV", "客厅 Hi-Fi", "影音室 TV")
+                presets.forEachIndexed { pIdx, preset ->
+                    val isCur = friendlyName == preset && !isEditingCustomName
+                    SegmentOptionButton(
+                        label = preset,
+                        isSelected = isCur,
+                        leftNavFocusRequester = if (pIdx == 0) leftNavFocusRequester else null,
+                        onClick = {
+                            onEditingCustomNameChange(false)
+                            settingsRepo.setFriendlyName(preset)
+                            PlaybackService.instance?.updateFriendlyName(preset)
+                            Toast.makeText(context, "已更新设备名为: $preset", Toast.LENGTH_SHORT).show()
+                        }
+                    )
+                }
+                val isCustomSelected = isEditingCustomName || friendlyName !in presets
+                val customLabel = if (!isEditingCustomName && friendlyName !in presets) "✏️ $friendlyName" else "✏️ 自定义"
+                SegmentOptionButton(
+                    label = customLabel,
+                    isSelected = isCustomSelected,
+                    focusRequester = customEditButtonFocusRequester,
+                    onClick = {
+                        customNameInput = friendlyName
+                        onEditingCustomNameChange(!isEditingCustomName)
+                    }
+                )
+            }
+        }
+
+        if (isEditingCustomName) {
+            SettingDivider()
+            SettingTieredRow(
+                title = "编辑自定义设备名",
+                subtitle = "输入新的设备发现名称并确认保存"
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .width(260.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(AppPalette.surfaceSecondary)
+                            .border(
+                                width = if (isTextFieldFocused) 2.dp else 1.dp,
+                                color = if (isTextFieldFocused) AppPalette.accent else Color.Transparent,
+                                shape = RoundedCornerShape(8.dp)
+                            )
+                            .padding(horizontal = 14.dp, vertical = 8.dp)
+                    ) {
+                        BasicTextField(
+                            value = customNameInput,
+                            onValueChange = { customNameInput = it },
+                            singleLine = true,
+                            textStyle = TextStyle(color = AppPalette.primaryText, fontSize = 14.sp),
+                            cursorBrush = SolidColor(AppPalette.primaryText),
+                            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                            keyboardActions = KeyboardActions(
+                                onDone = {
+                                    val t = customNameInput.trim()
+                                    if (t.isNotEmpty()) {
+                                        settingsRepo.setFriendlyName(t)
+                                        PlaybackService.instance?.updateFriendlyName(t)
+                                        onExitCustomNameEditing()
+                                        Toast.makeText(context, "已保存广播名为: $t", Toast.LENGTH_SHORT).show()
+                                    }
+                                }
+                            ),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .focusRequester(customNameFocusRequester)
+                                .focusProperties { left = leftNavFocusRequester }
+                                .onFocusChanged { isTextFieldFocused = it.isFocused }
+                        )
+                    }
+                    SegmentOptionButton(
+                        label = "保存",
+                        isSelected = true,
+                        onClick = {
+                            val t = customNameInput.trim()
+                            if (t.isNotEmpty()) {
+                                settingsRepo.setFriendlyName(t)
+                                PlaybackService.instance?.updateFriendlyName(t)
+                                onExitCustomNameEditing()
+                                Toast.makeText(context, "已保存广播名为: $t", Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                    )
+                    SegmentOptionButton(
+                        label = "取消",
+                        isSelected = false,
+                        onClick = { onExitCustomNameEditing() }
+                    )
+                }
+            }
+        }
+    }
+
+    // 3. 动态流光背景画质
+    SettingsSection(title = "动态流光背景画质") {
+        SettingTieredRow(
+            title = "GLES2 着色器渲染档位",
+            subtitle = "根据电视芯片性能调节流光分辨率与帧率节拍 (高配推荐极佳/标准，低配推荐省电或静态)"
+        ) {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                listOf(
+                    FluidQuality.HIGH_QUALITY to "极佳 (60fps)",
+                    FluidQuality.STANDARD to "标准 (20fps)",
+                    FluidQuality.POWER_SAVE to "省电 (20fps · 低清)",
+                    FluidQuality.STATIC to "静态磨砂",
+                    FluidQuality.OFF to "关闭"
+                ).forEachIndexed { qIdx, (quality, label) ->
+                    SegmentOptionButton(
+                        label = label,
+                        isSelected = currentFluidQuality == quality,
+                        leftNavFocusRequester = if (qIdx == 0) leftNavFocusRequester else null,
+                        onClick = {
+                            settingsRepo.setFluidQuality(quality)
+                            Toast.makeText(context, "已设置流光画质: $label", Toast.LENGTH_SHORT).show()
+                        }
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun UsbDacSettingsContent(
+    audioState: AudioPathState,
+    settingsRepo: SettingsRepository,
+    firstFocusRequester: FocusRequester?,
+    leftNavFocusRequester: FocusRequester
+) {
+    val context = LocalContext.current
+    val idleTimeoutSeconds by settingsRepo.idleTimeoutFlow.collectAsState()
+
+    SettingsSection(title = "USB DAC 硬件独占接管") {
+        SettingInlineRow(
+            title = "声卡端点与驱动状态",
+            subtitle = if (audioState.isExclusive) "已解绑 Linux snd-usb-audio 内核驱动，直通 UAC 音频硬件 (绕过 48kHz SRC)" else "声卡处于待机让渡或系统共享状态"
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Text(
+                    text = audioState.dacName,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = if (audioState.isExclusive) AppPalette.success else AppPalette.warning
+                )
+                SegmentOptionButton(
+                    label = if (audioState.isExclusive) "🔄 让渡声卡" else "⚡ 独占接管",
+                    isSelected = !audioState.isExclusive,
+                    focusRequester = firstFocusRequester,
+                    leftNavFocusRequester = leftNavFocusRequester,
+                    onClick = {
+                        if (audioState.isExclusive) {
+                            PlaybackService.instance?.releaseUsbExclusiveManually()
+                            Toast.makeText(context, "已释放独占，声卡已归还系统", Toast.LENGTH_SHORT).show()
+                        } else {
+                            if (context is Activity) {
+                                PlaybackService.instance?.claimUsbExclusiveManually(context) { _, msg ->
+                                    Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                                }
+                            }
+                        }
+                    }
+                )
+            }
+        }
+
+        SettingDivider()
+
+        SettingTieredRow(
+            title = "空闲自动让渡时机",
+            subtitle = "停止播放后，等待指定秒数自动解除声卡独占并归还系统"
+        ) {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                listOf(Pair(5, "5秒"), Pair(10, "10秒 (推荐)"), Pair(30, "30秒"), Pair(0, "常驻独占")).forEachIndexed { optIdx, (sec, label) ->
+                    val isSelected = idleTimeoutSeconds == sec
+                    SegmentOptionButton(
+                        label = label,
+                        isSelected = isSelected,
+                        leftNavFocusRequester = if (optIdx == 0) leftNavFocusRequester else null,
+                        onClick = {
+                            settingsRepo.setIdleTimeoutSeconds(sec)
+                            PlaybackService.instance?.setIdleTimeoutSeconds(sec)
+                            Toast.makeText(context, "已设置让渡超时为: $label", Toast.LENGTH_SHORT).show()
+                        }
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ProtocolsSettingsContent(
+    settingsRepo: SettingsRepository,
+    firstFocusRequester: FocusRequester?,
+    leftNavFocusRequester: FocusRequester
+) {
+    val isAirPlayEnabled by settingsRepo.airPlayEnabledFlow.collectAsState()
+    val isUpnpEnabled by settingsRepo.upnpEnabledFlow.collectAsState()
+
+    SettingsSection(title = "本地网络音频流服务") {
+        SettingInlineRow(
+            title = "AirPlay 1 (AirTunes / RAOP)",
+            subtitle = "支持 iOS / macOS / iTunes 纯音频低延迟推流，ALAC 44.1kHz 源码直通"
+        ) {
+            ToggleSwitchButton(
+                isEnabled = isAirPlayEnabled,
+                focusRequester = firstFocusRequester,
+                leftNavFocusRequester = leftNavFocusRequester,
+                onToggle = {
+                    val target = !isAirPlayEnabled
+                    settingsRepo.setAirPlayEnabled(target)
+                    PlaybackService.instance?.setAirPlayEnabled(target)
+                }
+            )
+        }
+
+        SettingDivider()
+
+        SettingInlineRow(
+            title = "UPnP / DLNA (MediaRenderer 2.0)",
+            subtitle = "支持 QQ音乐、网易云等 App 投播，支持 192kHz / 24bit Hi-Res 源码直通"
+        ) {
+            ToggleSwitchButton(
+                isEnabled = isUpnpEnabled,
+                leftNavFocusRequester = leftNavFocusRequester,
+                onToggle = {
+                    val target = !isUpnpEnabled
+                    settingsRepo.setUpnpEnabled(target)
+                    PlaybackService.instance?.setUpnpEnabled(target)
+                }
+            )
+        }
+    }
+}
+
+@Composable
+private fun HardwareMonitorSettingsContent(
+    audioState: AudioPathState
+) {
+    // 💡 仅当进入“硬件与时钟监控”分类时启动每秒 JNI 轮询，离开即自动取消，彻底消除其余分类每秒全页重组
+    var bufferCapacity by remember { mutableIntStateOf(65536) }
+    var bufferAvailableRead by remember { mutableIntStateOf(0) }
+    var libusbVer by remember { mutableStateOf("1.0.27") }
+
+    LaunchedEffect(Unit) {
+        while (true) {
+            try {
+                val snapshot = withContext(Dispatchers.IO) {
+                    Triple(
+                        NativeAudioEngine.getBufferCapacity().coerceAtLeast(1),
+                        NativeAudioEngine.getAvailableRead(),
+                        NativeAudioEngine.getLibusbVersion()
+                    )
+                }
+                bufferCapacity = snapshot.first
+                bufferAvailableRead = snapshot.second
+                libusbVer = snapshot.third
+            } catch (e: Exception) {
+                Logger.ui.w(TAG, "获取底层驱动信息异常", e)
+            }
+            delay(1000)
+        }
+    }
+
+    SettingsSection(title = "SPSC 无锁环形缓冲与时钟仪表盘") {
+        val formatSpec = if (audioState.protocol != StreamProtocol.NONE && audioState.sampleRate > 0) {
+            "${formatSampleRate(audioState.sampleRate)} / ${audioState.bitDepth}-bit (${audioState.channels} 声道)"
+        } else {
+            "待机无推流"
+        }
+
+        val bufferUsagePercent = if (bufferCapacity > 0) {
+            (bufferAvailableRead * 100L / bufferCapacity).toInt()
+        } else 0
+
+        val bufferAvailableKb = bufferAvailableRead / 1024
+        val bufferCapacityKb = bufferCapacity / 1024
+        val effectiveSampleRate = if (audioState.sampleRate > 0) audioState.sampleRate else 44100
+        val effectiveChannels = if (audioState.channels > 0) audioState.channels else 2
+        val effectiveBits = if (audioState.bitDepth > 0) audioState.bitDepth else 16
+        val bytesPerSec = effectiveSampleRate * effectiveChannels * (effectiveBits / 8)
+        val bufferMs = if (bytesPerSec > 0) (bufferAvailableRead * 1000L / bytesPerSec) else 0L
+
+        MetricDataRow(label = "当前实时采样率与位深", value = formatSpec)
+        SettingDivider()
+        MetricDataRow(
+            label = "SPSC 环形缓冲区",
+            value = "${bufferAvailableKb} KB / ${bufferCapacityKb} KB (${bufferMs}ms / $bufferUsagePercent% 水位)"
+        )
+        SettingDivider()
+        MetricDataRow(label = "UAC 物理时钟锁定", value = if (audioState.isExclusive) "UAC1/UAC2 异步/显式反馈闭环物理时钟 (SOF 同步)" else "让渡共享时钟")
+        SettingDivider()
+        MetricDataRow(label = "底层驱动与内核通信", value = "libusb-$libusbVer (usbfs 根权限包装)")
+    }
+}
+
+@Composable
+private fun HealthCheckSettingsContent(
+    firstFocusRequester: FocusRequester?,
+    leftNavFocusRequester: FocusRequester
+) {
+    val context = LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
+
+    // 💡 权限检查下沉到 HEALTH_CHECK 子页并通过 Dispatchers.IO 异步读取，彻底消除打开设置页首帧的 4 次同步 Binder IPC；
+    // 初始态为 null（检测中），避免异步返回前首帧误闪橙色“去授权 ›”。
+    var isUsbGranted by remember { mutableStateOf<Boolean?>(null) }
+    var isRecordAudioGranted by remember { mutableStateOf<Boolean?>(null) }
+    var isIgnoringBattery by remember { mutableStateOf<Boolean?>(null) }
+    var isOverlayGranted by remember { mutableStateOf<Boolean?>(null) }
+
+    suspend fun refreshPermissionsAsync() {
+        val result = withContext(Dispatchers.IO) {
+            booleanArrayOf(
+                checkUsbPermission(context),
+                PermissionHelper.isRecordAudioGranted(context),
+                PermissionHelper.isBatteryOptimizationIgnored(context),
+                PermissionHelper.isOverlayGranted(context)
+            )
+        }
+        isUsbGranted = result[0]
+        isRecordAudioGranted = result[1]
+        isIgnoringBattery = result[2]
+        isOverlayGranted = result[3]
+    }
+
+    // 💡 AndroidX Lifecycle 在宿主已 RESUMED 时注册 observer 会自动补发一次 ON_RESUME，
+    // 仅由 ON_RESUME 单入口 + Job 防重入驱动，杜绝首次挂载并发触发两次重复 IPC。
+    val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+    androidx.compose.runtime.DisposableEffect(lifecycleOwner) {
+        var refreshJob: Job? = null
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+                refreshJob?.cancel()
+                refreshJob = coroutineScope.launch {
+                    refreshPermissionsAsync()
+                }
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            refreshJob?.cancel()
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
+
+    SettingsSection(title = "Android 权限与系统保活自检") {
+        PermissionCheckRow(
+            label = "USB 硬件直接访问权限",
+            description = "直通 UAC 音频时钟与 Linux usbfs 底层声卡驱动",
+            isGranted = isUsbGranted,
+            focusRequester = firstFocusRequester,
+            leftNavFocusRequester = leftNavFocusRequester,
+            onClick = {
+                val act = context as? Activity
+                if (act != null) {
+                    PlaybackService.instance?.requestUsbPermission(act)
+                } else {
+                    PermissionHelper.openAppDetailsSettings(context)
+                }
+            }
+        )
+        SettingDivider()
+        PermissionCheckRow(
+            label = "后台无限制与电池优化白名单",
+            description = "防止大屏熄屏或空闲时系统清理后台推流服务",
+            isGranted = isIgnoringBattery,
+            leftNavFocusRequester = leftNavFocusRequester,
+            onClick = {
+                PermissionHelper.openBatteryOptimizationSettings(context)
+            }
+        )
+        SettingDivider()
+        PermissionCheckRow(
+            label = "核心录音权限 (RECORD_AUDIO)",
+            description = "仅用于系统免弹窗接管，工程绝不调用录音硬件",
+            isGranted = isRecordAudioGranted,
+            leftNavFocusRequester = leftNavFocusRequester,
+            onClick = {
+                val act = context as? Activity
+                if (act != null && isRecordAudioGranted == false) {
+                    androidx.core.app.ActivityCompat.requestPermissions(
+                        act,
+                        arrayOf(Manifest.permission.RECORD_AUDIO),
+                        1001
+                    )
+                } else {
+                    PermissionHelper.openAppDetailsSettings(context)
+                }
+            }
+        )
+        SettingDivider()
+        PermissionCheckRow(
+            label = "悬浮窗与前台拉起权限 (OVERLAY)",
+            description = "支持局域网接收推流时自动拉起大屏播放界面",
+            isGranted = isOverlayGranted,
+            leftNavFocusRequester = leftNavFocusRequester,
+            onClick = {
+                PermissionHelper.openOverlaySettings(context)
+            }
+        )
     }
 }
 
@@ -1032,7 +1141,7 @@ private fun MetricDataRow(
 private fun PermissionCheckRow(
     label: String,
     description: String,
-    isGranted: Boolean,
+    isGranted: Boolean?,
     modifier: Modifier = Modifier,
     focusRequester: FocusRequester? = null,
     leftNavFocusRequester: FocusRequester? = null,
@@ -1057,15 +1166,24 @@ private fun PermissionCheckRow(
         AppPalette.secondaryText
     }
 
-    // 状态指示色 (已就绪 / 去授权)
-    val statusColor = if (isFocused) {
-        if (isDark) {
-            if (isGranted) Color(0xFF1B5E20) else Color(0xFFE65100)
+    // 状态指示色 (检测中 / 已就绪 / 去授权)
+    val statusColor = when (isGranted) {
+        null -> descColor
+        true -> if (isFocused) {
+            if (isDark) Color(0xFF1B5E20) else Color(0xFF30D158)
         } else {
-            if (isGranted) Color(0xFF30D158) else Color(0xFFFF9F0A)
+            AppPalette.success
         }
-    } else {
-        if (isGranted) AppPalette.success else AppPalette.warning
+        false -> if (isFocused) {
+            if (isDark) Color(0xFFE65100) else Color(0xFFFF9F0A)
+        } else {
+            AppPalette.warning
+        }
+    }
+    val statusText = when (isGranted) {
+        null -> "检测中..."
+        true -> "已就绪"
+        false -> "去授权 ›"
     }
 
     Surface(
@@ -1129,7 +1247,7 @@ private fun PermissionCheckRow(
                         .background(statusColor)
                 )
                 Text(
-                    text = if (isGranted) "已就绪" else "去授权 ›",
+                    text = statusText,
                     fontSize = 13.sp,
                     fontWeight = FontWeight.SemiBold,
                     color = statusColor

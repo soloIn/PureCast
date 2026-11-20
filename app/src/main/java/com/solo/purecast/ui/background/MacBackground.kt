@@ -5,6 +5,8 @@ import android.graphics.Canvas
 import android.graphics.Paint
 import android.graphics.Rect
 import android.graphics.drawable.BitmapDrawable
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
@@ -12,17 +14,19 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -38,7 +42,7 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 
-private data class MacArtworkFrame(val source: Bitmap, val fallback: Bitmap)
+private data class MacArtworkFrame(val source: Bitmap, val fallback: Bitmap?)
 
 /**
  * 💡 PureCast Apple Music 原生 GLES2 材质网格动态流光背景 (MacBackground)
@@ -74,12 +78,24 @@ fun MacBackground(
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
+    val effectiveQuality = when {
+        reduceMotion -> FluidQuality.STATIC
+        lowPower && quality.animated -> FluidQuality.POWER_SAVE
+        else -> quality
+    }
+    var failed by remember(effectiveQuality) { mutableStateOf(false) }
+    // 💡 textureOpaque 绑定真实 AndroidView 生命周期，绝不以 effectiveQuality 为 key：
+    // 否则在 STANDARD / HIGH_QUALITY / POWER_SAVE 之间切换时 MacTextureView 复用不重建，
+    // fadeInStarted 仍为 true 导致 onOpaqueReady 永不再次回调，textureOpaque 永久卡死在 false。
+    var textureOpaque by remember { mutableStateOf(false) }
     var artwork by remember { mutableStateOf<MacArtworkFrame?>(null) }
+    var lastFallback by remember { mutableStateOf<Bitmap?>(null) }
 
     LaunchedEffect(coverData, isIdle, sceneClock.meshIndex, coverHash) {
         if (isIdle || coverData == null) {
             // 💡 待机空闲或确定无封面态：彻底释放已有 artwork 位图与离屏渲染资源，优雅回退至自适应纯净背景，杜绝浅色模式文字对比度崩溃
             artwork = null
+            lastFallback = null
             return@LaunchedEffect
         }
         try {
@@ -103,18 +119,18 @@ fun MacBackground(
             currentCoroutineContext().ensureActive()
             val input = ((result as? SuccessResult)?.drawable as? BitmapDrawable)?.bitmap
             if (input != null) {
+                val needFallback = !effectiveQuality.animated || failed || !textureOpaque
                 val newFrame = withContext(Dispatchers.Default) {
                     val copy = Bitmap.createBitmap(256, 256, Bitmap.Config.ARGB_8888)
                     Canvas(copy).drawBitmap(input, null, Rect(0, 0, 256, 256), Paint(Paint.FILTER_BITMAP_FLAG))
-                    // 💡 修复 Finding 2: 废除超低分辨率 (32x18) 点采样与拉伸，采用 96x96 三次迭代移动平均盒式模糊，
-                    // 在 <0.3ms 极速开销下输出数学等价于高斯模糊的连续温润渐变底图，彻底消除首帧撕裂与马赛克。
-                    val mini = Bitmap.createScaledBitmap(copy, 96, 96, true)
-                    val blurred = fastBoxBlur(mini, 6)
-                    val fallback = Bitmap.createScaledBitmap(blurred, 384, 384, true)
-                    if (mini !== copy && mini !== blurred) mini.recycle()
-                    if (blurred !== fallback) blurred.recycle()
+                    // 💡 当 GLES2 纹理已点亮且不透明 (textureOpaque == true) 时，切歌过渡完全由 GPU 离屏渲染完成，
+                    // 直接跳过 CPU fastBoxBlur 与 384x384 fallback 位图分配，零画质损失且大幅降低切歌瞬时 GC。
+                    val fallback = if (needFallback) buildBlurredFallbackBitmap(copy) else null
                     currentCoroutineContext().ensureActive()
                     MacArtworkFrame(copy, fallback)
+                }
+                if (newFrame.fallback != null) {
+                    lastFallback = newFrame.fallback
                 }
                 artwork = newFrame
             }
@@ -125,43 +141,52 @@ fun MacBackground(
         }
     }
 
+    // 💡 兜底按需补算：若用户切换至 STATIC 静态磨砂档位或 EGL 降级时当前帧尚未生成 fallback，异步按需补算
+    LaunchedEffect(artwork, effectiveQuality, failed, textureOpaque) {
+        val current = artwork ?: return@LaunchedEffect
+        val needFallback = !effectiveQuality.animated || failed || !textureOpaque
+        if (needFallback && current.fallback == null) {
+            val generated = withContext(Dispatchers.Default) {
+                buildBlurredFallbackBitmap(current.source)
+            }
+            if (artwork === current) {
+                lastFallback = generated
+                artwork = current.copy(fallback = generated)
+            }
+        }
+    }
+
     if (quality == FluidQuality.OFF || isIdle || (coverData == null && artwork == null)) {
         Box(modifier.fillMaxSize().background(AppPalette.background))
         return
     }
 
-    val effectiveQuality = when {
-        reduceMotion -> FluidQuality.STATIC
-        lowPower && quality.animated -> FluidQuality.POWER_SAVE
-        else -> quality
-    }
-    var failed by remember(effectiveQuality) { mutableStateOf(false) }
-    var textureOpaque by remember(effectiveQuality) { mutableStateOf(false) }
     val frame = artwork
     val showAnimatedTexture = frame != null && effectiveQuality.animated && !failed
-    val hideUnderlyingLayers = showAnimatedTexture && textureOpaque
 
-    LaunchedEffect(frame == null, failed) {
-        if (frame == null || failed) textureOpaque = false
+    LaunchedEffect(frame == null, failed, !effectiveQuality.animated) {
+        if (frame == null || failed || !effectiveQuality.animated) textureOpaque = false
+    }
+
+    // 💡 SurfaceView 走 HWC 硬件层叠加不支持 View.alpha 渐显；改为将模糊 fallback 静态图置顶，
+    // 收到首帧渲染就绪 (textureOpaque == true) 后以 350ms ModulateAlpha 淡出至 0 并卸载，视觉过渡 100% 一致且稳态零过绘。
+    val fallbackAlphaState = animateFloatAsState(
+        targetValue = if (showAnimatedTexture && textureOpaque) 0f else 1f,
+        animationSpec = tween(durationMillis = 350),
+        label = "fluidFallbackFadeOut"
+    )
+    val hideFallbackOverlay by remember(showAnimatedTexture, textureOpaque) {
+        derivedStateOf { showAnimatedTexture && textureOpaque && fallbackAlphaState.value <= 0.001f }
     }
 
     Box(
-        modifier = if (hideUnderlyingLayers) {
+        modifier = if (showAnimatedTexture) {
             modifier.fillMaxSize()
         } else {
             modifier.fillMaxSize().background(Color(0xFF101014))
         }
     ) {
         if (frame != null) {
-            // 💡 MacTextureView 首帧 350ms 渐显完全不透明后跳过底层 fallback 静态图，彻底消除 1920x1080 双重全屏过绘
-            if (!hideUnderlyingLayers) {
-                Image(
-                    bitmap = frame.fallback.asImageBitmap(),
-                    contentDescription = null,
-                    modifier = Modifier.fillMaxSize(),
-                    contentScale = ContentScale.Crop
-                )
-            }
             if (showAnimatedTexture) {
                 AndroidView(
                     factory = { ctx ->
@@ -190,8 +215,33 @@ fun MacBackground(
                     }
                 )
             }
+            if (!hideFallbackOverlay) {
+                val fallbackBitmap = frame.fallback ?: lastFallback ?: frame.source
+                Image(
+                    bitmap = fallbackBitmap.asImageBitmap(),
+                    contentDescription = null,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .graphicsLayer {
+                            compositingStrategy = CompositingStrategy.ModulateAlpha
+                            alpha = fallbackAlphaState.value
+                        },
+                    contentScale = ContentScale.Crop
+                )
+            }
         }
     }
+}
+
+private fun buildBlurredFallbackBitmap(source: Bitmap): Bitmap {
+    // 💡 修复 Finding 2: 废除超低分辨率 (32x18) 点采样与拉伸，采用 96x96 三次迭代移动平均盒式模糊，
+    // 在 <0.3ms 极速开销下输出数学等价于高斯模糊的连续温润渐变底图，彻底消除首帧撕裂与马赛克。
+    val mini = Bitmap.createScaledBitmap(source, 96, 96, true)
+    val blurred = fastBoxBlur(mini, 6)
+    val fallback = Bitmap.createScaledBitmap(blurred, 384, 384, true)
+    if (mini !== source && mini !== blurred) mini.recycle()
+    if (blurred !== fallback) blurred.recycle()
+    return fallback
 }
 
 /**

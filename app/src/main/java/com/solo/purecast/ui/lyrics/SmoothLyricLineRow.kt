@@ -98,10 +98,17 @@ fun SmoothLyricLineRow(
             .graphicsLayer {
                 val y = translationYProvider()
                 val edgeAlpha = edgeAlphaProvider(y)
-                // 💡 1:1 刚性常驻 Offscreen：按原生 Hinting 锐度光栅化缓存一次，60fps 浮点平移不重算字形、不切换合成策略；
-                // 逐字歌词激活态主词由 SrcIn 直接在此离屏层绘制 0.45f -> 1.0f 扫光，外层行 alpha 锁定 1.0f。
+                // 💡 仅对当前正在执行 BlendMode.SrcIn 逐字扫光的激活行（或显式开启景深模糊时）启用 Offscreen；
+                // 其余 12 行非激活行与普通逐行歌词中主词与翻译垂直排列互不重叠，必须使用 ModulateAlpha 而非 Auto
+                //（Compose 的 Auto 在 alpha < 1f 时仍会自动降级为 saveLayer 分配 Scratch RenderTarget），
+                // 视觉像素 100% 一致，但将 Skia 34MB Scratch RenderTarget 占用直接清零。
+                val useOffscreen = (hasWordSync && isActive) || useBlur
                 val rowAlpha = if (hasWordSync && isActive) 1.0f else alphaState.value
-                compositingStrategy = CompositingStrategy.Offscreen
+                compositingStrategy = if (useOffscreen) {
+                    CompositingStrategy.Offscreen
+                } else {
+                    CompositingStrategy.ModulateAlpha
+                }
                 translationY = y
                 alpha = edgeAlpha * rowAlpha
                 if (useBlur && blurDpState != null && blurEffectCache != null) {

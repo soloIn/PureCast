@@ -42,6 +42,11 @@ android {
                 "proguard-rules.pro"
             )
         }
+        create("releaseLocal") {
+            initWith(getByName("release"))
+            signingConfig = signingConfigs.getByName("debug")
+            matchingFallbacks += listOf("release")
+        }
         debug {
             isDebuggable = true
             isJniDebuggable = true

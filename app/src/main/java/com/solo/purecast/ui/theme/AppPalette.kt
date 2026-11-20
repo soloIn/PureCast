@@ -34,12 +34,21 @@ object AppPalette {
             ThemeMode.AUTO -> systemIsDark
         }
 
+    @Volatile
+    private var initializedFromUnlockedStorage = false
+
     fun init(context: Context) {
+        if (initializedFromUnlockedStorage) {
+            updateSystemNightMode(context)
+            return
+        }
         try {
             // 💡 针对 Android N+ Direct Boot 模式安全处理：设备锁定时使用设备保护存储上下文，防止 IllegalStateException 崩溃
+            var isUnlocked = true
             val safeContext = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N) {
                 val userManager = context.getSystemService(Context.USER_SERVICE) as? android.os.UserManager
                 if (userManager?.isUserUnlocked == false) {
+                    isUnlocked = false
                     context.createDeviceProtectedStorageContext()
                 } else {
                     context
@@ -60,6 +69,9 @@ object AppPalette {
                 if (prefs.getBoolean("is_dark_mode", true)) ThemeMode.DARK else ThemeMode.LIGHT
             } else {
                 ThemeMode.AUTO
+            }
+            if (isUnlocked) {
+                initializedFromUnlockedStorage = true
             }
         } catch (_: Exception) {
             // 💡 若 Direct Boot 阶段或读取异常，回退至默认 AUTO 模式

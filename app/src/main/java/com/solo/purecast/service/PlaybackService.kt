@@ -55,8 +55,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -89,7 +87,21 @@ class PlaybackService : LifecycleService() {
     @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
     private val coordinatorScope = CoroutineScope(SupervisorJob() + Dispatchers.Default.limitedParallelism(1))
 
+    // 💡 轻量有序状态副作用（快照分发、MediaSession 状态、通知同步与歌词触发）串行运行在单线程后台队列
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    private val serviceEffectsScope = CoroutineScope(SupervisorJob() + Dispatchers.IO.limitedParallelism(1))
+
+    // 💡 阻塞型冷启动/网络 IO（组播锁、NetworkCallback、UPnP/AirPlay 协议启停、封面解码）独立运行于并发 IO 池，
+    // 杜绝网卡枚举或锁竞争饥饿 serviceEffectsScope 导致快照与歌词分发延迟。
+    private val serviceIoScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    private val systemResourcesLock = Any()
+    @Volatile
+    private var isDestroyed = false
+
+    @Volatile
     private var upnpServer: UpnpRendererServer? = null
+    @Volatile
     var airPlayServer: AirPlayServerManager? = null
         private set
 
@@ -119,12 +131,15 @@ class PlaybackService : LifecycleService() {
         super.onCreate()
         Logger.service.i(TAG, "PlaybackService onCreate: 启动核心服务 (三状态协调器架构)...")
 
-        settingsRepository = SettingsRepository(this)
+        settingsRepository = SettingsRepository.getInstance(this)
         createNotificationChannel()
         setupMediaSession()
         startForegroundWithTypes()
-        acquireStandingLocks()
-        registerNetworkCallback()
+        // 💡 组播锁、WakeLock 与网络监听注册迁移至独立 IO 池，避免阻塞冷启动主线程与快照分发队列
+        serviceIoScope.launch {
+            acquireStandingLocks()
+            registerNetworkCallback()
+        }
 
         audioFocusManager = AudioFocusManager(
             context = this,
@@ -250,7 +265,7 @@ class PlaybackService : LifecycleService() {
         }
 
         sessionHost = PlaybackServiceSessionHost(
-            scope = lifecycleScope,
+            scope = serviceEffectsScope,
             coordinator = coordinator,
             hardwareBridge = usbDeviceManager,
             systemEffects = systemEffects,
@@ -272,19 +287,19 @@ class PlaybackService : LifecycleService() {
             neteaseDataSource = neteaseSource
         )
         lyricsTriggerManager = LyricsTriggerManager(
-            scope = lifecycleScope,
+            scope = serviceEffectsScope,
             cacheRepository = lyricsCacheRepo,
             waterfallFetcher = waterfallFetcher
         )
 
-        lifecycleScope.launch {
+        serviceEffectsScope.launch {
             lyricsTriggerManager.lyricUiState.collect { state ->
                 _lyricsUiState.value = state
             }
         }
 
-        // 💡 单向发布不可变全局快照与驱动歌词生命周期，必须在发起硬件扫描前启动观察
-        lifecycleScope.launch {
+        // 💡 单向发布不可变全局快照与驱动歌词生命周期，必须在发起硬件扫描前启动观察（后台调度，不抢占 UI 主线程）
+        serviceEffectsScope.launch {
             coordinator.snapshot.collect { snap ->
                 _sessionSnapshot.value = snap
                 lyricsTriggerManager.onSessionSnapshotChanged(snap)
@@ -295,16 +310,9 @@ class PlaybackService : LifecycleService() {
         // 冷启动异步扫描已连接的 USB DAC，避免阻塞 Service.onCreate 主线程
         usbDeviceManager.scanAndAttachDeviceAsync()
 
-        val friendlyName = settingsRepository.getFriendlyName()
-        if (settingsRepository.isUpnpEnabled()) {
-            upnpServer = createUpnpServer(formatUpnpName(friendlyName)).apply {
-                start()
-            }
-        }
-
-        airPlayServer = createAirPlayServer()
-        if (settingsRepository.isAirPlayEnabled()) {
-            airPlayServer?.start(formatAirPlayName(friendlyName))
+        // 💡 UPnP 网卡枚举/监听与 AirPlay 原生服务启动迁移至独立 IO 池，彻底消除冷启动主线程与快照队列阻塞
+        serviceIoScope.launch {
+            startProtocolServersIfEnabled()
         }
 
         // 💡 必须在所有 lateinit 核心协作者（sessionHost、usbDeviceManager、coordinator 等）就绪后再对外发布单实例引用
@@ -369,7 +377,7 @@ class PlaybackService : LifecycleService() {
                         TAG,
                         "开机广播网络巡检守护：检测到未绑定至有效局域网 IP (AirPlay=${airplayBound?.hostAddress}, UPnP=$upnpBound)，触发自愈刷新..."
                     )
-                    withContext(Dispatchers.Main) {
+                    serviceIoScope.launch {
                         refreshNetworkServices()
                     }
                 }
@@ -450,73 +458,86 @@ class PlaybackService : LifecycleService() {
     private val mediaSessionMetadataHelper = MediaSessionMetadataHelper()
 
     private fun updateMediaSessionMetadata(metadata: TrackMetadata) {
-        mediaSessionMetadataHelper.updateMediaSessionMetadata(mediaSession, metadata, lifecycleScope)
+        mediaSessionMetadataHelper.updateMediaSessionMetadata(mediaSession, metadata, serviceIoScope)
     }
 
     private fun acquireStandingLocks() {
-        try {
-            val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-            // 💡 必须获取 MulticastLock，否则电视机休眠或息屏时无法响应 SSDP/mDNS 广播
-            multicastLock = wifiManager.createMulticastLock("PureCast:MulticastLock").apply {
-                setReferenceCounted(true)
-                acquire()
-            }
-            Logger.service.i(TAG, "成功获取 Wi-Fi 组播锁 (MulticastLock)")
+        synchronized(systemResourcesLock) {
+            if (isDestroyed) return
+            try {
+                val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                // 💡 必须获取 MulticastLock，否则电视机休眠或息屏时无法响应 SSDP/mDNS 广播
+                multicastLock = wifiManager.createMulticastLock("PureCast:MulticastLock").apply {
+                    setReferenceCounted(true)
+                    acquire()
+                }
+                Logger.service.i(TAG, "成功获取 Wi-Fi 组播锁 (MulticastLock)")
 
-            val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
-            wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "PureCast:WakeLock").apply {
-                acquire(12 * 60 * 60 * 1000L)
+                val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+                wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "PureCast:WakeLock").apply {
+                    acquire(12 * 60 * 60 * 1000L)
+                }
+                Logger.service.i(TAG, "成功获取 CPU WakeLock")
+            } catch (e: Exception) {
+                Logger.service.w(TAG, "获取系统常驻锁异常", e)
             }
-            Logger.service.i(TAG, "成功获取 CPU WakeLock")
-        } catch (e: Exception) {
-            Logger.service.w(TAG, "获取系统常驻锁异常", e)
         }
     }
 
     private fun acquireWifiLowLatencyLock() {
-        try {
-            if (wifiLock == null) {
-                val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-                @Suppress("DEPRECATION")
-                wifiLock = wifiManager.createWifiLock(
-                    WifiManager.WIFI_MODE_FULL_LOW_LATENCY,
-                    "PureCast:WifiLock"
-                ).apply {
-                    setReferenceCounted(false)
+        synchronized(systemResourcesLock) {
+            if (isDestroyed) return
+            try {
+                if (wifiLock == null) {
+                    val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                    @Suppress("DEPRECATION")
+                    wifiLock = wifiManager.createWifiLock(
+                        WifiManager.WIFI_MODE_FULL_LOW_LATENCY,
+                        "PureCast:WifiLock"
+                    ).apply {
+                        setReferenceCounted(false)
+                    }
                 }
-            }
-            wifiLock?.let {
-                if (!it.isHeld) {
-                    it.acquire()
-                    Logger.service.i(TAG, "推流中: 已激活 Wi-Fi 低延迟锁 (WIFI_MODE_FULL_LOW_LATENCY)")
+                wifiLock?.let {
+                    if (!it.isHeld) {
+                        it.acquire()
+                        Logger.service.i(TAG, "推流中: 已激活 Wi-Fi 低延迟锁 (WIFI_MODE_FULL_LOW_LATENCY)")
+                    }
                 }
+            } catch (e: Exception) {
+                Logger.service.w(TAG, "激活 Wi-Fi 低延迟锁异常", e)
             }
-        } catch (e: Exception) {
-            Logger.service.w(TAG, "激活 Wi-Fi 低延迟锁异常", e)
         }
     }
 
     private fun releaseWifiLowLatencyLock() {
-        try {
-            wifiLock?.let {
-                if (it.isHeld) {
-                    it.release()
-                    Logger.service.i(TAG, "待机/暂停: 已释放 Wi-Fi 低延迟锁以降低电视功耗")
+        synchronized(systemResourcesLock) {
+            try {
+                wifiLock?.let {
+                    if (it.isHeld) {
+                        it.release()
+                        Logger.service.i(TAG, "待机/暂停: 已释放 Wi-Fi 低延迟锁以降低电视功耗")
+                    }
                 }
+            } catch (e: Exception) {
+                Logger.service.w(TAG, "释放 Wi-Fi 低延迟锁异常", e)
             }
-        } catch (e: Exception) {
-            Logger.service.w(TAG, "释放 Wi-Fi 低延迟锁异常", e)
         }
     }
 
     private fun releaseSystemLocks() {
-        try {
-            multicastLock?.let { if (it.isHeld) it.release() }
-            wifiLock?.let { if (it.isHeld) it.release() }
-            wakeLock?.let { if (it.isHeld) it.release() }
-            Logger.service.i(TAG, "已安全释放所有系统锁")
-        } catch (e: Exception) {
-            Logger.service.w(TAG, "释放系统锁异常", e)
+        synchronized(systemResourcesLock) {
+            try {
+                multicastLock?.let { if (it.isHeld) it.release() }
+                multicastLock = null
+                wifiLock?.let { if (it.isHeld) it.release() }
+                wifiLock = null
+                wakeLock?.let { if (it.isHeld) it.release() }
+                wakeLock = null
+                Logger.service.i(TAG, "已安全释放所有系统锁")
+            } catch (e: Exception) {
+                Logger.service.w(TAG, "释放系统锁异常", e)
+            }
         }
     }
 
@@ -589,14 +610,33 @@ class PlaybackService : LifecycleService() {
 
     fun updateFriendlyName(newName: String) {
         settingsRepository.setFriendlyName(newName)
+        serviceIoScope.launch {
+            applyFriendlyNameUpdate(newName)
+        }
+    }
+
+    @Synchronized
+    private fun applyFriendlyNameUpdate(newName: String) {
+        if (isDestroyed) return
         upnpServer?.updateFriendlyName(formatUpnpName(newName))
         airPlayServer?.updateDeviceName(formatAirPlayName(newName))
     }
 
     fun setAirPlayEnabled(enabled: Boolean) {
         settingsRepository.setAirPlayEnabled(enabled)
+        serviceIoScope.launch {
+            applyAirPlayEnabled(enabled)
+        }
+    }
+
+    @Synchronized
+    private fun applyAirPlayEnabled(enabled: Boolean) {
+        if (isDestroyed) return
         if (enabled) {
             val name = settingsRepository.getFriendlyName()
+            if (airPlayServer == null) {
+                airPlayServer = createAirPlayServer()
+            }
             airPlayServer?.start(formatAirPlayName(name))
         } else {
             airPlayServer?.stop()
@@ -605,6 +645,14 @@ class PlaybackService : LifecycleService() {
 
     fun setUpnpEnabled(enabled: Boolean) {
         settingsRepository.setUpnpEnabled(enabled)
+        serviceIoScope.launch {
+            applyUpnpEnabled(enabled)
+        }
+    }
+
+    @Synchronized
+    private fun applyUpnpEnabled(enabled: Boolean) {
+        if (isDestroyed) return
         if (enabled) {
             val name = settingsRepository.getFriendlyName()
             if (upnpServer == null) {
@@ -780,59 +828,90 @@ class PlaybackService : LifecycleService() {
     }
 
     private fun registerNetworkCallback() {
-        val connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
-        val callback = object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) {
-                Logger.service.i(TAG, "系统网络已连通，自检并刷新 UPnP / AirPlay 广播服务...")
-                lifecycleScope.launch(Dispatchers.Main) {
-                    refreshNetworkServices()
+        synchronized(systemResourcesLock) {
+            if (isDestroyed) return
+            val connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
+            val callback = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    Logger.service.i(TAG, "系统网络已连通，自检并刷新 UPnP / AirPlay 广播服务...")
+                    serviceIoScope.launch {
+                        refreshNetworkServices()
+                    }
+                }
+
+                override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
+                    Logger.service.i(TAG, "系统网络链路属性变更 (IP地址变动)，刷新广播服务...")
+                    serviceIoScope.launch {
+                        refreshNetworkServices()
+                    }
+                }
+
+                override fun onLost(network: Network) {
+                    Logger.service.w(TAG, "系统网络已断开")
                 }
             }
-
-            override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
-                Logger.service.i(TAG, "系统网络链路属性变更 (IP地址变动)，刷新广播服务...")
-                lifecycleScope.launch(Dispatchers.Main) {
-                    refreshNetworkServices()
-                }
-            }
-
-            override fun onLost(network: Network) {
-                Logger.service.w(TAG, "系统网络已断开")
-            }
-        }
-        networkCallback = callback
-        try {
-            val request = NetworkRequest.Builder()
-                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-                .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_RESTRICTED)
-                .build()
-            connectivityManager.registerNetworkCallback(request, callback)
-            Logger.service.i(TAG, "已成功注册网络状态监听器 (NetworkCallback)")
-        } catch (e: Exception) {
-            Logger.service.w(TAG, "按条件注册 NetworkCallback 失败，尝试默认注册", e)
+            networkCallback = callback
             try {
-                connectivityManager.registerDefaultNetworkCallback(callback)
-            } catch (e2: Exception) {
-                Logger.service.e(TAG, "注册 DefaultNetworkCallback 亦失败", e2)
+                val request = NetworkRequest.Builder()
+                    .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                    .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_RESTRICTED)
+                    .build()
+                connectivityManager.registerNetworkCallback(request, callback)
+                Logger.service.i(TAG, "已成功注册网络状态监听器 (NetworkCallback)")
+            } catch (e: Exception) {
+                Logger.service.w(TAG, "按条件注册 NetworkCallback 失败，尝试默认注册", e)
+                try {
+                    connectivityManager.registerDefaultNetworkCallback(callback)
+                } catch (e2: Exception) {
+                    Logger.service.e(TAG, "注册 DefaultNetworkCallback 亦失败", e2)
+                }
             }
         }
     }
 
     private fun unregisterNetworkCallback() {
-        networkCallback?.let {
-            try {
-                val connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
-                connectivityManager?.unregisterNetworkCallback(it)
-                Logger.service.i(TAG, "注销 NetworkCallback 监听器")
-            } catch (e: Exception) {
-                Logger.service.w(TAG, "注销 NetworkCallback 异常", e)
+        synchronized(systemResourcesLock) {
+            networkCallback?.let {
+                try {
+                    val connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                    connectivityManager?.unregisterNetworkCallback(it)
+                    Logger.service.i(TAG, "注销 NetworkCallback 监听器")
+                } catch (e: Exception) {
+                    Logger.service.w(TAG, "注销 NetworkCallback 异常", e)
+                }
+                networkCallback = null
             }
-            networkCallback = null
         }
     }
 
     @Synchronized
+    private fun startProtocolServersIfEnabled() {
+        if (isDestroyed) return
+        val friendlyName = settingsRepository.getFriendlyName()
+        if (settingsRepository.isUpnpEnabled() && upnpServer == null) {
+            upnpServer = createUpnpServer(formatUpnpName(friendlyName)).apply {
+                start()
+            }
+        }
+        if (airPlayServer == null) {
+            airPlayServer = createAirPlayServer()
+        }
+        if (settingsRepository.isAirPlayEnabled()) {
+            airPlayServer?.start(formatAirPlayName(friendlyName))
+        }
+    }
+
+    @Synchronized
+    private fun stopProtocolServers() {
+        upnpServer?.stop()
+        upnpServer = null
+        airPlayServer?.stop()
+        airPlayServer = null
+    }
+
+    @Synchronized
     fun refreshNetworkServices() {
+        if (isDestroyed) return
         val friendlyName = settingsRepository.getFriendlyName()
         if (settingsRepository.isUpnpEnabled()) {
             if (upnpServer == null) {
@@ -876,22 +955,22 @@ class PlaybackService : LifecycleService() {
 
     override fun onDestroy() {
         Logger.service.i(TAG, "PlaybackService onDestroy: 彻底清理服务...")
+        isDestroyed = true
         instance = null
         mediaSessionMetadataHelper.clear()
         unregisterNetworkCallback()
         if (::sessionHost.isInitialized) {
             sessionHost.stop()
         }
+        serviceIoScope.cancel()
+        serviceEffectsScope.cancel()
         coordinatorScope.cancel()
         mediaSession?.apply {
             isActive = false
             release()
         }
         mediaSession = null
-        upnpServer?.stop()
-        upnpServer = null
-        airPlayServer?.stop()
-        airPlayServer = null
+        stopProtocolServers()
         releaseWifiLowLatencyLock()
         releaseSystemLocks()
         if (::audioFocusManager.isInitialized) {

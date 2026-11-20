@@ -2,7 +2,6 @@ package com.solo.purecast.ui.background
 
 import android.content.Context
 import android.graphics.Bitmap
-import android.graphics.SurfaceTexture
 import android.opengl.EGL14
 import android.opengl.EGLConfig
 import android.opengl.EGLContext
@@ -10,17 +9,22 @@ import android.opengl.EGLDisplay
 import android.opengl.EGLSurface
 import android.os.Handler
 import android.os.HandlerThread
-import android.os.SystemClock
 import android.view.Choreographer
 import android.view.Surface
-import android.view.TextureView
+import android.view.SurfaceHolder
+import android.view.SurfaceView
 import android.view.View
 import com.solo.purecast.util.Logger
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * 💡 PureCast Apple Music 原生 GLES2 纹理承载视图 (MacTextureView)
- * 采用独立 HandlerThread 配合 Choreographer VSYNC 帧驱动，超低 CPU/GPU 开销，保障大屏 60 FPS 绝对丝滑。
+ * 💡 PureCast Apple Music 原生 GLES2 硬件叠加渲染视图 (MacTextureView -> SurfaceView)
+ * 升级为 SurfaceView + SurfaceHolder.setFixedSize 走电视芯片 HWC / VPU 硬件显示管线直接缩放叠加：
+ * 1. 彻底消除 TextureView 强制分配的 1920x1080 GlLayer (8.1MB) 以及 Skia 每帧重采样全屏背景的 GPU 占用；
+ * 2. 位于 Compose 透明窗口底层，大屏前景 UI、歌词与实心不透明设置页自然覆盖其上，无任何 Z-Order 冲突；
+ * 3. 采用独立 HandlerThread + Choreographer VSYNC 帧驱动，暂停态 GPU 占用归零。
  */
 internal class MacTextureView(
     context: Context,
@@ -28,7 +32,7 @@ internal class MacTextureView(
     private val onOpaqueReady: () -> Unit = {},
     private val onOpaqueLost: () -> Unit = {},
     private val onFailure: () -> Unit
-) : TextureView(context), TextureView.SurfaceTextureListener {
+) : SurfaceView(context), SurfaceHolder.Callback {
 
     @Volatile private var artwork: Bitmap? = null
     @Volatile private var renderState = FluidRenderState()
@@ -37,37 +41,44 @@ internal class MacTextureView(
     @Volatile private var surfaceGeneration = 0
     @Volatile private var surfaceWidth = 1
     @Volatile private var surfaceHeight = 1
-    private var fadeInStarted = false
+    private var fixedBufferWidth = -1
+    private var fixedBufferHeight = -1
     private var worker: Worker? = null
 
     init {
-        surfaceTextureListener = this
-        isOpaque = true
+        holder.addCallback(this)
         isFocusable = false
         isClickable = false
         importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
-        alpha = 0f
     }
 
     fun update(bitmap: Bitmap?, state: FluidRenderState, foreground: Boolean) {
         if (closed) return
         val changed = artwork !== bitmap || renderState != state || active != foreground
-        if (foreground && !active) requestOutputRecovery()
         artwork = bitmap
         renderState = state
         active = foreground
+        if (width > 0 && height > 0) {
+            applyFixedBufferSize(width, height, state.quality)
+        }
+        // 💡 设置页叠层关闭切回播放页时 SurfaceView 底层 Surface 从未丢失，只需 worker?.wake() 恢复 VSYNC 续绘
         if (changed) worker?.wake()
     }
 
-    private fun requestOutputRecovery() {
-        // 💡 仅递增 generation 以在待机恢复/HDMI切源时促使 EGLSurface 重建，绝不将 alpha 置 0 导致黑闪
-        surfaceGeneration++
-        worker?.wake()
+    private fun applyFixedBufferSize(viewWidth: Int, viewHeight: Int, quality: FluidQuality) {
+        val desired = backgroundOutputSize(viewWidth, viewHeight, quality)
+        if (desired.width != fixedBufferWidth || desired.height != fixedBufferHeight) {
+            fixedBufferWidth = desired.width
+            fixedBufferHeight = desired.height
+            holder.setFixedSize(desired.width, desired.height)
+        }
     }
 
-    override fun onWindowVisibilityChanged(visibility: Int) {
-        super.onWindowVisibilityChanged(visibility)
-        if (visibility == View.VISIBLE && !closed) requestOutputRecovery()
+    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+        super.onSizeChanged(w, h, oldw, oldh)
+        if (!closed && w > 0 && h > 0) {
+            applyFixedBufferSize(w, h, renderState.quality)
+        }
     }
 
     fun close() {
@@ -75,73 +86,68 @@ internal class MacTextureView(
         closed = true
         active = false
         artwork = null
-        animate().cancel()
-        fadeInStarted = false
-        worker?.stop(false)
+        val old = worker
+        worker = null
+        // 💡 与 surfaceDestroyed 保持一致的同步释放，确保 AndroidView.onRelease 先于 surfaceDestroyed 时
+        // GL 线程在底层 Surface 销毁前完成 eglDestroySurface / destroyEgl
+        old?.stopSync()
     }
 
-    override fun onSurfaceTextureAvailable(texture: SurfaceTexture, width: Int, height: Int) {
+    override fun surfaceCreated(holder: SurfaceHolder) {
         if (closed) return
-        if (!isHardwareAccelerated) {
-            Logger.ui.w("MacTextureView", "缺少硬件加速，回退静态背景")
-            onFailure()
-            return
+        if (width > 0 && height > 0) {
+            applyFixedBufferSize(width, height, renderState.quality)
+            surfaceWidth = fixedBufferWidth.coerceAtLeast(1)
+            surfaceHeight = fixedBufferHeight.coerceAtLeast(1)
+        } else {
+            val frame = holder.surfaceFrame
+            if (frame.width() > 0 && frame.height() > 0) {
+                applyFixedBufferSize(frame.width(), frame.height(), renderState.quality)
+                surfaceWidth = fixedBufferWidth.coerceAtLeast(1)
+                surfaceHeight = fixedBufferHeight.coerceAtLeast(1)
+            }
         }
-        surfaceWidth = width
-        surfaceHeight = height
-        worker = Worker(texture).also { it.start() }
+        val old = worker
+        worker = null
+        old?.stopSync()
+        worker = Worker(holder.surface).also { it.start() }
     }
 
-    override fun onSurfaceTextureSizeChanged(texture: SurfaceTexture, width: Int, height: Int) {
-        surfaceWidth = width
-        surfaceHeight = height
-        surfaceGeneration++
+    override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+        if (closed) return
+        val newW = width.coerceAtLeast(1)
+        val newH = height.coerceAtLeast(1)
+        val sizeChanged = newW != surfaceWidth || newH != surfaceHeight
+        surfaceWidth = newW
+        surfaceHeight = newH
+        if (sizeChanged) {
+            surfaceGeneration++
+        }
         worker?.wake()
     }
 
-    override fun onSurfaceTextureDestroyed(texture: SurfaceTexture): Boolean {
-        animate().cancel()
-        fadeInStarted = false
+    override fun surfaceDestroyed(holder: SurfaceHolder) {
         onOpaqueLost()
-        val old = worker ?: return true
+        val old = worker
         worker = null
-        old.stop(true)
-        return false
+        // 💡 SurfaceView 契约要求在 surfaceDestroyed 返回前完成 EGLSurface 解绑与释放，杜绝销毁后渲染崩溃
+        old?.stopSync()
     }
 
-    override fun onSurfaceTextureUpdated(texture: SurfaceTexture) {
-        // 💡 优化 5：MacTextureView 动画单次触发守卫
-        // 首帧渲染成功后通过 350ms 属性动画平滑渐显点亮，完全不透明后通知上层隐藏底层静态底图，消除全屏 1080p 过绘
-        if (!closed && !fadeInStarted && worker?.visibleFrame == true) {
-            fadeInStarted = true
-            alpha = 0.01f
-            animate().alpha(1f).setDuration(350L).withEndAction {
-                if (!closed) onOpaqueReady()
-            }.start()
-        }
-    }
-
-    private inner class Worker(private val texture: SurfaceTexture) {
+    private inner class Worker(private val surface: Surface) {
         private val thread = HandlerThread("Mac-GLES2-Worker")
         private lateinit var handler: Handler
         private val stopping = AtomicBoolean(false)
-        private val textureReleased = AtomicBoolean(false)
-        @Volatile private var releaseTexture = false
-        @Volatile private var cleanedUp = false
         @Volatile var visibleFrame = false
             private set
+        private var firstFrameNotified = false
         private var display: EGLDisplay = EGL14.EGL_NO_DISPLAY
         private var eglContext: EGLContext = EGL14.EGL_NO_CONTEXT
         private var eglSurface: EGLSurface = EGL14.EGL_NO_SURFACE
         private var eglConfig: EGLConfig? = null
-        private var outputSize: BackgroundOutputSize? = null
-        private var cachedViewWidth = -1
-        private var cachedViewHeight = -1
-        private var cachedQuality: FluidQuality? = null
-        private var cachedOutputSize: BackgroundOutputSize? = null
         private var outputGeneration = -1
-        private var reportedQuality: FluidQuality? = null
-        private var window: Surface? = null
+        private var outputWidth = -1
+        private var outputHeight = -1
         private var renderer: MacRenderer? = null
         private var uploaded: Bitmap? = null
         private var contextRestarts = 0
@@ -174,7 +180,6 @@ internal class MacTextureView(
                 render()
 
                 // 💡 当 state.playing == false（暂停或停止）且无材质交叉淡入渐变时，停止 choreographer 回调，GPU 占用直接降至 0%
-                // 若正在进行暂停期间的切歌封面淡入渐变 (renderer.isTransitioning == true)，维持帧率直至过渡完毕
                 if (shouldContinueVsync(state)) {
                     choreographer?.postFrameCallback(vsyncFrame)
                 }
@@ -204,7 +209,9 @@ internal class MacTextureView(
         }
 
         fun wake() {
-            if (!stopping.get()) handler.post { schedule() }
+            if (!stopping.get() && ::handler.isInitialized) {
+                handler.post { schedule() }
+            }
         }
 
         private fun schedule() {
@@ -217,7 +224,10 @@ internal class MacTextureView(
         }
 
         private fun render() {
-            if (stopping.get() || closed || !active) return
+            if (stopping.get() || closed || !active || !surface.isValid) return
+            val w = surfaceWidth
+            val h = surfaceHeight
+            if (w <= 1 || h <= 1) return
             try {
                 val r = renderer ?: return
                 val now = System.nanoTime()
@@ -227,23 +237,8 @@ internal class MacTextureView(
                     uploaded = bitmap
                 }
                 val state = renderState
-                val viewWidth = surfaceWidth
-                val viewHeight = surfaceHeight
-                val requested = if (viewWidth == cachedViewWidth && viewHeight == cachedViewHeight && state.quality == cachedQuality && cachedOutputSize != null) {
-                    cachedOutputSize!!
-                } else {
-                    backgroundOutputSize(viewWidth, viewHeight, state.quality).also {
-                        cachedViewWidth = viewWidth
-                        cachedViewHeight = viewHeight
-                        cachedQuality = state.quality
-                        cachedOutputSize = it
-                    }
-                }
-                ensureOutputSurface(requested)
-                visibleFrame = r.render(viewWidth, viewHeight, state, now, requested.width, requested.height)
-                if (reportedQuality != state.quality) {
-                    reportedQuality = state.quality
-                }
+                ensureOutputSurface(w, h)
+                visibleFrame = r.render(w, h, state, now, w, h)
                 // 💡 仅在成功完成有效帧渲染时才交换缓冲区，避免未就绪时向大屏输出黑底或残留帧
                 if (visibleFrame) {
                     if (!EGL14.eglSwapBuffers(display, eglSurface)) {
@@ -252,10 +247,16 @@ internal class MacTextureView(
                             Logger.ui.w("MacTextureView", "EGL 上下文丢失，重建中...")
                             destroyEgl()
                             createEgl()
-                            // 💡 修复：重建 EGL 上下文后立即 post 渲染一帧，消除在暂停态下因缺乏 VSYNC 驱动而黑屏
                             handler.post(frame)
                         } else {
                             error("EGL 交换缓冲失败: 0x${eglError.toString(16)}")
+                        }
+                    } else if (!firstFrameNotified) {
+                        firstFrameNotified = true
+                        this@MacTextureView.post {
+                            if (!closed && worker === this) {
+                                onOpaqueReady()
+                            }
                         }
                     }
                 }
@@ -265,6 +266,7 @@ internal class MacTextureView(
         }
 
         private fun createEgl() {
+            check(surface.isValid) { "Surface 无效" }
             display = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
             check(display != EGL14.EGL_NO_DISPLAY) { "无 EGL display" }
             val version = IntArray(2)
@@ -285,36 +287,30 @@ internal class MacTextureView(
                 intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE), 0
             )
             check(eglContext != EGL14.EGL_NO_CONTEXT) { "EGLContext 创建失败" }
-            // 💡 修复 Finding 2: setDefaultBufferSize 必须严格在 Surface(texture) 创建之前调用，
-            // 确保底层 BufferQueue 原生图层在首次与 Surface 绑定时即持有准确分辨率，杜绝首帧黑闪与拉伸错位
-            val initialSize = backgroundOutputSize(surfaceWidth, surfaceHeight, renderState.quality)
-            texture.setDefaultBufferSize(initialSize.width, initialSize.height)
-            window = Surface(texture)
-            ensureOutputSurface(initialSize)
+            ensureOutputSurface(surfaceWidth.coerceAtLeast(1), surfaceHeight.coerceAtLeast(1))
             renderer = MacRenderer(context, clock)
             renderer!!.initialize()
             uploaded = null
         }
 
-        private fun ensureOutputSurface(size: BackgroundOutputSize) {
+        private fun ensureOutputSurface(w: Int, h: Int) {
             val generation = surfaceGeneration
-            if (outputSize == size && outputGeneration == generation && eglSurface != EGL14.EGL_NO_SURFACE) return
+            if (outputWidth == w && outputHeight == h && outputGeneration == generation && eglSurface != EGL14.EGL_NO_SURFACE) return
             if (eglSurface != EGL14.EGL_NO_SURFACE) {
                 check(EGL14.eglMakeCurrent(display, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT))
                 check(EGL14.eglDestroySurface(display, eglSurface))
                 eglSurface = EGL14.EGL_NO_SURFACE
             }
-            texture.setDefaultBufferSize(size.width, size.height)
             eglSurface = EGL14.eglCreateWindowSurface(
-                display, checkNotNull(eglConfig), window,
+                display, checkNotNull(eglConfig), surface,
                 intArrayOf(EGL14.EGL_NONE), 0
             )
             check(eglSurface != EGL14.EGL_NO_SURFACE) { "EGLWindowSurface 创建失败" }
             check(EGL14.eglMakeCurrent(display, eglSurface, eglSurface, eglContext)) { "EGL make-current 失败" }
             EGL14.eglSwapInterval(display, 1)
-            outputSize = size
+            outputWidth = w
+            outputHeight = h
             outputGeneration = generation
-            reportedQuality = null
         }
 
         private fun destroyEgl() {
@@ -328,18 +324,12 @@ internal class MacTextureView(
                 EGL14.eglReleaseThread()
                 EGL14.eglTerminate(display)
             }
-            window?.release()
-            window = null
             eglSurface = EGL14.EGL_NO_SURFACE
             eglContext = EGL14.EGL_NO_CONTEXT
             eglConfig = null
-            outputSize = null
-            cachedViewWidth = -1
-            cachedViewHeight = -1
-            cachedQuality = null
-            cachedOutputSize = null
+            outputWidth = -1
+            outputHeight = -1
             outputGeneration = -1
-            reportedQuality = null
             display = EGL14.EGL_NO_DISPLAY
         }
 
@@ -348,31 +338,44 @@ internal class MacTextureView(
             Logger.ui.w("MacTextureView", "EGL 渲染异常，降级静态帧: ${error.message}")
             this@MacTextureView.post {
                 if (!closed && worker === this) {
-                    animate().cancel()
-                    fadeInStarted = false
-                    alpha = 0f
                     onFailure()
                 }
             }
-            stop(false)
+            stopAsync()
         }
 
-        fun stop(release: Boolean) {
-            if (release) releaseTexture = true
-            if (stopping.compareAndSet(false, true)) {
+        fun stopAsync() {
+            if (stopping.compareAndSet(false, true) && ::handler.isInitialized) {
                 handler.post {
                     handler.removeCallbacks(frame)
                     choreographer?.removeFrameCallback(vsyncFrame)
                     destroyEgl()
-                    cleanedUp = true
-                    if (releaseTexture) releaseNativeTexture()
                     thread.quitSafely()
                 }
-            } else if (release && cleanedUp) releaseNativeTexture()
+            }
         }
 
-        private fun releaseNativeTexture() {
-            if (textureReleased.compareAndSet(false, true)) texture.release()
+        fun stopSync() {
+            if (stopping.compareAndSet(false, true) && ::handler.isInitialized) {
+                val latch = CountDownLatch(1)
+                val posted = handler.post {
+                    try {
+                        handler.removeCallbacks(frame)
+                        choreographer?.removeFrameCallback(vsyncFrame)
+                        destroyEgl()
+                    } finally {
+                        latch.countDown()
+                        thread.quitSafely()
+                    }
+                }
+                if (posted) {
+                    try {
+                        latch.await(500L, TimeUnit.MILLISECONDS)
+                    } catch (_: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                    }
+                }
+            }
         }
     }
 }

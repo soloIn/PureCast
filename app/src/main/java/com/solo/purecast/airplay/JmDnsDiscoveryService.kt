@@ -57,6 +57,10 @@ class JmDnsDiscoveryService(private val context: Context) {
     private var targetDacpId: String? = null
     private var targetClientIp: String? = null
     private var onDacpPortResolvedCallback: ((Int) -> Unit)? = null
+    @Volatile
+    private var lastNotifiedDacpName: String? = null
+    @Volatile
+    private var lastNotifiedDacpPort: Int = -1
 
     @Volatile
     private var isBroadcasting = false
@@ -361,6 +365,8 @@ class JmDnsDiscoveryService(private val context: Context) {
         targetDacpId = dacpId.ifEmpty { null }
         targetClientIp = clientIp.ifEmpty { null }
         onDacpPortResolvedCallback = onPortResolved
+        lastNotifiedDacpName = null
+        lastNotifiedDacpPort = -1
 
         Logger.service.i(TAG, "注册 DACP 监听目标: dacpId=$dacpId, clientIp=$clientIp，启动动态匹配")
 
@@ -414,6 +420,12 @@ class JmDnsDiscoveryService(private val context: Context) {
         }
 
         if (matched) {
+            // 💡 同一会话内相同的 DACP 服务名与端口已通知过则直接去重跳过，消除 JmDNS 周期性多网卡重复解析刷屏与 GC 噪声
+            if (info.name == lastNotifiedDacpName && port == lastNotifiedDacpPort) {
+                return true
+            }
+            lastNotifiedDacpName = info.name
+            lastNotifiedDacpPort = port
             val ips = (info.hostAddresses.toList() + info.inet4Addresses.mapNotNull { it.hostAddress }).distinct().joinToString()
             Logger.service.i(TAG, "🎉 成功锁定 DACP 真实端口: $port (Name=${info.name}, IPs=[$ips])")
             onDacpPortResolvedCallback?.invoke(port)
@@ -434,6 +446,8 @@ class JmDnsDiscoveryService(private val context: Context) {
                 val directName = "iTunes_Ctrl_$targetId"
                 val fresh = dns.getServiceInfo(DACP_SERVICE_TYPE, directName, true, timeoutMs)
                 if (fresh != null && fresh.port > 0 && fresh.port != excludePort) {
+                    lastNotifiedDacpName = fresh.name.ifEmpty { directName }
+                    lastNotifiedDacpPort = fresh.port
                     Logger.service.i(TAG, "🔄 主动刷新 DACP 端口成功: $directName -> ${fresh.port}")
                     onDacpPortResolvedCallback?.invoke(fresh.port)
                     return@withContext fresh.port
@@ -461,5 +475,7 @@ class JmDnsDiscoveryService(private val context: Context) {
         targetDacpId = null
         targetClientIp = null
         onDacpPortResolvedCallback = null
+        lastNotifiedDacpName = null
+        lastNotifiedDacpPort = -1
     }
 }

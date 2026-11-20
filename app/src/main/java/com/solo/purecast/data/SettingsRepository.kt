@@ -16,7 +16,7 @@ import kotlinx.coroutines.flow.asStateFlow
  * 3. 首次开箱自检向导展示标记 (onboardingCompleted)
  * 4. 动态流光背景画质档位 (fluidQuality)
  */
-class SettingsRepository(context: Context) {
+class SettingsRepository internal constructor(context: Context) {
 
     private val prefs: SharedPreferences = context.applicationContext.getSharedPreferences(
         PREFS_NAME,
@@ -143,6 +143,26 @@ class SettingsRepository(context: Context) {
     companion object {
         private const val TAG = "SettingsRepository"
         private const val PREFS_NAME = "purecast_settings"
+
+        @Volatile
+        private var instance: SettingsRepository? = null
+
+        /**
+         * 💡 获取进程级单例仓库，确保主屏、设置页与前台服务共享同一组内存 StateFlow，
+         * 避免每次打开设置页重复同步读盘与配置状态不同步。
+         */
+        fun getInstance(context: Context): SettingsRepository {
+            return instance ?: synchronized(this) {
+                instance ?: SettingsRepository(context.applicationContext).also { instance = it }
+            }
+        }
+
+        @androidx.annotation.VisibleForTesting
+        internal fun resetInstanceForTest() {
+            synchronized(this) {
+                instance = null
+            }
+        }
 
         private const val KEY_FRIENDLY_NAME = "upnp_friendly_name"
         private const val KEY_IDLE_TIMEOUT_SECONDS = "usb_idle_timeout_seconds"

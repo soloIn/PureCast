@@ -9,7 +9,6 @@ import com.solo.purecast.model.TrackMetadata
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 
 /**
  * 💡 MediaSessionMetadataHelper: 封装系统 MediaSession 元数据及专辑封面位图采样解码逻辑，
@@ -18,6 +17,7 @@ import kotlinx.coroutines.withContext
  */
 class MediaSessionMetadataHelper {
 
+    private val cacheLock = Any()
     private var lastCoverMetadataHash: Int = 0
     private var lastCoverBitmap: Bitmap? = null
 
@@ -63,7 +63,7 @@ class MediaSessionMetadataHelper {
     }
 
     /**
-     * 更新 MediaSession 元数据，并在封面存在时异步下采样解码投递
+     * 更新 MediaSession 元数据，并在封面存在时异步下采样解码投递（全程在后台线程安全执行，不抢占主线程）
      */
     fun updateMediaSessionMetadata(
         session: MediaSession?,
@@ -81,30 +81,36 @@ class MediaSessionMetadataHelper {
             val coverBytes = metadata.coverBytes
             val currentHash = metadata.coverHash
 
-            // 💡 复用已解码的封面 Bitmap，避免无封面变更时被 baseBuilder 覆盖清空
-            if (coverBytes != null && coverBytes.isNotEmpty()) {
-                if (currentHash == lastCoverMetadataHash && lastCoverBitmap != null) {
-                    baseBuilder.putBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART, lastCoverBitmap)
-                    baseBuilder.putBitmap(MediaMetadata.METADATA_KEY_ART, lastCoverBitmap)
+            val shouldDecodeCover: Boolean
+            synchronized(cacheLock) {
+                // 💡 复用已解码的封面 Bitmap，避免无封面变更时被 baseBuilder 覆盖清空
+                if (coverBytes != null && coverBytes.isNotEmpty()) {
+                    if (currentHash == lastCoverMetadataHash && lastCoverBitmap != null) {
+                        baseBuilder.putBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART, lastCoverBitmap)
+                        baseBuilder.putBitmap(MediaMetadata.METADATA_KEY_ART, lastCoverBitmap)
+                        shouldDecodeCover = false
+                    } else {
+                        lastCoverMetadataHash = currentHash
+                        shouldDecodeCover = true
+                    }
+                } else {
+                    lastCoverMetadataHash = 0
+                    lastCoverBitmap = null
+                    shouldDecodeCover = false
                 }
-            } else {
-                lastCoverMetadataHash = 0
-                lastCoverBitmap = null
+                // 先快速更新纯文本元数据（若已有缓存封面则一并携带），在锁内串行提交避免快速切歌乱序覆盖
+                session.setMetadata(baseBuilder.build())
             }
 
-            // 先快速更新纯文本元数据（若已有缓存封面则一并携带）
-            session.setMetadata(baseBuilder.build())
-
-            // 💡 异步采样解码封面并同步至系统全局 MediaSession 卡片，限制 512x512 RGB_565
-            if (coverBytes != null && coverBytes.isNotEmpty() && currentHash != lastCoverMetadataHash) {
-                lastCoverMetadataHash = currentHash
+            // 💡 异步采样解码封面并同步至系统全局 MediaSession 卡片，限制 512x512 RGB_565，直接后台 Binder 提交不切回主线程
+            if (shouldDecodeCover && coverBytes != null) {
                 scope.launch(Dispatchers.IO) {
                     val bitmap = decodeSampledBitmapFromByteArray(coverBytes, reqWidth = 512, reqHeight = 512)
                     if (bitmap != null) {
-                        withContext(Dispatchers.Main) {
-                            try {
-                                if (lastCoverMetadataHash == currentHash) {
-                                    lastCoverBitmap = bitmap
+                        synchronized(cacheLock) {
+                            if (lastCoverMetadataHash == currentHash) {
+                                lastCoverBitmap = bitmap
+                                try {
                                     val fullBuilder = MediaMetadata.Builder()
                                         .putString(MediaMetadata.METADATA_KEY_TITLE, metadata.title)
                                         .putString(MediaMetadata.METADATA_KEY_ARTIST, metadata.artist)
@@ -113,9 +119,9 @@ class MediaSessionMetadataHelper {
                                         .putBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART, bitmap)
                                         .putBitmap(MediaMetadata.METADATA_KEY_ART, bitmap)
                                     session.setMetadata(fullBuilder.build())
+                                } catch (t: Throwable) {
+                                    Logger.service.w(TAG, "设置 MediaSession 带封面元数据异常", t)
                                 }
-                            } catch (t: Throwable) {
-                                Logger.service.w(TAG, "设置 MediaSession 带封面元数据异常", t)
                             }
                         }
                     }
@@ -130,8 +136,10 @@ class MediaSessionMetadataHelper {
      * 清理缓存的封面资源
      */
     fun clear() {
-        lastCoverBitmap = null
-        lastCoverMetadataHash = 0
+        synchronized(cacheLock) {
+            lastCoverBitmap = null
+            lastCoverMetadataHash = 0
+        }
     }
 
     companion object {

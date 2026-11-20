@@ -245,4 +245,17 @@ class SettingsRepositoryTest {
         assertTrue(SettingsRepository.PRESET_FRIENDLY_NAMES.isNotEmpty())
         assertTrue(SettingsRepository.PRESET_FRIENDLY_NAMES.contains(SettingsRepository.DEFAULT_FRIENDLY_NAME))
     }
+
+    @Test
+    fun testGetInstanceReturnsSharedSingleton() {
+        SettingsRepository.resetInstanceForTest()
+        val first = SettingsRepository.getInstance(app)
+        val second = SettingsRepository.getInstance(app)
+        assertTrue(first === second)
+
+        first.setFluidQuality(FluidQuality.HIGH_QUALITY)
+        assertEquals(FluidQuality.HIGH_QUALITY, second.fluidQualityFlow.value)
+
+        SettingsRepository.resetInstanceForTest()
+    }
 }

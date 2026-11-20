@@ -18,6 +18,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableFloatStateOf
@@ -67,9 +68,52 @@ fun LyricsStreamView(
     var activeLineIndex by remember(timeline) { mutableIntStateOf(-1) }
     var scrollLineIndex by remember(timeline) { mutableIntStateOf(-1) }
     var isInterludeRest by remember(timeline) { mutableStateOf(false) }
+    // 💡 O(1) 切句边界缓存：[0] = validFromMs, [1] = validUntilMs；未越过下一关键时间边界时直接跳过每帧两次二分查找
+    val boundaryWindowMs = remember(timeline) { longArrayOf(Long.MAX_VALUE, Long.MIN_VALUE) }
 
-    fun syncPlaybackIndices(nowTimeMs: Long) {
-        // 💡 60fps 零分配热路径：直接计算原始 Int 索引，避免每帧构造 ActiveLineState 与无效 words 遍历
+    fun computeNextBoundaryMs(nowTimeMs: Long, curActive: Int, curScroll: Int, curRest: Boolean): Long {
+        val lines = timeline.lines
+        if (lines.isEmpty()) return Long.MAX_VALUE
+        var nextBoundary = Long.MAX_VALUE
+        fun consider(t: Long) {
+            if (t > nowTimeMs && t < nextBoundary) nextBoundary = t
+        }
+        // 1. 下一激活行起始边界
+        val nextActiveIdx = if (curActive < 0) 0 else curActive + 1
+        if (nextActiveIdx in lines.indices) {
+            consider(syncClock.getEffectiveStartMs(nextActiveIdx, lines))
+        }
+        // 2. 下一滚动锚点行起始边界
+        val nextScrollIdx = if (curScroll < 0) 0 else curScroll + 1
+        if (nextScrollIdx in lines.indices) {
+            consider(syncClock.getScrollEffectiveStartMs(nextScrollIdx, lines))
+        }
+        // 3. 当前行结束时间与间奏静息进入边界
+        if (curActive in lines.indices) {
+            val curLine = lines[curActive]
+            consider(curLine.endMs + 1L)
+            if (!curRest) {
+                val vocalEndMs = curLine.words?.lastOrNull()?.endMs ?: curLine.endMs
+                if (vocalEndMs > curLine.startMs) {
+                    val nextStartMs = lines.getOrNull(curActive + 1)?.startMs
+                    if (nextStartMs != null) {
+                        if (nextStartMs - vocalEndMs >= 2500L) {
+                            consider(vocalEndMs + 500L)
+                        }
+                    } else {
+                        consider(vocalEndMs + 1500L)
+                    }
+                }
+            }
+        }
+        return nextBoundary
+    }
+
+    fun syncPlaybackIndices(nowTimeMs: Long, force: Boolean = false) {
+        if (!force && nowTimeMs >= boundaryWindowMs[0] && nowTimeMs < boundaryWindowMs[1]) {
+            return
+        }
+        // 💡 60fps 零分配热路径：仅在越过切句/滚动/间奏边界或 Seek 强制刷新时执行二分查找
         val nextActive = syncClock.calculateActiveLineIndex(timeline, nowTimeMs)
         val rawScroll = syncClock.calculateScrollLineIndex(timeline, nowTimeMs)
         val nextScroll = if (nextActive >= 0) maxOf(nextActive, rawScroll) else rawScroll
@@ -83,11 +127,15 @@ fun LyricsStreamView(
         if (rest != isInterludeRest) {
             isInterludeRest = rest
         }
+        boundaryWindowMs[0] = nowTimeMs
+        boundaryWindowMs[1] = computeNextBoundaryMs(nowTimeMs, nextActive, nextScroll, rest)
     }
 
     // 💡 播放态主循环：逐字与逐行歌词统一由 VSYNC 驱动，零重组且切句精准对齐 60Hz 帧边界
     LaunchedEffect(timeline, isPlaying) {
         if (!isPlaying) return@LaunchedEffect
+        // 切歌或恢复播放首帧强制对齐一次边界缓存
+        syncPlaybackIndices(syncClock.getCurrentInterpolatedTimeMs(), force = true)
         while (true) {
             withFrameNanos {
                 syncPlaybackIndices(syncClock.getCurrentInterpolatedTimeMs())
@@ -98,9 +146,9 @@ fun LyricsStreamView(
     // 💡 暂停态副作用：监听 mutationVersionFlow，确保暂停下 Seek 或切歌立即更新高亮行与间奏静息态
     LaunchedEffect(isPlaying, timeline) {
         if (!isPlaying) {
-            syncPlaybackIndices(syncClock.getCurrentInterpolatedTimeMs())
+            syncPlaybackIndices(syncClock.getCurrentInterpolatedTimeMs(), force = true)
             syncClock.mutationVersionFlow.collect {
-                syncPlaybackIndices(syncClock.getCurrentInterpolatedTimeMs())
+                syncPlaybackIndices(syncClock.getCurrentInterpolatedTimeMs(), force = true)
             }
         }
     }
@@ -119,6 +167,8 @@ fun LyricsStreamView(
     val waveGenCounter = remember(timeline) { intArrayOf(0) }
     val activeWaveLineGen = remember(timeline) { mutableMapOf<Int, Int>() }
     var layoutMeasureVersion by remember(timeline) { mutableIntStateOf(0) }
+    // 💡 批处理首帧/滑窗期间的多次 onSizeChanged：同一布局帧内最多写入一次 Snapshot State，避免 13 行连续递增触发重复失效
+    val measureFlushPending = remember(timeline) { booleanArrayOf(false) }
 
     val anchorIndex = scrollLineIndex.coerceAtLeast(0).coerceAtMost((timeline.lines.size - 1).coerceAtLeast(0))
 
@@ -142,9 +192,12 @@ fun LyricsStreamView(
         val targetCenterY = viewportHeightPx * 0.38f
 
         if (timeline.lines.isNotEmpty()) {
-            // 💡 订阅 layoutMeasureVersion，确保普通 HashMap 写入新测量行高后触发重算 latestTargetYs
+            // 💡 订阅 layoutMeasureVersion，确保普通 HashMap 写入新测量行高后触发重算 latestTargetYs，仅在组合提交后通过 SideEffect 复位脏标记
             @Suppress("UNUSED_VARIABLE")
             val measureVersion = layoutMeasureVersion
+            SideEffect {
+                measureFlushPending[0] = false
+            }
             // 💡 虚拟化窗口：仅挂载可见视口附近的最多 13 行，保证低端电视盒子满帧 60fps
             val windowStart = (anchorIndex - 4).coerceAtLeast(0)
             val windowEnd = (anchorIndex + 8).coerceAtMost(timeline.lines.lastIndex)
@@ -371,8 +424,9 @@ fun LyricsStreamView(
                                                 measuredHeights[index] = h
                                                 // 💡 底部新挂载行 (index == windowEnd && index != anchorIndex) 不影响当前窗口任何可见行坐标，
                                                 // 静默写入缓存供下一句使用，彻底消除每次切句第 1 帧的无效二次重组；
-                                                // 单行歌词或直接 Seek 到末行 (index == anchorIndex) 仍触发重算确保垂直居中。
-                                                if (index < windowEnd || index == anchorIndex) {
+                                                // 同一布局帧内其余多行首次测量仅合并触发一次 layoutMeasureVersion++。
+                                                if ((index < windowEnd || index == anchorIndex) && !measureFlushPending[0]) {
+                                                    measureFlushPending[0] = true
                                                     layoutMeasureVersion++
                                                 }
                                             }

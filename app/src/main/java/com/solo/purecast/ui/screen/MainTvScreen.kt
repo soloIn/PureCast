@@ -209,7 +209,7 @@ fun MainTvScreen(
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
-    val settingsRepo = remember { SettingsRepository(context) }
+    val settingsRepo = remember { SettingsRepository.getInstance(context) }
     val friendlyName by settingsRepo.friendlyNameFlow.collectAsState()
     val fluidQuality by settingsRepo.fluidQualityFlow.collectAsState()
 

@@ -36,7 +36,7 @@ internal object MacShaders {
     """.trimIndent()
 
     val ROTATION = """
-        precision highp float;
+        precision mediump float;
         uniform sampler2D u_texture, u_old;
         uniform float u_mix;
         varying highp vec2 v_uv;
@@ -59,7 +59,7 @@ internal object MacShaders {
     """.trimIndent()
 
     val MESH = """
-        precision highp float;
+        precision mediump float;
         uniform sampler2D u_texture;
         uniform float u_dark, u_luma;
         varying highp vec2 v_uv;
@@ -81,9 +81,10 @@ internal object MacShaders {
         val taps = MacScene.gaussian(sigma)
         fun num(v: Double) = String.format(Locale.US, "%.10f", v)
         return buildString {
-            append("precision highp float; uniform sampler2D u_texture; uniform vec2 u_axis, u_size; varying highp vec2 v_uv;")
-            append("vec4 zeroSample(vec2 uv) { vec2 f = clamp(min(uv, 1.0 - uv) * u_size + 0.5, 0.0, 1.0); return texture2D(u_texture, uv) * f.x * f.y; }")
-            append("void main() { vec2 uv = vec2(v_uv.x, 1.0 - v_uv.y); vec4 c = zeroSample(uv) * ${num(taps[0].second)};")
+            // 💡 片元颜色与高斯权重采用 mediump (Mali-G31 FP16 双倍算力)，UV 与步长保持 highp 防止边界精度偏移
+            append("precision mediump float; uniform sampler2D u_texture; uniform highp vec2 u_axis, u_size; varying highp vec2 v_uv;")
+            append("vec4 zeroSample(highp vec2 uv) { vec2 f = clamp(min(uv, 1.0 - uv) * u_size + 0.5, 0.0, 1.0); return texture2D(u_texture, uv) * f.x * f.y; }")
+            append("void main() { highp vec2 uv = vec2(v_uv.x, 1.0 - v_uv.y); vec4 c = zeroSample(uv) * ${num(taps[0].second)};")
             for ((offset, weight) in taps.drop(1)) {
                 append("c += (zeroSample(uv + u_axis * ${num(offset)}) + zeroSample(uv - u_axis * ${num(offset)})) * ${num(weight)};")
             }
