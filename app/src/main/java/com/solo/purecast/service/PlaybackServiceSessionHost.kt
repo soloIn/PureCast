@@ -409,8 +409,8 @@ class PlaybackServiceSessionHost(
             next.businessState == BusinessSessionState.PLAYING &&
             next.progressPositionMs == 0L
 
-        // 💡 开播保护：在当前曲目开播前 3.5 秒内，若协议上报了滞后小值 (0..1500ms)，不得逆向倒拉锚点；
-        // 仅用户显式寻道 (lastProgressFromUserSeek) 放行归零重播
+        // 💡 开播保护：仅拦截开播前 3.5 秒内协议补发的 0ms 未就绪空包；
+        // 真实非零协议进度（如切歌后到达的 7ms / 104ms）必须刷新锚点，防止 Ticker 持续偏快。
         val currentServiceElapsed = (nowMs - lastAnchorClockMs).coerceAtLeast(0L)
         val currentServicePos = lastAnchorPosMs + currentServiceElapsed
         val isInitialProtocolLag = !next.lastProgressFromUserSeek &&
@@ -418,8 +418,7 @@ class PlaybackServiceSessionHost(
             prev.trackGeneration == next.trackGeneration &&
             prev.businessState == BusinessSessionState.PLAYING &&
             currentServicePos in 1L..3500L &&
-            next.progressPositionMs in 0L..1500L &&
-            next.progressPositionMs < currentServicePos
+            next.progressPositionMs == 0L
 
         if (!isInitialProtocolLag && (prev == null ||
             prev.sessionId != next.sessionId ||

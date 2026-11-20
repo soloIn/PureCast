@@ -25,6 +25,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 internal class MacTextureView(
     context: Context,
     private val clock: MacClock,
+    private val onOpaqueReady: () -> Unit = {},
+    private val onOpaqueLost: () -> Unit = {},
     private val onFailure: () -> Unit
 ) : TextureView(context), TextureView.SurfaceTextureListener {
 
@@ -100,6 +102,7 @@ internal class MacTextureView(
     override fun onSurfaceTextureDestroyed(texture: SurfaceTexture): Boolean {
         animate().cancel()
         fadeInStarted = false
+        onOpaqueLost()
         val old = worker ?: return true
         worker = null
         old.stop(true)
@@ -108,11 +111,13 @@ internal class MacTextureView(
 
     override fun onSurfaceTextureUpdated(texture: SurfaceTexture) {
         // 💡 优化 5：MacTextureView 动画单次触发守卫
-        // 首帧渲染成功后通过 350ms 属性动画平滑渐显点亮，杜绝瞬时突变闪烁与每帧重复启动属性动画
+        // 首帧渲染成功后通过 350ms 属性动画平滑渐显点亮，完全不透明后通知上层隐藏底层静态底图，消除全屏 1080p 过绘
         if (!closed && !fadeInStarted && worker?.visibleFrame == true) {
             fadeInStarted = true
             alpha = 0.01f
-            animate().alpha(1f).setDuration(350L).start()
+            animate().alpha(1f).setDuration(350L).withEndAction {
+                if (!closed) onOpaqueReady()
+            }.start()
         }
     }
 
@@ -152,9 +157,14 @@ internal class MacTextureView(
             if (!stopping.get() && !closed && active) {
                 val state = renderState
 
-                // 💡 帧率节流：当 quality.fps 在 1..30 之间（如 POWER_SAVE 档位的 30fps）时，跳过奇数 VSYNC 信号（60Hz -> 30Hz）
+                // 💡 帧率节流：按 60Hz VSYNC 精确分频（例如 30fps -> 每 2 帧渲染 1 次，20fps -> 每 3 帧渲染 1 次）
+                val stride = if (state.quality.fps in 1..59) {
+                    (60 / state.quality.fps).coerceAtLeast(1).toLong()
+                } else {
+                    1L
+                }
                 vsyncFrameCount++
-                if (state.quality.fps in 1..30 && (vsyncFrameCount % 2L != 0L)) {
+                if (stride > 1L && (vsyncFrameCount % stride != 0L)) {
                     if (shouldContinueVsync(state)) {
                         choreographer?.postFrameCallback(vsyncFrame)
                     }

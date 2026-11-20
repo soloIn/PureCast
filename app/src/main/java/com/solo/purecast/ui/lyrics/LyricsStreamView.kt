@@ -22,18 +22,14 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
-import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.graphics.BlendMode
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
@@ -52,7 +48,7 @@ import kotlin.math.sin
  * 💡 沉浸式 Apple Music TV 风格逐行弹簧波浪歌词视口（参考 AMLL / AMLV 架构）：
  * 1. 由父容器统一持有每行独立 Y 轴物理弹簧 (posYAnims)，彻底杜绝虚拟窗口滑动时 key 重建导致的滚动动画丢失；
  * 2. 切句瞬间已唱行与当前行立即起动，下方队列行按行距错峰延迟形成波浪上涌，同时与高亮放大同频衔接、零延迟踩点；
- * 3. 每行弹簧在 graphicsLayer 中纯 GPU 合成（0 重组、0 重新布局），visibilityThreshold = 0.5px 根除亚像素长尾微颤，
+ * 3. 每行弹簧在 1:1 刚性 Offscreen graphicsLayer 中以连续浮点 translationY 纯 GPU 合成（0 重组、0 重新布局），visibilityThreshold = 0.5px 根除低速长尾拖影，
  *    且快节奏连续切句自动继承当前物理速度，零顿挫；
  * 4. 长前奏与长间奏优雅呈现 Apple Music 三点呼吸脉动指示器 (• • •)。
  */
@@ -69,33 +65,32 @@ fun LyricsStreamView(
 
     val isWordSync = timeline.format == LyricFormat.TTML_SYLLABLE || timeline.format == LyricFormat.LRC_WORD_SYNC
     var activeLineIndex by remember(timeline) { mutableIntStateOf(-1) }
+    var scrollLineIndex by remember(timeline) { mutableIntStateOf(-1) }
     var isInterludeRest by remember(timeline) { mutableStateOf(false) }
 
     fun syncPlaybackIndices(nowTimeMs: Long) {
-        val state = syncClock.calculateActiveLineState(timeline, nowTimeMs)
-        if (state.lineIndex != activeLineIndex) {
-            activeLineIndex = state.lineIndex
+        // 💡 60fps 零分配热路径：直接计算原始 Int 索引，避免每帧构造 ActiveLineState 与无效 words 遍历
+        val nextActive = syncClock.calculateActiveLineIndex(timeline, nowTimeMs)
+        val rawScroll = syncClock.calculateScrollLineIndex(timeline, nowTimeMs)
+        val nextScroll = if (nextActive >= 0) maxOf(nextActive, rawScroll) else rawScroll
+        if (nextActive != activeLineIndex) {
+            activeLineIndex = nextActive
         }
-        val rest = LyricsRenderingMath.isInInterludeRest(timeline, state.lineIndex, nowTimeMs)
+        if (nextScroll != scrollLineIndex) {
+            scrollLineIndex = nextScroll
+        }
+        val rest = LyricsRenderingMath.isInInterludeRest(timeline, nextActive, nowTimeMs)
         if (rest != isInterludeRest) {
             isInterludeRest = rest
         }
     }
 
-    // 💡 播放态主循环：追踪 activeLineIndex 与长间奏静息态
-    LaunchedEffect(timeline, isWordSync, isPlaying) {
+    // 💡 播放态主循环：逐字与逐行歌词统一由 VSYNC 驱动，零重组且切句精准对齐 60Hz 帧边界
+    LaunchedEffect(timeline, isPlaying) {
         if (!isPlaying) return@LaunchedEffect
-
-        if (isWordSync) {
-            while (true) {
-                withFrameNanos {
-                    syncPlaybackIndices(syncClock.getCurrentInterpolatedTimeMs())
-                }
-            }
-        } else {
-            while (true) {
+        while (true) {
+            withFrameNanos {
                 syncPlaybackIndices(syncClock.getCurrentInterpolatedTimeMs())
-                delay(33L)
             }
         }
     }
@@ -115,8 +110,9 @@ fun LyricsStreamView(
     val fallbackSingleHeightPx = with(density) { 46.dp.toPx() }.roundToInt().toFloat()
     val fallbackBilingualHeightPx = with(density) { 78.dp.toPx() }.roundToInt().toFloat()
 
-    // 💡 缓存每行实际测量高度、每行独立 Y 轴弹簧、最新目标坐标与波浪代数（按 timeline 隔离，切歌自动清空）
-    val measuredHeights = remember(timeline) { mutableStateMapOf<Int, Float>() }
+    // 💡 缓存每行实际测量高度（普通 HashMap + layoutMeasureVersion 驱动，避免 SnapshotStateMap 锁退化）、
+    // 每行独立 Y 轴弹簧、最新目标坐标与波浪代数（按 timeline 隔离，切歌自动清空）
+    val measuredHeights = remember(timeline) { HashMap<Int, Float>() }
     val posYAnims = remember(timeline) { mutableMapOf<Int, Animatable<Float, AnimationVector1D>>() }
     val latestTargetYs = remember(timeline) { mutableMapOf<Int, Float>() }
     val lastAnchorRef = remember(timeline) { intArrayOf(-1) }
@@ -124,7 +120,7 @@ fun LyricsStreamView(
     val activeWaveLineGen = remember(timeline) { mutableMapOf<Int, Int>() }
     var layoutMeasureVersion by remember(timeline) { mutableIntStateOf(0) }
 
-    val anchorIndex = activeLineIndex.coerceAtLeast(0).coerceAtMost((timeline.lines.size - 1).coerceAtLeast(0))
+    val anchorIndex = scrollLineIndex.coerceAtLeast(0).coerceAtMost((timeline.lines.size - 1).coerceAtLeast(0))
 
     val waveParams = remember(timeline, anchorIndex) {
         LyricsRenderingMath.calculateWaveSpringParams(
@@ -133,38 +129,22 @@ fun LyricsStreamView(
         )
     }
 
+    val topEdgeFadePx = with(density) { 110.dp.toPx() }
+    val bottomEdgeFadePx = with(density) { 130.dp.toPx() }
+
     BoxWithConstraints(
         modifier = modifier
             .fillMaxSize()
-            .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
-            .drawWithContent {
-                drawContent()
-                val fadeHeight = 80.dp.toPx()
-                // 顶部 80dp 羽化渐隐
-                drawRect(
-                    brush = Brush.verticalGradient(
-                        colors = listOf(Color.Transparent, Color.Black),
-                        startY = 0f,
-                        endY = fadeHeight
-                    ),
-                    blendMode = BlendMode.DstIn
-                )
-                // 底部 80dp 羽化渐隐
-                drawRect(
-                    brush = Brush.verticalGradient(
-                        colors = listOf(Color.Black, Color.Transparent),
-                        startY = size.height - fadeHeight,
-                        endY = size.height
-                    ),
-                    blendMode = BlendMode.DstIn
-                )
-            }
+            .clipToBounds()
     ) {
         val viewportHeightPx = constraints.maxHeight.toFloat()
         if (viewportHeightPx <= 0f) return@BoxWithConstraints
         val targetCenterY = viewportHeightPx * 0.38f
 
         if (timeline.lines.isNotEmpty()) {
+            // 💡 订阅 layoutMeasureVersion，确保普通 HashMap 写入新测量行高后触发重算 latestTargetYs
+            @Suppress("UNUSED_VARIABLE")
+            val measureVersion = layoutMeasureVersion
             // 💡 虚拟化窗口：仅挂载可见视口附近的最多 13 行，保证低端电视盒子满帧 60fps
             val windowStart = (anchorIndex - 4).coerceAtLeast(0)
             val windowEnd = (anchorIndex + 8).coerceAtMost(timeline.lines.lastIndex)
@@ -234,24 +214,21 @@ fun LyricsStreamView(
                         activeWaveLineGen[idx] = currentWaveGen
                     }
 
-                    // 2. 并发驱动视口内所有行（旧行先让位 0ms，新行微延迟跟进，下方行依次错峰形成全屏弹性波浪）
+                    // 2. 并发驱动视口内所有行（旧行与即将开口的新行同步 0ms 起动加速就位，下方队列行按 42ms 错峰形成流水波浪）
                     val isScrollingForward = anchorIndex >= prevAnchor
-                    val activeLeadDelayMs = (waveParams.staggerStepMs * 0.75).toLong()
                     for (idx in windowStart..windowEnd) {
                         launch {
                             try {
                                 val anim = posYAnims[idx] ?: return@launch
                                 val staggerDelayMs = if (isScrollingForward) {
                                     when {
-                                        idx < anchorIndex -> 0L
-                                        idx == anchorIndex -> activeLeadDelayMs
-                                        else -> (activeLeadDelayMs + (idx - anchorIndex) * waveParams.staggerStepMs).coerceAtMost(160L)
+                                        idx <= anchorIndex -> 0L
+                                        else -> ((idx - anchorIndex) * waveParams.staggerStepMs).coerceAtMost(240L)
                                     }
                                 } else {
                                     when {
-                                        idx > anchorIndex -> 0L
-                                        idx == anchorIndex -> activeLeadDelayMs
-                                        else -> (activeLeadDelayMs + (anchorIndex - idx) * waveParams.staggerStepMs).coerceAtMost(160L)
+                                        idx >= anchorIndex -> 0L
+                                        else -> ((anchorIndex - idx) * waveParams.staggerStepMs).coerceAtMost(240L)
                                     }
                                 }
                                 if (staggerDelayMs > 0L) {
@@ -270,7 +247,7 @@ fun LyricsStreamView(
                                 }
                                 // 若波浪进行期间上方新行完成了多行换行测量导致 latestTargetYs 更新，补做一次平滑收尾
                                 val settledTy = latestTargetYs[idx]
-                                if (settledTy != null && abs(anim.value - settledTy) > 1f) {
+                                if (settledTy != null && abs(anim.value - settledTy) > 0.5f) {
                                     anim.animateTo(
                                         targetValue = settledTy,
                                         animationSpec = spring(
@@ -304,8 +281,12 @@ fun LyricsStreamView(
             }
 
             // 💡 前奏期 (activeLineIndex == -1 且首句 >= 3s) 或长间奏静息期显示 Apple Music 经典三点呼吸指示器
-            val showIntroDots = activeLineIndex == -1 && (timeline.lines.firstOrNull()?.startMs ?: 0L) >= 3000L
-            val showInterludeDots = isInterludeRest && activeLineIndex in timeline.lines.indices && activeLineIndex < timeline.lines.lastIndex
+            // 当间奏最后 450ms scrollLineIndex 已提前切入下一句上滑时，三点指示器在原位平滑淡出（锁定 lastValidDotsYRef 绝不瞬移）
+            val showIntroDots = activeLineIndex == -1 && scrollLineIndex == -1 && (timeline.lines.firstOrNull()?.startMs ?: 0L) >= 3000L
+            val showInterludeDots = isInterludeRest &&
+                scrollLineIndex == activeLineIndex &&
+                activeLineIndex in timeline.lines.indices &&
+                activeLineIndex < timeline.lines.lastIndex
             val dotsHeightPx = with(density) { 20.dp.toPx() }
             val lastValidDotsYRef = remember(timeline) { floatArrayOf(targetCenterY) }
             val resolvedDotsY = when {
@@ -347,13 +328,39 @@ fun LyricsStreamView(
                 }
 
                 key(timeline) {
+                    val isInterludeHolding = isInterludeRest && (scrollLineIndex == activeLineIndex)
                     for (index in windowStart..windowEnd) {
                         val line = timeline.lines[index]
                         val posYAnim = posYAnims[index] ?: continue
-                        val isFocused = (index == activeLineIndex) && !isInterludeRest
-                        val distance = if (activeLineIndex >= 0) abs(index - activeLineIndex) else (index + 1)
+                        // 💡 逐字歌词用 activeLineIndex 保护上一句尾字扫光不被截断；
+                        // 普通逐行歌词直接与 scrollLineIndex 同频点亮，消除“滑到位了字还没亮”的割裂感。
+                        val visualFocusIndex = if (isWordSync) activeLineIndex else scrollLineIndex
+                        val isFocused = if (isWordSync) {
+                            (index == activeLineIndex) && !isInterludeRest
+                        } else {
+                            (index == scrollLineIndex) && !isInterludeHolding
+                        }
+                        // 💡 远距行透明度在 distance >= 5 时已钳位至下限，钳位入参避免切句时远距行无谓重组
+                        val distance = (if (visualFocusIndex >= 0) abs(index - visualFocusIndex) else (index + 1)).coerceAtMost(5)
+                        val estimatedLineHeight = heightOf(index)
 
                         key(index) {
+                            val translationYProvider = remember(posYAnim) { { posYAnim.value } }
+                            val edgeAlphaProvider = remember(
+                                estimatedLineHeight,
+                                viewportHeightPx,
+                                topEdgeFadePx,
+                                bottomEdgeFadePx
+                            ) {
+                                { y: Float ->
+                                    LyricsRenderingMath.calculateViewportEdgeFadeAlpha(
+                                        lineCenterY = y + estimatedLineHeight * 0.5f,
+                                        viewportHeightPx = viewportHeightPx,
+                                        topFadePx = topEdgeFadePx,
+                                        bottomFadePx = bottomEdgeFadePx
+                                    )
+                                }
+                            }
                             Box(
                                 modifier = Modifier
                                     .fillMaxWidth()
@@ -362,12 +369,14 @@ fun LyricsStreamView(
                                             val h = size.height.toFloat()
                                             if (measuredHeights[index] != h) {
                                                 measuredHeights[index] = h
-                                                layoutMeasureVersion++
+                                                // 💡 底部新挂载行 (index == windowEnd && index != anchorIndex) 不影响当前窗口任何可见行坐标，
+                                                // 静默写入缓存供下一句使用，彻底消除每次切句第 1 帧的无效二次重组；
+                                                // 单行歌词或直接 Seek 到末行 (index == anchorIndex) 仍触发重算确保垂直居中。
+                                                if (index < windowEnd || index == anchorIndex) {
+                                                    layoutMeasureVersion++
+                                                }
                                             }
                                         }
-                                    }
-                                    .graphicsLayer {
-                                        translationY = posYAnim.value
                                     }
                             ) {
                                 SmoothLyricLineRow(
@@ -378,7 +387,9 @@ fun LyricsStreamView(
                                     syncClock = syncClock,
                                     primaryColor = primaryTextColor,
                                     isPlaying = isPlaying,
-                                    springStiffness = waveParams.stiffness
+                                    springStiffness = waveParams.stiffness,
+                                    translationYProvider = translationYProvider,
+                                    edgeAlphaProvider = edgeAlphaProvider
                                 )
                             }
                         }

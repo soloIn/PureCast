@@ -127,4 +127,55 @@ class DacpClientTest {
             serverThread.join(1000L)
         }
     }
+
+    @Test
+    fun `executeRemoteCommand refreshes stale refused port and retries on live port`() = runBlocking {
+        // 1. 构造一个已关闭的死端口（模拟 iOS 重连后旧的 63302 端口报 ConnectException）
+        val deadSocket = ServerSocket(0)
+        val deadPort = deadSocket.localPort
+        deadSocket.close()
+
+        // 2. 启动一个新的真实监听端口（模拟 iOS 新会话的实时 DACP 端口）
+        val liveServer = ServerSocket(0)
+        val livePort = liveServer.localPort
+        val capturedRequests = CopyOnWriteArrayList<String>()
+        val serverThread = Thread {
+            try {
+                liveServer.accept().use { client ->
+                    val firstLine = client.getInputStream().bufferedReader().readLine() ?: ""
+                    capturedRequests += firstLine
+                    client.getOutputStream().write(
+                        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .toByteArray(Charsets.US_ASCII)
+                    )
+                    client.getOutputStream().flush()
+                }
+            } catch (_: Exception) {
+            }
+        }.apply {
+            isDaemon = true
+            start()
+        }
+
+        try {
+            val client = DacpClient(testScope)
+            client.updateSession("127.0.0.1", deadPort, "live_token_123")
+
+            val failedPortsReported = CopyOnWriteArrayList<Int>()
+            client.onPortRefreshRequested = { failedPort ->
+                failedPortsReported += failedPort
+                livePort
+            }
+
+            val result = client.executeRemoteCommand(RemoteCommandType.PLAY)
+            assertTrue("遇死端口刷新到新端口后应重试成功", result.isSuccess)
+            assertEquals(listOf(deadPort), failedPortsReported)
+            assertEquals("客户端应永久更新为新端口", livePort, client.getCurrentPort())
+            assertEquals(1, capturedRequests.size)
+            assertTrue(capturedRequests[0].startsWith("GET /ctrl-int/1/play "))
+        } finally {
+            runCatching { liveServer.close() }
+            serverThread.join(1000L)
+        }
+    }
 }

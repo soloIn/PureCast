@@ -103,14 +103,6 @@ data class ExplicitPauseEvent(
 ) : SessionEventPayload
 
 /**
- * Native 底层检测到隐式静音断流并确认进入保活后上报，触发协调层 0ms 立即切换 PAUSED
- */
-data class ImplicitPauseEvent(
-    val epoch: Long,
-    val reason: String = "native_implicit_silence"
-) : SessionEventPayload
-
-/**
  * 恢复推流或暂停续播事件
  * 若当前硬件态为 RELEASED（例如 USB 拔出插回授权后的待命态），恢复前须对新 fd 重新 open_device。
  */

@@ -116,7 +116,7 @@ bool RaopRtp::start(int& out_data_port, int& out_ctrl_port, int& out_timing_port
     data_thread_ = std::thread(&RaopRtp::data_loop, this);
     ctrl_thread_ = std::thread(&RaopRtp::ctrl_loop, this);
     timing_thread_ = std::thread(&RaopRtp::timing_loop, this);
-    watchdog_thread_ = std::thread(&RaopRtp::watchdog_loop, this);
+    sync_drain_thread_ = std::thread(&RaopRtp::sync_drain_loop, this);
 
     LOGI("RAOP RTP 服务启动成功: Data=%d, Control=%d, Timing=%d", data_port_, ctrl_port_, timing_port_);
     return true;
@@ -138,7 +138,7 @@ void RaopRtp::stop() {
     if (data_thread_.joinable()) data_thread_.join();
     if (ctrl_thread_.joinable()) ctrl_thread_.join();
     if (timing_thread_.joinable()) timing_thread_.join();
-    if (watchdog_thread_.joinable()) watchdog_thread_.join();
+    if (sync_drain_thread_.joinable()) sync_drain_thread_.join();
 
     // 💡 步骤 3: 线程完全终止后，再统一执行 close 释放文件描述符，彻底杜绝并发竞态
     if (data_fd_ >= 0) {
@@ -158,10 +158,26 @@ void RaopRtp::stop() {
     first_data_seq_ = true;
     last_data_seq_ = 0;
     has_client_ctrl_.store(false, std::memory_order_release);
+    has_client_timing_.store(false, std::memory_order_release);
+    has_ntp_offset_.store(false, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(ntp_mutex_);
+        ntp_sample_count_ = 0;
+        ntp_sample_cursor_ = 0;
+        ntp_offset_us_ = 0;
+    }
+    {
+        std::lock_guard<std::mutex> lock(sync_mutex_);
+        sync_rtp_ts_ = 0;
+        sync_local_mono_us_ = 0;
+        has_sync_anchor_ = false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(audio_packet_mutex_);
+        sync_playback_started_ = false;
+    }
     resend_req_seq_.store(0, std::memory_order_relaxed);
-    last_audio_packet_time_ms_.store(0, std::memory_order_relaxed);
     is_manually_paused_.store(false, std::memory_order_relaxed);
-    is_implicitly_paused_.store(false, std::memory_order_relaxed);
     emitted_first_epoch_.store(0ULL, std::memory_order_release);
     track_duration_ms_.store(0, std::memory_order_release);
     track_position_ms_.store(0, std::memory_order_release);
@@ -174,6 +190,17 @@ void RaopRtp::stop() {
         has_crypto_.store(false, std::memory_order_release);
     }
     LOGI("RAOP RTP 接收引擎已完全停止");
+}
+
+void RaopRtp::reset_buffer() {
+    // 💡 统一在 audio_packet_mutex_ 锁内原子重置 JitterBuffer、已写时间戳游标与起播门控态，
+    // 与 process_audio_packet / drain_jitter_buffer_locked 保持完全一致的锁序 (audio_packet_mutex_ -> jitter_buffer_.mutex_)。
+    // AirPlay 1 的 Sync 时钟映射 (rtp_now <-> ntp_time) 是会话级连续时钟：
+    // FLUSH / RECORD 绝不能擦除 has_sync_anchor_（仅在 stop() 清零，超 15 秒未更新由 get_target_speaker_rtp_ts() 自动失效）。
+    std::lock_guard<std::mutex> lock(audio_packet_mutex_);
+    jitter_buffer_.reset();
+    has_written_rtp_ts_.store(false, std::memory_order_release);
+    sync_playback_started_ = false;
 }
 
 void RaopRtp::set_client_control_endpoint(const std::string& client_ip, int client_ctrl_port) {
@@ -190,6 +217,55 @@ void RaopRtp::set_client_control_endpoint(const std::string& client_ip, int clie
         has_client_ctrl_.store(true, std::memory_order_release);
         LOGI("显式配置客户端控制端点: %s:%d (用于 RAOP 丢包重传)", client_ip.c_str(), client_ctrl_port);
     }
+}
+
+void RaopRtp::set_client_timing_endpoint(const std::string& client_ip, int client_timing_port) {
+    if (client_ip.empty() || client_timing_port <= 0) return;
+    struct sockaddr_in addr{};
+    std::memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(client_timing_port);
+    if (inet_pton(AF_INET, client_ip.c_str(), &addr.sin_addr) > 0) {
+        {
+            std::lock_guard<std::mutex> lock(timing_addr_mutex_);
+            client_timing_addr_ = addr;
+        }
+        has_client_timing_.store(true, std::memory_order_release);
+        LOGI("显式配置客户端 NTP Timing 授时端点: %s:%d", client_ip.c_str(), client_timing_port);
+    }
+}
+
+bool RaopRtp::get_target_speaker_rtp_ts(uint32_t& out_ts) const {
+    uint32_t anchor_rtp = 0;
+    int64_t anchor_mono_us = 0;
+    {
+        std::lock_guard<std::mutex> lock(sync_mutex_);
+        if (!has_sync_anchor_) {
+            return false;
+        }
+        anchor_rtp = sync_rtp_ts_;
+        anchor_mono_us = sync_local_mono_us_;
+    }
+
+    const int64_t now_us = get_monotonic_time_us();
+    const int64_t elapsed_us = now_us - anchor_mono_us;
+    // 若 Sync 锚点超过 15 秒未更新或时间戳严重倒置，视为失效并回退非门控模式
+    if (elapsed_us < -500000LL || elapsed_us > 15000000LL) {
+        return false;
+    }
+
+    int sr = 44100;
+    {
+        std::lock_guard<std::mutex> flock(format_mutex_);
+        if (format_sample_rate_ > 0) sr = format_sample_rate_;
+    }
+    const int64_t elapsed_samples = (elapsed_us * static_cast<int64_t>(sr)) / 1000000LL;
+    // 💡 精确扣除 RECORD 响应申报的 Audio-Latency (11025 采样 = 250ms)：
+    // iPhone 会将 Sync.rtp_now 提前 11025 采样下发以预留硬件延迟；扣除后扬声器真实出声时刻精准对齐 iPhone curr_ts。
+    out_ts = static_cast<uint32_t>(
+        static_cast<int64_t>(anchor_rtp) + elapsed_samples - static_cast<int64_t>(REPORTED_AUDIO_LATENCY_SAMPLES)
+    );
+    return true;
 }
 
 void RaopRtp::send_resend_request(uint16_t first_seq, uint16_t count) {
@@ -239,9 +315,24 @@ void RaopRtp::set_alac_config(int frame_length, int bit_depth, int channels, int
          frame_length, bit_depth, channels, sample_rate);
 }
 
-uint64_t RaopRtp::get_monotonic_time_ms() {
+int64_t RaopRtp::get_monotonic_time_us() {
     using namespace std::chrono;
-    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+    return duration_cast<microseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+uint64_t RaopRtp::mono_us_to_ntp(int64_t us) {
+    if (us < 0) us = 0;
+    const uint64_t sec = static_cast<uint64_t>(us / 1000000LL);
+    const uint64_t rem_us = static_cast<uint64_t>(us % 1000000LL);
+    const uint64_t frac = (rem_us << 32) / 1000000ULL;
+    return (sec << 32) | (frac & 0xFFFFFFFFULL);
+}
+
+int64_t RaopRtp::ntp_to_us(uint64_t ntp) {
+    const int64_t sec = static_cast<int64_t>(ntp >> 32);
+    const uint64_t frac = ntp & 0xFFFFFFFFULL;
+    const int64_t usec = static_cast<int64_t>((frac * 1000000ULL + 0x80000000ULL) >> 32);
+    return sec * 1000000LL + usec;
 }
 
 void RaopRtp::drain_jitter_buffer() {
@@ -250,28 +341,104 @@ void RaopRtp::drain_jitter_buffer() {
 }
 
 void RaopRtp::drain_jitter_buffer_locked() {
-    if (is_manually_paused_.load(std::memory_order_acquire)) {
+    // 💡 显式暂停态（RTSP PAUSE 或 TV 端主动暂停 AudioEngine）立即停止排空与漂移丢帧：
+    // 杜绝 AudioEngine 暂停冻结环形缓冲期间，慢晶振漂移收敛误判滞后狂丢帧。
+    if (is_manually_paused_.load(std::memory_order_acquire) ||
+        AudioEngine::instance().is_paused()) {
         return;
     }
+
+    int sr = 44100;
+    int bits = 16;
+    int ch = 2;
+    std::string codec_str = "ALAC";
+    {
+        std::lock_guard<std::mutex> flock(format_mutex_);
+        if (format_sample_rate_ > 0) sr = format_sample_rate_;
+        if (format_bit_depth_ > 0) bits = format_bit_depth_;
+        if (format_channels_ > 0) ch = format_channels_;
+        codec_str = format_codec_;
+    }
+    const uint32_t bytes_per_frame = static_cast<uint32_t>(ch * (bits / 8));
+
+    // 💡 基于 NTP Timing + Sync (PT=84) 计算此刻扬声器应出声的目标 RTP 时间戳
+    uint32_t target_speaker_ts = 0;
+    const bool has_sync_target = get_target_speaker_rtp_ts(target_speaker_ts);
+    const int32_t usb_urb_samples = static_cast<int32_t>((static_cast<int64_t>(sr) * 8LL) / 1000LL);        // ~8ms USB URB 在途管线
+    const int32_t target_ring_samples = static_cast<int32_t>((static_cast<int64_t>(sr) * 130LL) / 1000LL);   // ~130ms 目标环形缓冲水位 (>100ms 预充)
+    const int32_t max_drift_late_samples = static_cast<int32_t>((static_cast<int64_t>(sr) * 45LL) / 1000LL); // 45ms 滞后追赶门限
+    const int32_t max_sync_sanity_samples = static_cast<int32_t>(sr) * 4;                                    // 4s 异常时间戳防死锁保护
+
     size_t next_frame_size = 0;
+    uint32_t head_ts = 0;
+    bool has_head_ts = false;
     std::vector<uint8_t> ready_frame;
     uint32_t frame_ts = 0;
     bool has_frame_ts = false;
-    while (jitter_buffer_.peek_size(next_frame_size) &&
-           AudioEngine::instance().get_buffer_available() >= next_frame_size &&
-           jitter_buffer_.pop(ready_frame, &frame_ts, &has_frame_ts)) {
+
+    while (jitter_buffer_.peek_head(next_frame_size, head_ts, has_head_ts)) {
+        if (has_sync_target && has_head_ts) {
+            const int32_t ahead_of_speaker = static_cast<int32_t>(head_ts - target_speaker_ts);
+            if (ahead_of_speaker >= -max_sync_sanity_samples && ahead_of_speaker <= max_sync_sanity_samples) {
+                const size_t ring_bytes = AudioEngine::instance().get_available_read();
+                const uint32_t ring_unplayed_samples = (bytes_per_frame > 0)
+                    ? static_cast<uint32_t>(ring_bytes / bytes_per_frame)
+                    : 0U;
+
+                if (!sync_playback_started_) {
+                    // 💡 阶段 1 (起播门控)：在 head_ts 真正到达扬声器出声时刻 (减去 ~8ms USB URB 管线延迟) 前，
+                    // 将音频帧压在 RaopJitterBuffer 中等待，杜绝比 iPhone 提前 1.7~2.0s 出声！
+                    if (ahead_of_speaker > usb_urb_samples) {
+                        break;
+                    }
+                    if (ahead_of_speaker < -max_drift_late_samples) {
+                        // 首包已严重滞后于目标出声时刻，丢弃过期帧快速对齐
+                        jitter_buffer_.pop(ready_frame, nullptr, nullptr);
+                        continue;
+                    }
+                    sync_playback_started_ = true;
+                    LOGI("🎯 Sync 精准起播对齐: head_ts=%u, target_speaker_ts=%u (偏差=%d 采样 / %.1f ms, buffered=%zu)",
+                         head_ts, target_speaker_ts, ahead_of_speaker,
+                         static_cast<double>(ahead_of_speaker) * 1000.0 / static_cast<double>(sr),
+                         jitter_buffer_.buffered_packets());
+                } else {
+                    if (ring_unplayed_samples == 0 && ahead_of_speaker > max_drift_late_samples) {
+                        // 缓冲已完全排空且后续帧仍远在未来，重新进入起播门控
+                        sync_playback_started_ = false;
+                        break;
+                    }
+                    // 💡 阶段 2 (稳态水门)：仅在环形缓冲需要补水至 target_ring_samples (~130ms) 时放行帧写入 AudioEngine
+                    if (ahead_of_speaker > target_ring_samples + usb_urb_samples) {
+                        break;
+                    }
+                    // 💡 慢晶振漂移收敛：若实测扬声器滞后于 iPhone 超 45ms 且环形缓冲高于目标水位，静默丢弃 1 帧 (8ms) 追平
+                    if (has_written_rtp_ts_.load(std::memory_order_acquire)) {
+                        const uint32_t written_ts = last_written_rtp_ts_.load(std::memory_order_acquire);
+                        const uint32_t actual_speaker_ts = written_ts - ring_unplayed_samples;
+                        const int32_t speaker_lag = static_cast<int32_t>(target_speaker_ts - actual_speaker_ts);
+                        if (speaker_lag > max_drift_late_samples &&
+                            ring_unplayed_samples > static_cast<uint32_t>(target_ring_samples)) {
+                            LOGD("Sync 慢晶振漂移收敛: 滞后 %d 采样 (%.1f ms)，丢弃 1 帧追平",
+                                 speaker_lag, static_cast<double>(speaker_lag) * 1000.0 / static_cast<double>(sr));
+                            jitter_buffer_.pop(ready_frame, nullptr, nullptr);
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (AudioEngine::instance().get_buffer_available() < next_frame_size) {
+            break;
+        }
+        if (!jitter_buffer_.pop(ready_frame, &frame_ts, &has_frame_ts)) {
+            break;
+        }
+
         const uint64_t cur_epoch = active_epoch_.load(std::memory_order_acquire);
         int written = AudioEngine::instance().write_pcm(ready_frame.data(), ready_frame.size(), cur_epoch);
         if (written > 0) {
             if (has_frame_ts) {
-                int ch = 2;
-                int bits = 16;
-                {
-                    std::lock_guard<std::mutex> flock(format_mutex_);
-                    if (format_channels_ > 0) ch = format_channels_;
-                    if (format_bit_depth_ > 0) bits = format_bit_depth_;
-                }
-                const uint32_t bytes_per_frame = static_cast<uint32_t>(ch * (bits / 8));
                 const uint32_t written_samples = (bytes_per_frame > 0)
                     ? static_cast<uint32_t>(static_cast<size_t>(written) / bytes_per_frame)
                     : 352U;
@@ -283,17 +450,6 @@ void RaopRtp::drain_jitter_buffer_locked() {
             if (prev_emitted != cur_epoch &&
                 emitted_first_epoch_.compare_exchange_strong(prev_emitted, cur_epoch, std::memory_order_acq_rel)) {
                 FirstDataPacketCallback fcb_copy;
-                int sr = 44100;
-                int bits = 16;
-                int ch = 2;
-                std::string codec_str = "ALAC";
-                {
-                    std::lock_guard<std::mutex> flock(format_mutex_);
-                    sr = format_sample_rate_;
-                    bits = format_bit_depth_;
-                    ch = format_channels_;
-                    codec_str = format_codec_;
-                }
                 {
                     std::lock_guard<std::mutex> slock(state_mutex_);
                     fcb_copy = first_packet_cb_;
@@ -311,57 +467,76 @@ void RaopRtp::drain_jitter_buffer_locked() {
             break;
         }
     }
-}
 
-void RaopRtp::watchdog_loop() {
-    LOGI("RAOP RTP 数据流无数据看门狗已启动");
-    while (is_running_.load(std::memory_order_relaxed)) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        if (!is_running_.load(std::memory_order_relaxed)) break;
-
-        // 💡 修复 Finding 8: 周期性排空 JitterBuffer 中因环形缓冲填满而滞留的就绪帧，防止停顿后未送入 AudioEngine
-        drain_jitter_buffer();
-
-        uint64_t last_time = last_audio_packet_time_ms_.load(std::memory_order_relaxed);
-        if (last_time > 0 && !is_manually_paused_.load(std::memory_order_relaxed) && !is_implicitly_paused_.load(std::memory_order_relaxed)) {
-            uint64_t now = get_monotonic_time_ms();
-            if (now > last_time && (now - last_time) >= 600) {
-                // 💡 修复 Finding 2: 解耦隐式无数据饥饿暂停与显式手动暂停，绝不设置 is_manually_paused_ 锁死后续新包接入
-                is_implicitly_paused_.store(true, std::memory_order_release);
-                const uint64_t ep = active_epoch_.load(std::memory_order_acquire);
-                LOGI("⚠️ 检测到 RTP 音频流停顿超 600ms (iPhone 隐式停止推流)，通知上层隐式暂停: epoch=%llu",
-                     static_cast<unsigned long long>(ep));
-                emit_state_callback(true, true, ep);
+    // 💡 快晶振漂移防欠载：若 USB DAC 消耗略快于 iPhone 时钟导致环形缓冲逼近 100ms 预充下限，
+    // 而下一真实帧仍未到 Sync 放行时刻，补写 1 帧 (8ms) 静音垫步以保活不断音并平滑拉回同步
+    if (sync_playback_started_ && has_sync_target &&
+        has_written_rtp_ts_.load(std::memory_order_acquire) &&
+        jitter_buffer_.peek_head(next_frame_size, head_ts, has_head_ts) && has_head_ts) {
+        const int32_t ahead_of_speaker = static_cast<int32_t>(head_ts - target_speaker_ts);
+        const size_t ring_bytes = AudioEngine::instance().get_available_read();
+        const uint32_t ring_unplayed_samples = (bytes_per_frame > 0)
+            ? static_cast<uint32_t>(ring_bytes / bytes_per_frame)
+            : 0U;
+        const uint32_t min_safe_ring_samples = static_cast<uint32_t>((static_cast<int64_t>(sr) * 105LL) / 1000LL);
+        if (ring_unplayed_samples > 0 &&
+            ring_unplayed_samples < min_safe_ring_samples &&
+            ahead_of_speaker > target_ring_samples + usb_urb_samples &&
+            ahead_of_speaker <= max_sync_sanity_samples &&
+            bytes_per_frame > 0) {
+            const uint32_t pad_samples = static_cast<uint32_t>(
+                std::max<int64_t>(352LL, (static_cast<int64_t>(sr) * 8LL) / 1000LL)
+            );
+            const size_t pad_bytes = static_cast<size_t>(pad_samples) * bytes_per_frame;
+            if (AudioEngine::instance().get_buffer_available() >= pad_bytes) {
+                if (pad_silence_buf_.size() < pad_bytes) {
+                    pad_silence_buf_.assign(pad_bytes, 0);
+                }
+                const uint64_t cur_epoch = active_epoch_.load(std::memory_order_acquire);
+                const int pad_written = AudioEngine::instance().write_pcm(pad_silence_buf_.data(), pad_bytes, cur_epoch);
+                if (pad_written > 0) {
+                    LOGD("Sync 快晶振漂移垫步: ring=%u 采样 < %u，插入 %u 采样 (~8ms) 静音防欠载并回拉对齐",
+                         ring_unplayed_samples, min_safe_ring_samples, pad_samples);
+                }
             }
         }
     }
-    LOGI("RAOP RTP 数据流无数据看门狗已退出");
 }
 
-void RaopRtp::emit_state_callback(bool is_paused, bool is_implicit, uint64_t epoch) {
+void RaopRtp::sync_drain_loop() {
+    LOGI("RAOP RTP Sync 门控排空调度线程已启动");
+    while (is_running_.load(std::memory_order_relaxed)) {
+        // 💡 10ms 调度节拍：纯数据面职责，仅负责排空到达 Sync 放行时刻或因背压滞留的就绪帧
+        // 控制面暂停/恢复/停止严格由 RTSP 信令 (PAUSE / FLUSH / TEARDOWN / RECORD) 驱动，绝不在 UDP 层猜测停流
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        if (!is_running_.load(std::memory_order_relaxed)) break;
+        drain_jitter_buffer();
+    }
+    LOGI("RAOP RTP Sync 门控排空调度线程已退出");
+}
+
+void RaopRtp::emit_state_callback(bool is_paused, uint64_t epoch) {
     StreamStateCallback cb_copy;
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
         cb_copy = state_cb_;
     }
     if (cb_copy) {
-        cb_copy(is_paused, is_implicit, epoch);
+        cb_copy(is_paused, epoch);
     }
 }
 
 void RaopRtp::mark_paused_manually(bool paused, bool emit_callback) {
     is_manually_paused_.store(paused, std::memory_order_release);
-    is_implicitly_paused_.store(false, std::memory_order_release);
     if (paused) {
         LOGI("收到手动标记暂停指令 (RTSP PAUSE)");
     } else {
         LOGI("收到手动标记恢复指令 (RTSP RECORD, emit=%d)", emit_callback ? 1 : 0);
-        last_audio_packet_time_ms_.store(get_monotonic_time_ms(), std::memory_order_relaxed);
     }
     if (!emit_callback) {
         return;
     }
-    emit_state_callback(paused, false, active_epoch_.load(std::memory_order_acquire));
+    emit_state_callback(paused, active_epoch_.load(std::memory_order_acquire));
 }
 
 uint64_t RaopRtp::get_ntp_timestamp() {
@@ -428,19 +603,7 @@ void RaopRtp::process_audio_packet(const uint8_t* data, ssize_t len, uint8_t pay
              cur_cnt, payload_type, len, has_crypto_.load(std::memory_order_relaxed));
     }
 
-    // 💡 修复 Finding 2: 解耦隐式无数据饥饿与显式手动暂停
-    // 若此前看门狗因无数据触发了隐式暂停，新到达的音频包意味着推流恢复，立即自动解除隐式暂停并唤醒 AudioEngine
-    if (is_implicitly_paused_.load(std::memory_order_acquire)) {
-        is_implicitly_paused_.store(false, std::memory_order_release);
-        LOGI("收到新音频数据包，自动解除隐式暂停并恢复 AudioEngine");
-        AudioEngine::instance().resume_stream();
-        const uint64_t ep = active_epoch_.load(std::memory_order_acquire);
-        emit_state_callback(false, true, ep);
-    }
-
-    // 💡 更新最近音频数据包时间戳供看门狗超时检测 (绝不可在此盲目唤醒播放，须待解码确定非静音后方可唤醒)
-    uint64_t now_ms = get_monotonic_time_ms();
-    last_audio_packet_time_ms_.store(now_ms, std::memory_order_relaxed);
+    // 💡 控制面状态由 RTSP 信令严格驱动，音频数据面严禁越权猜测暂停或唤醒
 
     const uint8_t* pktp = data;
     ssize_t plen = len;
@@ -581,8 +744,8 @@ void RaopRtp::process_audio_packet(const uint8_t* data, ssize_t len, uint8_t pay
             LOGI("process_audio_packet: 短音频包原始负载 [pkt=%u, len=%zu]: %s", cur_cnt, payload_len, hex_buf);
         }
 
-        // 💡 显式暂停保护：若当前处于显式手动暂停态 (RTSP PAUSE / 本机主动暂停)，丢弃在途音频帧，杜绝污染与延迟
-        if (is_manually_paused_.load(std::memory_order_acquire)) {
+        // 💡 显式暂停保护：若当前处于显式手动暂停态 (RTSP PAUSE 或本机主动暂停 AudioEngine)，丢弃在途音频帧，杜绝旧帧堆积与恢复跳变
+        if (is_manually_paused_.load(std::memory_order_acquire) || AudioEngine::instance().is_paused()) {
             return;
         }
 
@@ -592,6 +755,163 @@ void RaopRtp::process_audio_packet(const uint8_t* data, ssize_t len, uint8_t pay
 
         // 3. 💡 修复 Finding 8 & Finding 5: 排空已就绪音频帧并写入 AudioEngine 环形缓冲
         drain_jitter_buffer_locked();
+    }
+}
+
+static inline uint32_t read_be32(const uint8_t* p) {
+    return (static_cast<uint32_t>(p[0]) << 24) |
+           (static_cast<uint32_t>(p[1]) << 16) |
+           (static_cast<uint32_t>(p[2]) << 8)  |
+           static_cast<uint32_t>(p[3]);
+}
+
+static inline uint64_t read_be64(const uint8_t* p) {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; ++i) {
+        v = (v << 8) | static_cast<uint64_t>(p[i]);
+    }
+    return v;
+}
+
+static inline void write_be64(uint8_t* p, uint64_t v) {
+    for (int i = 0; i < 8; ++i) {
+        p[i] = static_cast<uint8_t>((v >> ((7 - i) * 8)) & 0xFF);
+    }
+}
+
+void RaopRtp::handle_sync_packet(const uint8_t* data, ssize_t len) {
+    if (data == nullptr || len < 20) return;
+
+    const bool is_first_sync = (data[0] & 0x10) != 0;
+    const uint32_t rtp_now = read_be32(data + 4);
+    const uint64_t ntp_sender = read_be64(data + 8);
+    const uint32_t rtp_next = read_be32(data + 16);
+    const int64_t recv_mono_us = get_monotonic_time_us();
+
+    int64_t sync_local_mono_us = recv_mono_us;
+    bool used_ntp = false;
+    if (has_ntp_offset_.load(std::memory_order_acquire) && ntp_sender != 0) {
+        int64_t offset_us = 0;
+        {
+            std::lock_guard<std::mutex> lock(ntp_mutex_);
+            offset_us = ntp_offset_us_;
+        }
+        const int64_t mapped_mono_us = ntp_to_us(ntp_sender) - offset_us;
+        // 合理性保护：仅当 NTP 映射时刻与本地到达时刻相差在 ±500ms 内才采信，防止非标准客户端异常纪元污染
+        const int64_t diff_us = mapped_mono_us - recv_mono_us;
+        if (diff_us >= -500000LL && diff_us <= 500000LL) {
+            sync_local_mono_us = mapped_mono_us;
+            used_ntp = true;
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(sync_mutex_);
+        sync_rtp_ts_ = rtp_now;
+        sync_local_mono_us_ = sync_local_mono_us;
+        has_sync_anchor_ = true;
+    }
+
+    int sr = 44100;
+    {
+        std::lock_guard<std::mutex> flock(format_mutex_);
+        if (format_sample_rate_ > 0) sr = format_sample_rate_;
+    }
+    const int32_t sender_latency_samples = static_cast<int32_t>(rtp_next - rtp_now);
+    const double sender_latency_ms = static_cast<double>(sender_latency_samples) * 1000.0 / static_cast<double>(sr);
+
+    if (is_first_sync) {
+        LOGI("⏱️ 收到首帧 Sync 同步包: rtp_now=%u, rtp_next=%u (发端缓冲=%.1f ms), ntp_locked=%d",
+             rtp_now, rtp_next, sender_latency_ms, used_ntp ? 1 : 0);
+    } else {
+        LOGD("收到客户端 Sync 控制包 (len=%zd): rtp_now=%u, rtp_next=%u (发端缓冲=%.1f ms), ntp_locked=%d",
+             len, rtp_now, rtp_next, sender_latency_ms, used_ntp ? 1 : 0);
+    }
+
+    // 同步锚点更新后立即检查是否到达放行时刻
+    drain_jitter_buffer();
+}
+
+void RaopRtp::send_timing_request() {
+    if (!has_client_timing_.load(std::memory_order_acquire) || timing_fd_ < 0) {
+        return;
+    }
+
+    struct sockaddr_in target_addr{};
+    {
+        std::lock_guard<std::mutex> lock(timing_addr_mutex_);
+        target_addr = client_timing_addr_;
+    }
+
+    // 💡 遵循 RFC 5905 & Apple RAOP 32 字节 NTP Timing 请求报文 (0x80, 0xD2, seq=0x0007)
+    // 将本地单调时钟编码进 Transmit Timestamp (offset 24..31)，客户端回包时将原样回显到 offset 8..15，
+    // 从而直接解算出“发射端 NTP 时钟 - 本地单调时钟”的精确偏移，完全免疫 Android 系统墙钟跳变！
+    uint8_t req[32];
+    std::memset(req, 0, sizeof(req));
+    req[0] = 0x80;
+    req[1] = 0xD2;
+    req[2] = 0x00;
+    req[3] = 0x07;
+    const uint64_t t1_ntp = mono_us_to_ntp(get_monotonic_time_us());
+    write_be64(req + 24, t1_ntp);
+
+    ssize_t ret = sendto(timing_fd_, req, sizeof(req), 0,
+                         reinterpret_cast<const struct sockaddr*>(&target_addr),
+                         sizeof(target_addr));
+    if (ret < 0) {
+        LOGD("发送主动 NTP Timing 请求失败: errno=%d", errno);
+    }
+}
+
+void RaopRtp::handle_timing_reply(const uint8_t* data, ssize_t len, int64_t t4_mono_us) {
+    if (data == nullptr || len < 32) return;
+
+    const int64_t t1_mono_us = ntp_to_us(read_be64(data + 8));
+    const int64_t t2_sender_us = ntp_to_us(read_be64(data + 16));
+    const int64_t t3_sender_us = ntp_to_us(read_be64(data + 24));
+
+    const int64_t rtt_us = (t4_mono_us - t1_mono_us) - (t3_sender_us - t2_sender_us);
+    if (rtt_us < 0 || rtt_us > 500000LL) {
+        LOGD("忽略异常 NTP Timing 样本: rtt=%lld us", static_cast<long long>(rtt_us));
+        return;
+    }
+
+    // 💡 防溢出中值公式计算 sender_ntp_us - local_mono_us = ((T2 - T1) + (T3 - T4)) / 2
+    const int64_t diff1 = t2_sender_us - t1_mono_us;
+    const int64_t diff2 = t3_sender_us - t4_mono_us;
+    const int64_t sample_offset_us = diff1 + (diff2 - diff1) / 2;
+
+    int64_t best_rtt = rtt_us;
+    int64_t best_offset = sample_offset_us;
+    bool first_lock = false;
+    {
+        std::lock_guard<std::mutex> lock(ntp_mutex_);
+        first_lock = (ntp_sample_count_ == 0);
+        ntp_samples_[ntp_sample_cursor_] = NtpTimingSample{rtt_us, sample_offset_us};
+        ntp_sample_cursor_ = (ntp_sample_cursor_ + 1) % NTP_FILTER_WINDOW;
+        if (ntp_sample_count_ < NTP_FILTER_WINDOW) {
+            ntp_sample_count_++;
+        }
+
+        // 💡 最小 RTT 滤波（剔除 Wi-Fi 排队毛刺，取最对称网络往返样本）
+        best_rtt = ntp_samples_[0].rtt_us;
+        best_offset = ntp_samples_[0].offset_us;
+        for (size_t i = 1; i < ntp_sample_count_; ++i) {
+            if (ntp_samples_[i].rtt_us < best_rtt) {
+                best_rtt = ntp_samples_[i].rtt_us;
+                best_offset = ntp_samples_[i].offset_us;
+            }
+        }
+        ntp_offset_us_ = best_offset;
+    }
+    has_ntp_offset_.store(true, std::memory_order_release);
+
+    if (first_lock) {
+        LOGI("🎯 NTP Timing 时钟偏移首次锁定: rtt=%.2f ms, offset=%lld us",
+             static_cast<double>(best_rtt) / 1000.0, static_cast<long long>(best_offset));
+    } else {
+        LOGD("NTP Timing 时钟校准更新: cur_rtt=%.2f ms, best_rtt=%.2f ms",
+             static_cast<double>(rtt_us) / 1000.0, static_cast<double>(best_rtt) / 1000.0);
     }
 }
 
@@ -627,8 +947,8 @@ void RaopRtp::ctrl_loop() {
 
         uint8_t payload_type = buffer[1] & 0x7F;
         if (payload_type == 84) {
-            // RTP Sync 同步包 (包含 RTP 时间戳与 NTP 时间戳映射)
-            LOGD("收到客户端 Sync 控制包 (len=%zd)", n);
+            // 💡 RTP Sync 同步包 (20 字节，包含此刻扬声器应出声的 RTP 时间戳与 NTP 时间戳映射)
+            handle_sync_packet(buffer.data(), n);
         } else if (payload_type == 86) {
             // 💡 AirTunes/RAOP 重传音频数据包通过控制端口到达，交由 process_audio_packet 处理
             process_audio_packet(buffer.data(), n, payload_type);
@@ -640,10 +960,26 @@ void RaopRtp::ctrl_loop() {
 
 void RaopRtp::timing_loop() {
     std::vector<uint8_t> buffer(128);
+    int64_t last_req_mono_us = 0;
 
     LOGI("RAOP RTP 授时接收线程已启动");
 
     while (is_running_.load(std::memory_order_acquire)) {
+        // 💡 主动向发射端发起 NTP Timing 对时：收敛前 200ms 快速轮询 3 次，锁定后每 3 秒维持校准
+        if (has_client_timing_.load(std::memory_order_acquire)) {
+            const int64_t now_us = get_monotonic_time_us();
+            size_t count = 0;
+            {
+                std::lock_guard<std::mutex> lock(ntp_mutex_);
+                count = ntp_sample_count_;
+            }
+            const int64_t interval_us = (count < 3) ? 200000LL : 3000000LL;
+            if (last_req_mono_us == 0 || (now_us - last_req_mono_us) >= interval_us) {
+                send_timing_request();
+                last_req_mono_us = now_us;
+            }
+        }
+
         struct sockaddr_in client_addr{};
         socklen_t addr_len = sizeof(client_addr);
 
@@ -654,31 +990,27 @@ void RaopRtp::timing_loop() {
             break;
         }
 
-        // Timing 请求报文固定为 32 字节
+        // Timing 报文固定为 32 字节
         if (n == 32) {
-            uint64_t recv_time = get_ntp_timestamp();
-            // 回复报文: payload type 设置为 0x53 (带 marker 0xD3)
-            buffer[0] = 0x80;
-            buffer[1] = 0xD3;
+            const uint8_t pt = buffer[1] & 0x7F;
+            if (pt == 83) {
+                // 💡 收到发射端返回的 NTP Timing 响应 (PT=83)，解算精确时钟偏移
+                handle_timing_reply(buffer.data(), n, get_monotonic_time_us());
+            } else if (pt == 82) {
+                // 💡 被动回复客户端发起的 NTP Timing 请求 (PT=82)
+                uint64_t recv_time = get_ntp_timestamp();
+                buffer[0] = 0x80;
+                buffer[1] = 0xD3;
 
-            // 💡 关键修复: 将客户端请求中的 Transmit Timestamp (offset 24..31)
-            // 原样写回回复报文的 Originate Timestamp (offset 8..15)，满足 RFC 5905 与 Apple RAOP 严格时钟校准规范
-            std::memcpy(&buffer[8], &buffer[24], 8);
+                // 将客户端请求中的 Transmit Timestamp (offset 24..31) 原样写回 Originate Timestamp (offset 8..15)
+                std::memcpy(&buffer[8], &buffer[24], 8);
+                write_be64(&buffer[16], recv_time);
+                write_be64(&buffer[24], get_ntp_timestamp());
 
-            // 写入接收时间戳 (offset 16)
-            for (int i = 0; i < 8; ++i) {
-                buffer[16 + i] = static_cast<uint8_t>((recv_time >> ((7 - i) * 8)) & 0xFF);
+                sendto(timing_fd_, buffer.data(), 32, 0,
+                       reinterpret_cast<struct sockaddr*>(&client_addr), addr_len);
+                LOGD("处理并回复客户端 NTP Timing 授时校准包");
             }
-
-            // 写入发送时间戳 (offset 24)
-            uint64_t send_time = get_ntp_timestamp();
-            for (int i = 0; i < 8; ++i) {
-                buffer[24 + i] = static_cast<uint8_t>((send_time >> ((7 - i) * 8)) & 0xFF);
-            }
-
-            sendto(timing_fd_, buffer.data(), 32, 0,
-                   reinterpret_cast<struct sockaddr*>(&client_addr), addr_len);
-            LOGD("处理并回复客户端 NTP Timing 授时校准包");
         }
     }
 

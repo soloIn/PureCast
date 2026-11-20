@@ -199,7 +199,14 @@ bool RaopJitterBuffer::pop(std::vector<uint8_t>& out_pcm, uint32_t* out_timestam
 }
 
 bool RaopJitterBuffer::peek_size(size_t& out_size) {
+    uint32_t unused_ts = 0;
+    bool unused_has_ts = false;
+    return peek_head(out_size, unused_ts, unused_has_ts);
+}
+
+bool RaopJitterBuffer::peek_head(size_t& out_size, uint32_t& out_timestamp, bool& out_has_timestamp) {
     std::lock_guard<std::mutex> lock(mutex_);
+    out_has_timestamp = false;
 
     if (is_buffering_.load(std::memory_order_relaxed) || first_packet_) {
         return false;
@@ -208,12 +215,18 @@ bool RaopJitterBuffer::peek_size(size_t& out_size) {
     size_t index = head_seq_ % BUFFER_SIZE;
     if (slots_[index].valid && slots_[index].seq_num == head_seq_) {
         out_size = slots_[index].pcm.size();
+        out_timestamp = slots_[index].timestamp;
+        out_has_timestamp = true;
         return true;
     }
 
     int16_t diff = static_cast<int16_t>(max_seq_seen_ - head_seq_);
     if (diff > MAX_REORDER_TOLERANCE) {
         out_size = frame_bytes_;
+        if (has_popped_timestamp_) {
+            out_timestamp = last_popped_timestamp_ + 352U;
+            out_has_timestamp = true;
+        }
         return true;
     }
 

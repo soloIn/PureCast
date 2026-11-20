@@ -285,7 +285,7 @@ class PlaybackSessionCoordinatorTest {
     }
 
     @Test
-    fun `ImplicitPauseEvent transitions to PAUSED in 0ms immediately`() = runTest(StandardTestDispatcher()) {
+    fun `User ExplicitPauseEvent transitions to PAUSED in 0ms immediately`() = runTest(StandardTestDispatcher()) {
         val c = createCoordinator(this)
         c.dispatch(env(c, EventOrigin.USB_HARDWARE, 0L, HardwareAttachedEvent("DAC", hasPermission = true)))
         val s1 = c.allocateSessionId()
@@ -293,7 +293,7 @@ class PlaybackSessionCoordinatorTest {
         c.dispatch(env(c, EventOrigin.AIRPLAY, s1, FirstDataPacketEvent(StreamProtocol.AIRPLAY_1, 10L, 44100, 16, 2, "ALAC")))
         runCurrent()
 
-        c.dispatch(env(c, EventOrigin.AIRPLAY, s1, ImplicitPauseEvent(10L)))
+        c.dispatch(env(c, EventOrigin.USER_ACTION, s1, ExplicitPauseEvent(epoch = 10L)))
         runCurrent()
         assertEquals(TransportPipeState.INTERRUPTED, c.snapshot.value.transportState)
         assertEquals(BusinessSessionState.PAUSED, c.snapshot.value.businessState)
@@ -698,7 +698,7 @@ class PlaybackSessionCoordinatorTest {
         // 在 IDLE/PLAYING 下测试 UPnP PREVIOUS & NONE 下 RemoteSkip
         c.dispatch(env(c, EventOrigin.AIRPLAY, s0, ExplicitPauseEvent(FlushReason.EXPLICIT_PAUSE, 1L)))
         c.dispatch(env(c, EventOrigin.AIRPLAY, s0, TrackSwitchEvent(FlushReason.FLUSH_SWITCH, 2L)))
-        c.dispatch(env(c, EventOrigin.AIRPLAY, s0, ImplicitPauseEvent(2L)))
+        c.dispatch(env(c, EventOrigin.USER_ACTION, s0, ExplicitPauseEvent(epoch = 2L)))
         c.dispatch(env(c, EventOrigin.AIRPLAY, s0, StreamStopEvent(FlushReason.STOP_OR_TEARDOWN, newEpoch = 3L, isPreempted = true)))
         c.dispatch(env(c, EventOrigin.AIRPLAY, s0, StreamTeardownEvent(hardStop = true)))
         runCurrent()
@@ -778,7 +778,7 @@ class PlaybackSessionCoordinatorTest {
         c.dispatch(env(c, EventOrigin.AIRPLAY, sAp, StreamSetupEvent(StreamProtocol.AIRPLAY_1), seq = c.allocateSequence()))
         // 验证旧会话 sAp 传错 seq <= lastAccepted 丢弃与旧 Setup sid < activeSid 丢弃
         c.dispatch(env(c, EventOrigin.AIRPLAY, sOpenFail, StreamSetupEvent(StreamProtocol.UPNP_DLNA), seq = c.allocateSequence()))
-        c.dispatch(env(c, EventOrigin.AIRPLAY, sAp, ImplicitPauseEvent(31L)))
+        c.dispatch(env(c, EventOrigin.USER_ACTION, sAp, ExplicitPauseEvent(epoch = 31L)))
         runCurrent()
         assertEquals(BusinessSessionState.PAUSED, c.snapshot.value.businessState)
 
@@ -847,8 +847,8 @@ class PlaybackSessionCoordinatorTest {
         c.dispatch(env(c, EventOrigin.AIRPLAY, sRe, FirstDataPacketEvent(StreamProtocol.AIRPLAY_1, 1L, 44100, 16, 2, "ALAC"), deviceGen = 6L))
         c.dispatch(env(c, EventOrigin.USER_ACTION, sRe, RemoteSkipNextEvent(RemoteCommandType.NEXT, 300L), deviceGen = 6L))
         c.dispatch(env(c, EventOrigin.AIRPLAY, sRe, RemoteCommandFailedEvent(999L, ErrorCode.REMOTE_COMMAND_TIMEOUT, "wrong id fail"), deviceGen = 6L))
-        // 在 activeRemoteCommandId == 300L 时经 ImplicitPauseEvent 离开 TRANSITIONING，再收到匹配 id=300L 超时事件 (branch: id == active && !TRANSITIONING)
-        c.dispatch(env(c, EventOrigin.AIRPLAY, sRe, ImplicitPauseEvent(1L), deviceGen = 6L))
+        // 在 activeRemoteCommandId == 300L 时经用户显式暂停离开 TRANSITIONING，再收到匹配 id=300L 超时事件 (branch: id == active && !TRANSITIONING)
+        c.dispatch(env(c, EventOrigin.USER_ACTION, sRe, ExplicitPauseEvent(epoch = 1L), deviceGen = 6L))
         c.dispatch(env(c, EventOrigin.SERVICE, sRe, RemoteCommandTimeoutEvent(300L), deviceGen = 6L))
         c.dispatch(env(c, EventOrigin.AIRPLAY, sRe, FirstDataPacketEvent(StreamProtocol.AIRPLAY_1, 1L, 44100, 16, 2, "ALAC"), deviceGen = 6L))
         // 重新触发 TRANSITIONING 并在 PERMISSION_PENDING(非独占)下触发 RemoteCommandTimeout(301L)
@@ -1048,7 +1048,7 @@ class PlaybackSessionCoordinatorTest {
         var gen = 1L
         c.dispatch(env(c, EventOrigin.UPNP, s1, StreamSetupEvent(StreamProtocol.UPNP_DLNA), deviceGen = gen))
         c.dispatch(env(c, EventOrigin.UPNP, s1, FirstDataPacketEvent(StreamProtocol.UPNP_DLNA, 10L, 96000, 24, 2, "WAV"), deviceGen = gen))
-        c.dispatch(env(c, EventOrigin.UPNP, s1, ImplicitPauseEvent(10L), deviceGen = gen))
+        c.dispatch(env(c, EventOrigin.USER_ACTION, s1, ExplicitPauseEvent(epoch = 10L), deviceGen = gen))
         c.dispatch(env(c, EventOrigin.USB_HARDWARE, 0L, HardwareDetachedEvent("unplug-1"), deviceGen = ++gen))
         c.dispatch(env(c, EventOrigin.USB_HARDWARE, 0L, HardwareAttachedEvent("ZX300A", hasPermission = true), deviceGen = ++gen))
         runCurrent()
@@ -1067,7 +1067,7 @@ class PlaybackSessionCoordinatorTest {
         assertEquals(Triple(StreamProtocol.UPNP_DLNA, s1, 21L), resumeCallbacks.last())
 
         // Case 2: RESTARTING -> 重开 DAC 后管线重连中，停留在 TRANSITIONING + PREPARING + EXCLUSIVE_MUTED 等首包 (#2)
-        c.dispatch(env(c, EventOrigin.UPNP, s1, ImplicitPauseEvent(21L), deviceGen = gen))
+        c.dispatch(env(c, EventOrigin.USER_ACTION, s1, ExplicitPauseEvent(epoch = 21L), deviceGen = gen))
         c.dispatch(env(c, EventOrigin.USB_HARDWARE, 0L, HardwareDetachedEvent("unplug-2"), deviceGen = ++gen))
         c.dispatch(env(c, EventOrigin.USB_HARDWARE, 0L, HardwareAttachedEvent("ZX300A", hasPermission = true), deviceGen = ++gen))
         runCurrent()
@@ -1090,7 +1090,7 @@ class PlaybackSessionCoordinatorTest {
         assertEquals(HardwarePipelineState.EXCLUSIVE_ACTIVE, c.snapshot.value.hardwareState)
 
         // Case 3: PRODUCER_DEAD -> 标记 INTERRUPTED + PAUSED 并触发 10 分钟挂起回收 (#2)
-        c.dispatch(env(c, EventOrigin.UPNP, s1, ImplicitPauseEvent(22L), deviceGen = gen))
+        c.dispatch(env(c, EventOrigin.USER_ACTION, s1, ExplicitPauseEvent(epoch = 22L), deviceGen = gen))
         c.dispatch(env(c, EventOrigin.USB_HARDWARE, 0L, HardwareDetachedEvent("unplug-3"), deviceGen = ++gen))
         c.dispatch(env(c, EventOrigin.USB_HARDWARE, 0L, HardwareAttachedEvent("ZX300A", hasPermission = true), deviceGen = ++gen))
         runCurrent()
@@ -2056,5 +2056,52 @@ class PlaybackSessionCoordinatorTest {
         c.dispatch(env(c, EventOrigin.USER_ACTION, s1, ExplicitPauseEvent(epoch = 10L)))
         runCurrent()
         assertEquals(BusinessSessionState.PAUSED, c.snapshot.value.businessState)
+    }
+
+    @Test
+    fun `early non-zero protocol progress after track switch is accepted while 0ms placeholder is ignored`() {
+        val tm = TrackTransactionManager()
+        val snap = PlayerSessionSnapshot(
+            sessionId = 1L,
+            businessState = BusinessSessionState.PLAYING,
+            activeProtocol = StreamProtocol.AIRPLAY_1,
+            trackGeneration = 16L,
+            progressPositionMs = 1250L,
+            progressDurationMs = 182_765L,
+            progressRevision = 5L
+        )
+
+        // 1. 0ms 协议未就绪空包仍应拦截
+        val zeroEnv = matrixEnv(
+            origin = EventOrigin.AIRPLAY,
+            sessionId = 1L,
+            sequence = 1L,
+            payload = ProgressUpdateEvent(positionMs = 0L, durationMs = 182_765L, trackGeneration = 16L)
+        )
+        val outZero = TriStateTransitionMatrix.reduce(TransitionContext(snapshot = snap), zeroEnv, tm, 100L)
+        assertEquals(1250L, outZero.nextContext.snapshot.progressPositionMs)
+
+        // 2. 复现 4ever in U：切歌后 1.25s 收到真实非零进度 7ms，必须放行校准并递增 progressRevision
+        val realEnv1 = matrixEnv(
+            origin = EventOrigin.AIRPLAY,
+            sessionId = 1L,
+            sequence = 2L,
+            payload = ProgressUpdateEvent(positionMs = 7L, durationMs = 182_765L, trackGeneration = 16L)
+        )
+        val out1 = TriStateTransitionMatrix.reduce(TransitionContext(snapshot = snap), realEnv1, tm, 200L)
+        assertEquals(7L, out1.nextContext.snapshot.progressPositionMs)
+        assertEquals(6L, out1.nextContext.snapshot.progressRevision)
+
+        // 3. 1s 后 Ticker 推至 1100ms，协议补发 104ms：同样必须放行校准
+        val snapAfterTick = out1.nextContext.snapshot.copy(progressPositionMs = 1100L)
+        val realEnv2 = matrixEnv(
+            origin = EventOrigin.AIRPLAY,
+            sessionId = 1L,
+            sequence = 3L,
+            payload = ProgressUpdateEvent(positionMs = 104L, durationMs = 182_765L, trackGeneration = 16L)
+        )
+        val out2 = TriStateTransitionMatrix.reduce(TransitionContext(snapshot = snapAfterTick), realEnv2, tm, 300L)
+        assertEquals(104L, out2.nextContext.snapshot.progressPositionMs)
+        assertEquals(7L, out2.nextContext.snapshot.progressRevision)
     }
 }

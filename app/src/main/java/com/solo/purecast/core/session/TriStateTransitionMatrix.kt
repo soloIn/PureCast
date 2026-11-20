@@ -286,19 +286,6 @@ internal object TriStateTransitionMatrix {
                 return TransitionOutput(ctx.copy(snapshot = nextSnap, pendingDebounceToken = 0L), effects)
             }
 
-            is ImplicitPauseEvent -> {
-                effects += TransitionEffect.CancelDebouncePause
-                effects += TransitionEffect.ScheduleSuspendTimeout(snap.sessionId)
-                val nextSnap = snap.copy(
-                    transportState = TransportPipeState.INTERRUPTED,
-                    businessState = BusinessSessionState.PAUSED,
-                    hardwareState = muteIfExclusive(snap.hardwareState),
-                    uiProtectionActive = false,
-                    transitionOriginState = null
-                )
-                return TransitionOutput(ctx.copy(snapshot = nextSnap, pendingDebounceToken = 0L), effects)
-            }
-
             is TrackCompleteEvent ->
                 return transitionToStopped(ctx, effects, ev.newEpoch, scheduleIdleRelease = true)
 
@@ -750,12 +737,12 @@ internal object TriStateTransitionMatrix {
                 ) {
                     return TransitionOutput(ctx, emptyList())
                 }
-                // 💡 防倒流保护：拦截非用户显式寻道的开播延迟校准小包 (0..1500ms)，杜绝 AirPlay 1 开播 1~2 秒补发 0ms 导致进度倒退；用户主动 Seek 放行
+                // 💡 防倒流保护：仅拦截开播前 3.5 秒内非用户显式寻道的 0ms 未就绪占位空包；
+                // 真实非零协议进度（如自然切歌后 1~2s 到达的 7ms / 104ms）必须放行，杜绝本地 Ticker 带着 +1~2s 偏差空跑整首歌。
                 if (envelope.origin != EventOrigin.USER_ACTION &&
                     snap.businessState == BusinessSessionState.PLAYING &&
                     snap.progressPositionMs in 1L..3500L &&
-                    ev.positionMs in 0L..1500L &&
-                    ev.positionMs < snap.progressPositionMs
+                    ev.positionMs == 0L
                 ) {
                     return TransitionOutput(ctx, emptyList())
                 }

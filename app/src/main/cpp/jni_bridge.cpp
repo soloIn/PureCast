@@ -189,19 +189,8 @@ static void notify_java_stream_stopped(int64_t session_id, int64_t sequence, int
     notify_java_session_epoch_event(&AirPlayCallbackMethods::on_stream_stopped, session_id, sequence, epoch);
 }
 
-static void notify_java_stream_paused(int64_t session_id, int64_t sequence, int64_t epoch, bool is_implicit) {
-    ScopedJniCallback jni;
-    if (!jni || !jni.methods.on_stream_paused) return;
-
-    jni.env->CallVoidMethod(
-        jni.callback,
-        jni.methods.on_stream_paused,
-        static_cast<jlong>(session_id),
-        static_cast<jlong>(sequence),
-        static_cast<jlong>(epoch),
-        is_implicit ? JNI_TRUE : JNI_FALSE
-    );
-    clear_jni_exception(jni.env, "onStreamPaused");
+static void notify_java_stream_paused(int64_t session_id, int64_t sequence, int64_t epoch) {
+    notify_java_session_epoch_event(&AirPlayCallbackMethods::on_stream_paused, session_id, sequence, epoch);
 }
 
 static void notify_java_stream_resumed(int64_t session_id, int64_t sequence, int64_t epoch) {
@@ -612,7 +601,7 @@ Java_com_solo_purecast_core_nativebridge_NativeAudioEngine_startAirPlayServer(
                 "(JJIIILjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;I)J"
             );
             g_cb_methods.on_stream_stopped = env->GetMethodID(cb_cls, "onStreamStopped", "(JJJ)V");
-            g_cb_methods.on_stream_paused = env->GetMethodID(cb_cls, "onStreamPaused", "(JJJZ)V");
+            g_cb_methods.on_stream_paused = env->GetMethodID(cb_cls, "onStreamPaused", "(JJJ)V");
             g_cb_methods.on_stream_resumed = env->GetMethodID(cb_cls, "onStreamResumed", "(JJJ)V");
             g_cb_methods.on_track_switch_flushed = env->GetMethodID(cb_cls, "onTrackSwitchFlushed", "(JJJ)V");
             g_cb_methods.on_first_data_packet = env->GetMethodID(cb_cls, "onFirstDataPacket", "(JJJIIILjava/lang/String;)V");

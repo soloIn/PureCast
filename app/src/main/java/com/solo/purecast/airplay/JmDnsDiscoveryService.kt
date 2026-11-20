@@ -386,6 +386,7 @@ class JmDnsDiscoveryService(private val context: Context) {
 
     /**
      * 💡 匹配 DACP 服务的 IP、DACP-ID (通过服务名或 DbId 属性)
+     * 当已知本次会话的 targetDacpId 时，严禁被同 IP 上历史残留的旧 iTunes_Ctrl_<oldId> 缓存条目误匹配！
      */
     private fun inspectDacpServiceInfo(info: javax.jmdns.ServiceInfo): Boolean {
         val port = info.port
@@ -401,14 +402,54 @@ class JmDnsDiscoveryService(private val context: Context) {
         )
         val nameMatches = !targetId.isNullOrEmpty() && info.name.contains(targetId, ignoreCase = true)
         val dbIdMatches = !targetId.isNullOrEmpty() && info.getPropertyString("DbId")?.equals(targetId, ignoreCase = true) == true
+        val hasConflictingDacpId = !targetId.isNullOrEmpty() &&
+            info.name.startsWith("iTunes_Ctrl_", ignoreCase = true) &&
+            !nameMatches &&
+            !dbIdMatches
 
-        if (hostMatches || nameMatches || dbIdMatches) {
+        val matched = if (!targetId.isNullOrEmpty()) {
+            nameMatches || dbIdMatches || (hostMatches && !hasConflictingDacpId)
+        } else {
+            hostMatches
+        }
+
+        if (matched) {
             val ips = (info.hostAddresses.toList() + info.inet4Addresses.mapNotNull { it.hostAddress }).distinct().joinToString()
             Logger.service.i(TAG, "🎉 成功锁定 DACP 真实端口: $port (Name=${info.name}, IPs=[$ips])")
             onDacpPortResolvedCallback?.invoke(port)
             return true
         }
         return false
+    }
+
+    /**
+     * 💡 当旧 DACP 端口连接被拒 (ECONNREFUSED) 时，绕过 JmDNS 过期缓存主动重新探测发射端当前真实 DACP 端口
+     * @param excludePort 刚刚连接失败的旧端口，扫描时显式跳过避免再次命中死端口
+     */
+    suspend fun refreshDacpPortNow(excludePort: Int = 0, timeoutMs: Long = 1500L): Int? = withContext(Dispatchers.IO) {
+        val dns = jmdns ?: return@withContext null
+        val targetId = targetDacpId
+        try {
+            if (!targetId.isNullOrEmpty()) {
+                val directName = "iTunes_Ctrl_$targetId"
+                val fresh = dns.getServiceInfo(DACP_SERVICE_TYPE, directName, true, timeoutMs)
+                if (fresh != null && fresh.port > 0 && fresh.port != excludePort) {
+                    Logger.service.i(TAG, "🔄 主动刷新 DACP 端口成功: $directName -> ${fresh.port}")
+                    onDacpPortResolvedCallback?.invoke(fresh.port)
+                    return@withContext fresh.port
+                }
+            }
+            val services = dns.list(DACP_SERVICE_TYPE, timeoutMs)
+            for (stub in services) {
+                val fresh = dns.getServiceInfo(stub.type, stub.name, true, 800L) ?: stub
+                if (fresh.port > 0 && fresh.port != excludePort && inspectDacpServiceInfo(fresh)) {
+                    return@withContext fresh.port
+                }
+            }
+        } catch (e: Exception) {
+            Logger.service.w(TAG, "主动刷新 DACP 端口异常: ${e.message}")
+        }
+        null
     }
 
     /**

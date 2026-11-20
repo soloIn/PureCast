@@ -72,7 +72,8 @@ internal object MacShaders {
             } else {
                 c = min(vec3(1.0), mix(c, vec3(1.0), 0.25) + (u_luma < 0.3 ? 0.38 : 0.08) * 0.05);
             }
-            gl_FragColor = vec4(clamp(c, 0.07, 0.97), 1.0);
+            // 💡 将原 MainTvScreen 全屏 22% 黑色保护遮罩 (alpha=0.22 -> *0.78) 直接折入着色器，零画质损失省掉一整层 1080p 混合过绘
+            gl_FragColor = vec4(clamp(c, 0.07, 0.97) * 0.78, 1.0);
         }
     """.trimIndent()
 

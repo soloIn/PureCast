@@ -8,7 +8,6 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.tv.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.State
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -19,9 +18,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.drawscope.clipRect
-import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalDensity
@@ -36,7 +33,7 @@ import com.solo.purecast.model.LyricLine
  * 💡 逐字歌词（Karaoke Word-Sync）视觉与排版开销优化组件：
  * 1. 常驻单一稳定节点（传入 isActive），彻底消除切句首帧 Text ⇄ WordSyncKaraokeText 销毁重建与 TextLayout 重排卡顿；
  * 2. 0 重组纯 Draw 阶段渲染：完全隔离在 drawWithContent 内部读取时间，重组次数彻底归 0；
- * 3. 非激活态自动关闭 Offscreen FBO 与 VSYNC 循环，仅在 isActive == true 时激活单行扫光离屏混合；
+ * 3. 直接复用父级 SmoothLyricLineRow 的 1:1 刚性常驻 Offscreen 层执行 SrcIn 扫光，非激活态自动关闭 VSYNC 循环（CPU 归 0）；
  * 4. 零堆内存分配优化：复用预分配的 LinearGradient、Matrix 与 Native Paint，彻底消除 60fps 下每帧临时 Brush 堆内存分配；
  * 5. 实现真正的 Apple Music 卡拉 OK 逐像素平滑扫光与抗锯齿羽化边缘。
  */
@@ -48,8 +45,7 @@ fun WordSyncKaraokeText(
     primaryColor: Color,
     modifier: Modifier = Modifier,
     isPlaying: Boolean = true,
-    isActive: Boolean = true,
-    inactiveAlphaState: State<Float>? = null
+    isActive: Boolean = true
 ) {
     val words = line.words ?: return
     val fullText = line.mainText
@@ -111,6 +107,60 @@ fun WordSyncKaraokeText(
         }
     }
 
+    // 💡 预计算并扁平缓存每个视觉行与每个词的几何边界，彻底消除 60fps 绘制热路径中的 Rect / Pair 堆分配
+    val cachedGeometry = remember(layoutResult, wordRanges, fullText) {
+        val lr = layoutResult ?: return@remember null
+        if (fullText.isEmpty() || words.isEmpty() || lr.layoutInput.text.text != fullText) return@remember null
+        val lc = lr.lineCount
+        val lineTops = FloatArray(lc) { lr.getLineTop(it) }
+        val lineBottoms = FloatArray(lc) { lr.getLineBottom(it) }
+        val lineLefts = FloatArray(lc) { lr.getLineLeft(it) }
+        val lineRights = FloatArray(lc) { lr.getLineRight(it) }
+
+        val wc = words.size
+        val safeStarts = IntArray(wc)
+        val endChars = IntArray(wc)
+        val startLines = IntArray(wc)
+        val endLines = IntArray(wc)
+        val wordLefts = FloatArray(wc)
+        val wordRights = FloatArray(wc)
+        val endCharLefts = FloatArray(wc)
+        val endCharRights = FloatArray(wc)
+
+        for (i in 0 until wc) {
+            val (s, e) = LyricsRenderingMath.clampSafeCharBounds(
+                fullText = fullText,
+                startChar = wordRanges[i].first,
+                wordText = words[i].text
+            )
+            safeStarts[i] = s
+            endChars[i] = e
+            startLines[i] = lr.getLineForOffset(s)
+            endLines[i] = lr.getLineForOffset(e)
+            val startBox = lr.getBoundingBox(s)
+            val endBox = if (s == e) startBox else lr.getBoundingBox(e)
+            wordLefts[i] = startBox.left
+            wordRights[i] = endBox.right
+            endCharLefts[i] = endBox.left
+            endCharRights[i] = endBox.right
+        }
+        CachedKaraokeGeometry(
+            lineCount = lc,
+            lineTops = lineTops,
+            lineBottoms = lineBottoms,
+            lineLefts = lineLefts,
+            lineRights = lineRights,
+            safeStarts = safeStarts,
+            endChars = endChars,
+            startLines = startLines,
+            endLines = endLines,
+            wordLefts = wordLefts,
+            wordRights = wordRights,
+            endCharLefts = endCharLefts,
+            endCharRights = endCharRights
+        )
+    }
+
     Text(
         text = fullText,
         fontSize = 33.sp,
@@ -120,18 +170,12 @@ fun WordSyncKaraokeText(
         color = if (isActive) Color.White else primaryColor,
         modifier = modifier
             .fillMaxWidth()
-            .graphicsLayer {
-                compositingStrategy = if (isActive) CompositingStrategy.Offscreen else CompositingStrategy.Auto
-                alpha = if (isActive) 1.0f else (inactiveAlphaState?.value ?: 0.42f)
-            }
             .drawWithContent {
                 drawContent()
                 if (!isActive) return@drawWithContent
 
                 val lr = layoutResult ?: return@drawWithContent
-
-                // 💡 Finding #7: 头部快速返回保护，处理空文本或空词列表
-                if (fullText.isEmpty() || words.isNullOrEmpty()) {
+                val geom = cachedGeometry ?: run {
                     drawRect(color = unlitColor, blendMode = BlendMode.SrcIn)
                     return@drawWithContent
                 }
@@ -140,9 +184,9 @@ fun WordSyncKaraokeText(
                 frameTrigger.let { }
 
                 val now = currentTimeProvider()
-                val lineCount = lr.lineCount
+                val lineCount = geom.lineCount
 
-                if (words.isEmpty() || now < words.first().startMs) {
+                if (now < words.first().startMs) {
                     drawRect(color = unlitColor, blendMode = BlendMode.SrcIn)
                     return@drawWithContent
                 }
@@ -172,13 +216,8 @@ fun WordSyncKaraokeText(
                 }
 
                 val activeWord = words[activeWordIndex]
-                val range = wordRanges[activeWordIndex]
-                // 💡 Finding 12 & Finding #9 & Finding #7: 通过 LyricsRenderingMath 统一进行边界钳制与字符区间计算
-                val (safeStart, endChar) = LyricsRenderingMath.clampSafeCharBounds(
-                    fullText = fullText,
-                    startChar = range.first,
-                    wordText = activeWord.text
-                )
+                val safeStart = geom.safeStarts[activeWordIndex]
+                val endChar = geom.endChars[activeWordIndex]
 
                 val activeVisualLine: Int
                 val currentSweepX: Float
@@ -188,14 +227,14 @@ fun WordSyncKaraokeText(
                 if (now in activeWord.startMs..activeWord.endMs) {
                     val progress = syncClock.calculateWordProgress(activeWord, now).coerceIn(0f, 1f)
                     wordProgress = progress
-                    val startLine = lr.getLineForOffset(safeStart)
-                    val endLine = lr.getLineForOffset(endChar)
+                    val startLine = geom.startLines[activeWordIndex]
+                    val endLine = geom.endLines[activeWordIndex]
 
                     if (startLine == endLine) {
-                        // 单词处于同一视觉行：单行内匀速线性扫光
+                        // 单词处于同一视觉行：直接读取扁平预缓存边界（0 堆分配）
                         activeVisualLine = startLine
-                        val wordLeft = lr.getBoundingBox(safeStart).left
-                        val wordRight = lr.getBoundingBox(endChar).right
+                        val wordLeft = geom.wordLefts[activeWordIndex]
+                        val wordRight = geom.wordRights[activeWordIndex]
                         currentWordLeft = wordLeft
                         currentSweepX = wordLeft + (wordRight - wordLeft) * progress
                     } else {
@@ -213,22 +252,23 @@ fun WordSyncKaraokeText(
                         currentSweepX = segLeft + (segRight - segLeft) * seg.segProgress
                     }
                 } else {
-                    // 词间间隙：已完整唱完 activeWord，正在等待下一个词
-                    activeVisualLine = lr.getLineForOffset(endChar)
-                    val box = lr.getBoundingBox(endChar)
-                    currentSweepX = box.right
-                    currentWordLeft = box.left
-                    // 💡 Finding 5: 词间停顿期将 wordProgress 置 0f（effectiveHalfFeather = 0f），刚好精确停在已唱完词的 box.right 边界，绝不向右越界染亮下一个未唱字
+                    // 词间间隙：已完整唱完 activeWord，直接读取预缓存末端边界（0 堆分配）
+                    activeVisualLine = geom.endLines[activeWordIndex]
+                    currentSweepX = geom.endCharRights[activeWordIndex]
+                    currentWordLeft = geom.endCharLefts[activeWordIndex]
                     wordProgress = 0f
                 }
 
-                // 💡 Finding 12 & Finding #7: 将羽化区间随 progress 动态锚定，由 LyricsRenderingMath 计算有效羽化与平移
-                val (sweepStart, effectiveFeather) = LyricsRenderingMath.calculateEffectiveFeather(
-                    sweep = currentSweepX,
-                    feather = feather,
-                    wordLeft = currentWordLeft,
-                    wordProgress = wordProgress
-                )
+                // 💡 内联零分配羽化计算（与 LyricsRenderingMath.calculateEffectiveFeather 数学严格等价，避免每帧分配 Pair）
+                val halfFeather = (feather * 0.5f).coerceAtLeast(1f)
+                val maxSweepFromWordLeft = (currentSweepX - currentWordLeft).coerceAtLeast(0f)
+                val effectiveHalfFeather = if (wordProgress <= 0f) {
+                    0f
+                } else {
+                    minOf(halfFeather, maxSweepFromWordLeft)
+                }
+                val sweepStart = currentSweepX - effectiveHalfFeather
+                val effectiveFeather = (effectiveHalfFeather * 2f).coerceAtLeast(0.001f)
 
                 // 💡 Finding 3: 设置平移与缩放矩阵并更新 Shader，零对象分配
                 sweepMatrix.reset()
@@ -240,43 +280,37 @@ fun WordSyncKaraokeText(
 
                 val nativeCanvas = drawContext.canvas.nativeCanvas
 
-                // 💡 按视觉行分段精确裁切与绘制，彻底根除多行换行歌词跨行串色 Bug
+                // 💡 按视觉行分段精确裁切与绘制（读取预缓存行坐标，0 堆分配）
                 for (lineIdx in 0 until lineCount) {
-                    val lineTop = lr.getLineTop(lineIdx)
-                    val lineBottom = lr.getLineBottom(lineIdx)
-                    val lineLeft = lr.getLineLeft(lineIdx)
-                    val lineRight = lr.getLineRight(lineIdx)
+                    val lineTop = geom.lineTops[lineIdx]
+                    val lineBottom = geom.lineBottoms[lineIdx]
+                    val lineLeft = geom.lineLefts[lineIdx]
+                    val lineRight = geom.lineRights[lineIdx]
 
                     clipRect(left = 0f, top = lineTop, right = size.width, bottom = lineBottom) {
                         if (lineIdx < activeVisualLine) {
-                            // 该视觉行已全部唱完：整行主色高亮 (0 对象分配)
                             drawRect(
                                 color = primaryColor,
                                 blendMode = BlendMode.SrcIn
                             )
                         } else if (lineIdx > activeVisualLine) {
-                            // 该视觉行尚未唱到：整行暗色未激活 (0 对象分配)
                             drawRect(
                                 color = unlitColor,
                                 blendMode = BlendMode.SrcIn
                             )
                         } else {
-                            // 正在该视觉行演唱：仅在该行有效区域内应用扫光
                             val sweep = currentSweepX.coerceIn(lineLeft, lineRight)
                             if (sweep <= lineLeft) {
-                                // 尚未扫到该行有效区域：直接单色绘制，彻底避免调用 Shader
                                 drawRect(
                                     color = unlitColor,
                                     blendMode = BlendMode.SrcIn
                                 )
                             } else if (sweep >= lineRight) {
-                                // 该视觉行已全部扫完：直接主色绘制，彻底避免调用 Shader
                                 drawRect(
                                     color = primaryColor,
                                     blendMode = BlendMode.SrcIn
                                 )
                             } else {
-                                // 处于该视觉行动态过渡扫光阶段：使用单一复用 Paint 绘制平移后的 Shader
                                 nativeCanvas.drawRect(
                                     lineLeft,
                                     lineTop,
@@ -291,3 +325,19 @@ fun WordSyncKaraokeText(
             }
     )
 }
+
+private class CachedKaraokeGeometry(
+    val lineCount: Int,
+    val lineTops: FloatArray,
+    val lineBottoms: FloatArray,
+    val lineLefts: FloatArray,
+    val lineRights: FloatArray,
+    val safeStarts: IntArray,
+    val endChars: IntArray,
+    val startLines: IntArray,
+    val endLines: IntArray,
+    val wordLefts: FloatArray,
+    val wordRights: FloatArray,
+    val endCharLefts: FloatArray,
+    val endCharRights: FloatArray
+)

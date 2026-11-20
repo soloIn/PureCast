@@ -112,13 +112,13 @@ object LyricsRenderingMath {
 
     /**
      * 💡 Finding 10: 歌词行层级目标透明度计算
-     * 激活行保持 1.0f；非激活行随与激活行的行距线性衰减 (0.42f -> 0.18f)。
+     * 激活行保持 1.0f；非激活行随与激活行的行距线性衰减 (0.36f -> 0.16f)，在 1:1 原生字号下呈现鲜明焦点层次。
      */
     fun calculateLineTargetAlpha(isActive: Boolean, distanceFromActive: Int): Float {
         return if (isActive) {
             1.0f
         } else {
-            (0.42f - (distanceFromActive - 1) * 0.08f).coerceIn(0.18f, 0.42f)
+            (0.36f - (distanceFromActive - 1) * 0.06f).coerceIn(0.16f, 0.36f)
         }
     }
 
@@ -145,8 +145,27 @@ object LyricsRenderingMath {
     }
 
     /**
-     * 💡 AMLL / Apple Music 同款逐行弹簧波浪参数：
-     * 根据上下行歌词时间间隙动态调节每行独立弹簧刚度、阻尼与级联错峰延迟。
+     * 💡 零 FBO 视口边缘柔和渐隐系数（smoothstep 曲线）：
+     * 替代全高 CompositingStrategy.Offscreen + BlendMode.DstIn，
+     * 在顶部 [0, topFadePx] 与底部 [viewportHeightPx - bottomFadePx, viewportHeightPx] 区间内平滑衰减至 0，
+     * 视口核心区域恒为 1.0f，0 离屏显存、0 FBO 切换。
+     */
+    fun calculateViewportEdgeFadeAlpha(
+        lineCenterY: Float,
+        viewportHeightPx: Float,
+        topFadePx: Float,
+        bottomFadePx: Float
+    ): Float {
+        if (viewportHeightPx <= 0f) return 1f
+        val topT = if (topFadePx > 0f) (lineCenterY / topFadePx).coerceIn(0f, 1f) else 1f
+        val bottomT = if (bottomFadePx > 0f) ((viewportHeightPx - lineCenterY) / bottomFadePx).coerceIn(0f, 1f) else 1f
+        val t = minOf(topT, bottomT)
+        return t * t * (3f - 2f * t)
+    }
+
+    /**
+     * 💡 AMLL / Apple Music 同款逐行弹簧波浪参数（流水阻尼调校）：
+     * 采用柔和刚度 + 近临界阻尼 + 舒展级联错峰，起步轻快、中后段拥有丝绸般长尾减速。
      */
     data class WaveSpringParams(
         val stiffness: Float,
@@ -157,9 +176,9 @@ object LyricsRenderingMath {
     fun calculateWaveSpringParams(prevLine: LyricLine?, currentLine: LyricLine?): WaveSpringParams {
         if (prevLine == null || currentLine == null) {
             return WaveSpringParams(
-                stiffness = 380f,
-                dampingRatio = 0.90f,
-                staggerStepMs = 26L
+                stiffness = 300f,
+                dampingRatio = 1.0f,
+                staggerStepMs = 34L
             )
         }
         val startGapMs = (currentLine.startMs - prevLine.startMs).coerceAtLeast(0L)
@@ -167,19 +186,19 @@ object LyricsRenderingMath {
         val vocalGapMs = (currentLine.startMs - prevVocalEndMs).coerceAtLeast(0L)
         return when {
             startGapMs < 1500L -> WaveSpringParams(
-                stiffness = 520f,
-                dampingRatio = 0.92f,
-                staggerStepMs = 18L
+                stiffness = 380f,
+                dampingRatio = 1.0f,
+                staggerStepMs = 22L
             )
             startGapMs > 4500L || vocalGapMs >= 1500L -> WaveSpringParams(
-                stiffness = 300f,
-                dampingRatio = 0.90f,
-                staggerStepMs = 32L
+                stiffness = 240f,
+                dampingRatio = 1.0f,
+                staggerStepMs = 42L
             )
             else -> WaveSpringParams(
-                stiffness = 380f,
-                dampingRatio = 0.90f,
-                staggerStepMs = 26L
+                stiffness = 300f,
+                dampingRatio = 1.0f,
+                staggerStepMs = 34L
             )
         }
     }

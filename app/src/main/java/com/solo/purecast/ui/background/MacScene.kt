@@ -16,7 +16,7 @@ internal object MacScene {
     const val FPS = 60
     const val ARTWORK_SIZE = 256
     const val TRANSITION_SECONDS = 1.0
-    const val MOTION_SPEED = 0.7
+    const val MOTION_SPEED = 0.68
     const val BLUR_FACTOR = 0.04539470697716646
     const val CYCLE_SECONDS = 1260.0
 

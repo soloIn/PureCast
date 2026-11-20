@@ -96,6 +96,12 @@ internal class MacRenderer(private val context: Context, private val clock: MacC
     private var a: Target? = null
     private var b: Target? = null
     private var c: Target? = null
+    private var cachedPlanWidth = -1
+    private var cachedPlanHeight = -1
+    private var cachedPlanCap = -1
+    private var cachedPlanQuality: FluidQuality? = null
+    private var cachedPlan: IntermediatePlan? = null
+    private val singleIntBuf = IntArray(1)
 
     fun initialize() {
         val range = IntArray(2)
@@ -137,7 +143,10 @@ internal class MacRenderer(private val context: Context, private val clock: MacC
         get() = currentSpeedMultiplier >= 0.01 || isTransitioning
 
     fun setArtwork(bitmap: Bitmap?, now: Long) {
-        if (outgoing != 0) GL.glDeleteTextures(1, intArrayOf(outgoing), 0)
+        if (outgoing != 0) {
+            singleIntBuf[0] = outgoing
+            GL.glDeleteTextures(1, singleIntBuf, 0)
+        }
         outgoing = image
         image = 0
         if (bitmap != null) {
@@ -174,7 +183,17 @@ internal class MacRenderer(private val context: Context, private val clock: MacC
         if (image == 0) return false
 
         val cap = min(MacScene.maxEdge(state.quality, highp), maxSize)
-        val plan = intermediatePlan(width, height, cap, state.quality)
+        val plan = if (width == cachedPlanWidth && height == cachedPlanHeight && cap == cachedPlanCap && state.quality == cachedPlanQuality && cachedPlan != null) {
+            cachedPlan!!
+        } else {
+            intermediatePlan(width, height, cap, state.quality).also {
+                cachedPlanWidth = width
+                cachedPlanHeight = height
+                cachedPlanCap = cap
+                cachedPlanQuality = state.quality
+                cachedPlan = it
+            }
+        }
         val w = plan.width
         val h = plan.height
         val sizeChanged = a?.w != w || a?.h != h
@@ -210,7 +229,8 @@ internal class MacRenderer(private val context: Context, private val clock: MacC
             drawQuad(rotation)
         }
         if (outgoing != 0 && transition >= MacScene.TRANSITION_SECONDS) {
-            GL.glDeleteTextures(1, intArrayOf(outgoing), 0)
+            singleIntBuf[0] = outgoing
+            GL.glDeleteTextures(1, singleIntBuf, 0)
             outgoing = 0
         }
 
@@ -282,7 +302,6 @@ internal class MacRenderer(private val context: Context, private val clock: MacC
         if (texLoc >= 0) GL.glDisableVertexAttribArray(texLoc)
         if (fromLoc >= 0) GL.glDisableVertexAttribArray(fromLoc)
         if (toLoc >= 0) GL.glDisableVertexAttribArray(toLoc)
-        checkGl()
         return true
     }
 

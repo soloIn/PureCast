@@ -271,14 +271,14 @@ class LyricsRenderingTest {
 
         // 非激活行按距离递减
         val dist1Alpha = LyricsRenderingMath.calculateLineTargetAlpha(isActive = false, distanceFromActive = 1)
-        assertEquals(0.42f, dist1Alpha, 0.001f)
+        assertEquals(0.36f, dist1Alpha, 0.001f)
 
         val dist2Alpha = LyricsRenderingMath.calculateLineTargetAlpha(isActive = false, distanceFromActive = 2)
-        assertEquals(0.34f, dist2Alpha, 0.001f)
+        assertEquals(0.30f, dist2Alpha, 0.001f)
 
-        // 远距离钳位在 0.18f 下限
+        // 远距离钳位在 0.16f 下限
         val farAlpha = LyricsRenderingMath.calculateLineTargetAlpha(isActive = false, distanceFromActive = 10)
-        assertEquals(0.18f, farAlpha, 0.001f)
+        assertEquals(0.16f, farAlpha, 0.001f)
     }
 
     @Test
@@ -421,25 +421,26 @@ class LyricsRenderingTest {
 
     @Test
     fun `calculateWaveSpringParams adapts stiffness and stagger by inter-line gap`() {
-        // 1. 首行或空行兜底：返回标准中速参数
+        // 1. 首行或空行兜底：返回标准临界阻尼参数
         val defaultParams = LyricsRenderingMath.calculateWaveSpringParams(prevLine = null, currentLine = null)
-        assertEquals(380f, defaultParams.stiffness, 0.001f)
-        assertEquals(26L, defaultParams.staggerStepMs)
+        assertEquals(300f, defaultParams.stiffness, 0.001f)
+        assertEquals(1.0f, defaultParams.dampingRatio, 0.001f)
+        assertEquals(34L, defaultParams.staggerStepMs)
 
         // 2. 快歌/密集连唱 (startGapMs < 1500ms)：更紧致弹簧与更短错峰
         val fastPrev = LyricLine(lineIndex = 0, startMs = 10_000L, endMs = 11_000L, mainText = "Fast 1")
         val fastCurr = LyricLine(lineIndex = 1, startMs = 11_000L, endMs = 12_000L, mainText = "Fast 2")
         val fastParams = LyricsRenderingMath.calculateWaveSpringParams(fastPrev, fastCurr)
-        assertEquals(520f, fastParams.stiffness, 0.001f)
-        assertEquals(18L, fastParams.staggerStepMs)
+        assertEquals(380f, fastParams.stiffness, 0.001f)
+        assertEquals(22L, fastParams.staggerStepMs)
 
         // 3. 标准 LRC 常规节奏 (startGapMs = 2800ms, endMs == next.startMs 导致 vocalGapMs == 0)：
         //    严禁误判为快歌，必须落入常规档位
         val lrcPrev = LyricLine(lineIndex = 0, startMs = 10_000L, endMs = 12_800L, mainText = "LRC 1")
         val lrcCurr = LyricLine(lineIndex = 1, startMs = 12_800L, endMs = 15_600L, mainText = "LRC 2")
         val normalParams = LyricsRenderingMath.calculateWaveSpringParams(lrcPrev, lrcCurr)
-        assertEquals(380f, normalParams.stiffness, 0.001f)
-        assertEquals(26L, normalParams.staggerStepMs)
+        assertEquals(300f, normalParams.stiffness, 0.001f)
+        assertEquals(34L, normalParams.staggerStepMs)
 
         // 4. 抒情慢歌 (startGapMs > 4500ms) 或明显人声停顿 (vocalGapMs >= 1500ms)：更舒缓弹性
         val balladPrev = LyricLine(
@@ -451,8 +452,28 @@ class LyricsRenderingTest {
         )
         val balladCurr = LyricLine(lineIndex = 1, startMs = 23_200L, endMs = 26_000L, mainText = "Ballad 2")
         val balladParams = LyricsRenderingMath.calculateWaveSpringParams(balladPrev, balladCurr)
-        assertEquals(300f, balladParams.stiffness, 0.001f)
-        assertEquals(32L, balladParams.staggerStepMs)
+        assertEquals(240f, balladParams.stiffness, 0.001f)
+        assertEquals(42L, balladParams.staggerStepMs)
+    }
+
+    @Test
+    fun `calculateViewportEdgeFadeAlpha smoothly fades near viewport top and bottom edges`() {
+        val viewportH = 1000f
+        val topFade = 100f
+        val bottomFade = 120f
+
+        // 视口核心区域恒为 1.0f
+        assertEquals(1f, LyricsRenderingMath.calculateViewportEdgeFadeAlpha(380f, viewportH, topFade, bottomFade), 0.001f)
+        assertEquals(1f, LyricsRenderingMath.calculateViewportEdgeFadeAlpha(500f, viewportH, topFade, bottomFade), 0.001f)
+
+        // 顶部中点 (t = 0.5 -> smoothstep = 0.5) 与越界 (<= 0 -> 0f)
+        assertEquals(0.5f, LyricsRenderingMath.calculateViewportEdgeFadeAlpha(50f, viewportH, topFade, bottomFade), 0.001f)
+        assertEquals(0f, LyricsRenderingMath.calculateViewportEdgeFadeAlpha(0f, viewportH, topFade, bottomFade), 0.001f)
+        assertEquals(0f, LyricsRenderingMath.calculateViewportEdgeFadeAlpha(-20f, viewportH, topFade, bottomFade), 0.001f)
+
+        // 底部中点 (1000 - 940 = 60 -> t = 0.5 -> smoothstep = 0.5) 与越界 (>= 1000 -> 0f)
+        assertEquals(0.5f, LyricsRenderingMath.calculateViewportEdgeFadeAlpha(940f, viewportH, topFade, bottomFade), 0.001f)
+        assertEquals(0f, LyricsRenderingMath.calculateViewportEdgeFadeAlpha(1000f, viewportH, topFade, bottomFade), 0.001f)
     }
 
     @Test

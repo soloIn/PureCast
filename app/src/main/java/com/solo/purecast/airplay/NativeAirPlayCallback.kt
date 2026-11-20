@@ -30,9 +30,9 @@ interface NativeAirPlayCallback {
     fun onStreamStopped(nativeSessionId: Long, sequence: Long, epoch: Long)
 
     /**
-     * 💡 接收到推流端暂停请求或检测到音频流静音/断流 (isImplicit=true 表示 600ms/180帧静音触发，须 0ms 瞬切 UI)
+     * 💡 接收到推流端显式暂停信令 (RTSP PAUSE)
      */
-    fun onStreamPaused(nativeSessionId: Long, sequence: Long, epoch: Long, isImplicit: Boolean)
+    fun onStreamPaused(nativeSessionId: Long, sequence: Long, epoch: Long)
 
     /**
      * 💡 接收到推流端同流恢复请求或静音恢复 (PAUSE -> RECORD 无 FLUSH 触发)

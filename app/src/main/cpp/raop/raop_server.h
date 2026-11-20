@@ -37,7 +37,7 @@ public:
     using ChallengeCallback = std::function<std::string(const std::string& challenge_b64)>;
     using ProgressCallback = std::function<void(int64_t session_id, int64_t sequence, long position_ms, long duration_ms)>;
     using FlushCallback = std::function<void(int64_t session_id, int64_t sequence, int64_t new_epoch)>;
-    using StreamPauseCallback = std::function<void(int64_t session_id, int64_t sequence, int64_t epoch, bool is_implicit)>;
+    using StreamPauseCallback = std::function<void(int64_t session_id, int64_t sequence, int64_t epoch)>;
     using StreamResumeCallback = std::function<void(int64_t session_id, int64_t sequence, int64_t epoch)>;
     using FirstDataPacketCallback = std::function<void(int64_t session_id, int64_t sequence, int64_t epoch, int sample_rate, int bit_depth, int channels, const std::string& codec)>;
 

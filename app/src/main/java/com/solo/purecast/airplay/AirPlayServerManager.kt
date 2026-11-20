@@ -57,7 +57,11 @@ class AirPlayServerManager(
     )
 
     private val jmdnsDiscoveryService = JmDnsDiscoveryService(context)
-    val dacpClient = DacpClient(scope)
+    val dacpClient = DacpClient(scope).apply {
+        onPortRefreshRequested = { failedPort ->
+            jmdnsDiscoveryService.refreshDacpPortNow(excludePort = failedPort)
+        }
+    }
 
     private var isRunning = false
     private var currentPort = DEFAULT_RTSP_PORT

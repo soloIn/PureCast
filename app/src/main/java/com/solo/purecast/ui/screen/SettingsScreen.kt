@@ -540,8 +540,8 @@ fun SettingsScreen(
                                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                     listOf(
                                         FluidQuality.HIGH_QUALITY to "极佳 (60fps)",
-                                        FluidQuality.STANDARD to "标准 (60fps)",
-                                        FluidQuality.POWER_SAVE to "省电 (30fps)",
+                                        FluidQuality.STANDARD to "标准 (20fps)",
+                                        FluidQuality.POWER_SAVE to "省电 (20fps · 低清)",
                                         FluidQuality.STATIC to "静态磨砂",
                                         FluidQuality.OFF to "关闭"
                                     ).forEachIndexed { qIdx, (quality, label) ->

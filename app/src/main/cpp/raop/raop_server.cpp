@@ -47,11 +47,11 @@ static inline std::string to_lower_copy(std::string_view s) {
 }
 
 RaopServer::RaopServer() {
-    rtp_.set_stream_state_callback([this](bool is_paused, bool is_implicit, uint64_t epoch) {
+    rtp_.set_stream_state_callback([this](bool is_paused, uint64_t epoch) {
         const int64_t sid = active_session_id_.load(std::memory_order_acquire);
         const int64_t seq = next_seq();
         if (is_paused) {
-            if (stream_pause_cb_) stream_pause_cb_(sid, seq, static_cast<int64_t>(epoch), is_implicit);
+            if (stream_pause_cb_) stream_pause_cb_(sid, seq, static_cast<int64_t>(epoch));
         } else {
             if (stream_resume_cb_) stream_resume_cb_(sid, seq, static_cast<int64_t>(epoch));
         }
@@ -388,14 +388,12 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
                      << "Server: AirTunes/105.1\r\n\r\n";
         }
     } else if (method == "FLUSH") {
-        // 💡 收到 FLUSH 立即无锁静音递增 epoch 并重置 JitterBuffer，杜绝残音爆音并隔离旧包
-        rtp_.reset_buffer();
+        // 💡 收到 FLUSH 先递增 AudioEngine epoch 并同步给 rtp_，最后在 audio_packet_mutex_ 锁内原子重置 JitterBuffer，
+        // 消除 reset_buffer() 与 set_active_epoch() 之间的并发窗口导致首包拿旧 epoch 被拒丢帧的竞态；
+        // 严禁在 FLUSH 中越权调用 AudioEngine::resume_stream()，避免 TV 端暂停后 iPhone 响应发 FLUSH 提前解除本机静音漏出尾音。
         const uint64_t new_epoch = AudioEngine::instance().emergency_mute_and_flush(FlushReason::FLUSH_SWITCH);
         rtp_.set_active_epoch(new_epoch);
-        // 💡 修复 Finding 4: 若远端处于正常推流态（非 PAUSE 挂起），FLUSH 换代切歌时解除底层声卡暂停标记，杜绝电视端暂停后手机切歌死锁
-        if (!rtp_.is_manually_paused()) {
-            AudioEngine::instance().resume_stream();
-        }
+        rtp_.reset_buffer();
         if (flush_cb_) {
             flush_cb_(active_session_id_.load(std::memory_order_acquire), next_seq(), static_cast<int64_t>(new_epoch));
         }
@@ -551,14 +549,29 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
                  << apple_response_header
                  << "Server: AirTunes/105.1\r\n\r\n";
     } else if (method == "SETUP") {
-        // 解析控制端口 (Active-Remote / DACP-ID / DACP-Port 已在公共请求头入口统一解析)
+        // 解析控制端口与授时端口 (Active-Remote / DACP-ID / DACP-Port 已在公共请求头入口统一解析)
         std::string transport = parse_header(request, "Transport");
         LOGI("=== 收到 RTSP SETUP Transport ===: %s", transport.c_str());
         size_t cport_pos = transport.find("control_port=");
         if (cport_pos != std::string::npos) {
-            current_params_.client_control_port = std::stoi(transport.substr(cport_pos + 13));
-            if (!current_params_.client_ip.empty() && current_params_.client_control_port > 0) {
-                rtp_.set_client_control_endpoint(current_params_.client_ip, current_params_.client_control_port);
+            try {
+                current_params_.client_control_port = std::stoi(transport.substr(cport_pos + 13));
+                if (!current_params_.client_ip.empty() && current_params_.client_control_port > 0) {
+                    rtp_.set_client_control_endpoint(current_params_.client_ip, current_params_.client_control_port);
+                }
+            } catch (const std::exception& e) {
+                LOGW("解析 control_port 异常: %s", e.what());
+            }
+        }
+        size_t tport_pos = transport.find("timing_port=");
+        if (tport_pos != std::string::npos) {
+            try {
+                current_params_.client_timing_port = std::stoi(transport.substr(tport_pos + 12));
+                if (!current_params_.client_ip.empty() && current_params_.client_timing_port > 0) {
+                    rtp_.set_client_timing_endpoint(current_params_.client_ip, current_params_.client_timing_port);
+                }
+            } catch (const std::exception& e) {
+                LOGW("解析 timing_port 异常: %s", e.what());
             }
         }
 
@@ -613,7 +626,7 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
         }
         response << "RTSP/1.0 200 OK\r\n"
                  << "CSeq: " << cseq << "\r\n"
-                 << "Audio-Latency: 11025\r\n"
+                 << "Audio-Latency: " << RaopRtp::REPORTED_AUDIO_LATENCY_SAMPLES << "\r\n"
                  << "Server: AirTunes/105.1\r\n\r\n";
     } else if (method == "PAUSE") {
         LOGI("收到 RTSP PAUSE 请求，执行无锁快路径静音 (EXPLICIT_PAUSE) 并保留环形缓冲");

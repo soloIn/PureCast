@@ -23,6 +23,7 @@ class LyricsSyncClock(
     private val jumpThresholdMs: Long = DEFAULT_JUMP_THRESHOLD_MS,
     private val ringBufferDelayMsProvider: () -> Long = { 0L },
     private val lineLeadInMs: Long = DEFAULT_LINE_LEAD_IN_MS,
+    private val scrollLeadInMs: Long = DEFAULT_SCROLL_LEAD_IN_MS,
     private val delayEmaAlpha: Double = DEFAULT_DELAY_EMA_ALPHA
 ) {
 
@@ -30,7 +31,8 @@ class LyricsSyncClock(
         val lineIndex: Int,
         val lineProgressFraction: Float,
         val activeWordIndex: Int = -1,
-        val wordProgressFraction: Float = 0f
+        val wordProgressFraction: Float = 0f,
+        val scrollLineIndex: Int = lineIndex
     )
 
     private var reportedPositionMs: Long = 0L
@@ -121,14 +123,15 @@ class LyricsSyncClock(
 
         val jumpDelta = abs(newPositionMs - currentEstimatedTime)
 
-        // 💡 修复开播初期 iPhone 迟到的极小进度上报误判为 Seek 倒退的缺陷：
-        // 切歌开播初始 3.5 秒内，若协议上报的进度极小 (0..1500ms) 且落后于当前已平滑推演的时钟，
-        // 判定为推流端未就绪的延迟校准包，绝不触发向后 Seek 硬重置；仅用户显式寻道 (isUserSeek = true) 放行归零重播。
-        val isInitialWarmupLag = !isUserSeek && currentEstimatedTime <= 3500L && newPositionMs <= 1500L && newPositionMs < currentEstimatedTime
-        if (isInitialWarmupLag) {
+        // 💡 修复开播初期伪 0ms 空包误判为 Seek 倒退的缺陷：
+        // 切歌开播初始 3.5 秒内，仅拦截协议未就绪补发的 0ms 占位空包；
+        // 对于 AirPlay/DLNA 上报的真实非零进度 (newPositionMs > 0L，例如自然切歌 DMAP 提前 ~2s 起跑后到达的 268ms / 360ms)，
+        // 必须放行校准，杜绝时钟带着 +2~3 秒偏差空跑整首歌直到下一次心跳才剧烈回跳。
+        val isInitialWarmupZeroLag = !isUserSeek && currentEstimatedTime <= 3500L && newPositionMs == 0L && currentEstimatedTime > 0L
+        if (isInitialWarmupZeroLag) {
             Logger.lyrics.d(
                 TAG,
-                "开播初期推流端进度滞后 (currentEst=${currentEstimatedTime}ms, incoming=${newPositionMs}ms)，重设基准为当前推演时间，维持单调平滑推进"
+                "开播初期协议补发 0ms 未就绪空包 (currentEst=${currentEstimatedTime}ms)，重设基准为当前推演时间，维持单调平滑推进"
             )
             reportedPositionMs = currentEstimatedTime
             anchorNanoTime = nowNanoTime
@@ -268,29 +271,68 @@ class LyricsSyncClock(
     }
 
     /**
-     * 💡 针对当前推演时间检索当前高亮行并计算逐字/逐行进度比例
+     * 💡 计算某行歌词应当启动列表滚动居中的时间戳 (毫秒)
+     * 与逐字扫光激活解耦：不受上一句末字 prevVocalsEnd 截断，允许在开口前 scrollLeadInMs (默认 450ms) 启动弹簧上滑，
+     * 使歌词在开口前夕刚好滑到 38% 视觉中心就位，同时仍受 prev.startMs 单调保护杜绝跳过紧凑行。
      */
-    fun calculateActiveLineState(
+    fun getScrollEffectiveStartMs(
+        index: Int,
+        lines: List<LyricLine>,
+        leadInMs: Long = scrollLeadInMs
+    ): Long {
+        if (index !in lines.indices) return 0L
+        val line = lines[index]
+        if (leadInMs <= 0L) return line.startMs
+        val raw = (line.startMs - leadInMs).coerceAtLeast(0L)
+        if (index == 0) return raw
+        val prev = lines[index - 1]
+        return maxOf(prev.startMs, raw)
+    }
+
+    /**
+     * 💡 计算当前推演时间对应的列表滚动锚点行号（提前 scrollLeadInMs 启动滚动就位）
+     */
+    fun calculateScrollLineIndex(
+        timeline: LyricTimeline,
+        currentTimeMs: Long,
+        leadInMs: Long = scrollLeadInMs
+    ): Int {
+        val lines = timeline.lines
+        if (lines.isEmpty()) return -1
+        if (currentTimeMs < getScrollEffectiveStartMs(0, lines, leadInMs)) return -1
+        var low = 0
+        var high = lines.size - 1
+        var candidate = 0
+        while (low <= high) {
+            val mid = (low + high) ushr 1
+            if (getScrollEffectiveStartMs(mid, lines, leadInMs) <= currentTimeMs) {
+                candidate = mid
+                low = mid + 1
+            } else {
+                high = mid - 1
+            }
+        }
+        return candidate
+    }
+
+    /**
+     * 💡 零分配轻量版激活行号计算（供 60fps VSYNC 循环调用）：
+     * 仅计算当前高亮行索引，不遍历 words、不构造 ActiveLineState 对象，实现热路径 0 堆分配。
+     */
+    fun calculateActiveLineIndex(
         timeline: LyricTimeline,
         currentTimeMs: Long,
         leadInMs: Long = lineLeadInMs
-    ): ActiveLineState {
+    ): Int {
         val lines = timeline.lines
-        if (lines.isEmpty()) {
-            return ActiveLineState(lineIndex = -1, lineProgressFraction = 0f)
-        }
+        if (lines.isEmpty()) return -1
 
-        // 前奏期判定 —— 若当前时间尚未到达第一句歌词的提前起始时间，明确返回 -1
         val firstEffectiveStart = getEffectiveStartMs(0, lines, leadInMs)
-        if (currentTimeMs < firstEffectiveStart) {
-            return ActiveLineState(lineIndex = -1, lineProgressFraction = 0f)
-        }
+        if (currentTimeMs < firstEffectiveStart) return -1
 
-        // 基于单调递增的 effectiveStartMs 进行二分搜索，找到最后一个 effectiveStartMs <= currentTimeMs 的行
         var low = 0
         var high = lines.size - 1
         var candidateIndex = 0
-
         while (low <= high) {
             val mid = (low + high) ushr 1
             val effectiveStart = getEffectiveStartMs(mid, lines, leadInMs)
@@ -303,11 +345,6 @@ class LyricsSyncClock(
         }
 
         var activeIndex = candidateIndex
-
-        // 💡 检查是否有交叠行或和声行：
-        // 仅在当前候选行已经开始（currentTimeMs >= candidateLine.startMs）且已超出其 endMs 时，
-        // 检查相邻行是否精确包含 currentTimeMs；若处于候选行的提前预卷期 (currentTimeMs < candidateLine.startMs)，
-        // 则严格保持候选行为激活行，绝不回退至前一行而破坏提前量！
         val candidateLine = lines[candidateIndex]
         if (currentTimeMs >= candidateLine.startMs && currentTimeMs > candidateLine.endMs) {
             for (offset in -1..1) {
@@ -320,6 +357,29 @@ class LyricsSyncClock(
                     }
                 }
             }
+        }
+        return activeIndex
+    }
+
+    /**
+     * 💡 针对当前推演时间检索当前高亮行、列表滚动锚点行并计算逐字/逐行进度比例
+     */
+    fun calculateActiveLineState(
+        timeline: LyricTimeline,
+        currentTimeMs: Long,
+        leadInMs: Long = lineLeadInMs
+    ): ActiveLineState {
+        val lines = timeline.lines
+        if (lines.isEmpty()) {
+            return ActiveLineState(lineIndex = -1, lineProgressFraction = 0f, scrollLineIndex = -1)
+        }
+
+        val effectiveScrollLeadIn = if (leadInMs <= 0L) 0L else maxOf(leadInMs, scrollLeadInMs)
+        val scrollIndex = calculateScrollLineIndex(timeline, currentTimeMs, effectiveScrollLeadIn)
+
+        val activeIndex = calculateActiveLineIndex(timeline, currentTimeMs, leadInMs)
+        if (activeIndex < 0) {
+            return ActiveLineState(lineIndex = -1, lineProgressFraction = 0f, scrollLineIndex = scrollIndex)
         }
 
         val activeLine = lines[activeIndex]
@@ -352,7 +412,8 @@ class LyricsSyncClock(
             lineIndex = activeIndex,
             lineProgressFraction = lineProgressFraction,
             activeWordIndex = activeWordIndex,
-            wordProgressFraction = wordProgressFraction
+            wordProgressFraction = wordProgressFraction,
+            scrollLineIndex = maxOf(activeIndex, scrollIndex)
         )
     }
 
@@ -402,5 +463,12 @@ class LyricsSyncClock(
          * 彻底消除“唱出来了界面才开始缓慢移动”的滞后感。
          */
         const val DEFAULT_LINE_LEAD_IN_MS = 280L
+
+        /**
+         * 💡 列表滚动提前就位时间 (Scroll Lead-in Time):
+         * 匹配弹簧滑行耗时 (~380~420ms)，提前 450ms 启动列表上滑且不受上一句末字截断，
+         * 让文字在人声开口前夕刚好滑到 38% 视觉中心就位，逐字扫光仍严格踩在真实时间戳上。
+         */
+        const val DEFAULT_SCROLL_LEAD_IN_MS = 450L
     }
 }

@@ -4,7 +4,6 @@ import com.solo.purecast.core.session.ErrorClearedEvent
 import com.solo.purecast.core.session.EventOrigin
 import com.solo.purecast.core.session.ExplicitPauseEvent
 import com.solo.purecast.core.session.FirstDataPacketEvent
-import com.solo.purecast.core.session.ImplicitPauseEvent
 import com.solo.purecast.core.session.MetadataPatchEvent
 import com.solo.purecast.core.session.ProgressUpdateEvent
 import com.solo.purecast.core.session.SessionEventEnvelope
@@ -52,7 +51,7 @@ class AirPlayServerEventDispatchTest {
     }
 
     @Test
-    fun setupToFirstPacketToExplicitAndImplicitPauseAndResumeTransitions() {
+    fun setupToFirstPacketToExplicitPauseAndResumeAndTeardownTransitions() {
         val (dispatcher, events) = createDispatcher()
 
         val ep = dispatcher.onStreamRequested(
@@ -79,19 +78,16 @@ class AirPlayServerEventDispatchTest {
         dispatcher.onFirstDataPacket(1L, 2L, 11L, 44100, 16, 2, "ALAC")
         assertTrue(events.last().payload is FirstDataPacketEvent)
 
-        dispatcher.onStreamPaused(1L, 3L, 11L, isImplicit = false)
+        dispatcher.onStreamPaused(1L, 3L, 11L)
         assertTrue(events.last().payload is ExplicitPauseEvent)
 
         dispatcher.onStreamResumed(1L, 4L, 11L)
         assertEquals(11L, (events.last().payload as StreamResumeEvent).resumedEpoch)
 
-        dispatcher.onStreamPaused(1L, 5L, 11L, isImplicit = true)
-        assertTrue(events.last().payload is ImplicitPauseEvent)
-
-        dispatcher.onTrackSwitchFlushed(1L, 6L, 12L)
+        dispatcher.onTrackSwitchFlushed(1L, 5L, 12L)
         assertEquals(12L, (events.last().payload as TrackSwitchEvent).newEpoch)
 
-        dispatcher.onStreamStopped(1L, 7L, 13L)
+        dispatcher.onStreamStopped(1L, 6L, 13L)
         val teardown = events.last().payload as StreamTeardownEvent
         assertFalse("TEARDOWN 事件严禁作为 hardStop 硬停止", teardown.hardStop)
     }
@@ -201,7 +197,7 @@ class AirPlayServerEventDispatchTest {
         val countAfterSecondSetup = events.size
 
         // 旧会话 (nativeSessionId = 1) 迟到的 TEARDOWN / PAUSE 必须被静默丢弃
-        dispatcher.onStreamPaused(1L, 99L, 11L, isImplicit = true)
+        dispatcher.onStreamPaused(1L, 99L, 11L)
         dispatcher.onStreamStopped(1L, 100L, 12L)
         assertEquals(countAfterSecondSetup, events.size)
     }
@@ -410,5 +406,113 @@ class AirPlayServerEventDispatchTest {
         assertEquals("Within You Without You|The Beatles", boundary.trackKey)
         assertEquals(0L, boundary.initialPositionMs)
         assertEquals(304_714L, boundary.initialDurationMs)
+    }
+
+    @Test
+    fun `same-track TEARDOWN then SETUP resume reuses trackGeneration and new track DMAP still increments`() {
+        var mockClock = 1000L
+        val events = mutableListOf<SessionEventEnvelope<SessionEventPayload>>()
+        val globalSessionGen = AtomicLong(100L)
+        val seqGen = AtomicLong(0L)
+        val dispatcher = AirPlayNativeEventDispatcher(
+            dispatchEvent = { events += it },
+            allocateSessionId = { globalSessionGen.incrementAndGet() },
+            allocateSequence = { seqGen.incrementAndGet() },
+            onAcquireHardwareForStream = { _, _, _, _ -> 11L },
+            onDecryptAndInjectCryptoKey = { _, _ -> },
+            onUpdateDacpTarget = { _, _, _, _ -> },
+            onSolveChallenge = { "mock-resp" },
+            clockMs = { mockClock }
+        )
+
+        dispatcher.onStreamRequested(1L, 1L, 44100, 16, 2, "ALAC", "192.168.2.113", "", "", "", "", 0)
+        dispatcher.onMetadataReceived(1L, 2L, "情意结", "陈慧娴", "情意结", 242_000L, null)
+        val activeGenBeforePause = events.map { it.payload }.filterIsInstance<TrackBoundaryEvent>().last().trackGeneration
+
+        // iOS 暂停发 TEARDOWN
+        mockClock = 10_000L
+        dispatcher.onStreamStopped(1L, 3L, 12L)
+
+        // 同客户端恢复播放发新 SETUP：必须复用 activeGenBeforePause，杜绝歌词大屏重载
+        mockClock = 12_000L
+        dispatcher.onStreamRequested(2L, 1L, 44100, 16, 2, "ALAC", "192.168.2.113", "", "", "", "", 0)
+        val resumeSetup = events.last().payload as StreamSetupEvent
+        assertEquals(activeGenBeforePause, resumeSetup.trackGeneration)
+        assertEquals("情意结", resumeSetup.initialMetadata?.title)
+
+        // 若暂停期间用户在手机换了新歌，紧随其后的 DMAP 到达时必须正常递增 trackGeneration
+        mockClock = 12_150L
+        dispatcher.onMetadataReceived(2L, 2L, "踏浪", "小阿七", "踏浪", 165_000L, null)
+        val newTrackBoundary = events.map { it.payload }.filterIsInstance<TrackBoundaryEvent>().last()
+        assertTrue(newTrackBoundary.trackGeneration > activeGenBeforePause)
+        assertEquals("踏浪|小阿七", newTrackBoundary.trackKey)
+    }
+
+    @Test
+    fun `expired postFlushProgress does not leak stale position onto track switched 35s later`() {
+        var mockClock = 1000L
+        val events = mutableListOf<SessionEventEnvelope<SessionEventPayload>>()
+        val globalSessionGen = AtomicLong(100L)
+        val seqGen = AtomicLong(0L)
+        val dispatcher = AirPlayNativeEventDispatcher(
+            dispatchEvent = { events += it },
+            allocateSessionId = { globalSessionGen.incrementAndGet() },
+            allocateSequence = { seqGen.incrementAndGet() },
+            onAcquireHardwareForStream = { _, _, _, _ -> 11L },
+            onDecryptAndInjectCryptoKey = { _, _ -> },
+            onUpdateDacpTarget = { _, _, _, _ -> },
+            onSolveChallenge = { "mock-resp" },
+            clockMs = { mockClock }
+        )
+
+        dispatcher.onStreamRequested(1L, 1L, 44100, 16, 2, "ALAC", "192.168.2.113", "", "", "", "", 0)
+        dispatcher.onMetadataReceived(1L, 2L, "情意结", "陈慧娴", "情意结", 242_000L, null)
+
+        // 模拟暂停恢复时 FLUSH 后 1s 内上报了 41894ms（但未发生切歌消费 postFlushProgressPositionMs）
+        mockClock = 5000L
+        dispatcher.onTrackSwitchFlushed(1L, 3L, 12L)
+        mockClock = 6000L
+        dispatcher.onProgressUpdated(1L, 4L, 41_894L, 242_000L)
+
+        // 35 秒后切到新歌 踏浪：旧 postFlushProgressPositionMs 已超时过期，绝不能泄漏 41894ms！
+        mockClock = 41_000L
+        dispatcher.onMetadataReceived(1L, 5L, "踏浪", "小阿七", "踏浪", 165_000L, null)
+        val boundary = events.map { it.payload }.filterIsInstance<TrackBoundaryEvent>().last()
+        assertEquals("踏浪|小阿七", boundary.trackKey)
+        assertEquals(0L, boundary.initialPositionMs)
+    }
+
+    @Test
+    fun `transient iOS loading DMAP title is ignored without firing spurious TrackBoundaryEvent`() {
+        var mockClock = 1000L
+        val events = mutableListOf<SessionEventEnvelope<SessionEventPayload>>()
+        val globalSessionGen = AtomicLong(100L)
+        val seqGen = AtomicLong(0L)
+        val dispatcher = AirPlayNativeEventDispatcher(
+            dispatchEvent = { events += it },
+            allocateSessionId = { globalSessionGen.incrementAndGet() },
+            allocateSequence = { seqGen.incrementAndGet() },
+            onAcquireHardwareForStream = { _, _, _, _ -> 11L },
+            onDecryptAndInjectCryptoKey = { _, _ -> },
+            onUpdateDacpTarget = { _, _, _, _ -> },
+            onSolveChallenge = { "mock-resp" },
+            clockMs = { mockClock }
+        )
+
+        dispatcher.onStreamRequested(1L, 1L, 44100, 16, 2, "ALAC", "192.168.2.113", "", "", "", "", 0)
+        dispatcher.onMetadataReceived(1L, 2L, "香水有毒", "胡杨林", "", 290_000L, null)
+        val countBeforeLoading = events.size
+
+        // iOS 切歌前 35ms 瞬推 "正在载入…"：必须完全忽略
+        mockClock = 2000L
+        dispatcher.onMetadataReceived(1L, 3L, "正在载入…", "", "", 0L, null)
+        assertEquals(countBeforeLoading, events.size)
+
+        // 随后真实新歌 4ever in U 到达，正常确立唯一曲目边界
+        mockClock = 2035L
+        dispatcher.onMetadataReceived(1L, 4L, "4ever in U", "Artist", "", 182_765L, null)
+        val boundaries = events.drop(countBeforeLoading).map { it.payload }.filterIsInstance<TrackBoundaryEvent>()
+        assertEquals(1, boundaries.size)
+        assertEquals("4ever in U|Artist", boundaries.single().trackKey)
     }
 }

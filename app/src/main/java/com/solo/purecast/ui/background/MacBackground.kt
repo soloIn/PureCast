@@ -136,21 +136,51 @@ fun MacBackground(
         else -> quality
     }
     var failed by remember(effectiveQuality) { mutableStateOf(false) }
+    var textureOpaque by remember(effectiveQuality) { mutableStateOf(false) }
+    val frame = artwork
+    val showAnimatedTexture = frame != null && effectiveQuality.animated && !failed
+    val hideUnderlyingLayers = showAnimatedTexture && textureOpaque
 
-    Box(modifier.fillMaxSize().background(Color(0xFF101014))) {
-        val frame = artwork
+    LaunchedEffect(frame == null, failed) {
+        if (frame == null || failed) textureOpaque = false
+    }
+
+    Box(
+        modifier = if (hideUnderlyingLayers) {
+            modifier.fillMaxSize()
+        } else {
+            modifier.fillMaxSize().background(Color(0xFF101014))
+        }
+    ) {
         if (frame != null) {
-            Image(
-                bitmap = frame.fallback.asImageBitmap(),
-                contentDescription = null,
-                modifier = Modifier.fillMaxSize(),
-                contentScale = ContentScale.Crop
-            )
-            if (effectiveQuality.animated && !failed) {
-                AndroidView(
-                    factory = { ctx -> MacTextureView(ctx, sceneClock) { failed = true } },
+            // 💡 MacTextureView 首帧 350ms 渐显完全不透明后跳过底层 fallback 静态图，彻底消除 1920x1080 双重全屏过绘
+            if (!hideUnderlyingLayers) {
+                Image(
+                    bitmap = frame.fallback.asImageBitmap(),
+                    contentDescription = null,
                     modifier = Modifier.fillMaxSize(),
-                    onRelease = { it.close() },
+                    contentScale = ContentScale.Crop
+                )
+            }
+            if (showAnimatedTexture) {
+                AndroidView(
+                    factory = { ctx ->
+                        MacTextureView(
+                            context = ctx,
+                            clock = sceneClock,
+                            onOpaqueReady = { textureOpaque = true },
+                            onOpaqueLost = { textureOpaque = false },
+                            onFailure = {
+                                textureOpaque = false
+                                failed = true
+                            }
+                        )
+                    },
+                    modifier = Modifier.fillMaxSize(),
+                    onRelease = {
+                        textureOpaque = false
+                        it.close()
+                    },
                     update = { view ->
                         view.update(
                             bitmap = frame.source,
@@ -234,9 +264,8 @@ private fun fastBoxBlur(src: Bitmap, radius: Int = 6): Bitmap {
         }
     }
 
-    // 💡 修复 Finding 13: 同步应用与 MacShaders.MESH 完全一致的饱和度增强 (1.5x) 与暗化系数 (* 0.73 且钳制在 [18, 220])，
-    // 消除“静态磨砂 (FluidQuality.STATIC)”或无障碍减弱动态效果下纯白/浅色封面导致的前景白色文字对比度吞噬问题，
-    // 确保静态帧 fallback 与 GLES2 渲染画面的明度与色调完全对齐。
+    // 💡 修复 Finding 13 + 零过绘优化: 同步应用与 MacShaders.MESH 完全一致的饱和度增强 (1.5x)、暗化系数与 22% 保护遮罩 (* 0.78)，
+    // 确保静态磨砂 (FluidQuality.STATIC) 与 GLES2 渲染画面明度完全对齐，且无需叠加额外的全屏半透明黑色 Box。
     for (i in 0 until w * h) {
         val c = pix[i]
         val r = (c shr 16) and 0xFF
@@ -246,9 +275,9 @@ private fun fastBoxBlur(src: Bitmap, radius: Int = 6): Bitmap {
         val satR = gray + (r - gray) * 1.5f
         val satG = gray + (g - gray) * 1.5f
         val satB = gray + (b - gray) * 1.5f
-        val finalR = (satR * 0.73f).roundToInt().coerceIn(18, 220)
-        val finalG = (satG * 0.73f).roundToInt().coerceIn(18, 220)
-        val finalB = (satB * 0.73f).roundToInt().coerceIn(18, 220)
+        val finalR = (satR * 0.73f * 0.78f).roundToInt().coerceIn(14, 172)
+        val finalG = (satG * 0.73f * 0.78f).roundToInt().coerceIn(14, 172)
+        val finalB = (satB * 0.73f * 0.78f).roundToInt().coerceIn(14, 172)
         pix[i] = (-0x1000000) or (finalR shl 16) or (finalG shl 8) or finalB
     }
 

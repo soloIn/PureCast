@@ -38,7 +38,6 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
-import androidx.compose.runtime.withFrameNanos
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -394,12 +393,18 @@ fun MainTvScreen(
         label = "coverScaleAnim"
     )
 
+    val hasFluidBackdrop = !isIdle && fluidQuality != FluidQuality.OFF && hasActiveCover
+
     Box(
-        modifier = modifier
-            .fillMaxSize()
-            .background(AppPalette.background)
+        modifier = if (hasFluidBackdrop) {
+            modifier.fillMaxSize()
+        } else {
+            modifier
+                .fillMaxSize()
+                .background(AppPalette.background)
+        }
     ) {
-        // 1. GLES2 材质网格动态流光背景 (无推流时 MacBackground 优雅呈现自适应纯净背景)
+        // 1. GLES2 材质网格动态流光背景 (已内置 22% 文字对比度暗化与底色覆盖，消除 5 层 1080p 全屏过绘)
         FluidBackground(
             coverData = persistentCover,
             isPlaying = isPlaying,
@@ -408,15 +413,6 @@ fun MainTvScreen(
             coverHash = persistentCoverHash,
             isForeground = isForeground
         )
-
-        // 💡 柔和暗化层：仅在推流播放动态流光背景时启用，防止高饱和流光吞没文字；待机时关闭以呈现原汁原味的深/浅主题
-        if (!isIdle && fluidQuality != FluidQuality.OFF && hasActiveCover) {
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .background(Color.Black.copy(alpha = 0.22f))
-            )
-        }
 
         // 2. 主体展示层：支持标准 42%/58% 主屏与 Apple Music TV 歌词全屏展开空间层次过渡
         SharedTransitionLayout {
@@ -741,21 +737,22 @@ private fun IsolatedProgressBar(
     val isPlaying = playbackStatus == PlaybackStatus.PLAYING
     val isIdle = playbackStatus == PlaybackStatus.IDLE || playbackStatus == PlaybackStatus.STOPPED
 
-    // 💡 播放态：以 60fps/120fps VSYNC 高频驱动 drawTrigger 与秒级文本量化
-    // 当处于前台且播放时才运行高频 VSYNC；设置页打开或后台时立即停止空转 (Finding 1)
-    val shouldRunVsync = isPlaying && isForeground
-    LaunchedEffect(shouldRunVsync) {
-        if (shouldRunVsync) {
+    // 💡 播放态进度条降频驱动（~10fps / 100ms）：
+    // Android HWUI 局部重绘仍会触发整窗 1080p Skia 合成（含重采样全屏 TextureView），
+    // 而 3~4 分钟歌曲进度条每秒仅移动约 3~5px，10fps 视觉完全平滑且将主屏 Skia 合成开销降低 ~83%。
+    val shouldRunProgressTicker = isPlaying && isForeground
+    LaunchedEffect(shouldRunProgressTicker) {
+        if (shouldRunProgressTicker) {
             while (true) {
-                withFrameNanos { frameNanos ->
-                    drawTrigger = frameNanos
-                    val currentMs = syncClock.getCurrentInterpolatedTimeMs(frameNanos)
-                    val clamped = if (totalDurationMs > 0) currentMs.coerceIn(0L, totalDurationMs) else currentMs
-                    val sec = (clamped / 1000L) * 1000L
-                    if (sec != displaySecondMs) {
-                        displaySecondMs = sec
-                    }
+                val nowNanos = System.nanoTime()
+                drawTrigger = nowNanos
+                val currentMs = syncClock.getCurrentInterpolatedTimeMs(nowNanos)
+                val clamped = if (totalDurationMs > 0) currentMs.coerceIn(0L, totalDurationMs) else currentMs
+                val sec = (clamped / 1000L) * 1000L
+                if (sec != displaySecondMs) {
+                    displaySecondMs = sec
                 }
+                delay(100L)
             }
         }
     }

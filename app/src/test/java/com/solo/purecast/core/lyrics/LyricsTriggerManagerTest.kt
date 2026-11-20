@@ -7,6 +7,9 @@ import com.solo.purecast.data.lyrics.remote.LrclibDataSource
 import com.solo.purecast.data.lyrics.remote.LyricsHttpClient
 import com.solo.purecast.model.BusinessSessionState
 import com.solo.purecast.model.DurationState
+import com.solo.purecast.model.LyricFormat
+import com.solo.purecast.model.LyricLine
+import com.solo.purecast.model.LyricTimeline
 import com.solo.purecast.model.LyricUiState
 import com.solo.purecast.model.PlayerSessionSnapshot
 import com.solo.purecast.model.TrackMetadata
@@ -91,6 +94,24 @@ class LyricsTriggerManagerTest {
     }
 
     @Test
+    fun `ignores airplay passthrough placeholder title and skips network query`() = testScope.runTest {
+        val snapshot = PlayerSessionSnapshot(
+            businessState = BusinessSessionState.PLAYING,
+            trackGeneration = 1L,
+            metadata = TrackMetadata(
+                title = "AirPlay 音频直通",
+                artist = "AirPlay 设备"
+            )
+        )
+
+        triggerManager.onSessionSnapshotChanged(snapshot)
+        advanceUntilIdle()
+
+        assertEquals(LyricUiState.Idle, triggerManager.lyricUiState.value)
+        assertEquals(0, fakeClient.fetchCount)
+    }
+
+    @Test
     fun `rapid track switching cancels earlier in-flight requests and executes only latest`() = testScope.runTest {
         val amllSearchUrl = "https://api.amll.dev/v1/lyrics/search?musicName=song2&artistName=artist2"
         fakeClient.responses[amllSearchUrl] = LyricsHttpClient.HttpResponse(
@@ -151,5 +172,47 @@ class LyricsTriggerManagerTest {
         assertTrue(state is LyricUiState.NotFound)
         assertEquals(10L, (state as LyricUiState.NotFound).trackGeneration)
         assertEquals(0, fakeClient.fetchCount)
+    }
+
+    @Test
+    fun `same-track resume with incremented trackGeneration preserves Success timeline without reloading`() = testScope.runTest {
+        val cachedTimeline = LyricTimeline(
+            source = "cache",
+            format = LyricFormat.LRC_LINE_SYNC,
+            durationMs = 242_000L,
+            lines = listOf(LyricLine(0, 10_000L, 20_000L, "情意结"))
+        )
+        val cacheKey = cacheRepo.computeCacheKey("陈慧娴", "情意结", 242_000L)
+        cacheRepo.put(cacheKey, cachedTimeline)
+
+        triggerManager.onSessionSnapshotChanged(
+            PlayerSessionSnapshot(
+                businessState = BusinessSessionState.PLAYING,
+                trackGeneration = 6L,
+                metadata = TrackMetadata(title = "情意结", artist = "陈慧娴", durationMs = 242_000L)
+            )
+        )
+        advanceTimeBy(400L)
+        advanceUntilIdle()
+
+        val initialSuccess = triggerManager.lyricUiState.value as LyricUiState.Success
+        val fetchCountAfterLoad = fakeClient.fetchCount
+
+        // 模拟 TEARDOWN 暂停后重连 SETUP 导致 trackGeneration 递增为 7，但歌名与歌手未变
+        triggerManager.onSessionSnapshotChanged(
+            PlayerSessionSnapshot(
+                businessState = BusinessSessionState.TRANSITIONING,
+                trackGeneration = 7L,
+                metadata = TrackMetadata(title = "情意结", artist = "陈慧娴", durationMs = 242_000L)
+            )
+        )
+        advanceUntilIdle()
+
+        val resumedState = triggerManager.lyricUiState.value
+        assertTrue("同曲目续播绝不能退回 Loading 重载大屏", resumedState is LyricUiState.Success)
+        val resumedSuccess = resumedState as LyricUiState.Success
+        assertEquals(7L, resumedSuccess.trackGeneration)
+        assertTrue("timeline 引用必须保持一致以防 Compose 重建视图", resumedSuccess.timeline === initialSuccess.timeline)
+        assertEquals("不应产生任何重复网络检索", fetchCountAfterLoad, fakeClient.fetchCount)
     }
 }

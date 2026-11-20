@@ -208,29 +208,33 @@ class LyricsSyncClockTest {
     }
 
     @Test
-    fun `initial warmup delayed progress packet within 3500ms does not pull back clock`() {
+    fun `initial warmup ignores spurious 0ms packet but accepts real non-zero protocol progress`() {
         val baseNano = 1_000_000_000L
-        // 开播硬对齐至 0ms (带 100ms 预充)
+        // 模拟自然切歌 DMAP 提前 ~2s 到达：先硬对齐至 0ms 开始推演
         syncClock.hardAlign(targetPositionMs = 0L, playing = true, nowNanoTime = baseNano)
 
         // 走字 1000ms (预充 100ms 扣除后推演到达 900ms)
         val t1 = syncClock.getCurrentInterpolatedTimeMs(baseNano + 1_000_000_000L)
         assertEquals(900L, t1)
 
-        // 此时推流端 iPhone 下发了首包迟到的极小进度 131ms (|900 - 131| = 769ms > 350ms)
-        syncClock.updatePosition(131L, playing = true, nowNanoTime = baseNano + 1_000_000_000L)
+        // 1. 协议层在开播前 3.5 秒内补发未就绪 0ms 占位空包仍应拦截，不拉偏时钟
+        syncClock.updatePosition(0L, playing = true, nowNanoTime = baseNano + 1_100_000_000L, isUserSeek = false)
+        assertTrue(syncClock.getCurrentInterpolatedTimeMs(baseNano + 1_100_000_000L) >= 1000L)
 
-        // 验证开播防倒拉保护生效：绝不触发向后 Seek 重置为 131ms，维持单调推演继续前进 (900ms + 100ms = 1000ms)
-        val t2 = syncClock.getCurrentInterpolatedTimeMs(baseNano + 1_100_000_000L)
-        assertEquals(1000L, t2)
+        // 2. 切歌 2.04s 后 AirPlay 下发真实非零进度 268ms（扬声器刚刚开始出声）：必须立即放行对齐，绝不能吞掉导致 +2.8s 跑偏！
+        val prog1Nano = baseNano + 2_040_000_000L
+        syncClock.updatePosition(268L, playing = true, nowNanoTime = prog1Nano, isUserSeek = false, allowSeekJump = true)
+        assertEquals(268L, syncClock.getCurrentInterpolatedTimeMs(prog1Nano))
 
-        // 协议层在开播前 3.5 秒内补发 0ms 仍应拦截，不拉偏时钟
-        syncClock.updatePosition(0L, playing = true, nowNanoTime = baseNano + 1_300_000_000L, isUserSeek = false)
-        assertTrue(syncClock.getCurrentInterpolatedTimeMs(baseNano + 1_300_000_000L) >= 1000L)
+        // 3. 切歌 3.14s 后 AirPlay 再次下发校准进度 360ms：同样立即对齐，之后 52s 内时钟与真声误差 < 10ms
+        val prog2Nano = baseNano + 3_140_000_000L
+        syncClock.updatePosition(360L, playing = true, nowNanoTime = prog2Nano, isUserSeek = false, allowSeekJump = true)
+        assertEquals(360L, syncClock.getCurrentInterpolatedTimeMs(prog2Nano))
 
-        // 但若用户在前 3.5 秒内显式拖动回开头 0ms (isUserSeek = true)，必须放行硬对齐至 0ms
-        syncClock.updatePosition(0L, playing = true, nowNanoTime = baseNano + 1_500_000_000L, isUserSeek = true)
-        assertEquals(0L, syncClock.getCurrentInterpolatedTimeMs(baseNano + 1_500_000_000L))
+        // 4. 若用户在前 3.5 秒内显式拖动回开头 0ms (isUserSeek = true)，必须放行硬对齐至 0ms
+        val userSeekNano = baseNano + 3_300_000_000L
+        syncClock.updatePosition(0L, playing = true, nowNanoTime = userSeekNano, isUserSeek = true)
+        assertEquals(0L, syncClock.getCurrentInterpolatedTimeMs(userSeekNano))
     }
 
     @Test
@@ -536,5 +540,45 @@ class LyricsSyncClockTest {
         // 7. reset 必须补上自增 mutationVersion
         clock.reset()
         assertEquals(6L, clock.mutationVersion)
+    }
+
+    @Test
+    fun `tight word-sync gap scrolls next line 450ms early while keeping active vocal line intact`() {
+        val timeline = LyricTimeline(
+            source = "test",
+            format = LyricFormat.TTML_SYLLABLE,
+            lines = listOf(
+                LyricLine(
+                    lineIndex = 0,
+                    startMs = 5_000L,
+                    endMs = 10_000L,
+                    mainText = "Line 0",
+                    words = listOf(LyricWord("Hello", 5_000L, 9_950L))
+                ),
+                LyricLine(
+                    lineIndex = 1,
+                    startMs = 10_000L,
+                    endMs = 15_000L,
+                    mainText = "Line 1",
+                    words = listOf(LyricWord("World", 10_000L, 14_000L))
+                )
+            )
+        )
+
+        // 9_500ms：距离下一句开口 500ms (> 450ms)，仍在第 0 行
+        val stateBefore = syncClock.calculateActiveLineState(timeline, 9_500L)
+        assertEquals(0, stateBefore.lineIndex)
+        assertEquals(0, stateBefore.scrollLineIndex)
+
+        // 9_600ms：距离下一句开口 400ms (<= 450ms)，滚动锚点已提前切到第 1 行启动弹簧上滑，
+        // 同时第 0 行最后一个字尚未唱完 (9_950ms)，lineIndex 严格保持 0 不截断扫光！
+        val statePreScroll = syncClock.calculateActiveLineState(timeline, 9_600L)
+        assertEquals(0, statePreScroll.lineIndex)
+        assertEquals(1, statePreScroll.scrollLineIndex)
+
+        // 9_950ms：上一行唱完，高亮也切入第 1 行准备开口
+        val stateSwitched = syncClock.calculateActiveLineState(timeline, 9_950L)
+        assertEquals(1, stateSwitched.lineIndex)
+        assertEquals(1, stateSwitched.scrollLineIndex)
     }
 }

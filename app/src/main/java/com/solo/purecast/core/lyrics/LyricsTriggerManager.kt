@@ -103,6 +103,16 @@ class LyricsTriggerManager(
         val isGenerationChanged = generation != currentTrackGeneration
         val isSignatureChanged = signature != lastTriggeredSignature
 
+        // 💡 同曲目续播保护：若曲目代数因重连发生变更，但歌曲签名（标题+歌手）完全一致且当前已持有成功歌词，
+        // 仅静默更新 currentTrackGeneration 并保持原 timeline 引用，杜绝暂停恢复时大屏重载闪回 Loading。
+        val existingState = _lyricUiState.value
+        if (isGenerationChanged && !isSignatureChanged && existingState is LyricUiState.Success) {
+            currentTrackGeneration = generation
+            _lyricUiState.value = existingState.copy(trackGeneration = generation)
+            checkDurationPatchRecalibration(snapshot)
+            return
+        }
+
         if (isGenerationChanged || isSignatureChanged) {
             handleMetadataReady(snapshot, signature)
             return
@@ -309,6 +319,7 @@ class LyricsTriggerManager(
             "等待音频推送",
             "no media",
             "airplay",
+            "airplay 音频直通",
             "audio cast",
             "bluetooth"
         )

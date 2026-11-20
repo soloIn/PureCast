@@ -40,6 +40,8 @@ class DacpClient(
     private var activeRemoteToken: String? = null
     @Volatile
     private var pendingCommand: String? = null
+    @Volatile
+    var onPortRefreshRequested: (suspend (failedPort: Int) -> Int?)? = null
 
     /**
      * 更新当前 AirPlay 会话的 DACP 连接凭据
@@ -113,14 +115,24 @@ class DacpClient(
         val params = prepareCommandParams(command)
             ?: return Result.failure(IllegalStateException("DACP 会话未连接，无法发送指令 [$command]"))
         return withContext(Dispatchers.IO) {
-            executeHttpCommand(params.first, params.second, params.third, command)
+            val firstResult = executeHttpCommand(params.first, params.second, params.third, command)
+            if (firstResult.isSuccess) return@withContext firstResult
+
+            // 💡 iOS 重连或切换会话后会更换随机 DACP 端口，旧端口会立刻报 ConnectException；
+            // 触发 mDNS 强制刷新端口（显式排除已失败的旧端口）并立即重试一次，彻底解决 TV 遥控器按钮间歇失灵。
+            val refreshedPort = onPortRefreshRequested?.invoke(params.second)
+            if (refreshedPort != null && refreshedPort > 0 && refreshedPort != params.second) {
+                dacpPort = refreshedPort
+                Logger.airplay.i(TAG, "DACP 端口已刷新 (${params.second} -> $refreshedPort)，自动重试指令 [$command]")
+                return@withContext executeHttpCommand(params.first, refreshedPort, params.third, command)
+            }
+            firstResult
         }
     }
 
     private fun sendCommand(command: String) {
-        val params = prepareCommandParams(command) ?: return
         scope.launch(Dispatchers.IO) {
-            executeHttpCommand(params.first, params.second, params.third, command)
+            sendCommandAndAwait(command)
         }
     }
 

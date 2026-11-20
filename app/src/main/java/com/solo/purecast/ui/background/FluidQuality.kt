@@ -7,8 +7,8 @@ package com.solo.purecast.ui.background
 enum class FluidQuality(val maxEdge: Int, val fps: Int) {
     OFF(0, 0),
     STATIC(0, 0),
-    POWER_SAVE(640, 30),
-    STANDARD(960, 60),
+    POWER_SAVE(480, 20),
+    STANDARD(640, 20),
     HIGH_QUALITY(1280, 60);
 
     val animated: Boolean get() = fps > 0

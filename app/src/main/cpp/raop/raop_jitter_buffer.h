@@ -26,8 +26,8 @@ struct JitterPacket {
  */
 class RaopJitterBuffer {
 public:
-    static constexpr size_t BUFFER_SIZE = 128; // 128 帧 * 352 采样 / 44100 = 约 1021ms 容量
-    static constexpr size_t PRE_ROLL_PACKETS = 25; // 25 帧 * 8ms = 约 200ms 预充 (对齐 AirPlay 标称延迟，彻底杜绝水位过浅造成的声卡 Underrun)
+    static constexpr size_t BUFFER_SIZE = 512; // 512 帧 * 352 采样 / 44100 = 约 4.08s 容量（完整容纳 AirPlay 2s 同步缓冲与抖动余量）
+    static constexpr size_t PRE_ROLL_PACKETS = 25; // 25 帧 * 8ms = 约 200ms 预充 (无 Sync 包回退路径防声卡 Underrun)
     static constexpr int16_t MAX_REORDER_TOLERANCE = 8; // 乱序等待上限 8 帧 (~64ms，预留充足局域网 RTT 供 RAOP 0xd5 重传包返回，超差后插补静音帧垫步)
     static constexpr size_t FRAME_BYTES = 352 * 2 * 2; // 352 采样 * 2 声道 * 16-bit (2 字节) = 1408 字节
 
@@ -66,6 +66,11 @@ public:
      * @return true 存在就绪帧；false 处于预充或正在等待乱序包
      */
     bool peek_size(size_t& out_size);
+
+    /**
+     * 💡 探查队首待出队帧的字节尺寸与 RTP 时间戳（供 Sync 精准出声时间门控使用，不弹出数据）
+     */
+    bool peek_head(size_t& out_size, uint32_t& out_timestamp, bool& out_has_timestamp);
 
     /**
      * 获取当前 JitterBuffer 中缓存的有效音频包数量
