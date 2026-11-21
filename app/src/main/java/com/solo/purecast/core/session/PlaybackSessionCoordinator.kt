@@ -89,6 +89,7 @@ class PlaybackSessionCoordinator(
     @Volatile
     private var idleTimeoutMillis: Long = HARDWARE_IDLE_RELEASE_MS
 
+    private val timerLock = Any()
     private var debouncePauseJob: Job? = null
     private var uiProtectionJob: Job? = null
     private var hardwareIdleTimeoutJob: Job? = null
@@ -96,31 +97,33 @@ class PlaybackSessionCoordinator(
     private var remoteCommandTimeoutJob: Job? = null
     private var coverGraceJob: Job? = null
     private var transitionTimeoutJob: Job? = null
-    private val transientErrorDismissJobs = HashMap<ErrorCode, Job>()
+    private val transientErrorDismissJobs = java.util.concurrent.ConcurrentHashMap<ErrorCode, Job>()
 
     init {
         startEventLoop()
         startDacpSerialLoop()
     }
 
-    /** 释放协调器定时器与通道，停止事件循环 */
+    /** 释放协调器定时器与通道，停止事件循环（线程安全，可从主线程 onDestroy 调用） */
     fun shutdown() {
-        debouncePauseJob?.cancel()
-        debouncePauseJob = null
-        uiProtectionJob?.cancel()
-        uiProtectionJob = null
-        hardwareIdleTimeoutJob?.cancel()
-        hardwareIdleTimeoutJob = null
-        suspendTimeoutJob?.cancel()
-        suspendTimeoutJob = null
-        remoteCommandTimeoutJob?.cancel()
-        remoteCommandTimeoutJob = null
-        coverGraceJob?.cancel()
-        coverGraceJob = null
-        transitionTimeoutJob?.cancel()
-        transitionTimeoutJob = null
-        transientErrorDismissJobs.values.forEach { it.cancel() }
-        transientErrorDismissJobs.clear()
+        synchronized(timerLock) {
+            debouncePauseJob?.cancel()
+            debouncePauseJob = null
+            uiProtectionJob?.cancel()
+            uiProtectionJob = null
+            hardwareIdleTimeoutJob?.cancel()
+            hardwareIdleTimeoutJob = null
+            suspendTimeoutJob?.cancel()
+            suspendTimeoutJob = null
+            remoteCommandTimeoutJob?.cancel()
+            remoteCommandTimeoutJob = null
+            coverGraceJob?.cancel()
+            coverGraceJob = null
+            transitionTimeoutJob?.cancel()
+            transitionTimeoutJob = null
+            transientErrorDismissJobs.values.forEach { it.cancel() }
+            transientErrorDismissJobs.clear()
+        }
         eventChannel.close()
         dacpCommandChannel.close()
     }
@@ -378,12 +381,14 @@ class PlaybackSessionCoordinator(
 
                             ProtocolResumeReopenResult.RESTARTING -> {
                                 // 💡 P1-4 修复：UPnP 重新拉流进入 TRANSITIONING，挂载 5s 过渡态看门狗防止无数据卡死
-                                transitionTimeoutJob = rescheduleServiceTimer(
-                                    previous = transitionTimeoutJob,
-                                    delayMs = TRANSITION_TIMEOUT_MS,
-                                    sessionId = snap.sessionId,
-                                    payload = TransitionTimeoutEvent(snap.sessionId)
-                                )
+                                synchronized(timerLock) {
+                                    transitionTimeoutJob = rescheduleServiceTimer(
+                                        previous = transitionTimeoutJob,
+                                        delayMs = TRANSITION_TIMEOUT_MS,
+                                        sessionId = snap.sessionId,
+                                        payload = TransitionTimeoutEvent(snap.sessionId)
+                                    )
+                                }
                                 snap.copy(
                                     transportState = TransportPipeState.PREPARING,
                                     businessState = BusinessSessionState.TRANSITIONING,
@@ -399,12 +404,14 @@ class PlaybackSessionCoordinator(
                             }
 
                             ProtocolResumeReopenResult.PRODUCER_DEAD -> {
-                                suspendTimeoutJob = rescheduleServiceTimer(
-                                    previous = suspendTimeoutJob,
-                                    delayMs = SUSPEND_TIMEOUT_MS,
-                                    sessionId = snap.sessionId,
-                                    payload = SuspendTimeoutEvent
-                                )
+                                synchronized(timerLock) {
+                                    suspendTimeoutJob = rescheduleServiceTimer(
+                                        previous = suspendTimeoutJob,
+                                        delayMs = SUSPEND_TIMEOUT_MS,
+                                        sessionId = snap.sessionId,
+                                        payload = SuspendTimeoutEvent
+                                    )
+                                }
                                 snap.copy(
                                     transportState = TransportPipeState.INTERRUPTED,
                                     businessState = BusinessSessionState.PAUSED,
@@ -422,12 +429,14 @@ class PlaybackSessionCoordinator(
                     },
                     onFailure = { snap, err ->
                         // 💡 P1-4 修复：恢复打开硬件失败回退 PAUSED，重新挂载 10 分钟挂起超时定时器
-                        suspendTimeoutJob = rescheduleServiceTimer(
-                            previous = suspendTimeoutJob,
-                            delayMs = SUSPEND_TIMEOUT_MS,
-                            sessionId = snap.sessionId,
-                            payload = SuspendTimeoutEvent
-                        )
+                        synchronized(timerLock) {
+                            suspendTimeoutJob = rescheduleServiceTimer(
+                                previous = suspendTimeoutJob,
+                                delayMs = SUSPEND_TIMEOUT_MS,
+                                sessionId = snap.sessionId,
+                                payload = SuspendTimeoutEvent
+                            )
+                        }
                         snap.copy(
                             businessState = BusinessSessionState.PAUSED,
                             hardwareState = HardwarePipelineState.RELEASED,
@@ -455,131 +464,161 @@ class PlaybackSessionCoordinator(
             }
 
             is TransitionEffect.ScheduleDebouncePause -> {
-                debouncePauseJob = rescheduleServiceTimer(
-                    previous = debouncePauseJob,
-                    delayMs = DEBOUNCE_PAUSE_MS,
-                    sessionId = context.snapshot.sessionId,
-                    payload = DebouncePauseTimeoutEvent(effect.token)
-                )
+                synchronized(timerLock) {
+                    debouncePauseJob = rescheduleServiceTimer(
+                        previous = debouncePauseJob,
+                        delayMs = DEBOUNCE_PAUSE_MS,
+                        sessionId = context.snapshot.sessionId,
+                        payload = DebouncePauseTimeoutEvent(effect.token)
+                    )
+                }
             }
 
             is TransitionEffect.CancelDebouncePause -> {
-                debouncePauseJob?.cancel()
-                debouncePauseJob = null
+                synchronized(timerLock) {
+                    debouncePauseJob?.cancel()
+                    debouncePauseJob = null
+                }
             }
 
             is TransitionEffect.ScheduleUiProtection -> {
-                uiProtectionJob = rescheduleServiceTimer(
-                    previous = uiProtectionJob,
-                    delayMs = UI_PROTECTION_WINDOW_MS,
-                    sessionId = context.snapshot.sessionId,
-                    payload = UiProtectionTimeoutEvent(effect.token)
-                )
+                synchronized(timerLock) {
+                    uiProtectionJob = rescheduleServiceTimer(
+                        previous = uiProtectionJob,
+                        delayMs = UI_PROTECTION_WINDOW_MS,
+                        sessionId = context.snapshot.sessionId,
+                        payload = UiProtectionTimeoutEvent(effect.token)
+                    )
+                }
             }
 
             is TransitionEffect.ScheduleHardwareIdleTimeout -> {
                 val timeoutMs = idleTimeoutMillis
-                hardwareIdleTimeoutJob = if (timeoutMs <= 0L) {
-                    hardwareIdleTimeoutJob?.cancel()
-                    null
-                } else {
-                    rescheduleServiceTimer(
-                        previous = hardwareIdleTimeoutJob,
-                        delayMs = timeoutMs,
-                        sessionId = 0L,
-                        payload = HardwareIdleTimeoutEvent
-                    )
+                synchronized(timerLock) {
+                    hardwareIdleTimeoutJob = if (timeoutMs <= 0L) {
+                        hardwareIdleTimeoutJob?.cancel()
+                        null
+                    } else {
+                        rescheduleServiceTimer(
+                            previous = hardwareIdleTimeoutJob,
+                            delayMs = timeoutMs,
+                            sessionId = 0L,
+                            payload = HardwareIdleTimeoutEvent
+                        )
+                    }
                 }
             }
 
             is TransitionEffect.CancelHardwareIdleTimeout -> {
-                hardwareIdleTimeoutJob?.cancel()
-                hardwareIdleTimeoutJob = null
+                synchronized(timerLock) {
+                    hardwareIdleTimeoutJob?.cancel()
+                    hardwareIdleTimeoutJob = null
+                }
             }
 
             is TransitionEffect.ScheduleSuspendTimeout -> {
-                suspendTimeoutJob = rescheduleServiceTimer(
-                    previous = suspendTimeoutJob,
-                    delayMs = SUSPEND_TIMEOUT_MS,
-                    sessionId = effect.sessionId,
-                    payload = SuspendTimeoutEvent
-                )
+                synchronized(timerLock) {
+                    suspendTimeoutJob = rescheduleServiceTimer(
+                        previous = suspendTimeoutJob,
+                        delayMs = SUSPEND_TIMEOUT_MS,
+                        sessionId = effect.sessionId,
+                        payload = SuspendTimeoutEvent
+                    )
+                }
             }
 
             is TransitionEffect.CancelSuspendTimeout -> {
-                suspendTimeoutJob?.cancel()
-                suspendTimeoutJob = null
+                synchronized(timerLock) {
+                    suspendTimeoutJob?.cancel()
+                    suspendTimeoutJob = null
+                }
             }
 
             is TransitionEffect.ScheduleRemoteCommandTimeout -> {
-                remoteCommandTimeoutJob = rescheduleServiceTimer(
-                    previous = remoteCommandTimeoutJob,
-                    delayMs = REMOTE_COMMAND_TIMEOUT_MS,
-                    sessionId = context.snapshot.sessionId,
-                    payload = RemoteCommandTimeoutEvent(effect.commandId)
-                )
+                synchronized(timerLock) {
+                    remoteCommandTimeoutJob = rescheduleServiceTimer(
+                        previous = remoteCommandTimeoutJob,
+                        delayMs = REMOTE_COMMAND_TIMEOUT_MS,
+                        sessionId = context.snapshot.sessionId,
+                        payload = RemoteCommandTimeoutEvent(effect.commandId)
+                    )
+                }
             }
 
             is TransitionEffect.CancelRemoteCommandTimeout -> {
-                remoteCommandTimeoutJob?.cancel()
-                remoteCommandTimeoutJob = null
+                synchronized(timerLock) {
+                    remoteCommandTimeoutJob?.cancel()
+                    remoteCommandTimeoutJob = null
+                }
             }
 
             is TransitionEffect.ScheduleCoverGraceTimeout -> {
-                coverGraceJob?.cancel()
-                coverGraceJob = scope.launch {
-                    delay(1200L)
-                    dispatch(
-                        SessionEventEnvelope(
-                            origin = EventOrigin.SERVICE,
-                            sessionId = context.snapshot.sessionId,
-                            deviceGeneration = latestDeviceGeneration,
-                            sequence = allocateSequence(),
-                            timestampElapsedMs = clockMs(),
-                            payload = CoverGraceTimeoutEvent(effect.trackGeneration)
+                synchronized(timerLock) {
+                    coverGraceJob?.cancel()
+                    coverGraceJob = scope.launch {
+                        delay(1200L)
+                        dispatch(
+                            SessionEventEnvelope(
+                                origin = EventOrigin.SERVICE,
+                                sessionId = context.snapshot.sessionId,
+                                deviceGeneration = latestDeviceGeneration,
+                                sequence = allocateSequence(),
+                                timestampElapsedMs = clockMs(),
+                                payload = CoverGraceTimeoutEvent(effect.trackGeneration)
+                            )
                         )
-                    )
+                    }
                 }
             }
 
             is TransitionEffect.CancelCoverGraceTimeout -> {
-                coverGraceJob?.cancel()
-                coverGraceJob = null
+                synchronized(timerLock) {
+                    coverGraceJob?.cancel()
+                    coverGraceJob = null
+                }
             }
 
             is TransitionEffect.ScheduleTransientErrorDismiss -> {
-                transientErrorDismissJobs[effect.code]?.cancel()
-                transientErrorDismissJobs[effect.code] = scope.launch {
-                    delay(3500L)
-                    dispatch(
-                        SessionEventEnvelope(
-                            origin = EventOrigin.SERVICE,
-                            sessionId = context.snapshot.sessionId,
-                            deviceGeneration = latestDeviceGeneration,
-                            sequence = allocateSequence(),
-                            timestampElapsedMs = clockMs(),
-                            payload = ErrorClearedEvent(effect.code)
+                synchronized(timerLock) {
+                    transientErrorDismissJobs[effect.code]?.cancel()
+                    transientErrorDismissJobs[effect.code] = scope.launch {
+                        delay(3500L)
+                        dispatch(
+                            SessionEventEnvelope(
+                                origin = EventOrigin.SERVICE,
+                                sessionId = context.snapshot.sessionId,
+                                deviceGeneration = latestDeviceGeneration,
+                                sequence = allocateSequence(),
+                                timestampElapsedMs = clockMs(),
+                                payload = ErrorClearedEvent(effect.code)
+                            )
                         )
-                    )
+                    }
                 }
             }
 
             is TransitionEffect.CancelTransientErrorDismiss -> {
-                transientErrorDismissJobs.remove(effect.code)?.cancel()
+                synchronized(timerLock) {
+                    transientErrorDismissJobs.remove(effect.code)?.cancel()
+                }
             }
 
             is TransitionEffect.ScheduleTransitionTimeout -> {
-                transitionTimeoutJob = rescheduleServiceTimer(
-                    previous = transitionTimeoutJob,
-                    delayMs = TRANSITION_TIMEOUT_MS,
-                    sessionId = effect.sessionId,
-                    payload = TransitionTimeoutEvent(effect.sessionId)
-                )
+                synchronized(timerLock) {
+                    transitionTimeoutJob = rescheduleServiceTimer(
+                        previous = transitionTimeoutJob,
+                        delayMs = TRANSITION_TIMEOUT_MS,
+                        sessionId = effect.sessionId,
+                        payload = TransitionTimeoutEvent(effect.sessionId)
+                    )
+                }
             }
 
             is TransitionEffect.CancelTransitionTimeout -> {
-                transitionTimeoutJob?.cancel()
-                transitionTimeoutJob = null
+                synchronized(timerLock) {
+                    transitionTimeoutJob?.cancel()
+                    transitionTimeoutJob = null
+                }
             }
         }
     }

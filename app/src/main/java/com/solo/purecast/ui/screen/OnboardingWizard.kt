@@ -1,6 +1,10 @@
 package com.solo.purecast.ui.screen
 
+import android.Manifest
+import android.os.Build
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -70,6 +74,24 @@ fun OnboardingWizard(
     // 当前权限自检状态
     var permissionStatus by remember {
         mutableStateOf(PermissionHelper.checkAllPermissions(context))
+    }
+
+    // 💡 直接拉起系统运行时权限弹窗，拒绝后再平滑降级跳转应用详情页，缩短 TV 遥控器操作路径
+    val recordAudioPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        permissionStatus = PermissionHelper.checkAllPermissions(context)
+        if (!granted) {
+            PermissionHelper.openAppDetailsSettings(context)
+        }
+    }
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        permissionStatus = PermissionHelper.checkAllPermissions(context)
+        if (!granted) {
+            PermissionHelper.openAppDetailsSettings(context)
+        }
     }
 
     // 💡 监听页面 Resume 事件，从系统设置返回时自动静默刷新权限快照
@@ -168,18 +190,24 @@ fun OnboardingWizard(
                 Text(
                     text = "PureCast 纯粹作为局域网高保真音频渲染器与 USB 转盘。全工程严禁且绝无任何 AudioRecord 硬件录音 API 调用，绝不收录任何麦克风环境声音。申请录音权限仅用于满足 Android 系统内核对 USB 声卡设备免弹窗静默接管的合规要求。",
                     color = Color(0xFFBAC7D5),
-                    fontSize = 12.sp,
-                    lineHeight = 17.sp
+                    fontSize = 13.sp,
+                    lineHeight = 19.sp
                 )
             }
 
-            // 四项核心自检卡片
+            // 核心自检卡片
             PermissionItemCard(
                 title = "1. USB 声卡静默接管 (RECORD_AUDIO)",
                 description = "允许电视在冷开机或待机唤醒后，自动且静默接管外接 Hi-Fi DAC，杜绝频繁弹出系统 USB 授权确认框。",
                 isGranted = permissionStatus.isRecordAudioGranted,
-                grantButtonText = "前往授权",
-                onGrantClick = { PermissionHelper.openAppDetailsSettings(context) }
+                grantButtonText = "直接授权",
+                onGrantClick = {
+                    if (permissionStatus.isRecordAudioGranted) {
+                        PermissionHelper.openAppDetailsSettings(context)
+                    } else {
+                        recordAudioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                    }
+                }
             )
 
             PermissionItemCard(
@@ -205,6 +233,22 @@ fun OnboardingWizard(
                 grantButtonText = "查看设置",
                 onGrantClick = { PermissionHelper.openAutoRevokeSettings(context) }
             )
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                PermissionItemCard(
+                    title = "5. 前台服务与媒体通知 (POST_NOTIFICATIONS)",
+                    description = "保障 Android 13+ 后台保活通知与系统媒体播放状态正常展示。",
+                    isGranted = permissionStatus.isNotificationGranted,
+                    grantButtonText = "直接授权",
+                    onGrantClick = {
+                        if (permissionStatus.isNotificationGranted) {
+                            PermissionHelper.openAppDetailsSettings(context)
+                        } else {
+                            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                        }
+                    }
+                )
+            }
 
             Spacer(modifier = Modifier.height(4.dp))
 
@@ -294,7 +338,7 @@ private fun PermissionItemCard(
                 Text(
                     text = title,
                     color = Color.White,
-                    fontSize = 13.sp,
+                    fontSize = 14.sp,
                     style = MaterialTheme.typography.titleSmall
                 )
                 // 状态指示
@@ -307,15 +351,15 @@ private fun PermissionItemCard(
                     Text(
                         text = if (isGranted) "已授权" else "待配置",
                         color = if (isGranted) Color(0xFF30D158) else Color(0xFFFF9F0A),
-                        fontSize = 10.sp
+                        fontSize = 12.sp
                     )
                 }
             }
             Text(
                 text = description,
                 color = Color(0xFF8E8E93),
-                fontSize = 11.sp,
-                lineHeight = 15.sp
+                fontSize = 13.sp,
+                lineHeight = 18.sp
             )
         }
 

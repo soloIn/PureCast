@@ -513,14 +513,14 @@ class UpnpRendererServer(
             multicastSocket?.close()
             multicastSocket = null
         } catch (e: Exception) {
-            // ignore
+            Logger.upnp.d(TAG, "关闭 SSDP MulticastSocket 异常: ${e.message}")
         }
 
         try {
             serverSocket?.close()
             serverSocket = null
         } catch (e: Exception) {
-            // ignore
+            Logger.upnp.d(TAG, "关闭 UPnP ServerSocket 异常: ${e.message}")
         }
     }
 
@@ -1321,7 +1321,7 @@ class UpnpRendererServer(
             try {
                 multicastSocket?.send(packet)
             } catch (e: Exception) {
-                // ignore
+                Logger.upnp.d(TAG, "发送 SSDP alive 包异常 ($target): ${e.message}")
             }
         }
     }
@@ -1378,8 +1378,8 @@ class UpnpRendererServer(
             } finally {
                 try {
                     sock?.close()
-                } catch (_: Exception) {
-                    // ignore
+                } catch (e: Exception) {
+                    Logger.upnp.d(TAG, "关闭 SSDP byebye Socket 异常: ${e.message}")
                 }
             }
         }
@@ -1420,7 +1420,7 @@ class UpnpRendererServer(
                 }
             }
         } catch (e: Exception) {
-            // fallback
+            Logger.upnp.d(TAG, "枚举局域网活跃网卡失败，回退默认组播路由: ${e.message}")
         }
         return null
     }

@@ -339,8 +339,8 @@ class StreamDemuxer(
                 } finally {
                     if (activeConnection === connection) activeConnection = null
                     if (activeInputStream === inputStream) activeInputStream = null
-                    try { inputStream?.close() } catch (_: Exception) {}
-                    try { connection?.disconnect() } catch (_: Exception) {}
+                    try { inputStream?.close() } catch (e: Exception) { Logger.upnp.d(TAG, "关闭 Seek 输入流异常: ${e.message}") }
+                    try { connection?.disconnect() } catch (e: Exception) { Logger.upnp.d(TAG, "断开 Seek HTTP 连接异常: ${e.message}") }
                     // 💡 完整收尾：同步重置 isDemuxing 并触发 onStreamEnded，防止 Seek 后自然播完进度冻结 (B-1)
                     if (thisSession == sessionToken.get()) {
                         progressJob?.cancel()
@@ -391,8 +391,10 @@ class StreamDemuxer(
             // 💡 确保前序 native 解码任务彻底退出，消除快速切歌时计数器与 JNI 资源的并发竞争
             try {
                 previousJob?.cancelAndJoin()
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
-                // ignore
+                Logger.upnp.d(TAG, "等待前序拉流任务取消结束时捕获异常: ${e.message}")
             }
             if (thisSession != sessionToken.get()) return@launch
 
@@ -503,7 +505,7 @@ class StreamDemuxer(
                         abortedByEpoch = true
                         return@launch
                     }
-                    wavDataStartOffsetBytes = format.headerLength.toLong()
+                    wavDataStartOffsetBytes = format.headerLengthBytes
                     wavDataSizeBytes = format.dataSize
                     currentSampleRate = format.sampleRate
                     currentBitDepth = format.bitDepth
@@ -658,7 +660,7 @@ class StreamDemuxer(
                     inputStream?.close()
                     connection?.disconnect()
                 } catch (e: Exception) {
-                    // ignore
+                    Logger.upnp.d(TAG, "清理音频流连接异常: ${e.message}")
                 }
                 if (thisSession == sessionToken.get()) {
                     progressJob?.cancel()
@@ -716,22 +718,23 @@ class StreamDemuxer(
         val bitDepth: Int,
         val channels: Int,
         val dataSize: Long = 0L,
-        val headerLength: Int = 44
+        val headerLength: Int = 44,
+        val headerLengthBytes: Long = headerLength.toLong()
     )
 
     /**
      * 流式状态机解析 WAV 头部多 Chunk，并提取 LIST INFO 内嵌元数据
      */
     internal fun parseHeader(input: InputStream): AudioStreamFormat {
-        var totalBytesRead = 0
+        var totalBytesRead = 0L
         fun readFullyTracked(target: ByteArray, offset: Int, length: Int): Boolean {
             val ok = readFully(input, target, offset, length)
-            if (ok) totalBytesRead += length
+            if (ok) totalBytesRead += length.toLong()
             return ok
         }
         fun skipFullyTracked(length: Long) {
             skipFully(input, length)
-            totalBytesRead += length.toInt()
+            totalBytesRead += length
         }
 
         val magic = ByteArray(12)
@@ -759,22 +762,41 @@ class StreamDemuxer(
 
             when (chunkId) {
                 "fmt " -> {
-                    val fmtLen = chunkSize.toInt()
-                    if (fmtLen < 16) throw IllegalStateException("fmt Chunk 长度不足 16 字节: $fmtLen")
+                    if (chunkSize < 16L) throw IllegalStateException("fmt Chunk 长度不足 16 字节: $chunkSize")
                     val fmtData = ByteArray(16)
                     if (!readFullyTracked(fmtData, 0, 16)) throw IllegalStateException("流提前结束 (EOF in readFully)")
                     val fmtBuf = ByteBuffer.wrap(fmtData).order(ByteOrder.LITTLE_ENDIAN)
-                    fmtBuf.short // audioFormat (1=PCM)
+                    val audioFormat = fmtBuf.short.toInt() and 0xFFFF
                     channels = fmtBuf.short.toInt()
                     sampleRate = fmtBuf.int
                     fmtBuf.int // byteRate
                     fmtBuf.short // blockAlign
                     bitDepth = fmtBuf.short.toInt()
-                    Logger.upnp.d(TAG, "解析 fmt Chunk 成功: $sampleRate Hz, $bitDepth bit, $channels ch")
-                    val extraFmt = fmtLen - 16
-                    if (extraFmt > 0) {
-                        skipFullyTracked(extraFmt.toLong())
+                    // 💡 强校验线性整数 PCM (0x0001) 或 WAVE_FORMAT_EXTENSIBLE (0xFFFE 且 SubFormat 为 PCM)，
+                    // 拦截 IEEE Float (3) / ADPCM 等非 PCM WAV，防止直接灌入 USB DAC 产生白噪音
+                    val extraFmt = chunkSize - 16L
+                    if (audioFormat == 0xFFFE) {
+                        if (extraFmt < 24L) {
+                            throw IllegalArgumentException("无效的 WAVE_FORMAT_EXTENSIBLE fmt 扩展长度: $extraFmt")
+                        }
+                        val extData = ByteArray(24)
+                        if (!readFullyTracked(extData, 0, 24)) throw IllegalStateException("流提前结束 (EOF in readFully)")
+                        val subFormatTag = ByteBuffer.wrap(extData, 8, 2).order(ByteOrder.LITTLE_ENDIAN).short.toInt() and 0xFFFF
+                        if (subFormatTag != 1) {
+                            Logger.upnp.e(TAG, "不支持的 WAVE_FORMAT_EXTENSIBLE SubFormat=0x${subFormatTag.toString(16)}，拦截直通")
+                            throw IllegalArgumentException("不支持的非整数 PCM WAV 扩展格式: 0x${subFormatTag.toString(16)}")
+                        }
+                        val remainingExtra = extraFmt - 24L
+                        if (remainingExtra > 0L) {
+                            skipFullyTracked(remainingExtra)
+                        }
+                    } else if (audioFormat != 1) {
+                        Logger.upnp.e(TAG, "不支持的 WAV audioFormat=$audioFormat（仅支持线性整数 PCM=1），拦截直通以防白噪音")
+                        throw IllegalArgumentException("不支持的非 PCM WAV 格式: audioFormat=$audioFormat")
+                    } else if (extraFmt > 0L) {
+                        skipFullyTracked(extraFmt)
                     }
+                    Logger.upnp.d(TAG, "解析 fmt Chunk 成功: format=$audioFormat, $sampleRate Hz, $bitDepth bit, $channels ch")
                     if (chunkSize % 2L != 0L) {
                         skipFullyTracked(1L)
                     }
@@ -879,7 +901,14 @@ class StreamDemuxer(
             }
         }
 
-        return AudioStreamFormat(sampleRate, bitDepth, channels, dataSize, totalBytesRead)
+        return AudioStreamFormat(
+            sampleRate = sampleRate,
+            bitDepth = bitDepth,
+            channels = channels,
+            dataSize = dataSize,
+            headerLength = totalBytesRead.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+            headerLengthBytes = totalBytesRead
+        )
     }
 
     private fun skipFully(input: InputStream, length: Long) {

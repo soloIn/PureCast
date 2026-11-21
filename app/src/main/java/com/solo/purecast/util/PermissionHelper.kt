@@ -32,7 +32,8 @@ object PermissionHelper {
         val isRecordAudioGranted: Boolean,
         val isOverlayGranted: Boolean,
         val isBatteryOptimizationIgnored: Boolean,
-        val isAutoRevokeWhitelisted: Boolean
+        val isAutoRevokeWhitelisted: Boolean,
+        val isNotificationGranted: Boolean = true
     ) {
         /**
          * 是否所有必需与建议项均已就绪
@@ -41,7 +42,8 @@ object PermissionHelper {
             get() = isRecordAudioGranted &&
                     isOverlayGranted &&
                     isBatteryOptimizationIgnored &&
-                    isAutoRevokeWhitelisted
+                    isAutoRevokeWhitelisted &&
+                    isNotificationGranted
     }
 
     /**
@@ -96,24 +98,40 @@ object PermissionHelper {
     }
 
     /**
-     * 一键全量自检所有 4 项核心权限状态
+     * 💡 检查通知权限 (Android 13+ POST_NOTIFICATIONS)，保障前台服务与锁屏媒体通知正常显示
+     */
+    fun isNotificationGranted(context: Context): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.POST_NOTIFICATIONS
+            ) == PackageManager.PERMISSION_GRANTED
+        } else {
+            true
+        }
+    }
+
+    /**
+     * 一键全量自检核心权限状态
      */
     fun checkAllPermissions(context: Context): PermissionStatus {
         val audio = isRecordAudioGranted(context)
         val overlay = isOverlayGranted(context)
         val battery = isBatteryOptimizationIgnored(context)
         val autoRevoke = isAutoRevokeWhitelisted(context)
+        val notification = isNotificationGranted(context)
 
         Logger.service.d(
             TAG,
-            "自检权限状态: RECORD_AUDIO=$audio, OVERLAY=$overlay, BATTERY=$battery, AUTO_REVOKE=$autoRevoke"
+            "自检权限状态: RECORD_AUDIO=$audio, OVERLAY=$overlay, BATTERY=$battery, AUTO_REVOKE=$autoRevoke, POST_NOTIFICATIONS=$notification"
         )
 
         return PermissionStatus(
             isRecordAudioGranted = audio,
             isOverlayGranted = overlay,
             isBatteryOptimizationIgnored = battery,
-            isAutoRevokeWhitelisted = autoRevoke
+            isAutoRevokeWhitelisted = autoRevoke,
+            isNotificationGranted = notification
         )
     }
 

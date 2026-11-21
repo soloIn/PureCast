@@ -158,17 +158,17 @@ fun LyricsStreamView(
     val fallbackSingleHeightPx = with(density) { 46.dp.toPx() }.roundToInt().toFloat()
     val fallbackBilingualHeightPx = with(density) { 78.dp.toPx() }.roundToInt().toFloat()
 
-    // 💡 缓存每行实际测量高度（普通 HashMap + layoutMeasureVersion 驱动，避免 SnapshotStateMap 锁退化）、
-    // 每行独立 Y 轴弹簧、最新目标坐标与波浪代数（按 timeline 隔离，切歌自动清空）
-    val measuredHeights = remember(timeline) { HashMap<Int, Float>() }
-    val posYAnims = remember(timeline) { mutableMapOf<Int, Animatable<Float, AnimationVector1D>>() }
-    val latestTargetYs = remember(timeline) { mutableMapOf<Int, Float>() }
-    val lastAnchorRef = remember(timeline) { intArrayOf(-1) }
-    val waveGenCounter = remember(timeline) { intArrayOf(0) }
-    val activeWaveLineGen = remember(timeline) { mutableMapOf<Int, Int>() }
+    // 💡 统一封装每行测量高度、Y 轴弹簧、目标坐标与波浪代数至稳定状态 Holder（按 timeline 隔离，切歌自动重建）
+    val layoutState = remember(timeline) { LyricsStreamLayoutState() }
+    val measuredHeights = layoutState.measuredHeights
+    val posYAnims = layoutState.posYAnims
+    val latestTargetYs = layoutState.latestTargetYs
+    val lastAnchorRef = layoutState.lastAnchorRef
+    val waveGenCounter = layoutState.waveGenCounter
+    val activeWaveLineGen = layoutState.activeWaveLineGen
     var layoutMeasureVersion by remember(timeline) { mutableIntStateOf(0) }
     // 💡 批处理首帧/滑窗期间的多次 onSizeChanged：同一布局帧内最多写入一次 Snapshot State，避免 13 行连续递增触发重复失效
-    val measureFlushPending = remember(timeline) { booleanArrayOf(false) }
+    val measureFlushPending = layoutState.measureFlushPending
 
     val anchorIndex = scrollLineIndex.coerceAtLeast(0).coerceAtMost((timeline.lines.size - 1).coerceAtLeast(0))
 
@@ -239,7 +239,7 @@ fun LyricsStreamView(
                         index < anchorIndex && anchorIndex < prevAnchorForInit -> -(anchorHeight + lineSpacingPx)
                         else -> 0f
                     }
-                    posYAnims[index] = Animatable(targetY + initialOffset)
+                    layoutState.ensurePosYAnim(index, targetY + initialOffset)
                 }
             }
 
@@ -451,6 +451,21 @@ fun LyricsStreamView(
                 }
             }
         }
+    }
+}
+
+@androidx.compose.runtime.Stable
+private class LyricsStreamLayoutState {
+    val measuredHeights = HashMap<Int, Float>()
+    val posYAnims = mutableMapOf<Int, Animatable<Float, AnimationVector1D>>()
+    val latestTargetYs = mutableMapOf<Int, Float>()
+    val lastAnchorRef = intArrayOf(-1)
+    val waveGenCounter = intArrayOf(0)
+    val activeWaveLineGen = mutableMapOf<Int, Int>()
+    val measureFlushPending = booleanArrayOf(false)
+
+    fun ensurePosYAnim(index: Int, initialValue: Float) {
+        posYAnims.getOrPut(index) { Animatable(initialValue) }
     }
 }
 

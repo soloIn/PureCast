@@ -71,9 +71,7 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    kotlinOptions {
-        jvmTarget = "17"
-    }
+
 
     buildFeatures {
         compose = true
@@ -104,6 +102,12 @@ android {
     }
 }
 
+kotlin {
+    compilerOptions {
+        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
+    }
+}
+
 jacoco {
     toolVersion = "0.8.12"
 }
@@ -118,7 +122,6 @@ dependencies {
 
     // Compose for TV
     implementation(libs.androidx.tv.material)
-    implementation(libs.androidx.tv.foundation)
     implementation(libs.androidx.palette.ktx)
     implementation(libs.coil.compose)
 

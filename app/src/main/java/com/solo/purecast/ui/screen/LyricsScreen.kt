@@ -95,12 +95,14 @@ fun LyricsScreen(
 ) {
     val context = LocalContext.current
 
-    // 💡 优先拦截遥控器返回键，优雅缩回主屏而非退出 App
-    BackHandler(enabled = true) {
+    // 💡 仅当全屏歌词位于前台时拦截遥控器返回键，防止叠加设置页退出动画期间误关歌词屏
+    BackHandler(enabled = isForeground) {
         onClose()
     }
 
-    val isPlaying = (playbackStatus == PlaybackStatus.PLAYING) && isForeground
+    // 💡 拆分真实播放态（驱动播放/暂停图标）与前台动画态（打开设置页时仅冻结动画，不翻转播放图标）
+    val isPlaybackActive = playbackStatus == PlaybackStatus.PLAYING
+    val isPlaying = isPlaybackActive && isForeground
     val playPauseFocusRequester = remember { FocusRequester() }
 
     LaunchedEffect(Unit) {
@@ -288,8 +290,8 @@ fun LyricsScreen(
 
                 // 播放/暂停按钮 (▶ / ❚❚) - 绑定 focusRequester 确保大屏遥控器入场时焦点立即可用
                 TransportIconButton(
-                    iconResId = if (isPlaying) R.drawable.ic_pause_fill else R.drawable.ic_play_fill,
-                    contentDescription = if (isPlaying) "暂停" else "播放",
+                    iconResId = if (isPlaybackActive) R.drawable.ic_pause_fill else R.drawable.ic_play_fill,
+                    contentDescription = if (isPlaybackActive) "暂停" else "播放",
                     buttonSize = 52.dp,
                     iconSize = 26.dp,
                     hasDarkBackground = hasDarkBackground,

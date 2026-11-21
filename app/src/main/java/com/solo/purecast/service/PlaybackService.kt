@@ -83,9 +83,9 @@ class PlaybackService : LifecycleService() {
 
     private val fastPath = HardwareFastPathController.default
 
-    // 💡 协调器事件循环独立运行在受限单线程后台调度器，避免 sync 硬件操作阻塞 Android UI 主线程
+    // 💡 协调器事件循环独立运行在受限单线程 IO 后台调度器（内部包含阻塞式 libusb/HardwareExecutor 同步调用，避免占用 Dispatchers.Default 计算池）
     @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
-    private val coordinatorScope = CoroutineScope(SupervisorJob() + Dispatchers.Default.limitedParallelism(1))
+    private val coordinatorScope = CoroutineScope(SupervisorJob() + Dispatchers.IO.limitedParallelism(1))
 
     // 💡 轻量有序状态副作用（快照分发、MediaSession 状态、通知同步与歌词触发）串行运行在单线程后台队列
     @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
@@ -149,6 +149,9 @@ class PlaybackService : LifecycleService() {
                 } else {
                     false
                 }
+            },
+            onAudioFocusLost = {
+                handleAudioFocusLost()
             }
         ) { shouldPlay ->
             if (shouldPlay) {
@@ -471,13 +474,14 @@ class PlaybackService : LifecycleService() {
                     setReferenceCounted(true)
                     acquire()
                 }
-                Logger.service.i(TAG, "成功获取 Wi-Fi 组播锁 (MulticastLock)")
-
+                // 💡 常驻获取 PARTIAL_WAKE_LOCK，防止电视待机/息屏期间 CPU 休眠导致无法接收 AirPlay/UPnP 推流唤醒；
+                //    并在每次活跃推流时通过 acquireWifiLowLatencyLock 按 12h 续期，消除 7x24 运行过期失效
                 val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
                 wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "PureCast:WakeLock").apply {
+                    setReferenceCounted(false)
                     acquire(12 * 60 * 60 * 1000L)
                 }
-                Logger.service.i(TAG, "成功获取 CPU WakeLock")
+                Logger.service.i(TAG, "成功获取常驻 Wi-Fi 组播锁 (MulticastLock) 与 CPU WakeLock")
             } catch (e: Exception) {
                 Logger.service.w(TAG, "获取系统常驻锁异常", e)
             }
@@ -504,8 +508,17 @@ class PlaybackService : LifecycleService() {
                         Logger.service.i(TAG, "推流中: 已激活 Wi-Fi 低延迟锁 (WIFI_MODE_FULL_LOW_LATENCY)")
                     }
                 }
+                // 💡 活跃推流时续期常驻 CPU PARTIAL_WAKE_LOCK（12h 滑动窗口），防止长时间运行后超时释放
+                if (wakeLock == null) {
+                    val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+                    wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "PureCast:WakeLock").apply {
+                        setReferenceCounted(false)
+                    }
+                }
+                wakeLock?.acquire(12 * 60 * 60 * 1000L)
+                Logger.service.i(TAG, "推流中: 已续期常驻 CPU WakeLock (12h)")
             } catch (e: Exception) {
-                Logger.service.w(TAG, "激活 Wi-Fi 低延迟锁异常", e)
+                Logger.service.w(TAG, "激活 Wi-Fi 低延迟锁/续期 WakeLock 异常", e)
             }
         }
     }
@@ -516,7 +529,7 @@ class PlaybackService : LifecycleService() {
                 wifiLock?.let {
                     if (it.isHeld) {
                         it.release()
-                        Logger.service.i(TAG, "待机/暂停: 已释放 Wi-Fi 低延迟锁以降低电视功耗")
+                        Logger.service.i(TAG, "待机/暂停: 已释放 Wi-Fi 低延迟锁以降低电视功耗 (常驻 WakeLock 保持待命)")
                     }
                 }
             } catch (e: Exception) {
@@ -811,7 +824,7 @@ class PlaybackService : LifecycleService() {
 
     private fun startForegroundWithTypes() {
         val notification = buildNotification(_sessionSnapshot.value)
-        val foregroundServiceType = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK or
+        val fullType = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK or
             ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
 
         try {
@@ -819,9 +832,22 @@ class PlaybackService : LifecycleService() {
                 this,
                 NOTIFICATION_ID,
                 notification,
-                foregroundServiceType
+                fullType
             )
             Logger.service.i(TAG, "已启动前台服务 (mediaPlayback | connectedDevice)")
+        } catch (e: SecurityException) {
+            // 💡 Android 14 冷开机未接管 USB 前若 connectedDevice 权限不满足，平滑降级为 mediaPlayback 保障前台保活
+            Logger.service.w(TAG, "startForeground(mediaPlayback|connectedDevice) 被系统拒绝，降级为 mediaPlayback: ${e.message}")
+            try {
+                ServiceCompat.startForeground(
+                    this,
+                    NOTIFICATION_ID,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+                )
+            } catch (e2: Exception) {
+                Logger.service.e(TAG, "降级 startForeground(mediaPlayback) 亦失败!", e2)
+            }
         } catch (e: Exception) {
             Logger.service.e(TAG, "startForeground 失败!", e)
         }
@@ -905,7 +931,7 @@ class PlaybackService : LifecycleService() {
     private fun stopProtocolServers() {
         upnpServer?.stop()
         upnpServer = null
-        airPlayServer?.stop()
+        airPlayServer?.destroy()
         airPlayServer = null
     }
 

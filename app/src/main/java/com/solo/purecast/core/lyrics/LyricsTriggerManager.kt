@@ -210,47 +210,56 @@ class LyricsTriggerManager(
             Logger.lyrics.i(TAG, "检测到时长延迟补丁更新 ($currentActiveDurationMs -> ${newDurationMs}ms)，启动静默重校准比分")
 
             inFlightRecalibrateJob = scope.launch {
-                val recalibrated = waterfallFetcher.fetch(artist, title, newDurationMs, album)
+                try {
+                    val recalibrated = waterfallFetcher.fetch(artist, title, newDurationMs, album)
 
-                if (recalibrated != null && generation == currentTrackGeneration) {
-                    // 💡 Finding 7 修复：严格打分比对，只有新抓取歌词得分高于当前歌词才予以平滑置换
-                    val oldScore = LyricCandidateScorer.evaluate(
-                        expectedArtist = artist,
-                        expectedTitle = title,
-                        expectedDurationMs = newDurationMs,
-                        candidateArtist = artist,
-                        candidateTitle = title,
-                        candidateDurationMs = currentTimeline.durationMs,
-                        candidateFormat = currentTimeline.format
-                    )
-                    val newScore = LyricCandidateScorer.evaluate(
-                        expectedArtist = artist,
-                        expectedTitle = title,
-                        expectedDurationMs = newDurationMs,
-                        candidateArtist = artist,
-                        candidateTitle = title,
-                        candidateDurationMs = recalibrated.durationMs,
-                        candidateFormat = recalibrated.format
-                    )
-
-                    if (newScore.totalScore > oldScore.totalScore) {
-                        Logger.lyrics.i(
-                            TAG,
-                            "静默重校准胜出 (${newScore.totalScore} > ${oldScore.totalScore}分)，平滑置换歌词时间轴"
-                        )
+                    if (generation == currentTrackGeneration) {
+                        // 💡 标记该目标时长已完成重校准评估，避免未胜出或返回空时在后续快照上反复重触发
                         currentActiveDurationMs = newDurationMs
-                        _lyricUiState.value = LyricUiState.Success(
-                            trackGeneration = generation,
-                            timeline = recalibrated
-                        )
-                    } else {
-                        Logger.lyrics.d(
-                            TAG,
-                            "静默重校准新得分未超过旧歌词 (${newScore.totalScore} <= ${oldScore.totalScore}分)，保留现有歌词"
-                        )
+
+                        if (recalibrated != null) {
+                            // 💡 Finding 7 修复：严格打分比对，只有新抓取歌词得分高于当前歌词才予以平滑置换
+                            val oldScore = LyricCandidateScorer.evaluate(
+                                expectedArtist = artist,
+                                expectedTitle = title,
+                                expectedDurationMs = newDurationMs,
+                                candidateArtist = artist,
+                                candidateTitle = title,
+                                candidateDurationMs = currentTimeline.durationMs,
+                                candidateFormat = currentTimeline.format
+                            )
+                            val newScore = LyricCandidateScorer.evaluate(
+                                expectedArtist = artist,
+                                expectedTitle = title,
+                                expectedDurationMs = newDurationMs,
+                                candidateArtist = artist,
+                                candidateTitle = title,
+                                candidateDurationMs = recalibrated.durationMs,
+                                candidateFormat = recalibrated.format
+                            )
+
+                            if (newScore.totalScore > oldScore.totalScore) {
+                                Logger.lyrics.i(
+                                    TAG,
+                                    "静默重校准胜出 (${newScore.totalScore} > ${oldScore.totalScore}分)，平滑置换歌词时间轴"
+                                )
+                                _lyricUiState.value = LyricUiState.Success(
+                                    trackGeneration = generation,
+                                    timeline = recalibrated
+                                )
+                            } else {
+                                Logger.lyrics.d(
+                                    TAG,
+                                    "静默重校准新得分未超过旧歌词 (${newScore.totalScore} <= ${oldScore.totalScore}分)，保留现有歌词"
+                                )
+                            }
+                        }
+                    }
+                } finally {
+                    if (inFlightRecalibrateJob === coroutineContext[Job]) {
+                        inFlightRecalibrateJob = null
                     }
                 }
-                inFlightRecalibrateJob = null
             }
         }
     }

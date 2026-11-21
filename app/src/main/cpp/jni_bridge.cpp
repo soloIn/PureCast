@@ -44,7 +44,49 @@ inline bool clear_jni_exception(JNIEnv* env, const char* site) {
 
 inline jstring safe_new_jstring(JNIEnv* env, const std::string& str, const char* site) {
     if (!env) return nullptr;
-    jstring res = env->NewStringUTF(str.c_str());
+    // 💡 将标准 UTF-8（含 4 字节 Emoji / 补充平面字符）安全解码为 UTF-16 代理对并调用 NewString，
+    // 彻底避免 NewStringUTF 在遇到非 Modified UTF-8 时触发 ART CheckJNI Fatal Abort。
+    std::vector<jchar> utf16;
+    utf16.reserve(str.size());
+    const auto* bytes = reinterpret_cast<const uint8_t*>(str.data());
+    const size_t len = str.size();
+    size_t i = 0;
+    while (i < len) {
+        uint32_t cp = 0xFFFD;
+        const uint8_t b0 = bytes[i];
+        if (b0 < 0x80) {
+            cp = b0;
+            i += 1;
+        } else if ((b0 & 0xE0) == 0xC0 && i + 1 < len && (bytes[i + 1] & 0xC0) == 0x80) {
+            cp = ((b0 & 0x1Fu) << 6) | (bytes[i + 1] & 0x3Fu);
+            if (cp < 0x80) cp = 0xFFFD;
+            i += 2;
+        } else if ((b0 & 0xF0) == 0xE0 && i + 2 < len &&
+                   (bytes[i + 1] & 0xC0) == 0x80 && (bytes[i + 2] & 0xC0) == 0x80) {
+            cp = ((b0 & 0x0Fu) << 12) | ((bytes[i + 1] & 0x3Fu) << 6) | (bytes[i + 2] & 0x3Fu);
+            if (cp < 0x800 || (cp >= 0xD800 && cp <= 0xDFFF)) cp = 0xFFFD;
+            i += 3;
+        } else if ((b0 & 0xF8) == 0xF0 && i + 3 < len &&
+                   (bytes[i + 1] & 0xC0) == 0x80 && (bytes[i + 2] & 0xC0) == 0x80 &&
+                   (bytes[i + 3] & 0xC0) == 0x80) {
+            cp = ((b0 & 0x07u) << 18) | ((bytes[i + 1] & 0x3Fu) << 12) |
+                 ((bytes[i + 2] & 0x3Fu) << 6) | (bytes[i + 3] & 0x3Fu);
+            if (cp < 0x10000 || cp > 0x10FFFF) cp = 0xFFFD;
+            i += 4;
+        } else {
+            i += 1;
+        }
+
+        if (cp <= 0xFFFF) {
+            utf16.push_back(static_cast<jchar>(cp));
+        } else {
+            cp -= 0x10000;
+            utf16.push_back(static_cast<jchar>(0xD800 + (cp >> 10)));
+            utf16.push_back(static_cast<jchar>(0xDC00 + (cp & 0x3FF)));
+        }
+    }
+
+    jstring res = env->NewString(utf16.data(), static_cast<jsize>(utf16.size()));
     if (clear_jni_exception(env, site)) {
         return nullptr;
     }

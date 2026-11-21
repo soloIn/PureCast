@@ -21,11 +21,13 @@ import com.solo.purecast.util.Logger
 class AudioFocusManager(
     private val context: Context,
     private val isPlaybackActiveProvider: (() -> Boolean)? = null,
+    private val onAudioFocusLost: (() -> Unit)? = null,
     private val onPlaybackStateChange: (shouldPlay: Boolean) -> Unit
 ) {
 
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
     private val handler = Handler(Looper.getMainLooper())
+    private val focusLock = Any()
     private var focusRequest: AudioFocusRequest? = null
     private var hasFocus = false
     // 💡 仅当暂时失去焦点且之前确实在播放时才允许在重新获焦后自动恢复播放，防止主动暂停后被误恢复
@@ -35,22 +37,27 @@ class AudioFocusManager(
         Logger.audio.i(TAG, "系统音频焦点发生变化: $focusChange")
         when (focusChange) {
             AudioManager.AUDIOFOCUS_GAIN -> {
-                Logger.audio.i(TAG, "重新获得音频焦点 (AUDIOFOCUS_GAIN), resumeOnFocusGain=$resumeOnFocusGain")
-                hasFocus = true
-                if (resumeOnFocusGain) {
+                val shouldResume = synchronized(focusLock) {
+                    val resume = resumeOnFocusGain
+                    hasFocus = true
                     resumeOnFocusGain = false
+                    resume
+                }
+                Logger.audio.i(TAG, "重新获得音频焦点 (AUDIOFOCUS_GAIN), resumeOnFocusGain=$shouldResume")
+                if (shouldResume) {
                     onPlaybackStateChange(true)
                 }
             }
 
             AudioManager.AUDIOFOCUS_LOSS -> {
                 Logger.audio.w(TAG, "完全失去音频焦点 (AUDIOFOCUS_LOSS)，执行声卡归还让渡时序...")
-                hasFocus = false
-                resumeOnFocusGain = false
-                // 💡 彻底归还 USB 声卡给系统内核，确保 UsbDeviceConnection 同步释放并回传协调器
-                val svc = com.solo.purecast.service.PlaybackService.instance
-                if (svc != null) {
-                    svc.handleAudioFocusLost()
+                synchronized(focusLock) {
+                    hasFocus = false
+                    resumeOnFocusGain = false
+                }
+                // 💡 通过注入回调归还 USB 声卡给系统内核，彻底解耦对 PlaybackService 静态单例的硬依赖
+                if (onAudioFocusLost != null) {
+                    onAudioFocusLost.invoke()
                 } else {
                     onPlaybackStateChange(false)
                 }
@@ -58,9 +65,12 @@ class AudioFocusManager(
 
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
                 Logger.audio.w(TAG, "暂时失去音频焦点 (AUDIOFOCUS_LOSS_TRANSIENT)，暂停推流")
-                val wasPlaying = isPlaybackActiveProvider?.invoke() ?: hasFocus
-                resumeOnFocusGain = wasPlaying
-                hasFocus = false
+                val wasPlaying = synchronized(focusLock) {
+                    val playing = isPlaybackActiveProvider?.invoke() ?: hasFocus
+                    resumeOnFocusGain = playing
+                    hasFocus = false
+                    playing
+                }
                 if (wasPlaying) {
                     onPlaybackStateChange(false)
                 }
@@ -77,7 +87,9 @@ class AudioFocusManager(
      * @return true 表示成功获取焦点，false 表示被系统拒绝
      */
     fun requestFocus(): Boolean {
-        if (hasFocus) return true
+        synchronized(focusLock) {
+            if (hasFocus) return true
+        }
 
         val playbackAttributes = AudioAttributes.Builder()
             .setUsage(AudioAttributes.USAGE_MEDIA)
@@ -90,30 +102,37 @@ class AudioFocusManager(
             .setOnAudioFocusChangeListener(focusChangeListener, handler)
             .build()
 
-        focusRequest = request
         val res = audioManager.requestAudioFocus(request)
-        hasFocus = (res == AudioManager.AUDIOFOCUS_REQUEST_GRANTED)
-        if (res == AudioManager.AUDIOFOCUS_REQUEST_DELAYED) {
-            Logger.audio.i(TAG, "音频焦点被系统延迟授予 (AUDIOFOCUS_REQUEST_DELAYED)，将在获得焦点时自动恢复播放")
-            resumeOnFocusGain = true
-        } else if (!hasFocus) {
-            resumeOnFocusGain = false
+        val granted = (res == AudioManager.AUDIOFOCUS_REQUEST_GRANTED)
+        synchronized(focusLock) {
+            focusRequest = request
+            hasFocus = granted
+            if (res == AudioManager.AUDIOFOCUS_REQUEST_DELAYED) {
+                Logger.audio.i(TAG, "音频焦点被系统延迟授予 (AUDIOFOCUS_REQUEST_DELAYED)，将在获得焦点时自动恢复播放")
+                resumeOnFocusGain = true
+            } else if (!granted) {
+                resumeOnFocusGain = false
+            }
         }
 
-        Logger.audio.i(TAG, "请求音频焦点结果: $res (granted=$hasFocus)")
-        return hasFocus
+        Logger.audio.i(TAG, "请求音频焦点结果: $res (granted=$granted)")
+        return granted
     }
 
     /**
      * 放弃音频焦点
      */
     fun abandonFocus() {
-        focusRequest?.let { req ->
-            Logger.audio.i(TAG, "主动放弃系统音频焦点...")
-            audioManager.abandonAudioFocusRequest(req)
+        val req = synchronized(focusLock) {
+            val current = focusRequest
             focusRequest = null
             hasFocus = false
             resumeOnFocusGain = false
+            current
+        }
+        req?.let {
+            Logger.audio.i(TAG, "主动放弃系统音频焦点...")
+            audioManager.abandonAudioFocusRequest(it)
         }
     }
 

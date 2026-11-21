@@ -6,7 +6,6 @@ appcompat = "1.7.0"
 lifecycle = "2.8.6"
 activityCompose = "1.9.3"
 composeTvMaterial = "1.0.0"
-composeTvFoundation = "1.0.0-alpha11"
 composeAnimation = "1.7.5"
 palette = "1.0.0"
 coil = "2.6.0"
@@ -17,7 +16,7 @@ jmdns = "3.5.9"
 junit = "4.13.2"
 androidXTest = "1.6.1"
 androidXTestExtJunit = "1.2.1"
-composeUiTest = "1.6.8"
+composeUiTest = "1.7.5"
 robolectric = "4.13"
 fuzzywuzzy = "1.4.0"
 
@@ -31,7 +30,6 @@ androidx-compose-animation = { group = "androidx.compose.animation", name = "ani
 
 # Compose for TV
 androidx-tv-material = { group = "androidx.tv", name = "tv-material", version.ref = "composeTvMaterial" }
-androidx-tv-foundation = { group = "androidx.tv", name = "tv-foundation", version.ref = "composeTvFoundation" }
 androidx-palette-ktx = { group = "androidx.palette", name = "palette-ktx", version.ref = "palette" }
 coil-compose = { group = "io.coil-kt", name = "coil-compose", version.ref = "coil" }
 

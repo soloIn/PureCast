@@ -312,4 +312,27 @@ class WavHeaderParserTest {
             demuxer.parseHeader(ByteArrayInputStream(bb.array()))
         }
     }
+
+    @Test
+    fun testDemuxerRejectsNonPcmFloatWavHeader() {
+        val bb = ByteBuffer.allocate(44).order(ByteOrder.LITTLE_ENDIAN)
+        bb.put("RIFF".toByteArray())
+        bb.putInt(10044)
+        bb.put("WAVE".toByteArray())
+        bb.put("fmt ".toByteArray())
+        bb.putInt(16)
+        bb.putShort(3.toShort()) // IEEE Float (非线性整数 PCM)
+        bb.putShort(2.toShort())
+        bb.putInt(48000)
+        bb.putInt(48000 * 8)
+        bb.putShort(8.toShort())
+        bb.putShort(32.toShort())
+        bb.put("data".toByteArray())
+        bb.putInt(10000)
+
+        val demuxer = StreamDemuxer(CoroutineScope(Dispatchers.Unconfined))
+        assertThrows(IllegalArgumentException::class.java) {
+            demuxer.parseHeader(ByteArrayInputStream(bb.array()))
+        }
+    }
 }

@@ -138,13 +138,15 @@ internal class AndroidUsbSystemBridge(
     override fun requestPermission(device: UsbDeviceDescriptor, activity: Activity?) {
         val raw = device.rawDevice ?: findRawDevice(device) ?: return
         val targetCtx: Context = activity ?: context
+        // 💡 Android 12–14 要求 UsbManager.requestPermission 使用 FLAG_MUTABLE 以便系统回填 EXTRA_DEVICE 与 EXTRA_PERMISSION_GRANTED，
+        // 配合显式 setPackage(context.packageName) 满足 Android 14 安全规范
         val permissionIntent = PendingIntent.getBroadcast(
             targetCtx,
             0,
             Intent(UsbDeviceManager.ACTION_USB_PERMISSION).apply {
                 setPackage(context.packageName)
             },
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
         )
         usbManager.requestPermission(raw, permissionIntent)
     }
@@ -252,6 +254,7 @@ class UsbDeviceManager internal constructor(
     // 💡 重入检测标识：若已经在 HardwareExecutor 线程中直接调用同步方法，避免向单线程池 submit 自锁
     private val inHardwareExecutor = ThreadLocal.withInitial { false }
 
+    @Volatile
     private var activeDevice: UsbDeviceDescriptor? = null
     private var activeConnection: UsbOpenFdHandle? = null
     private val isExclusiveTaken = AtomicBoolean(false)

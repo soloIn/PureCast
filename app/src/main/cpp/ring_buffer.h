@@ -21,7 +21,7 @@ namespace purecast {
 class SpscRingBuffer {
 public:
     explicit SpscRingBuffer(size_t min_capacity_bytes = 1024 * 512) // 默认 512KB (~3秒 16bit/44.1k/2ch)
-        : head_(0), tail_(0), buffer_(nullptr), capacity_(0), mask_(0) {
+        : head_(0), tail_(0), buffer_(nullptr), capacity_(0), mask_(0), mlocked_(false) {
         
         // 计算大于等于 min_capacity_bytes 的最小 2^N
         capacity_ = 1;
@@ -34,14 +34,17 @@ public:
         buffer_ = static_cast<uint8_t*>(aligned_alloc(64, capacity_));
         if (buffer_) {
             std::memset(buffer_, 0, capacity_);
-            // 💡 锁定物理内存页，杜绝缺页中断 (Page Fault)
-            mlock(buffer_, capacity_);
+            // 💡 尝试锁定物理内存页以减少缺页中断；非特权进程受 RLIMIT_MEMLOCK 限制可能失败，记录真实状态
+            mlocked_ = (mlock(buffer_, capacity_) == 0);
         }
     }
 
     ~SpscRingBuffer() {
         if (buffer_) {
-            munlock(buffer_, capacity_);
+            if (mlocked_) {
+                munlock(buffer_, capacity_);
+                mlocked_ = false;
+            }
             free(buffer_);
             buffer_ = nullptr;
         }
@@ -146,6 +149,7 @@ private:
     uint8_t* buffer_;
     size_t capacity_;
     size_t mask_;
+    bool mlocked_;
 };
 
 } // namespace purecast

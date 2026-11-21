@@ -116,7 +116,13 @@ class DacpClient(
             ?: return Result.failure(IllegalStateException("DACP 会话未连接，无法发送指令 [$command]"))
         return withContext(Dispatchers.IO) {
             val firstResult = executeHttpCommand(params.first, params.second, params.third, command)
-            if (firstResult.isSuccess) return@withContext firstResult
+            if (firstResult.isSuccess) {
+                // 💡 指令已通过当前端口（含 3689 默认探测端口）成功执行，立即清空暂存防止 mDNS 回调重复发令
+                if (pendingCommand == command) {
+                    pendingCommand = null
+                }
+                return@withContext firstResult
+            }
 
             // 💡 iOS 重连或切换会话后会更换随机 DACP 端口，旧端口会立刻报 ConnectException；
             // 触发 mDNS 强制刷新端口（显式排除已失败的旧端口）并立即重试一次，彻底解决 TV 遥控器按钮间歇失灵。
@@ -124,7 +130,11 @@ class DacpClient(
             if (refreshedPort != null && refreshedPort > 0 && refreshedPort != params.second) {
                 dacpPort = refreshedPort
                 Logger.airplay.i(TAG, "DACP 端口已刷新 (${params.second} -> $refreshedPort)，自动重试指令 [$command]")
-                return@withContext executeHttpCommand(params.first, refreshedPort, params.third, command)
+                val retryResult = executeHttpCommand(params.first, refreshedPort, params.third, command)
+                if (retryResult.isSuccess && pendingCommand == command) {
+                    pendingCommand = null
+                }
+                return@withContext retryResult
             }
             firstResult
         }

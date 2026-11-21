@@ -1,16 +1,11 @@
 package com.solo.purecast.ui.components
 
 import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
-import androidx.compose.foundation.focusable
-import androidx.compose.foundation.interaction.MutableInteractionSource
-import androidx.compose.foundation.interaction.collectIsFocusedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -29,14 +24,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawWithContent
-import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.focus.FocusRequester
-import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -156,7 +148,7 @@ fun ProgressBarComponent(
             }
             Text(
                 text = formattedCurrentTime,
-                fontSize = 12.sp,
+                fontSize = 14.sp,
                 fontWeight = FontWeight.Medium,
                 color = currentTimeColor
             )
@@ -165,7 +157,7 @@ fun ProgressBarComponent(
                 ProgressRightLabelMode.Standby -> {
                     Text(
                         text = "等待投屏接入",
-                        fontSize = 12.sp,
+                        fontSize = 14.sp,
                         fontWeight = FontWeight.Normal,
                         color = totalTimeColor
                     )
@@ -196,7 +188,7 @@ fun ProgressBarComponent(
                         )
                         Text(
                             text = "LIVE / 实时直通",
-                            fontSize = 12.sp,
+                            fontSize = 14.sp,
                             fontWeight = FontWeight.SemiBold,
                             color = Color(0xFFFF453A)
                         )
@@ -206,7 +198,7 @@ fun ProgressBarComponent(
                 is ProgressRightLabelMode.Placeholder -> {
                     Text(
                         text = rightLabelMode.text,
-                        fontSize = 12.sp,
+                        fontSize = 14.sp,
                         fontWeight = FontWeight.Medium,
                         color = totalTimeColor
                     )
@@ -215,7 +207,7 @@ fun ProgressBarComponent(
                 is ProgressRightLabelMode.FormattedTime -> {
                     Text(
                         text = rightLabelMode.text,
-                        fontSize = 12.sp,
+                        fontSize = 14.sp,
                         fontWeight = FontWeight.Medium,
                         color = totalTimeColor
                     )

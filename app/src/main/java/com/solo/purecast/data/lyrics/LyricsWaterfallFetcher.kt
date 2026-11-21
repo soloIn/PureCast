@@ -6,9 +6,13 @@ import com.solo.purecast.data.lyrics.remote.NeteaseDataSource
 import com.solo.purecast.model.LyricFormat
 import com.solo.purecast.model.LyricTimeline
 import com.solo.purecast.util.Logger
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -27,8 +31,9 @@ class LyricsWaterfallFetcher(
     private val neteaseDataSource: NeteaseDataSource? = null
 ) {
 
-    // 💡 In-flight 请求单飞去重映射表，杜绝同一曲目的并发重复请求
+    // 💡 In-flight 请求单飞去重映射表 + Mutex 消除 check-then-act 并发竞态
     private val inFlightRequests = ConcurrentHashMap<String, Deferred<LyricTimeline?>>()
+    private val inFlightMutex = Mutex()
 
     suspend fun fetch(
         artist: String,
@@ -50,23 +55,29 @@ class LyricsWaterfallFetcher(
             return@coroutineScope cached
         }
 
-        // 2. In-flight 单飞去重检查 (Finding 5)
-        val existingDeferred = inFlightRequests[cacheKey]
-        if (existingDeferred != null && existingDeferred.isActive) {
-            Logger.lyrics.d(TAG, "复用在途 In-flight 请求: $cleanArtist - $cleanTitle")
-            return@coroutineScope existingDeferred.await()
-        }
-
-        val newDeferred = async {
-            try {
-                executeWaterfall(cleanArtist, cleanTitle, durationMs, album, cacheKey)
-            } finally {
-                inFlightRequests.remove(cacheKey)
+        // 2. In-flight 单飞去重原子检查与登记 (Finding 5)
+        // 💡 使用 CoroutineStart.LAZY + invokeOnCompletion 消除 lateinit var 未初始化访问竞态
+        val (deferred, isReused) = inFlightMutex.withLock {
+            val existing = inFlightRequests[cacheKey]
+            if (existing != null && existing.isActive) {
+                existing to true
+            } else {
+                val created = async(start = CoroutineStart.LAZY) {
+                    executeWaterfall(cleanArtist, cleanTitle, durationMs, album, cacheKey)
+                }
+                created.invokeOnCompletion {
+                    inFlightRequests.remove(cacheKey, created)
+                }
+                inFlightRequests[cacheKey] = created
+                created to false
             }
         }
-
-        inFlightRequests[cacheKey] = newDeferred
-        newDeferred.await()
+        if (isReused) {
+            Logger.lyrics.d(TAG, "复用在途 In-flight 请求: $cleanArtist - $cleanTitle")
+        } else {
+            deferred.start()
+        }
+        deferred.await()
     }
 
     private suspend fun executeWaterfall(
@@ -102,6 +113,8 @@ class LyricsWaterfallFetcher(
                         Logger.lyrics.w(TAG, "AMLL 候选评分未达标 (${score.totalScore}分): ${score.vetoReason}，降级至 Step 2")
                     }
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 Logger.lyrics.w(TAG, "AMLL 检索异常，平滑降级至 Step 2", e)
             }
@@ -122,6 +135,8 @@ class LyricsWaterfallFetcher(
                     cacheRepository.put(cacheKey, enriched)
                     return enriched
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 Logger.lyrics.w(TAG, "LRCLIB 精确匹配异常，平滑降级至 Step 3", e)
             }
@@ -141,6 +156,8 @@ class LyricsWaterfallFetcher(
                 cacheRepository.put(cacheKey, enriched)
                 return enriched
             }
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             Logger.lyrics.w(TAG, "LRCLIB 模糊搜索异常，降级至网易云源", e)
         }
@@ -154,6 +171,8 @@ class LyricsWaterfallFetcher(
                     cacheRepository.put(cacheKey, neteaseHit)
                     return neteaseHit
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 Logger.lyrics.w(TAG, "网易云歌词检索异常", e)
             }
@@ -194,6 +213,8 @@ class LyricsWaterfallFetcher(
             } else {
                 timeline
             }
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             Logger.lyrics.d(TAG, "尝试补齐翻译异常，保留原歌词: ${e.message}")
             timeline

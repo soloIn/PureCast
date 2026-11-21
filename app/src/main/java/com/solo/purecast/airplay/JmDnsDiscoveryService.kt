@@ -8,6 +8,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -69,6 +70,7 @@ class JmDnsDiscoveryService(private val context: Context) {
     private var currentFriendlyName: String? = null
     private var currentRaopPort: Int = DEFAULT_RAOP_PORT
     private val broadcastMutex = Mutex()
+    private val isStoppingDetached = java.util.concurrent.atomic.AtomicBoolean(false)
 
     /**
      * 获取当前是否正在广播
@@ -194,6 +196,10 @@ class JmDnsDiscoveryService(private val context: Context) {
      * 确保 Service.onDestroy() 或禁用协议时能够完整发出 RFC 6762 Goodbye 包后再关闭套接字。
      */
     fun stopBroadcastDetached() {
+        if (!isStoppingDetached.compareAndSet(false, true)) {
+            Logger.service.d(TAG, "已有在途的 JmDNS 独立下线线程，跳过重复启动")
+            return
+        }
         Thread({
             try {
                 kotlinx.coroutines.runBlocking {
@@ -201,8 +207,18 @@ class JmDnsDiscoveryService(private val context: Context) {
                 }
             } catch (e: Exception) {
                 Logger.service.w(TAG, "独立线程注销 JmDNS 广播异常: ${e.message}")
+            } finally {
+                isStoppingDetached.set(false)
             }
         }, "AirPlay-mDNS-Goodbye").start()
+    }
+
+    /**
+     * 💡 彻底销毁服务作用域（在所属 AirPlayServerManager 永久释放时调用）
+     */
+    fun destroy() {
+        clearDacpTarget()
+        serviceScope.cancel()
     }
 
     private fun stopBroadcastInternal() {
@@ -321,9 +337,18 @@ class JmDnsDiscoveryService(private val context: Context) {
             Logger.service.w(TAG, "读取 NetworkInterface MAC 异常: ${e.message}")
         }
 
-        // 3. 兜底策略：回退至当前真机真实物理 MAC 默认值
-        Logger.service.w(TAG, "无法动态获取物理 MAC，回退至基线物理 MAC")
-        return "1485540BCBC4"
+        // 3. 兜底策略：使用持久化本地管理 MAC (LAA)，避免多台 PureCast 设备在局域网内冲突
+        val fallbackMac = try {
+            com.solo.purecast.data.SettingsRepository.getInstance(context).getOrCreateFallbackMacAddress()
+        } catch (e: Exception) {
+            Logger.service.w(TAG, "读取持久化兜底 MAC 失败，使用一次性随机 LAA MAC: ${e.message}")
+            val bytes = ByteArray(6)
+            java.security.SecureRandom().nextBytes(bytes)
+            bytes[0] = ((bytes[0].toInt() and 0xFC) or 0x02).toByte()
+            bytes.joinToString("") { "%02X".format(it) }
+        }
+        Logger.service.w(TAG, "无法动态获取物理 MAC，回退至持久化本地管理 MAC: $fallbackMac")
+        return fallbackMac
     }
 
     private fun formatMacWithColons(mac: String): String {

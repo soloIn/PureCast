@@ -143,6 +143,14 @@ class AirPlayServerManager(
         Logger.airplay.i(TAG, "AirPlay 1 服务已完全停止")
     }
 
+    /**
+     * 💡 永久释放服务及其底层 mDNS 协程作用域（在宿主服务销毁时调用）
+     */
+    fun destroy() = synchronized(serverLock) {
+        stop()
+        jmdnsDiscoveryService.destroy()
+    }
+
     private fun injectCryptoKey(aesKeyBase64: String, aesIvBase64: String) {
         if (aesKeyBase64.isNotEmpty() && aesIvBase64.isNotEmpty()) {
             try {

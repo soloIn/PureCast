@@ -35,11 +35,15 @@ class SettingsRepositoryTest {
     private lateinit var app: Application
     private lateinit var repo: SettingsRepository
 
+    private fun dpPrefs() = app.createDeviceProtectedStorageContext()
+        .getSharedPreferences("purecast_settings", Context.MODE_PRIVATE)
+
     @Before
     fun setUp() {
         app = ApplicationProvider.getApplicationContext()
-        // 清理 SharedPreferences，保证测试用例独立性
+        // 清理 CE 与 DE SharedPreferences，保证测试用例独立性
         app.getSharedPreferences("purecast_settings", Context.MODE_PRIVATE).edit().clear().commit()
+        dpPrefs().edit().clear().commit()
         repo = SettingsRepository(app)
     }
 
@@ -67,8 +71,8 @@ class SettingsRepositoryTest {
 
     @Test
     fun testPreExistingSharedPreferencesInitialization() {
-        // 预写入持久化数据
-        app.getSharedPreferences("purecast_settings", Context.MODE_PRIVATE).edit()
+        // 预写入持久化数据至 DE 存储
+        dpPrefs().edit()
             .putString("upnp_friendly_name", "Pre-set TV")
             .putInt("usb_idle_timeout_seconds", 45)
             .putBoolean("airplay_enabled", false)
@@ -99,6 +103,18 @@ class SettingsRepositoryTest {
     }
 
     @Test
+    fun testFallbackMacAddressIsPersistedValidLaa() {
+        val mac1 = repo.getOrCreateFallbackMacAddress()
+        val mac2 = repo.getOrCreateFallbackMacAddress()
+        assertEquals(12, mac1.length)
+        assertTrue(mac1.matches(Regex("^[0-9A-F]{12}$")))
+        // 首字节应为单播本地管理地址 (bit1=1, bit0=0)
+        val firstByte = mac1.substring(0, 2).toInt(16)
+        assertEquals(0x02, firstByte and 0x03)
+        assertEquals(mac1, mac2)
+    }
+
+    @Test
     fun testIdleTimeoutFlowAndSetter() {
         assertEquals(SettingsRepository.DEFAULT_IDLE_TIMEOUT, repo.getIdleTimeoutSeconds())
         assertEquals(SettingsRepository.DEFAULT_IDLE_TIMEOUT, repo.idleTimeoutFlow.value)
@@ -108,8 +124,7 @@ class SettingsRepositoryTest {
         assertEquals(30, repo.idleTimeoutFlow.value)
 
         // 验证磁盘 SharedPreferences 同步写入
-        val diskVal = app.getSharedPreferences("purecast_settings", Context.MODE_PRIVATE)
-            .getInt("usb_idle_timeout_seconds", -1)
+        val diskVal = dpPrefs().getInt("usb_idle_timeout_seconds", -1)
         assertEquals(30, diskVal)
     }
 
@@ -122,8 +137,7 @@ class SettingsRepositoryTest {
         assertTrue(repo.isOnboardingCompleted())
         assertTrue(repo.onboardingCompletedFlow.value)
 
-        val diskVal = app.getSharedPreferences("purecast_settings", Context.MODE_PRIVATE)
-            .getBoolean("onboarding_completed", false)
+        val diskVal = dpPrefs().getBoolean("onboarding_completed", false)
         assertTrue(diskVal)
     }
 
@@ -148,8 +162,7 @@ class SettingsRepositoryTest {
         assertEquals(SettingsRepository.DEFAULT_FRIENDLY_NAME, repo.friendlyNameFlow.value)
 
         // 验证磁盘 SharedPreferences 同步写入
-        val diskVal = app.getSharedPreferences("purecast_settings", Context.MODE_PRIVATE)
-            .getString("upnp_friendly_name", null)
+        val diskVal = dpPrefs().getString("upnp_friendly_name", null)
         assertEquals(SettingsRepository.DEFAULT_FRIENDLY_NAME, diskVal)
     }
 
@@ -162,8 +175,7 @@ class SettingsRepositoryTest {
         assertFalse(repo.isAirPlayEnabled())
         assertFalse(repo.airPlayEnabledFlow.value)
 
-        val diskAirPlay = app.getSharedPreferences("purecast_settings", Context.MODE_PRIVATE)
-            .getBoolean("airplay_enabled", true)
+        val diskAirPlay = dpPrefs().getBoolean("airplay_enabled", true)
         assertFalse(diskAirPlay)
 
         assertTrue(repo.isUpnpEnabled())
@@ -173,8 +185,7 @@ class SettingsRepositoryTest {
         assertFalse(repo.isUpnpEnabled())
         assertFalse(repo.upnpEnabledFlow.value)
 
-        val diskUpnp = app.getSharedPreferences("purecast_settings", Context.MODE_PRIVATE)
-            .getBoolean("upnp_enabled", true)
+        val diskUpnp = dpPrefs().getBoolean("upnp_enabled", true)
         assertFalse(diskUpnp)
     }
 
@@ -191,8 +202,7 @@ class SettingsRepositoryTest {
         assertEquals(FluidQuality.OFF, repo.getFluidQuality())
         assertEquals(FluidQuality.OFF, repo.fluidQualityFlow.value)
 
-        val diskQuality = app.getSharedPreferences("purecast_settings", Context.MODE_PRIVATE)
-            .getString("fluid_quality", null)
+        val diskQuality = dpPrefs().getString("fluid_quality", null)
         assertEquals(FluidQuality.OFF.name, diskQuality)
     }
 

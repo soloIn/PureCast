@@ -452,7 +452,9 @@ fun MainTvScreen(
                                 delay(150)
                                 try {
                                     lyricsFocusRequester.requestFocus()
-                                } catch (_: Exception) {}
+                                } catch (e: Exception) {
+                                    Logger.ui.d("MainTvScreen", "收起歌词后恢复歌词按钮焦点异常: ${e.message}")
+                                }
                             }
                         },
                         isForeground = isForeground,

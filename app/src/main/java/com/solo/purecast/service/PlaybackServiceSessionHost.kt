@@ -497,11 +497,6 @@ class PlaybackServiceSessionHost(
         coordinator.shutdown()
     }
 
-    private fun originForProtocol(protocol: StreamProtocol): EventOrigin = when (protocol) {
-        StreamProtocol.AIRPLAY_1 -> EventOrigin.AIRPLAY
-        else -> EventOrigin.UPNP
-    }
-
     companion object {
         private const val TAG = "PlaybackSessionHost"
     }
