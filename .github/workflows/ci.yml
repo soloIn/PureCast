@@ -59,23 +59,14 @@ jobs:
       - name: Run Android Unit Tests
         run: ./gradlew testDebugUnitTest
 
-      - name: Build Debug & ReleaseLocal APKs
-        run: ./gradlew assembleDebug assembleReleaseLocal
+      - name: Build ReleaseLocal APKs (Split by ABI + Universal)
+        run: ./gradlew assembleReleaseLocal
 
-      - name: Upload Debug APK
+      - name: Upload Release APKs (arm64-v8a, armeabi-v7a, universal)
         if: success() || failure()
         uses: actions/upload-artifact@v4
         with:
-          name: PureCast-debug-apk
-          path: app/build/outputs/apk/debug/*.apk
-          if-no-files-found: ignore
-          retention-days: 14
-
-      - name: Upload ReleaseLocal APK
-        if: success() || failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: PureCast-releaseLocal-apk
+          name: PureCast-release-apks
           path: app/build/outputs/apk/releaseLocal/*.apk
           if-no-files-found: ignore
           retention-days: 14

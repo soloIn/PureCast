@@ -5,6 +5,10 @@ plugins {
     jacoco
 }
 
+base {
+    archivesName.set("PureCast")
+}
+
 android {
     namespace = "com.solo.purecast"
     compileSdk = 34
@@ -30,6 +34,15 @@ android {
                     "-DANDROID_STL=c++_static"
                 )
             }
+        }
+    }
+
+    splits {
+        abi {
+            isEnable = true
+            reset()
+            include("armeabi-v7a", "arm64-v8a")
+            isUniversalApk = true
         }
     }
 
