@@ -215,4 +215,61 @@ class LyricsTriggerManagerTest {
         assertTrue("timeline 引用必须保持一致以防 Compose 重建视图", resumedSuccess.timeline === initialSuccess.timeline)
         assertEquals("不应产生任何重复网络检索", fetchCountAfterLoad, fakeClient.fetchCount)
     }
+
+    @Test
+    fun `track boundary updating duration before new title does not trigger wasted old-song recalibration`() = testScope.runTest {
+        val oldTimeline = LyricTimeline(
+            source = "cache",
+            format = LyricFormat.LRC_LINE_SYNC,
+            durationMs = 225_000L,
+            lines = listOf(LyricLine(0, 10_000L, 20_000L, "Old Song Line"))
+        )
+        val newTimeline = LyricTimeline(
+            source = "cache",
+            format = LyricFormat.LRC_LINE_SYNC,
+            durationMs = 233_500L,
+            lines = listOf(LyricLine(0, 10_000L, 20_000L, "New Song Line"))
+        )
+        cacheRepo.put(cacheRepo.computeCacheKey("Artist A", "Song A", 225_000L), oldTimeline)
+        cacheRepo.put(cacheRepo.computeCacheKey("Artist B", "Song B", 233_500L), newTimeline)
+
+        // 1. 先加载旧歌 A
+        triggerManager.onSessionSnapshotChanged(
+            PlayerSessionSnapshot(
+                businessState = BusinessSessionState.PLAYING,
+                trackGeneration = 5L,
+                metadata = TrackMetadata(title = "Song A", artist = "Artist A", durationMs = 225_000L)
+            )
+        )
+        advanceTimeBy(400L)
+        advanceUntilIdle()
+        assertEquals(0, fakeClient.fetchCount)
+
+        // 2. 模拟 TrackBoundaryEvent 先行到达：trackGeneration=6 且 durationMs 变为新歌时长，但歌名仍为旧歌
+        triggerManager.onSessionSnapshotChanged(
+            PlayerSessionSnapshot(
+                businessState = BusinessSessionState.PLAYING,
+                trackGeneration = 6L,
+                metadata = TrackMetadata(title = "Song A", artist = "Artist A", durationMs = 233_500L)
+            )
+        )
+        advanceTimeBy(10L)
+
+        // 3. 10ms 后 MetadataPatchEvent 到达，更新为新歌 B
+        triggerManager.onSessionSnapshotChanged(
+            PlayerSessionSnapshot(
+                businessState = BusinessSessionState.PLAYING,
+                trackGeneration = 6L,
+                metadata = TrackMetadata(title = "Song B", artist = "Artist B", durationMs = 233_500L)
+            )
+        )
+        advanceTimeBy(400L)
+        advanceUntilIdle()
+
+        // 全程命中缓存，绝不以旧歌名 + 新时长发起网络检索
+        assertEquals("切歌边界绝不应以旧歌名+新时长触发网络重校准", 0, fakeClient.fetchCount)
+        val finalState = triggerManager.lyricUiState.value as LyricUiState.Success
+        assertEquals(6L, finalState.trackGeneration)
+        assertEquals("New Song Line", finalState.timeline.lines[0].mainText)
+    }
 }

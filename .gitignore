@@ -19,6 +19,8 @@ captures/
 .cxx/
 *.apk
 *.aab
+*.jks
+*.keystore
 
 # Temp
 /tmp/

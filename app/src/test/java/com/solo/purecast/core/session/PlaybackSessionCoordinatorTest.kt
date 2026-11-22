@@ -301,7 +301,7 @@ class PlaybackSessionCoordinatorTest {
     }
 
     @Test
-    fun `TrackComplete transitions to STOPPED and 10s HardwareIdleTimeout releases device into IDLE`() = runTest(StandardTestDispatcher()) {
+    fun `TrackComplete immediately disconnects session to IDLE while 10s HardwareIdleTimeout releases device independently`() = runTest(StandardTestDispatcher()) {
         val hw = FakeSessionHardwareBridge()
         val c = createCoordinator(this, hw)
 
@@ -314,17 +314,20 @@ class PlaybackSessionCoordinatorTest {
         c.dispatch(env(c, EventOrigin.UPNP, s1, TrackCompleteEvent(newEpoch = 11L)))
         runCurrent()
         assertEquals(TransportPipeState.DISCONNECTED, c.snapshot.value.transportState)
-        assertEquals(BusinessSessionState.STOPPED, c.snapshot.value.businessState)
+        assertEquals(BusinessSessionState.IDLE, c.snapshot.value.businessState)
+        assertEquals(0L, c.snapshot.value.sessionId)
+        assertEquals(StreamProtocol.NONE, c.snapshot.value.activeProtocol)
         assertEquals(HardwarePipelineState.EXCLUSIVE_MUTED, c.snapshot.value.hardwareState)
         assertEquals(0, hw.releaseDeviceCalls)
 
-        // 9.9 秒尚未释放
+        // 9.9 秒会话已归 IDLE，但 USB 声卡尚未释放
         advanceTimeBy(9_900)
         runCurrent()
-        assertEquals(BusinessSessionState.STOPPED, c.snapshot.value.businessState)
+        assertEquals(BusinessSessionState.IDLE, c.snapshot.value.businessState)
+        assertEquals(HardwarePipelineState.EXCLUSIVE_MUTED, c.snapshot.value.hardwareState)
         assertEquals(0, hw.releaseDeviceCalls)
 
-        // 10.0 秒触发 HardwareIdleTimeoutEvent -> IDLE + RELEASED + releaseDevice()
+        // 10.0 秒触发 HardwareIdleTimeoutEvent -> RELEASED + releaseDevice()
         advanceTimeBy(200)
         runCurrent()
         assertEquals(BusinessSessionState.IDLE, c.snapshot.value.businessState)
@@ -343,6 +346,8 @@ class PlaybackSessionCoordinatorTest {
         val s1 = c.allocateSessionId()
         c.dispatch(env(c, EventOrigin.AIRPLAY, s1, StreamSetupEvent(StreamProtocol.AIRPLAY_1)))
         c.dispatch(env(c, EventOrigin.AIRPLAY, s1, FirstDataPacketEvent(StreamProtocol.AIRPLAY_1, 10L, 44100, 16, 2, "ALAC")))
+        // 先暂停进入 PAUSED，再收到 iOS 暂停 8s 后的 TEARDOWN -> 保持 PAUSED 挂起 10 分钟
+        c.dispatch(env(c, EventOrigin.USER_ACTION, s1, ExplicitPauseEvent(epoch = 10L)))
         c.dispatch(env(c, EventOrigin.AIRPLAY, s1, StreamTeardownEvent(hardStop = false)))
         runCurrent()
 
@@ -702,7 +707,7 @@ class PlaybackSessionCoordinatorTest {
         c.dispatch(env(c, EventOrigin.AIRPLAY, s0, StreamStopEvent(FlushReason.STOP_OR_TEARDOWN, newEpoch = 3L, isPreempted = true)))
         c.dispatch(env(c, EventOrigin.AIRPLAY, s0, StreamTeardownEvent(hardStop = true)))
         runCurrent()
-        assertEquals(BusinessSessionState.STOPPED, c.snapshot.value.businessState)
+        assertEquals(BusinessSessionState.IDLE, c.snapshot.value.businessState)
 
         // STOPPED 下硬件离线且在 PLAYING 之外拔出不影响 PAUSED，10s 让渡保留 DISCONNECTED
         c.dispatch(env(c, EventOrigin.USB_HARDWARE, 0L, HardwareDetachedEvent("offline"), deviceGen = 1L))
@@ -907,15 +912,18 @@ class PlaybackSessionCoordinatorTest {
         assertEquals(HardwarePipelineState.RELEASED, c.snapshot.value.hardwareState)
         assertEquals(1, hw.releaseDeviceCalls)
 
-        // 配置 0s (永久独占) -> 停播 30s 仍保持 EXCLUSIVE_MUTED 且不触发 RELEASED
+        // 配置 0s (永久独占) -> 停播后会话立即归 IDLE，同时声卡 30s 后仍保持 EXCLUSIVE_MUTED 不释放
         c.setIdleTimeoutSeconds(0)
         val s2 = c.allocateSessionId()
         c.dispatch(env(c, EventOrigin.AIRPLAY, s2, StreamSetupEvent(StreamProtocol.AIRPLAY_1)))
         c.dispatch(env(c, EventOrigin.AIRPLAY, s2, FirstDataPacketEvent(StreamProtocol.AIRPLAY_1, 10L, 44100, 16, 2, "ALAC")))
         c.dispatch(env(c, EventOrigin.AIRPLAY, s2, StreamStopEvent(FlushReason.STOP_OR_TEARDOWN, newEpoch = 11L)))
         runCurrent()
+        assertEquals(BusinessSessionState.IDLE, c.snapshot.value.businessState)
+        assertEquals(0L, c.snapshot.value.sessionId)
         advanceTimeBy(30_000)
         runCurrent()
+        assertEquals(BusinessSessionState.IDLE, c.snapshot.value.businessState)
         assertEquals(HardwarePipelineState.EXCLUSIVE_MUTED, c.snapshot.value.hardwareState)
         assertEquals(1, hw.releaseDeviceCalls)
     }
@@ -936,7 +944,7 @@ class PlaybackSessionCoordinatorTest {
         assertEquals(idleCtx, idleOut.nextContext)
         assertTrue(idleOut.effects.isEmpty())
 
-        // 2. 验证协调器在 STOPPED（停播但保留最后快照）状态下收到同会话迟到 StreamResumeEvent 时仍保持 STOPPED (#23)
+        // 2. 验证协调器在停止归 IDLE 状态下收到同会话迟到 StreamResumeEvent 时仍保持 IDLE (#23)
         val hw = FakeSessionHardwareBridge()
         val c = createCoordinator(this, hwBridge = hw)
         c.dispatch(env(c, EventOrigin.USB_HARDWARE, 0L, HardwareAttachedEvent("ZX300A", hasPermission = true)))
@@ -945,14 +953,14 @@ class PlaybackSessionCoordinatorTest {
         c.dispatch(env(c, EventOrigin.UPNP, sid, FirstDataPacketEvent(StreamProtocol.UPNP_DLNA, 10L, 48000, 24, 2, "WAV")))
         c.dispatch(env(c, EventOrigin.UPNP, sid, StreamStopEvent(FlushReason.STOP_OR_TEARDOWN, newEpoch = 11L)))
         runCurrent()
-        assertEquals(BusinessSessionState.STOPPED, c.snapshot.value.businessState)
+        assertEquals(BusinessSessionState.IDLE, c.snapshot.value.businessState)
 
-        // 直接在 STOPPED 状态下投递迟到 StreamResumeEvent，确认绝不重开 DAC、恢复推流或变为 PLAYING
+        // 直接在 IDLE 状态下投递迟到 StreamResumeEvent，确认绝不重开 DAC、恢复推流或变为 PLAYING
         val opensBefore = hw.openDeviceCalls
         val resumesBefore = hw.fastPath.resumeCalls
         c.dispatch(env(c, EventOrigin.UPNP, sid, StreamResumeEvent(StreamProtocol.UPNP_DLNA, resumedEpoch = 12L)))
         runCurrent()
-        assertEquals(BusinessSessionState.STOPPED, c.snapshot.value.businessState)
+        assertEquals(BusinessSessionState.IDLE, c.snapshot.value.businessState)
         assertEquals(HardwarePipelineState.EXCLUSIVE_MUTED, c.snapshot.value.hardwareState)
         assertEquals(opensBefore, hw.openDeviceCalls)
         assertEquals(resumesBefore, hw.fastPath.resumeCalls)
@@ -1266,10 +1274,10 @@ class PlaybackSessionCoordinatorTest {
         runCurrent()
         assertEquals(BusinessSessionState.TRANSITIONING, c.snapshot.value.businessState)
 
-        // 5000ms 超时看门狗触发: 初始建流超时安全降级至 STOPPED，杜绝伪暂停占住声卡 10 分钟 (B-3)
+        // 5000ms 超时看门狗触发: 初始建流超时直接断开归 IDLE，杜绝伪暂停占住声卡 10 分钟 (B-3)
         advanceTimeBy(2L)
         runCurrent()
-        assertEquals(BusinessSessionState.STOPPED, c.snapshot.value.businessState)
+        assertEquals(BusinessSessionState.IDLE, c.snapshot.value.businessState)
     }
 
     @Test
@@ -1361,42 +1369,72 @@ class PlaybackSessionCoordinatorTest {
     }
 
     @Test
-    fun `StreamTeardownEvent in PAUSED state preserves PAUSED businessState and keeps 10m SuspendTimeout`() = runTest(StandardTestDispatcher()) {
+    fun `StreamTeardownEvent distinguishes pause sleep from active disconnect and blocks zombie resume`() = runTest(StandardTestDispatcher()) {
         val hw = FakeSessionHardwareBridge()
-        val c = createCoordinator(this, hw)
+        val terminated = mutableListOf<Pair<StreamProtocol, Long>>()
+        var dacpShouldFail = false
+        val c = createCoordinator(
+            this,
+            hwBridge = hw,
+            dacpSender = { _, _ ->
+                if (dacpShouldFail) Result.failure(IllegalStateException("connection refused"))
+                else Result.success(Unit)
+            },
+            onPreempted = { p, sid -> terminated += p to sid }
+        )
 
         c.dispatch(env(c, EventOrigin.USB_HARDWARE, 0L, HardwareAttachedEvent("DAC", hasPermission = true), deviceGen = 1L))
         runCurrent()
 
-        val s1 = c.allocateSessionId()
-        c.dispatch(env(c, EventOrigin.AIRPLAY, s1, StreamSetupEvent(StreamProtocol.AIRPLAY_1, 44100, 16, 2, "ALAC", 10L)))
-        c.dispatch(env(c, EventOrigin.AIRPLAY, s1, FirstDataPacketEvent(StreamProtocol.AIRPLAY_1, 10L, 44100, 16, 2, "ALAC")))
+        // 场景 1: 播放中收到 DACP 探活确认断开 (hardStop=true) -> 不管前置状态直接断开会话归 IDLE
+        val sPlayDisconnect = c.allocateSessionId()
+        c.dispatch(env(c, EventOrigin.AIRPLAY, sPlayDisconnect, StreamSetupEvent(StreamProtocol.AIRPLAY_1, 44100, 16, 2, "ALAC", 10L)))
+        c.dispatch(env(c, EventOrigin.AIRPLAY, sPlayDisconnect, FirstDataPacketEvent(StreamProtocol.AIRPLAY_1, 10L, 44100, 16, 2, "ALAC")))
         runCurrent()
         assertEquals(BusinessSessionState.PLAYING, c.snapshot.value.businessState)
 
-        // 1. 用户主动暂停 -> PAUSED
-        c.dispatch(env(c, EventOrigin.USER_ACTION, s1, ExplicitPauseEvent(epoch = 11L)))
-        runCurrent()
-        assertEquals(BusinessSessionState.PAUSED, c.snapshot.value.businessState)
-
-        // 2. iOS 暂停 2 秒后下发 TEARDOWN 拆除音频通道 (即使携带 hardStop = true，业务层也绝不退化为 STOPPED)
-        c.dispatch(env(c, EventOrigin.AIRPLAY, s1, StreamTeardownEvent(hardStop = true)))
-        runCurrent()
-
-        // 验证：契约保护生效，业务态依然为 PAUSED，管道变为 DISCONNECTED，不进 STOPPED，大屏不闪回待机！
-        assertEquals(BusinessSessionState.PAUSED, c.snapshot.value.businessState)
-        assertEquals(TransportPipeState.DISCONNECTED, c.snapshot.value.transportState)
-        assertEquals(PlaybackStatus.PAUSED, c.snapshot.value.playbackStatus)
-
-        // 推进 9 分钟 (540s)：未到 10 分钟挂起超时，依然保持 PAUSED
-        advanceTimeBy(540_000L)
-        runCurrent()
-        assertEquals(BusinessSessionState.PAUSED, c.snapshot.value.businessState)
-
-        // 推进至 10 分钟超时：触发 SuspendTimeoutEvent 优雅回归 IDLE
-        advanceTimeBy(60_000L)
+        c.dispatch(env(c, EventOrigin.AIRPLAY, sPlayDisconnect, StreamTeardownEvent(hardStop = true)))
         runCurrent()
         assertEquals(BusinessSessionState.IDLE, c.snapshot.value.businessState)
+        assertEquals(0L, c.snapshot.value.sessionId)
+        assertEquals(TransportPipeState.DISCONNECTED, c.snapshot.value.transportState)
+        assertTrue(terminated.contains(StreamProtocol.AIRPLAY_1 to sPlayDisconnect))
+
+        // 场景 2: DACP 探活确认存活 (hardStop=false) -> 无论此前是 PLAYING 还是 PAUSED，均保留 PAUSED 挂起态，且阻断直接 StreamResumeEvent
+        val sPauseSleep = c.allocateSessionId()
+        c.dispatch(env(c, EventOrigin.AIRPLAY, sPauseSleep, StreamSetupEvent(StreamProtocol.AIRPLAY_1, 44100, 16, 2, "ALAC", 11L)))
+        c.dispatch(env(c, EventOrigin.AIRPLAY, sPauseSleep, FirstDataPacketEvent(StreamProtocol.AIRPLAY_1, 11L, 44100, 16, 2, "ALAC")))
+        c.dispatch(env(c, EventOrigin.AIRPLAY, sPauseSleep, StreamTeardownEvent(hardStop = false)))
+        runCurrent()
+        assertEquals(BusinessSessionState.PAUSED, c.snapshot.value.businessState)
+        assertEquals(TransportPipeState.DISCONNECTED, c.snapshot.value.transportState)
+
+        // 阻断直接 StreamResumeEvent 防止虚空播放
+        c.dispatch(env(c, EventOrigin.USER_ACTION, sPauseSleep, StreamResumeEvent(StreamProtocol.AIRPLAY_1, 11L)))
+        runCurrent()
+        assertEquals(BusinessSessionState.PAUSED, c.snapshot.value.businessState)
+        assertEquals(TransportPipeState.DISCONNECTED, c.snapshot.value.transportState)
+
+        // 场景 3: 暂停挂起后 DACP 探活确认断开 (hardStop=true) -> 立即断开会话归 IDLE
+        c.dispatch(env(c, EventOrigin.AIRPLAY, sPauseSleep, StreamTeardownEvent(hardStop = true)))
+        runCurrent()
+        assertEquals(BusinessSessionState.IDLE, c.snapshot.value.businessState)
+        assertEquals(0L, c.snapshot.value.sessionId)
+        assertTrue(terminated.contains(StreamProtocol.AIRPLAY_1 to sPauseSleep))
+
+        // 场景 4: 暂停挂起后点击播放 (RemoteCommandType.PLAY) 但 DACP 失败 -> 立即断开会话归 IDLE 而非虚空播放
+        val sDeadPlay = c.allocateSessionId()
+        c.dispatch(env(c, EventOrigin.AIRPLAY, sDeadPlay, StreamSetupEvent(StreamProtocol.AIRPLAY_1, 44100, 16, 2, "ALAC", 12L)))
+        c.dispatch(env(c, EventOrigin.AIRPLAY, sDeadPlay, FirstDataPacketEvent(StreamProtocol.AIRPLAY_1, 12L, 44100, 16, 2, "ALAC")))
+        c.dispatch(env(c, EventOrigin.USER_ACTION, sDeadPlay, ExplicitPauseEvent(epoch = 12L)))
+        c.dispatch(env(c, EventOrigin.AIRPLAY, sDeadPlay, StreamTeardownEvent(hardStop = false)))
+        runCurrent()
+        dacpShouldFail = true
+        c.dispatch(env(c, EventOrigin.USER_ACTION, sDeadPlay, RemoteSkipNextEvent(RemoteCommandType.PLAY, c.allocateCommandId())))
+        runCurrent()
+        assertEquals(BusinessSessionState.IDLE, c.snapshot.value.businessState)
+        assertEquals(0L, c.snapshot.value.sessionId)
+        assertTrue(terminated.contains(StreamProtocol.AIRPLAY_1 to sDeadPlay))
     }
 
     @Test
@@ -1667,7 +1705,7 @@ class PlaybackSessionCoordinatorTest {
             payload = TransitionTimeoutEvent(sessionId = 1L)
         )
         val outPreparing = TriStateTransitionMatrix.reduce(TransitionContext(snapshot = snapPreparing), envPreparingTimeout, tm, 100L)
-        assertEquals("PREPARING 超时必须回退至 STOPPED", BusinessSessionState.STOPPED, outPreparing.nextContext.snapshot.businessState)
+        assertEquals("PREPARING 超时必须直接断开归 IDLE", BusinessSessionState.IDLE, outPreparing.nextContext.snapshot.businessState)
         assertEquals("PREPARING 超时硬件态静音", HardwarePipelineState.EXCLUSIVE_MUTED, outPreparing.nextContext.snapshot.hardwareState)
         assertTrue("PREPARING 超时必须调度 10s 空闲释放定时器", outPreparing.effects.any { it is TransitionEffect.ScheduleHardwareIdleTimeout })
 

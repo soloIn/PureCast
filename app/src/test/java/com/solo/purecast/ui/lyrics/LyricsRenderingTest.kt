@@ -518,13 +518,13 @@ class LyricsRenderingTest {
         assertEquals(false, LyricsRenderingMath.isInInterludeRest(wordSyncTimeline, -1, 500L))
         assertEquals(false, LyricsRenderingMath.isInInterludeRest(wordSyncTimeline, 99, 500L))
 
-        // 短间隙 (4500 - 2800 = 1700ms < 2500ms)：始终 false
+        // 短间隙与常规换气停顿 (1700ms / 3500ms < 5000ms)：始终 false
         assertEquals(false, LyricsRenderingMath.isInInterludeRest(wordSyncTimeline, 0, 3_500L))
 
-        // 长间奏 (12000 - 6500 = 5500ms >= 2500ms)：
-        // 唱完后 500ms 内 (6900ms) 不静息；7000ms 起持续静息直至切入下一句 (index = 2)，绝不在 index = 1 期间提前退静息导致上一行回亮
-        assertEquals(false, LyricsRenderingMath.isInInterludeRest(wordSyncTimeline, 1, 6_900L))
-        assertEquals(true, LyricsRenderingMath.isInInterludeRest(wordSyncTimeline, 1, 7_000L))
+        // 长间奏 (12000 - 6500 = 5500ms >= 5000ms)：
+        // 唱完后 800ms 内 (7200ms) 不静息；7300ms 起持续静息直至切入下一句 (index = 2)，绝不在 index = 1 期间提前退静息导致上一行回亮
+        assertEquals(false, LyricsRenderingMath.isInInterludeRest(wordSyncTimeline, 1, 7_200L))
+        assertEquals(true, LyricsRenderingMath.isInInterludeRest(wordSyncTimeline, 1, 7_300L))
         assertEquals(true, LyricsRenderingMath.isInInterludeRest(wordSyncTimeline, 1, 11_500L))
         assertEquals(false, LyricsRenderingMath.isInInterludeRest(wordSyncTimeline, 2, 11_800L))
 

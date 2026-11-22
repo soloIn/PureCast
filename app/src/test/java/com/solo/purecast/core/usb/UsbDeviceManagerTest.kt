@@ -220,11 +220,11 @@ class UsbDeviceManagerTest {
             )
         )
         testScheduler.runCurrent()
-        assertEquals(BusinessSessionState.STOPPED, coordinator.snapshot.value.businessState)
+        assertEquals(BusinessSessionState.IDLE, coordinator.snapshot.value.businessState)
 
         assertTrue(usbManager.handleDeviceDetached(null))
         testScheduler.runCurrent()
-        assertEquals(BusinessSessionState.STOPPED, coordinator.snapshot.value.businessState)
+        assertEquals(BusinessSessionState.IDLE, coordinator.snapshot.value.businessState)
         assertEquals(HardwarePipelineState.DISCONNECTED, coordinator.snapshot.value.hardwareState)
 
         usbManager.destroy()

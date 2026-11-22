@@ -178,4 +178,35 @@ class DacpClientTest {
             serverThread.join(1000L)
         }
     }
+
+    @Test
+    fun `hasResolvedDacpEndpoint and probeSessionAlive distinguish live vs refused vs missing endpoint`() = runBlocking {
+        val client = DacpClient(testScope)
+        assertFalse(client.hasResolvedDacpEndpoint())
+        assertFalse(client.probeSessionAlive(100L))
+
+        client.updateSession("127.0.0.1", 0, "tok")
+        assertFalse(client.hasResolvedDacpEndpoint())
+        assertFalse(client.probeSessionAlive(100L))
+
+        val server = ServerSocket(0)
+        val livePort = server.localPort
+        val acceptThread = Thread {
+            runCatching { server.accept().close() }
+        }.apply {
+            isDaemon = true
+            start()
+        }
+        try {
+            client.updatePort(livePort)
+            assertTrue(client.hasResolvedDacpEndpoint())
+            assertTrue("监听中的 DACP TCP 端口应探活成功", client.probeSessionAlive(300L))
+        } finally {
+            runCatching { server.close() }
+            acceptThread.join(500L)
+        }
+
+        // 端口关闭后应毫秒级返回不可达
+        assertFalse("关闭后的 DACP TCP 端口应探活失败", client.probeSessionAlive(300L))
+    }
 }

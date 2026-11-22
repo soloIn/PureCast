@@ -12,6 +12,18 @@ object LyricsRenderingMath {
     /** 简体中文/次级翻译固定基础透明度 */
     const val TRANSLATION_ALPHA: Float = 0.78f
 
+    /** 长前奏三点呼吸指示器最小前奏时长 (ms) */
+    const val INTRO_DOTS_MIN_START_MS: Long = 4500L
+
+    /** 曲中长间奏最小人声空拍时长 (ms)：过滤 2.5s~4.5s 普通乐句换气停顿，仅在真正间奏时展示 ··· */
+    const val INTERLUDE_MIN_GAP_MS: Long = 5000L
+
+    /** 曲中长间奏进入静息延迟 (ms)：上一句唱完后等待 800ms 再温和过渡至间奏呼吸态 */
+    const val INTERLUDE_ENTER_DELAY_MS: Long = 800L
+
+    /** 歌曲尾奏进入静息延迟 (ms) */
+    const val OUTRO_ENTER_DELAY_MS: Long = 1500L
+
     /**
      * 边界安全字符区间钳位计算
      * 自动去除词尾空白字符，并对 startChar 与 endChar 进行 [0, fullText.length - 1] 边界安全钳位。
@@ -205,11 +217,9 @@ object LyricsRenderingMath {
 
     /**
      * 💡 长间奏/尾奏呼吸静息判定：
-     * 当上一句人声唱完且距离下一句还有足够长的间奏（总间隙 >= 2500ms，且已过唱完点 500ms），
-     * 或歌曲尾奏（末句唱完 1500ms 后）时，让当前行优雅去高亮并恢复至 0.95f，并持续保持静息直到 activeLineIndex 真正切入下一句，
-     * 杜绝间奏 `• • •` 提前退出导致上一行歌词重新亮起的回闪 Bug。
-     * 注：无逐字时间戳的标准 LRC 若解析器将 line.endMs 填为 nextLine.startMs，则 gapMs == 0 不会在曲中误熄灭长拖音，
-     * 仅在 TTML/逐字歌词、含显式结束时间的 LRC 或歌曲尾奏触发。
+     * 仅当上一句人声唱完且距离下一句存在真正长间奏（总间隙 >= 5000ms，且已过唱完点 800ms），
+     * 或歌曲尾奏（末句唱完 1500ms 后）时，让当前行优雅去高亮并显示呼吸三点，并持续保持静息直到切入下一句，
+     * 既避免 2.5s~4.5s 常规换气停顿频繁弹出 `• • •` 与提前熄灭当前行，也杜绝回闪。
      */
     fun isInInterludeRest(timeline: LyricTimeline, activeLineIndex: Int, currentTimeMs: Long): Boolean {
         val lines = timeline.lines
@@ -220,9 +230,9 @@ object LyricsRenderingMath {
         val nextStartMs = lines.getOrNull(activeLineIndex + 1)?.startMs
         return if (nextStartMs != null) {
             val gapMs = nextStartMs - vocalEndMs
-            gapMs >= 2500L && currentTimeMs >= vocalEndMs + 500L
+            gapMs >= INTERLUDE_MIN_GAP_MS && currentTimeMs >= vocalEndMs + INTERLUDE_ENTER_DELAY_MS
         } else {
-            currentTimeMs >= vocalEndMs + 1500L
+            currentTimeMs >= vocalEndMs + OUTRO_ENTER_DELAY_MS
         }
     }
 }

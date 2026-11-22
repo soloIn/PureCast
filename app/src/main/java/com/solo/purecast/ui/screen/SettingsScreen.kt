@@ -36,6 +36,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -578,6 +579,87 @@ private fun AppearanceAndGeneralSettingsContent(
             }
         }
     }
+
+    // 4. 存储与歌词缓存清理
+    val cacheScope = rememberCoroutineScope()
+    var cacheFileCount by remember { mutableIntStateOf(-1) }
+    var cacheTotalBytes by remember { mutableLongStateOf(0L) }
+    var isClearingCache by remember { mutableStateOf(false) }
+
+    fun formatCacheBytes(bytes: Long): String = when {
+        bytes < 1024L -> "${bytes} B"
+        bytes < 1024L * 1024L -> String.format(java.util.Locale.US, "%.1f KB", bytes / 1024.0)
+        else -> String.format(java.util.Locale.US, "%.2f MB", bytes / (1024.0 * 1024.0))
+    }
+
+    LaunchedEffect(Unit) {
+        val stats = withContext(Dispatchers.IO) {
+            PlaybackService.instance?.getLyricsCacheStats()
+                ?: run {
+                    val dir = java.io.File(context.cacheDir, "lyrics")
+                    val files = dir.listFiles { f -> f.isFile && f.name.endsWith(".json") }.orEmpty()
+                    com.solo.purecast.data.lyrics.LyricsCacheRepository.CacheStats(
+                        fileCount = files.size,
+                        totalBytes = files.sumOf { it.length() }
+                    )
+                }
+        }
+        cacheFileCount = stats.fileCount
+        cacheTotalBytes = stats.totalBytes
+    }
+
+    SettingsSection(title = "存储与缓存") {
+        val cacheSubtitle = when {
+            isClearingCache -> "正在清理本地歌词与临时缓存..."
+            cacheFileCount < 0 -> "正在统计缓存大小..."
+            cacheFileCount == 0 -> "当前无本地歌词缓存 (0 B)"
+            else -> "已缓存 $cacheFileCount 首歌词 (${formatCacheBytes(cacheTotalBytes)})，清空后当前歌曲将重新检索最新歌词"
+        }
+        SettingInlineRow(
+            title = "清空歌词缓存",
+            subtitle = cacheSubtitle
+        ) {
+            SegmentOptionButton(
+                label = if (isClearingCache) "清理中..." else "🗑 清空缓存",
+                isSelected = false,
+                leftNavFocusRequester = leftNavFocusRequester,
+                onClick = {
+                    if (isClearingCache) return@SegmentOptionButton
+                    isClearingCache = true
+                    cacheScope.launch {
+                        val cleared = withContext(Dispatchers.IO) {
+                            val svc = PlaybackService.instance
+                            if (svc != null) {
+                                svc.clearAllCaches()
+                            } else {
+                                val dir = java.io.File(context.cacheDir, "lyrics")
+                                val files = dir.listFiles { f -> f.isFile }.orEmpty()
+                                var bytes = 0L
+                                var count = 0
+                                for (f in files) {
+                                    val len = f.length()
+                                    if (f.delete()) {
+                                        bytes += len
+                                        if (f.name.endsWith(".json")) count++
+                                    }
+                                }
+                                com.solo.purecast.data.lyrics.LyricsCacheRepository.CacheStats(count, bytes)
+                            }
+                        }
+                        cacheFileCount = 0
+                        cacheTotalBytes = 0L
+                        isClearingCache = false
+                        val msg = if (cleared.fileCount > 0 || cleared.totalBytes > 0L) {
+                            "已清空 ${cleared.fileCount} 首歌词缓存 (释放 ${formatCacheBytes(cleared.totalBytes)})"
+                        } else {
+                            "缓存已是空的"
+                        }
+                        Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                    }
+                }
+            )
+        }
+    }
 }
 
 @Composable
@@ -671,8 +753,12 @@ private fun ProtocolsSettingsContent(
                 leftNavFocusRequester = leftNavFocusRequester,
                 onToggle = {
                     val target = !isAirPlayEnabled
-                    settingsRepo.setAirPlayEnabled(target)
-                    PlaybackService.instance?.setAirPlayEnabled(target)
+                    val svc = PlaybackService.instance
+                    if (svc != null) {
+                        svc.setAirPlayEnabled(target)
+                    } else {
+                        settingsRepo.setAirPlayEnabled(target)
+                    }
                 }
             )
         }
@@ -688,8 +774,12 @@ private fun ProtocolsSettingsContent(
                 leftNavFocusRequester = leftNavFocusRequester,
                 onToggle = {
                     val target = !isUpnpEnabled
-                    settingsRepo.setUpnpEnabled(target)
-                    PlaybackService.instance?.setUpnpEnabled(target)
+                    val svc = PlaybackService.instance
+                    if (svc != null) {
+                        svc.setUpnpEnabled(target)
+                    } else {
+                        settingsRepo.setUpnpEnabled(target)
+                    }
                 }
             )
         }

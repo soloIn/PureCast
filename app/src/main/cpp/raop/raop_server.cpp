@@ -388,12 +388,10 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
                      << "Server: AirTunes/105.1\r\n\r\n";
         }
     } else if (method == "FLUSH") {
-        // 💡 收到 FLUSH 先递增 AudioEngine epoch 并同步给 rtp_，最后在 audio_packet_mutex_ 锁内原子重置 JitterBuffer，
-        // 消除 reset_buffer() 与 set_active_epoch() 之间的并发窗口导致首包拿旧 epoch 被拒丢帧的竞态；
+        // 💡 在 RaopRtp::audio_packet_mutex_ 锁内原子执行 AudioEngine 排空递增 epoch、同步 active_epoch、
+        // 重置 JitterBuffer 与开启 FLUSH 后静音拦截门控，彻底消除 sync_drain_thread 抢跑垫步与首包旧 epoch 竞态；
         // 严禁在 FLUSH 中越权调用 AudioEngine::resume_stream()，避免 TV 端暂停后 iPhone 响应发 FLUSH 提前解除本机静音漏出尾音。
-        const uint64_t new_epoch = AudioEngine::instance().emergency_mute_and_flush(FlushReason::FLUSH_SWITCH);
-        rtp_.set_active_epoch(new_epoch);
-        rtp_.reset_buffer();
+        const uint64_t new_epoch = rtp_.on_rtsp_flush();
         if (flush_cb_) {
             flush_cb_(active_session_id_.load(std::memory_order_acquire), next_seq(), static_cast<int64_t>(new_epoch));
         }

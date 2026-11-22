@@ -346,15 +346,13 @@ class LyricsSyncClock(
 
         var activeIndex = candidateIndex
         val candidateLine = lines[candidateIndex]
+        // 💡 仅允许在当前行已结束且下一行已开唱时向前衔接，严禁因上一行拖尾/和声交叠而倒跳回 candidateIndex - 1 导致唱完前闪暗回跳
         if (currentTimeMs >= candidateLine.startMs && currentTimeMs > candidateLine.endMs) {
-            for (offset in -1..1) {
-                val testIdx = candidateIndex + offset
-                if (testIdx in lines.indices && testIdx != candidateIndex) {
-                    val l = lines[testIdx]
-                    if (currentTimeMs in l.startMs..l.endMs) {
-                        activeIndex = testIdx
-                        break
-                    }
+            val nextIdx = candidateIndex + 1
+            if (nextIdx in lines.indices) {
+                val nextLine = lines[nextIdx]
+                if (currentTimeMs in nextLine.startMs..nextLine.endMs) {
+                    activeIndex = nextIdx
                 }
             }
         }
@@ -470,5 +468,13 @@ class LyricsSyncClock(
          * 让文字在人声开口前夕刚好滑到 38% 视觉中心就位，逐字扫光仍严格踩在真实时间戳上。
          */
         const val DEFAULT_SCROLL_LEAD_IN_MS = 450L
+
+        /**
+         * 💡 非逐字（逐行 LRC）歌词专用节奏参数：
+         * 提前 550ms 启动弹簧上滑（~380~420ms 完成整像素落位），并收紧至开唱前 100ms 再点亮，
+         * 在滚动停稳与高亮之间留出 ~50~70ms 静止呼吸间隙，彻底消除高亮期间亚像素漂移感。
+         */
+        const val LINE_SYNC_SCROLL_LEAD_IN_MS = 550L
+        const val LINE_SYNC_HIGHLIGHT_LEAD_IN_MS = 100L
     }
 }

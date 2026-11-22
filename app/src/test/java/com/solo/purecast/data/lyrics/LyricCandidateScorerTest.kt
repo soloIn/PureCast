@@ -197,4 +197,64 @@ class LyricCandidateScorerTest {
         assertTrue("歌手得分应保持高分", result.artistScore >= 25.0f)
         assertTrue("总分达到准入门槛", result.totalScore >= 85.0f)
     }
+
+    @Test
+    fun `part tag mismatch vetoes sequel confusion while part 1 matches untagged title`() {
+        val pt2VsPt1 = LyricCandidateScorer.evaluate(
+            expectedArtist = "Rihanna",
+            expectedTitle = "Love the Way You Lie, Pt. 2",
+            expectedDurationMs = 296_000L,
+            candidateArtist = "Rihanna",
+            candidateTitle = "Love the Way You Lie",
+            candidateDurationMs = 296_000L,
+            candidateFormat = LyricFormat.TTML_SYLLABLE
+        )
+        assertFalse(pt2VsPt1.isPassed)
+        assertNotNull(pt2VsPt1.vetoReason)
+        assertTrue(pt2VsPt1.vetoReason!!.contains("续集/分部编号不匹配"))
+
+        val partIiMatch = LyricCandidateScorer.evaluate(
+            expectedArtist = "Rihanna",
+            expectedTitle = "Love the Way You Lie Part II",
+            expectedDurationMs = 296_000L,
+            candidateArtist = "Rihanna",
+            candidateTitle = "Love the Way You Lie, Pt. 2",
+            candidateDurationMs = 296_000L,
+            candidateFormat = LyricFormat.TTML_SYLLABLE
+        )
+        assertTrue("Part II 与 Pt. 2 应视为同一分部通过", partIiMatch.isPassed)
+
+        val partIiiVsIv = LyricCandidateScorer.evaluate(
+            expectedArtist = "Artist",
+            expectedTitle = "Symphony Part III",
+            expectedDurationMs = 200_000L,
+            candidateArtist = "Artist",
+            candidateTitle = "Symphony Part IV",
+            candidateDurationMs = 200_000L,
+            candidateFormat = LyricFormat.TTML_SYLLABLE
+        )
+        assertFalse(partIiiVsIv.isPassed)
+
+        val partVVsUntagged = LyricCandidateScorer.evaluate(
+            expectedArtist = "Artist",
+            expectedTitle = "Suite Part V",
+            expectedDurationMs = 200_000L,
+            candidateArtist = "Artist",
+            candidateTitle = "Suite",
+            candidateDurationMs = 200_000L,
+            candidateFormat = LyricFormat.TTML_SYLLABLE
+        )
+        assertFalse(partVVsUntagged.isPassed)
+
+        val part1MatchesUntagged = LyricCandidateScorer.evaluate(
+            expectedArtist = "Eminem",
+            expectedTitle = "Love the Way You Lie, Pt. 1",
+            expectedDurationMs = 263_000L,
+            candidateArtist = "Eminem",
+            candidateTitle = "Love the Way You Lie",
+            candidateDurationMs = 263_000L,
+            candidateFormat = LyricFormat.TTML_SYLLABLE
+        )
+        assertTrue("Pt. 1 与无分部标记应视为等价", part1MatchesUntagged.isPassed)
+    }
 }

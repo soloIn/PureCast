@@ -98,12 +98,12 @@ fun SmoothLyricLineRow(
             .graphicsLayer {
                 val y = translationYProvider()
                 val edgeAlpha = edgeAlphaProvider(y)
-                // 💡 仅对当前正在执行 BlendMode.SrcIn 逐字扫光的激活行（或显式开启景深模糊时）启用 Offscreen；
-                // 其余 12 行非激活行与普通逐行歌词中主词与翻译垂直排列互不重叠，必须使用 ModulateAlpha 而非 Auto
-                //（Compose 的 Auto 在 alpha < 1f 时仍会自动降级为 saveLayer 分配 Scratch RenderTarget），
-                // 视觉像素 100% 一致，但将 Skia 34MB Scratch RenderTarget 占用直接清零。
-                val useOffscreen = (hasWordSync && isActive) || useBlur
-                val rowAlpha = if (hasWordSync && isActive) 1.0f else alphaState.value
+                val currentAlpha = alphaState.value
+                // 💡 仅在逐字行刚从激活态退场且透明度仍在 1.0f -> 0.45f 区间时短时保持 Offscreen，
+                // 既防止行尾未唱字符在失活首帧闪白，又避免非激活行在 0.36f -> 0.16f 距离衰减时误开 Scratch FBO！
+                val isExitingWordSync = hasWordSync && !isActive && currentAlpha > 0.45f
+                val useOffscreen = (hasWordSync && (isActive || isExitingWordSync)) || useBlur
+                val rowAlpha = if (hasWordSync && isActive) 1.0f else currentAlpha
                 compositingStrategy = if (useOffscreen) {
                     CompositingStrategy.Offscreen
                 } else {
@@ -133,13 +133,15 @@ fun SmoothLyricLineRow(
         // 💡 消除切句首帧 Text ⇄ WordSyncKaraokeText 销毁重建：
         // 只要该行具备逐字时间戳 (hasWordSync)，始终保持单一稳定 WordSyncKaraokeText 节点，仅原位切换 isActive！
         if (hasWordSync) {
+            val rowAlphaProvider = remember(alphaState) { { alphaState.value } }
             WordSyncKaraokeText(
                 line = line,
                 syncClock = syncClock,
                 currentTimeProvider = currentTimeProvider,
                 primaryColor = primaryColor,
                 isPlaying = isPlaying,
-                isActive = isActive
+                isActive = isActive,
+                exitingRowAlphaProvider = rowAlphaProvider
             )
         } else {
             Text(

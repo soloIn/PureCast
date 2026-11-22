@@ -208,9 +208,7 @@ class UpnpRendererServer(
                 emitEventLocked(StreamStopEvent(newEpoch = stoppedEpoch, isPreempted = isPreempted))
             }
             sessionSetupDispatched = false
-            if (isPreempted) {
-                activeUpnpSessionId = 0L
-            }
+            activeUpnpSessionId = 0L
         }
         notifyTransportState("STOPPED")
     }

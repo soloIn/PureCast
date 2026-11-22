@@ -64,7 +64,23 @@ fun LyricsStreamView(
     val density = LocalDensity.current
     val currentTimeProvider = remember(syncClock) { { syncClock.getCurrentInterpolatedTimeMs() } }
 
-    val isWordSync = timeline.format == LyricFormat.TTML_SYLLABLE || timeline.format == LyricFormat.LRC_WORD_SYNC
+    // 💡 区分逐字歌词与非逐字（逐行 LRC）歌词的滚动/高亮节奏：
+    // 逐字歌词沿用 450ms 提前滚动 + 280ms 激活（开唱前处于暗色就绪态，踩点扫光）；
+    // 非逐字歌词提前 550ms 滚动、收紧至 100ms 点亮，让文字先滑到 38% 中心完全停稳再点亮，消除高亮期间字体漂移感。
+    val isWordSyncTimeline = remember(timeline) {
+        timeline.format == LyricFormat.TTML_SYLLABLE || timeline.lines.any { !it.words.isNullOrEmpty() }
+    }
+    val activeLeadInMs = if (isWordSyncTimeline) {
+        LyricsSyncClock.DEFAULT_LINE_LEAD_IN_MS
+    } else {
+        LyricsSyncClock.LINE_SYNC_HIGHLIGHT_LEAD_IN_MS
+    }
+    val scrollLeadInMs = if (isWordSyncTimeline) {
+        LyricsSyncClock.DEFAULT_SCROLL_LEAD_IN_MS
+    } else {
+        LyricsSyncClock.LINE_SYNC_SCROLL_LEAD_IN_MS
+    }
+
     var activeLineIndex by remember(timeline) { mutableIntStateOf(-1) }
     var scrollLineIndex by remember(timeline) { mutableIntStateOf(-1) }
     var isInterludeRest by remember(timeline) { mutableStateOf(false) }
@@ -81,12 +97,12 @@ fun LyricsStreamView(
         // 1. 下一激活行起始边界
         val nextActiveIdx = if (curActive < 0) 0 else curActive + 1
         if (nextActiveIdx in lines.indices) {
-            consider(syncClock.getEffectiveStartMs(nextActiveIdx, lines))
+            consider(syncClock.getEffectiveStartMs(nextActiveIdx, lines, activeLeadInMs))
         }
         // 2. 下一滚动锚点行起始边界
         val nextScrollIdx = if (curScroll < 0) 0 else curScroll + 1
         if (nextScrollIdx in lines.indices) {
-            consider(syncClock.getScrollEffectiveStartMs(nextScrollIdx, lines))
+            consider(syncClock.getScrollEffectiveStartMs(nextScrollIdx, lines, scrollLeadInMs))
         }
         // 3. 当前行结束时间与间奏静息进入边界
         if (curActive in lines.indices) {
@@ -97,11 +113,11 @@ fun LyricsStreamView(
                 if (vocalEndMs > curLine.startMs) {
                     val nextStartMs = lines.getOrNull(curActive + 1)?.startMs
                     if (nextStartMs != null) {
-                        if (nextStartMs - vocalEndMs >= 2500L) {
-                            consider(vocalEndMs + 500L)
+                        if (nextStartMs - vocalEndMs >= LyricsRenderingMath.INTERLUDE_MIN_GAP_MS) {
+                            consider(vocalEndMs + LyricsRenderingMath.INTERLUDE_ENTER_DELAY_MS)
                         }
                     } else {
-                        consider(vocalEndMs + 1500L)
+                        consider(vocalEndMs + LyricsRenderingMath.OUTRO_ENTER_DELAY_MS)
                     }
                 }
             }
@@ -114,8 +130,8 @@ fun LyricsStreamView(
             return
         }
         // 💡 60fps 零分配热路径：仅在越过切句/滚动/间奏边界或 Seek 强制刷新时执行二分查找
-        val nextActive = syncClock.calculateActiveLineIndex(timeline, nowTimeMs)
-        val rawScroll = syncClock.calculateScrollLineIndex(timeline, nowTimeMs)
+        val nextActive = syncClock.calculateActiveLineIndex(timeline, nowTimeMs, activeLeadInMs)
+        val rawScroll = syncClock.calculateScrollLineIndex(timeline, nowTimeMs, scrollLeadInMs)
         val nextScroll = if (nextActive >= 0) maxOf(nextActive, rawScroll) else rawScroll
         if (nextActive != activeLineIndex) {
             activeLineIndex = nextActive
@@ -333,9 +349,9 @@ fun LyricsStreamView(
                 }
             }
 
-            // 💡 前奏期 (activeLineIndex == -1 且首句 >= 3s) 或长间奏静息期显示 Apple Music 经典三点呼吸指示器
-            // 当间奏最后 450ms scrollLineIndex 已提前切入下一句上滑时，三点指示器在原位平滑淡出（锁定 lastValidDotsYRef 绝不瞬移）
-            val showIntroDots = activeLineIndex == -1 && scrollLineIndex == -1 && (timeline.lines.firstOrNull()?.startMs ?: 0L) >= 3000L
+            // 💡 前奏期 (activeLineIndex == -1 且首句 >= 4.5s) 或长间奏静息期 (>= 5s) 显示 Apple Music 经典三点呼吸指示器
+            // 当间奏最后 scrollLeadInMs 提前切入下一句上滑时，三点指示器在原位平滑淡出（锁定 lastValidDotsYRef 绝不瞬移）
+            val showIntroDots = activeLineIndex == -1 && scrollLineIndex == -1 && (timeline.lines.firstOrNull()?.startMs ?: 0L) >= LyricsRenderingMath.INTRO_DOTS_MIN_START_MS
             val showInterludeDots = isInterludeRest &&
                 scrollLineIndex == activeLineIndex &&
                 activeLineIndex in timeline.lines.indices &&
@@ -381,18 +397,13 @@ fun LyricsStreamView(
                 }
 
                 key(timeline) {
-                    val isInterludeHolding = isInterludeRest && (scrollLineIndex == activeLineIndex)
                     for (index in windowStart..windowEnd) {
                         val line = timeline.lines[index]
                         val posYAnim = posYAnims[index] ?: continue
-                        // 💡 逐字歌词用 activeLineIndex 保护上一句尾字扫光不被截断；
-                        // 普通逐行歌词直接与 scrollLineIndex 同频点亮，消除“滑到位了字还没亮”的割裂感。
-                        val visualFocusIndex = if (isWordSync) activeLineIndex else scrollLineIndex
-                        val isFocused = if (isWordSync) {
-                            (index == activeLineIndex) && !isInterludeRest
-                        } else {
-                            (index == scrollLineIndex) && !isInterludeHolding
-                        }
+                        // 💡 逐字与逐行歌词统一使用 activeLineIndex 控制视觉高亮，与 scrollLineIndex（提前 450ms 启动上滑）解耦：
+                        // 先平滑起动上滑，临近 38% 视觉中心到位时再接力点亮，消除行高亮歌词提前半秒在下方突兀闪亮的割裂感。
+                        val visualFocusIndex = activeLineIndex
+                        val isFocused = (index == activeLineIndex) && !isInterludeRest
                         // 💡 远距行透明度在 distance >= 5 时已钳位至下限，钳位入参避免切句时远距行无谓重组
                         val distance = (if (visualFocusIndex >= 0) abs(index - visualFocusIndex) else (index + 1)).coerceAtMost(5)
                         val estimatedLineHeight = heightOf(index)

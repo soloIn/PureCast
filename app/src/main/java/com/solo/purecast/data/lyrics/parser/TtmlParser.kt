@@ -14,8 +14,9 @@ import java.io.StringReader
  * 💡 AMLL TTML 高精逐字歌词健壮解析器
  * 1. 彻底弃用易引发异常崩溃的 parser.nextText()，采用纯事件驱动的上下文栈遍历；
  * 2. 完美支持任意多层 <span> 嵌套与混合排版；
- * 3. 严格遵循用户决策：提取原词与翻译，自动过滤所有背景人声 (tt:role="bg") 与音译 (tt:role="roman")；
- * 4. 0 崩溃容错，任何畸形或非标 XML 均能安全降级。
+ * 3. 保留英文/西文 <span> 之间的真实空格（杜绝单词粘连），同时过滤纯空白 <span> 防止行尾钳位回闪；
+ * 4. 提取原词与翻译，自动过滤所有背景人声 (tt:role="bg") 与音译 (tt:role="roman")；
+ * 5. 0 崩溃容错，任何畸形或非标 XML 均能安全降级。
  */
 object TtmlParser {
 
@@ -49,6 +50,9 @@ object TtmlParser {
             val currentWords = mutableListOf<LyricWord>()
             val currentMainTextBuilder = StringBuilder()
             val currentTranslationBuilder = StringBuilder()
+            // 💡 记录两个 <span> 之间是否出现过纯水平空格或换行，确保英文单词保留空格且不给中文误插空格
+            var pendingSpaceAfterPrevWord = false
+            var pendingNewlineAfterPrevWord = false
 
             val spanStack = ArrayDeque<SpanContext>()
 
@@ -69,6 +73,8 @@ object TtmlParser {
                             currentWords.clear()
                             currentMainTextBuilder.setLength(0)
                             currentTranslationBuilder.setLength(0)
+                            pendingSpaceAfterPrevWord = false
+                            pendingNewlineAfterPrevWord = false
                         } else if (localTagName == "span" && inParagraph) {
                             val role = (getAttr(parser, "role") ?: "").lowercase()
                             val spanBegin = getAttr(parser, "begin")
@@ -99,14 +105,43 @@ object TtmlParser {
                             if (text.isNotEmpty()) {
                                 val currentCtx = spanStack.lastOrNull()
                                 if (currentCtx == null) {
-                                    // p 标签直属文本：忽略标签间换行缩进空白
+                                    // p 标签直属文本：
+                                    // 1) 若是 <span> 之间的水平空格（如 " "），标记为待补空格，附着到前一个词尾；
+                                    // 2) 若包含换行符（XML 缩进），仅在相邻两词为拉丁/数字词时补空格；
+                                    // 3) 若含非空白字符，直接拼接。
                                     if (text.isNotBlank()) {
                                         currentMainTextBuilder.append(text.trim())
+                                    } else if (currentWords.isNotEmpty()) {
+                                        if (text.contains('\n') || text.contains('\r')) {
+                                            pendingNewlineAfterPrevWord = true
+                                        } else {
+                                            pendingSpaceAfterPrevWord = true
+                                        }
                                     }
                                 } else if (!currentCtx.isIgnored) {
                                     if (currentCtx.isTranslation) {
                                         currentTranslationBuilder.append(text)
+                                    } else if (text.isBlank()) {
+                                        // 纯空白 <span> 不作为独立 LyricWord 入队（防止尾随空白词触发行尾钳位回闪），
+                                        // 若不含换行则作为词间空格标记保留
+                                        if (currentWords.isNotEmpty() && !text.contains('\n') && !text.contains('\r')) {
+                                            pendingSpaceAfterPrevWord = true
+                                        }
                                     } else {
+                                        if (currentWords.isNotEmpty()) {
+                                            val prev = currentWords.last()
+                                            val needSpace = (pendingSpaceAfterPrevWord ||
+                                                (pendingNewlineAfterPrevWord && needsLatinWordSpace(prev.text, text))) &&
+                                                !prev.text.endsWith(" ") &&
+                                                !text.startsWith(" ")
+                                            if (needSpace) {
+                                                currentWords[currentWords.lastIndex] = prev.copy(text = prev.text + " ")
+                                                currentMainTextBuilder.append(' ')
+                                            }
+                                        }
+                                        pendingSpaceAfterPrevWord = false
+                                        pendingNewlineAfterPrevWord = false
+
                                         currentWords.add(
                                             LyricWord(
                                                 text = text,
@@ -132,6 +167,28 @@ object TtmlParser {
                         } else if (localTagName == "p" && inParagraph) {
                             inParagraph = false
                             spanStack.clear()
+                            pendingSpaceAfterPrevWord = false
+                            pendingNewlineAfterPrevWord = false
+
+                            // 去除首词前导空格与末词尾随空格，保证 mainText 与 words 字符边界完全一致
+                            if (currentWords.isNotEmpty()) {
+                                val firstWord = currentWords.first()
+                                val trimmedFirst = firstWord.text.trimStart()
+                                if (trimmedFirst.isEmpty()) {
+                                    currentWords.removeAt(0)
+                                } else if (trimmedFirst != firstWord.text) {
+                                    currentWords[0] = firstWord.copy(text = trimmedFirst)
+                                }
+                            }
+                            if (currentWords.isNotEmpty()) {
+                                val lastWord = currentWords.last()
+                                val trimmedLast = lastWord.text.trimEnd()
+                                if (trimmedLast.isEmpty()) {
+                                    currentWords.removeAt(currentWords.lastIndex)
+                                } else if (trimmedLast != lastWord.text) {
+                                    currentWords[currentWords.lastIndex] = lastWord.copy(text = trimmedLast)
+                                }
+                            }
 
                             val mainText = if (currentWords.isNotEmpty()) {
                                 currentWords.joinToString("") { it.text }.trim()
@@ -149,11 +206,11 @@ object TtmlParser {
                             val resolvedTrans = if (mainText.isNotEmpty()) translationText else null
 
                             if (resolvedMain.isNotEmpty()) {
-                                val resolvedEndMs = if (pEndMs > pStartMs) {
-                                    pEndMs
-                                } else {
-                                    currentWords.lastOrNull()?.endMs?.takeIf { it > pStartMs } ?: (pStartMs + 3000L)
-                                }
+                                // 💡 逐字行优先以主唱末字 endMs 作为行结束时间，避免被已过滤的背景和声 (tt:role="bg") 拖尾拉长导致与后续行交叠回闪
+                                val lastWordEndMs = currentWords.lastOrNull()?.endMs?.takeIf { it > pStartMs }
+                                val resolvedEndMs = lastWordEndMs
+                                    ?: pEndMs.takeIf { it > pStartMs }
+                                    ?: (pStartMs + 3000L)
 
                                 val simplifiedMain = ChineseConverter.toSimplified(resolvedMain)
                                 val simplifiedTrans = resolvedTrans?.let { ChineseConverter.toSimplified(it) }
@@ -192,6 +249,16 @@ object TtmlParser {
             Logger.lyrics.w(TAG, "解析 TTML 歌词异常", e)
             return null
         }
+    }
+
+    private fun needsLatinWordSpace(prevText: String, nextText: String): Boolean {
+        val lastChar = prevText.trimEnd().lastOrNull() ?: return false
+        val firstChar = nextText.trimStart().firstOrNull() ?: return false
+        val prevIsLatinOrPunct = lastChar.code in 0x21..0x7E && lastChar != '\'' && lastChar != '-' && lastChar != '('
+        val nextIsLatinWord = firstChar.code in 0x30..0x39 ||
+            firstChar.code in 0x41..0x5A ||
+            firstChar.code in 0x61..0x7A
+        return prevIsLatinOrPunct && nextIsLatinWord
     }
 
     private fun getAttr(parser: XmlPullParser, attrName: String): String? {

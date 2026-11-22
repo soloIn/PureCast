@@ -175,6 +175,9 @@ void RaopRtp::stop() {
     {
         std::lock_guard<std::mutex> lock(audio_packet_mutex_);
         sync_playback_started_ = false;
+        awaiting_post_flush_audio_ = false;
+        post_flush_silence_paused_ = false;
+        post_flush_silence_frames_ = 0;
     }
     resend_req_seq_.store(0, std::memory_order_relaxed);
     is_manually_paused_.store(false, std::memory_order_relaxed);
@@ -193,7 +196,7 @@ void RaopRtp::stop() {
 }
 
 void RaopRtp::reset_buffer() {
-    // 💡 统一在 audio_packet_mutex_ 锁内原子重置 JitterBuffer、已写时间戳游标与起播门控态，
+    // 💡 统一在 audio_packet_mutex_ 锁内原子重置 JitterBuffer、已写时间戳游标与起播/静音门控态，
     // 与 process_audio_packet / drain_jitter_buffer_locked 保持完全一致的锁序 (audio_packet_mutex_ -> jitter_buffer_.mutex_)。
     // AirPlay 1 的 Sync 时钟映射 (rtp_now <-> ntp_time) 是会话级连续时钟：
     // FLUSH / RECORD 绝不能擦除 has_sync_anchor_（仅在 stop() 清零，超 15 秒未更新由 get_target_speaker_rtp_ts() 自动失效）。
@@ -201,6 +204,45 @@ void RaopRtp::reset_buffer() {
     jitter_buffer_.reset();
     has_written_rtp_ts_.store(false, std::memory_order_release);
     sync_playback_started_ = false;
+    awaiting_post_flush_audio_ = false;
+    post_flush_silence_paused_ = false;
+    post_flush_silence_frames_ = 0;
+}
+
+uint64_t RaopRtp::on_rtsp_flush() {
+    std::lock_guard<std::mutex> lock(audio_packet_mutex_);
+    const uint64_t new_epoch = AudioEngine::instance().emergency_mute_and_flush(FlushReason::FLUSH_SWITCH);
+    active_epoch_.store(new_epoch, std::memory_order_release);
+    jitter_buffer_.reset();
+    has_written_rtp_ts_.store(false, std::memory_order_release);
+    sync_playback_started_ = false;
+    awaiting_post_flush_audio_ = true;
+    post_flush_silence_paused_ = false;
+    post_flush_silence_frames_ = 0;
+    return new_epoch;
+}
+
+bool RaopRtp::is_pcm_frame_silent(const uint8_t* data, size_t size, int bit_depth) {
+    if (data == nullptr || size == 0) return true;
+    if (bit_depth == 24) {
+        for (size_t i = 0; i + 2 < size; i += 3) {
+            const uint32_t raw = static_cast<uint32_t>(data[i]) |
+                                 (static_cast<uint32_t>(data[i + 1]) << 8) |
+                                 (static_cast<uint32_t>(data[i + 2]) << 16);
+            const int32_t sample = (raw & 0x800000U)
+                ? static_cast<int32_t>(raw | 0xFF000000U)
+                : static_cast<int32_t>(raw);
+            if (sample > 1 || sample < -1) return false;
+        }
+        return true;
+    }
+    for (size_t i = 0; i + 1 < size; i += 2) {
+        int16_t sample = static_cast<int16_t>(
+            static_cast<uint16_t>(data[i]) | (static_cast<uint16_t>(data[i + 1]) << 8)
+        );
+        if (sample > 1 || sample < -1) return false;
+    }
+    return true;
 }
 
 void RaopRtp::set_client_control_endpoint(const std::string& client_ip, int client_ctrl_port) {
@@ -345,6 +387,8 @@ void RaopRtp::drain_jitter_buffer_locked() {
     // 杜绝 AudioEngine 暂停冻结环形缓冲期间，慢晶振漂移收敛误判滞后狂丢帧。
     if (is_manually_paused_.load(std::memory_order_acquire) ||
         AudioEngine::instance().is_paused()) {
+        // 💡 重置首包已上报世代：确保无 FLUSH 的暂停恢复后，首帧重新写入 AudioEngine 时能确定性触发 FirstDataPacketEvent
+        emitted_first_epoch_.store(0ULL, std::memory_order_release);
         return;
     }
 
@@ -449,13 +493,24 @@ void RaopRtp::drain_jitter_buffer_locked() {
             uint64_t prev_emitted = emitted_first_epoch_.load(std::memory_order_acquire);
             if (prev_emitted != cur_epoch &&
                 emitted_first_epoch_.compare_exchange_strong(prev_emitted, cur_epoch, std::memory_order_acq_rel)) {
+                const bool should_resume_from_silence_pause = post_flush_silence_paused_;
+                post_flush_silence_paused_ = false;
                 FirstDataPacketCallback fcb_copy;
+                StreamStateCallback scb_copy;
                 {
                     std::lock_guard<std::mutex> slock(state_mutex_);
                     fcb_copy = first_packet_cb_;
+                    if (should_resume_from_silence_pause) {
+                        scb_copy = state_cb_;
+                    }
                 }
                 if (fcb_copy) {
                     fcb_copy(cur_epoch, sr, bits, ch, codec_str);
+                }
+                if (scb_copy) {
+                    LOGI("检测到 FLUSH 静音暂停后首帧有声音频到达出声时刻，发射恢复回调 (epoch=%llu)",
+                         static_cast<unsigned long long>(cur_epoch));
+                    scb_copy(false, cur_epoch);
                 }
             }
         } else if (written < 0) {
@@ -744,12 +799,47 @@ void RaopRtp::process_audio_packet(const uint8_t* data, ssize_t len, uint8_t pay
             LOGI("process_audio_packet: 短音频包原始负载 [pkt=%u, len=%zu]: %s", cur_cnt, payload_len, hex_buf);
         }
 
-        // 💡 显式暂停保护：若当前处于显式手动暂停态 (RTSP PAUSE 或本机主动暂停 AudioEngine)，丢弃在途音频帧，杜绝旧帧堆积与恢复跳变
-        if (is_manually_paused_.load(std::memory_order_acquire) || AudioEngine::instance().is_paused()) {
+        // 💡 显式 RTSP PAUSE 保护：直接丢弃在途音频帧，杜绝旧帧堆积与恢复跳变
+        if (is_manually_paused_.load(std::memory_order_acquire)) {
+            emitted_first_epoch_.store(0ULL, std::memory_order_release);
             return;
         }
 
-        // 💡 修复 Finding 3: 绝不丢弃正常全 0 音频帧，全量入队 JitterBuffer 以维持 RTP 序列号 seq 的绝对连续
+        // 💡 FLUSH 后静音拦截门控：iOS 暂停时会先发 RTSP FLUSH 再持续推 44B 全 0 静音包；
+        // 在新世代尚未收到真实有声帧前，直接丢弃全 0 静音帧（AudioEngine 等时 URB 已自动泵全 0 保活 DAC），
+        // 杜绝静音包触发 Sync 起播与 FirstDataPacketEvent 把状态机假复活回 PLAYING；
+        // 若用户在 TV 端按暂停后又在手机端直接点继续播放，收到非全 0 真实有声帧时自动解除本机暂停标记恢复出声。
+        if (awaiting_post_flush_audio_) {
+            int cur_bit_depth = 16;
+            {
+                std::lock_guard<std::mutex> flock(format_mutex_);
+                if (format_bit_depth_ > 0) cur_bit_depth = format_bit_depth_;
+            }
+            if (is_pcm_frame_silent(decode_pcm_buf_.data(), out_bytes, cur_bit_depth)) {
+                post_flush_silence_frames_++;
+                if (!post_flush_silence_paused_ && post_flush_silence_frames_ >= POST_FLUSH_SILENCE_PAUSE_FRAMES) {
+                    post_flush_silence_paused_ = true;
+                    const uint64_t cur_epoch = active_epoch_.load(std::memory_order_acquire);
+                    LOGI("检测到 RTSP FLUSH 后连续 %u 帧全 0 静音包 (~%u ms)，判定发送端已暂停并保持静音",
+                         post_flush_silence_frames_, post_flush_silence_frames_ * 8U);
+                    emit_state_callback(true, cur_epoch);
+                }
+                return;
+            }
+            awaiting_post_flush_audio_ = false;
+            post_flush_silence_frames_ = 0;
+            if (AudioEngine::instance().is_paused()) {
+                post_flush_silence_paused_ = true;
+                AudioEngine::instance().resume_stream();
+                LOGI("检测到 TV 端暂停且 FLUSH 后收到手机端真实有声帧，自动解除静音并恢复播放");
+            }
+        } else if (AudioEngine::instance().is_paused()) {
+            // 💡 TV 端刚按暂停且尚未收到 iOS 响应 FLUSH 前的在途旧尾包：严格拦截杜绝尾音泄漏
+            emitted_first_epoch_.store(0ULL, std::memory_order_release);
+            return;
+        }
+
+        // 💡 正常播流期间保留全 0 音频帧入队 JitterBuffer 以维持 RTP 序列号 seq 连续性
         std::vector<uint8_t> pcm_copy(decode_pcm_buf_.data(), decode_pcm_buf_.data() + out_bytes);
         jitter_buffer_.push(seq, ts, std::move(pcm_copy));
 

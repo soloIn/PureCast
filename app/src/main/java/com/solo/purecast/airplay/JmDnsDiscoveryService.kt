@@ -46,6 +46,7 @@ class JmDnsDiscoveryService(private val context: Context) {
         fun getLocalIpv4Address(): InetAddress? = NetworkUtils.getLocalIpv4Address()
     }
 
+    @Volatile
     private var jmdns: JmDNS? = null
     private var multicastLock: WifiManager.MulticastLock? = null
     private var airPlayServiceInfo: ServiceInfo? = null
@@ -55,9 +56,14 @@ class JmDnsDiscoveryService(private val context: Context) {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var dacpResolveJob: Job? = null
     private var dacpListener: javax.jmdns.ServiceListener? = null
+    @Volatile
     private var targetDacpId: String? = null
+    @Volatile
     private var targetClientIp: String? = null
+    @Volatile
     private var onDacpPortResolvedCallback: ((Int) -> Unit)? = null
+    @Volatile
+    private var onDacpServiceRemovedCallback: ((String) -> Unit)? = null
     @Volatile
     private var lastNotifiedDacpName: String? = null
     @Volatile
@@ -70,7 +76,14 @@ class JmDnsDiscoveryService(private val context: Context) {
     private var currentFriendlyName: String? = null
     private var currentRaopPort: Int = DEFAULT_RAOP_PORT
     private val broadcastMutex = Mutex()
-    private val isStoppingDetached = java.util.concurrent.atomic.AtomicBoolean(false)
+    private val multicastLockGuard = Any()
+    private var isStartingBroadcast = false
+    private val broadcastGeneration = java.util.concurrent.atomic.AtomicLong(0L)
+    private val closeExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+        Thread(r, "AirPlay-mDNS-Goodbye").apply { isDaemon = true }
+    }
+    @Volatile
+    private var activeCloseLatch: java.util.concurrent.CountDownLatch? = null
 
     /**
      * 获取当前是否正在广播
@@ -92,92 +105,116 @@ class JmDnsDiscoveryService(private val context: Context) {
         friendlyName: String = "PureCast TV",
         airPlayPort: Int = DEFAULT_AIRPLAY_PORT,
         raopPort: Int = DEFAULT_RAOP_PORT
-    ): Boolean = broadcastMutex.withLock {
+    ): Boolean {
+        // 💡 递增代数令牌：立刻作废任何尚未执行的迟到 stopBroadcastDetached()，杜绝快速关→开时旧停播线程误杀新广播
+        val myGen = broadcastGeneration.incrementAndGet()
+        // 💡 若有前序独立下线线程正在发 Goodbye 包关闭旧 JmDNS，先等待其收尾（最多 2.5s），
+        // 杜绝旧实例 TTL=0 Goodbye 包晚到毒化新实例或引发同名主机 purecast-<mac>.local. 冲突！
         withContext(Dispatchers.IO) {
-            val localIp = getLocalIpv4Address()
-            if (localIp == null) {
-                Logger.service.e(TAG, "未获取到有效的局域网 IPv4 地址，广播启动失败")
-                releaseMulticastLock()
-                return@withContext false
-            }
-
-            // 💡 若已在运行且绑定 IP、端口、服务名完全相同，则复用现有实例无需重复注册
-            if (isBroadcasting && jmdns != null && boundIp == localIp && currentFriendlyName == friendlyName && currentRaopPort == raopPort) {
-                Logger.service.w(TAG, "JmDnsDiscoveryService 已处于运行状态且配置一致，无需重复启动")
-                return@withContext true
-            }
-
-            // 💡 修复 Finding 1: 若已有旧实例或配置变动，先安全彻底同步关闭，杜绝 JmDNS 实例泄漏与组播套接字冲突
-            stopBroadcastInternal()
-
-            try {
-                acquireMulticastLock()
-
-                val macAddressFormatted = getMacAddressFormatted()
-                // 💡 严格遵循 RFC 1034 / RFC 6762 规范：mDNS 主机名严禁包含空格等非法字符！
-                // 传入纯小写字母与连字符构造合法的主机名 (如 purecast-1485540bcbc4)，SRV 记录的 Target 即为合规的 purecast-1485540bcbc4.local.
-                // 解决 iOS 的 mDNSResponder 将带空格的主机名判定为 Malformed DNS Label 导致 iPhone 直接搜不到设备的致命 Bug
-                val hostName = "purecast-${macAddressFormatted.lowercase()}"
-                Logger.service.i(TAG, "初始化 JmDNS 实例: IP=${localIp.hostAddress}, MAC=$macAddressFormatted, HostName=$hostName, FriendlyName=$friendlyName")
-
-                jmdns = JmDNS.create(localIp, hostName)
-
-                // 💡 彻底注销旧残留的 _airplay._tcp 服务，杜绝 iOS/macOS 误入 AirPlay 2 配对通道
+            val pendingClose = activeCloseLatch
+            if (pendingClose != null) {
                 try {
-                    val staleAirPlayInfo = ServiceInfo.create(AIRPLAY_SERVICE_TYPE, friendlyName, raopPort, 0, 0, emptyMap<String, String>())
-                    jmdns?.unregisterService(staleAirPlayInfo)
-                } catch (e: Exception) {
-                    Logger.service.w(TAG, "注销残留 _airplay._tcp 服务异常", e)
+                    pendingClose.await(2500L, java.util.concurrent.TimeUnit.MILLISECONDS)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                }
+            }
+        }
+        return broadcastMutex.withLock {
+            withContext(Dispatchers.IO) {
+                if (broadcastGeneration.get() != myGen) {
+                    Logger.service.d(TAG, "startBroadcast 已被更新指令替代 (gen=$myGen)，跳过")
+                    return@withContext false
+                }
+                val localIp = getLocalIpv4Address()
+                if (localIp == null) {
+                    Logger.service.e(TAG, "未获取到有效的局域网 IPv4 地址，广播启动失败")
+                    releaseMulticastLockIfIdle()
+                    return@withContext false
                 }
 
-                // 💡 严格遵循经典 AirTunes / AirPort Express 纯音频规范 (与实测通过的 AirReceiver 100% 对齐)
-                // 严禁注册 _airplay._tcp，iOS / macOS 音乐 App 仅凭借 _raop._tcp 即可直接发现并显示为无线音频音箱
-                // am 使用 "AirRecever3,1" 避开 Apple 对官方硬件指纹与固件配对的严格校验，解决 macOS 报“不兼容”问题
-                val raopInstanceName = "${macAddressFormatted}@$friendlyName"
-                val raopProps = mapOf(
-                    "txtvers" to "1",
-                    "ch" to "2",
-                    "cn" to "0,1",
-                    "et" to "0,1",
-                    "sv" to "false",
-                    "da" to "true",
-                    "sr" to "44100",
-                    "ss" to "16",
-                    "pw" to "false",
-                    "vn" to "3",
-                    "tp" to "UDP",
-                    "md" to "0,1,2",
-                    "vs" to "105.1",
-                    "am" to "AirRecever3,1",
-                    "sf" to "0x4",
-                    "fv" to "76400.10",
-                    "ek" to "1"
-                )
+                // 💡 若已在运行且绑定 IP、端口、服务名完全相同，则复用现有实例无需重复注册
+                if (isBroadcasting && jmdns != null && boundIp == localIp && currentFriendlyName == friendlyName && currentRaopPort == raopPort) {
+                    Logger.service.w(TAG, "JmDnsDiscoveryService 已处于运行状态且配置一致，无需重复启动")
+                    return@withContext true
+                }
 
-                raopServiceInfo = ServiceInfo.create(
-                    RAOP_SERVICE_TYPE,
-                    raopInstanceName,
-                    raopPort,
-                    0,
-                    0,
-                    raopProps
-                )
+                // 💡 若存在旧实例（如改名或 IP 变动），必须先等旧实例完成 close() 再创建新实例，严禁同名主机并发宣告
+                val oldDns = detachCurrentDnsLocked()
+                if (oldDns != null) {
+                    closeDnsBlocking(oldDns, latch = null)
+                }
 
-                jmdns?.registerService(raopServiceInfo)
+                synchronized(multicastLockGuard) {
+                    isStartingBroadcast = true
+                }
+                try {
+                    acquireMulticastLock()
 
-                // 💡 注册 DACP 服务监听器，实时捕获 iPhone / iPad 在局域网中广播的临时 DACP 端口
-                setupDacpServiceListener()
+                    val macAddressFormatted = getMacAddressFormatted()
+                    // 💡 严格遵循 RFC 1034 / RFC 6762 规范：mDNS 主机名严禁包含空格等非法字符！
+                    val hostName = "purecast-${macAddressFormatted.lowercase()}"
+                    Logger.service.i(TAG, "初始化 JmDNS 实例: IP=${localIp.hostAddress}, MAC=$macAddressFormatted, HostName=$hostName, FriendlyName=$friendlyName")
 
-                boundIp = localIp
-                currentFriendlyName = friendlyName
-                currentRaopPort = raopPort
-                isBroadcasting = true
-                Logger.service.i(TAG, "AirPlay 1 (AirTunes / RAOP) 纯音频广播已成功注册: Instance=$raopInstanceName, Target=$hostName.local.:$raopPort, am=AirRecever3,1")
-                true
-            } catch (e: Exception) {
-                Logger.service.e(TAG, "启动 JmDnsDiscoveryService 异常", e)
-                stopBroadcastInternal()
-                false
+                    val newDns = JmDNS.create(localIp, hostName)
+                    jmdns = newDns
+
+                    // 💡 严格遵循经典 AirTunes / AirPort Express 纯音频规范 (与实测通过的 AirReceiver 100% 对齐)
+                    // 严禁注册 _airplay._tcp，iOS / macOS 音乐 App 仅凭借 _raop._tcp 即可直接发现并显示为无线音频音箱
+                    val raopInstanceName = "${macAddressFormatted}@$friendlyName"
+                    val raopProps = mapOf(
+                        "txtvers" to "1",
+                        "ch" to "2",
+                        "cn" to "0,1",
+                        "et" to "0,1",
+                        "sv" to "false",
+                        "da" to "true",
+                        "sr" to "44100",
+                        "ss" to "16",
+                        "pw" to "false",
+                        "vn" to "3",
+                        "tp" to "UDP",
+                        "md" to "0,1,2",
+                        "vs" to "105.1",
+                        "am" to "AirRecever3,1",
+                        "sf" to "0x4",
+                        "fv" to "76400.10",
+                        "ek" to "1"
+                    )
+
+                    raopServiceInfo = ServiceInfo.create(
+                        RAOP_SERVICE_TYPE,
+                        raopInstanceName,
+                        raopPort,
+                        0,
+                        0,
+                        raopProps
+                    )
+
+                    newDns.registerService(raopServiceInfo)
+
+                    // 💡 注册 DACP 服务监听器，实时捕获 iPhone / iPad 在局域网中广播的临时 DACP 端口
+                    setupDacpServiceListener()
+
+                    boundIp = localIp
+                    currentFriendlyName = friendlyName
+                    currentRaopPort = raopPort
+                    isBroadcasting = true
+                    Logger.service.i(TAG, "AirPlay 1 (AirTunes / RAOP) 纯音频广播已成功注册: Instance=$raopInstanceName, Target=$hostName.local.:$raopPort, am=AirRecever3,1")
+                    true
+                } catch (e: Exception) {
+                    Logger.service.e(TAG, "启动 JmDnsDiscoveryService 异常", e)
+                    val failedDns = detachCurrentDnsLocked()
+                    if (failedDns != null) {
+                        closeDnsBlocking(failedDns, latch = null)
+                    }
+                    false
+                } finally {
+                    synchronized(multicastLockGuard) {
+                        isStartingBroadcast = false
+                    }
+                    releaseMulticastLockIfIdle()
+                }
             }
         }
     }
@@ -185,32 +222,56 @@ class JmDnsDiscoveryService(private val context: Context) {
     /**
      * 停止并注销广播服务
      */
-    suspend fun stopBroadcast() = broadcastMutex.withLock {
-        withContext(Dispatchers.IO) {
-            stopBroadcastInternal()
+    suspend fun stopBroadcast() {
+        val stopGen = broadcastGeneration.incrementAndGet()
+        var closeLatch: java.util.concurrent.CountDownLatch? = null
+        val dnsToClose = broadcastMutex.withLock {
+            if (broadcastGeneration.get() != stopGen) return
+            detachCurrentDnsLocked()?.also {
+                closeLatch = java.util.concurrent.CountDownLatch(1)
+                activeCloseLatch = closeLatch
+            }
+        }
+        if (dnsToClose != null) {
+            withContext(Dispatchers.IO) {
+                closeDnsBlocking(dnsToClose, closeLatch)
+            }
+        } else {
+            releaseMulticastLockIfIdle()
         }
     }
 
     /**
      * 在不受调用方 CoroutineScope 生命周期取消影响的独立线程上执行 mDNS 下线注销，
-     * 确保 Service.onDestroy() 或禁用协议时能够完整发出 RFC 6762 Goodbye 包后再关闭套接字。
+     * 严格绑定 broadcastGeneration 代数：若期间已发起新的 startBroadcast()，自动放弃停播，绝不误杀新广播。
      */
     fun stopBroadcastDetached() {
-        if (!isStoppingDetached.compareAndSet(false, true)) {
-            Logger.service.d(TAG, "已有在途的 JmDNS 独立下线线程，跳过重复启动")
-            return
-        }
-        Thread({
+        val stopGen = broadcastGeneration.incrementAndGet()
+        closeExecutor.execute {
             try {
-                kotlinx.coroutines.runBlocking {
-                    stopBroadcast()
+                var closeLatch: java.util.concurrent.CountDownLatch? = null
+                val dnsToClose = kotlinx.coroutines.runBlocking {
+                    broadcastMutex.withLock {
+                        if (broadcastGeneration.get() != stopGen) {
+                            Logger.service.d(TAG, "跳过已过期的 JmDNS 独立下线任务 (stopGen=$stopGen, current=${broadcastGeneration.get()})")
+                            null
+                        } else {
+                            detachCurrentDnsLocked()?.also {
+                                closeLatch = java.util.concurrent.CountDownLatch(1)
+                                activeCloseLatch = closeLatch
+                            }
+                        }
+                    }
+                }
+                if (dnsToClose != null) {
+                    closeDnsBlocking(dnsToClose, closeLatch)
+                } else {
+                    releaseMulticastLockIfIdle()
                 }
             } catch (e: Exception) {
                 Logger.service.w(TAG, "独立线程注销 JmDNS 广播异常: ${e.message}")
-            } finally {
-                isStoppingDetached.set(false)
             }
-        }, "AirPlay-mDNS-Goodbye").start()
+        }
     }
 
     /**
@@ -221,60 +282,67 @@ class JmDnsDiscoveryService(private val context: Context) {
         serviceScope.cancel()
     }
 
-    private fun stopBroadcastInternal() {
+    /**
+     * 💡 锁内瞬时摘除当前 JmDNS 实例与状态
+     */
+    private fun detachCurrentDnsLocked(): JmDNS? {
         val dns = jmdns
-        if (!isBroadcasting && dns == null) return
-
+        if (!isBroadcasting && dns == null) return null
         Logger.service.i(TAG, "正在停止 JmDNS 广播并注销 Bonjour 服务...")
         try {
             dacpListener?.let { dns?.removeServiceListener(DACP_SERVICE_TYPE, it) }
-            dacpListener = null
-            clearDacpTarget()
-            val hadRegisteredService = airPlayServiceInfo != null || raopServiceInfo != null || isBroadcasting
-            airPlayServiceInfo?.let { dns?.unregisterService(it) }
-            raopServiceInfo?.let { dns?.unregisterService(it) }
-            dns?.unregisterAllServices()
-            if (dns != null && hadRegisteredService) {
-                // 💡 JmDNS 的 unregisterService 通过后台 Canceler 异步发送 3 次 RFC 6762 TTL=0 Goodbye 包（间隔约 250ms），
-                // 必须在 close() 与释放 MulticastLock 前留出完整发送窗口，否则 iOS mDNSResponder 只能等缓存自然过期。
-                try {
-                    Thread.sleep(750L)
-                } catch (_: InterruptedException) {
-                    Thread.currentThread().interrupt()
-                }
-            }
-            dns?.close()
         } catch (e: Exception) {
-            Logger.service.w(TAG, "注销 JmDNS 服务时发生异常: ${e.message}")
+            Logger.service.w(TAG, "移除 DACP 监听器异常: ${e.message}")
+        }
+        dacpListener = null
+        clearDacpTarget()
+        jmdns = null
+        airPlayServiceInfo = null
+        raopServiceInfo = null
+        boundIp = null
+        currentFriendlyName = null
+        isBroadcasting = false
+        return dns
+    }
+
+    private fun closeDnsBlocking(dns: JmDNS, latch: java.util.concurrent.CountDownLatch?) {
+        try {
+            // 💡 JmDNS.close() 内部会统一调用 unregisterAllServices() 发送 RFC 6762 TTL=0 Goodbye 包并等待 Canceler 完成，
+            // 无需额外重复 unregisterService + Thread.sleep(750ms) 叠加停顿。
+            dns.close()
+        } catch (e: Exception) {
+            Logger.service.w(TAG, "关闭 JmDNS 实例异常: ${e.message}")
         } finally {
-            jmdns = null
-            airPlayServiceInfo = null
-            raopServiceInfo = null
-            boundIp = null
-            currentFriendlyName = null
-            isBroadcasting = false
-            releaseMulticastLock()
-            Logger.service.i(TAG, "JmDNS 广播已注销，MulticastLock 已释放")
+            latch?.countDown()
+            if (latch != null && activeCloseLatch === latch) {
+                activeCloseLatch = null
+            }
+            releaseMulticastLockIfIdle()
+            Logger.service.i(TAG, "JmDNS 广播已注销")
         }
     }
 
     private fun acquireMulticastLock() {
-        if (multicastLock == null) {
-            val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
-            multicastLock = wifiManager?.createMulticastLock("PureCast_AirPlay_mDNS")?.apply {
-                setReferenceCounted(true)
+        synchronized(multicastLockGuard) {
+            if (multicastLock == null) {
+                val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+                multicastLock = wifiManager?.createMulticastLock("PureCast_AirPlay_mDNS")?.apply {
+                    setReferenceCounted(false)
+                }
             }
-        }
-        if (multicastLock?.isHeld == false) {
-            multicastLock?.acquire()
-            Logger.service.i(TAG, "已获取 WifiManager.MulticastLock 组播锁")
+            if (multicastLock?.isHeld == false) {
+                multicastLock?.acquire()
+                Logger.service.i(TAG, "已获取 WifiManager.MulticastLock 组播锁")
+            }
         }
     }
 
-    private fun releaseMulticastLock() {
-        if (multicastLock?.isHeld == true) {
-            multicastLock?.release()
-            Logger.service.i(TAG, "已释放 WifiManager.MulticastLock 组播锁")
+    private fun releaseMulticastLockIfIdle() {
+        synchronized(multicastLockGuard) {
+            if (!isStartingBroadcast && !isBroadcasting && jmdns == null && multicastLock?.isHeld == true) {
+                multicastLock?.release()
+                Logger.service.i(TAG, "已释放 WifiManager.MulticastLock 组播锁")
+            }
         }
     }
 
@@ -371,11 +439,19 @@ class JmDnsDiscoveryService(private val context: Context) {
 
             override fun serviceRemoved(event: javax.jmdns.ServiceEvent) {
                 Logger.service.d(TAG, "_dacp._tcp 服务移除: ${event.name}")
+                val targetId = targetDacpId
+                if (!targetId.isNullOrEmpty() && event.name.contains(targetId, ignoreCase = true)) {
+                    Logger.service.i(TAG, "检测到当前活跃会话的 _dacp._tcp 服务下线: ${event.name}")
+                    onDacpServiceRemovedCallback?.invoke(event.name)
+                }
             }
 
             override fun serviceResolved(event: javax.jmdns.ServiceEvent) {
                 val info = event.info ?: return
-                Logger.service.d(TAG, "已解析 _dacp._tcp 服务: Name=${info.name}, Port=${info.port}")
+                // 💡 待机空闲态（无活跃 AirPlay 会话目标）不刷屏打印多条 DNS 记录的重复解析日志
+                if (targetDacpId != null || targetClientIp != null) {
+                    Logger.service.d(TAG, "已解析 _dacp._tcp 服务: Name=${info.name}, Port=${info.port}")
+                }
                 inspectDacpServiceInfo(info)
             }
         }
@@ -386,10 +462,16 @@ class JmDnsDiscoveryService(private val context: Context) {
     /**
      * 💡 注册 DACP 目标客户端信息，并启动端口匹配
      */
-    fun resolveDacpPort(dacpId: String, clientIp: String, onPortResolved: (Int) -> Unit) {
+    fun resolveDacpPort(
+        dacpId: String,
+        clientIp: String,
+        onPortResolved: (Int) -> Unit,
+        onServiceRemoved: ((String) -> Unit)? = null
+    ) {
         targetDacpId = dacpId.ifEmpty { null }
         targetClientIp = clientIp.ifEmpty { null }
         onDacpPortResolvedCallback = onPortResolved
+        onDacpServiceRemovedCallback = onServiceRemoved
         lastNotifiedDacpName = null
         lastNotifiedDacpPort = -1
 
@@ -500,6 +582,7 @@ class JmDnsDiscoveryService(private val context: Context) {
         targetDacpId = null
         targetClientIp = null
         onDacpPortResolvedCallback = null
+        onDacpServiceRemovedCallback = null
         lastNotifiedDacpName = null
         lastNotifiedDacpPort = -1
     }

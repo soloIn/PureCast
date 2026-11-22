@@ -92,14 +92,15 @@ class LyricsWaterfallFetcher(
         // 阶梯 Step 1: AMLL TTML 逐字高精库 (硬超时 1.5s，需已知歌手)
         if (cleanArtist.isNotBlank()) {
             try {
-                val amllHit = amllDataSource.fetch(cleanArtist, cleanTitle)
-                if (amllHit != null) {
+                val amllResult = amllDataSource.fetchWithMetadata(cleanArtist, cleanTitle, durationMs)
+                if (amllResult != null) {
+                    val amllHit = amllResult.timeline
                     val score = LyricCandidateScorer.evaluate(
                         expectedArtist = cleanArtist,
                         expectedTitle = cleanTitle,
                         expectedDurationMs = durationMs,
-                        candidateArtist = cleanArtist,
-                        candidateTitle = cleanTitle,
+                        candidateArtist = amllResult.candidateArtist,
+                        candidateTitle = amllResult.candidateTitle,
                         candidateDurationMs = amllHit.durationMs,
                         candidateFormat = amllHit.format
                     )

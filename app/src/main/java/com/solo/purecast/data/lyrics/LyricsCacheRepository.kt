@@ -47,15 +47,56 @@ class LyricsCacheRepository(
      * 统一使用 MetadataNormalizer 进行清洗归一化，杜绝键值裂变 (Finding 5)
      * [durationMs] 实施 3 秒分桶（durationMs / 3000L），有效吸收流媒体传输中的毫秒级边界抖动
      */
+    data class CacheStats(
+        val fileCount: Int,
+        val totalBytes: Long
+    )
+
     fun computeCacheKey(artist: String, title: String, durationMs: Long): String {
         val cleanArtist = MetadataNormalizer.normalizeArtist(artist)
         val cleanTitle = MetadataNormalizer.normalizeTitle(title)
         val durationBucket = if (durationMs > 0) durationMs / 3000L else 0L
-        val raw = "${cleanArtist}_${cleanTitle}_$durationBucket"
+        val raw = "v3_${cleanArtist}_${cleanTitle}_$durationBucket"
 
         val digest = MessageDigest.getInstance("SHA-256")
         val bytes = digest.digest(raw.toByteArray(Charsets.UTF_8))
         return bytes.joinToString("") { "%02x".format(it) }
+    }
+
+    /**
+     * 💡 统计磁盘歌词缓存条目数与占用字节数
+     */
+    fun getCacheStats(): CacheStats {
+        val files = diskCacheDir.listFiles { f -> f.isFile && (f.name.endsWith(".json") || f.name.contains(".tmp_")) }
+            ?: return CacheStats(0, 0L)
+        var totalBytes = 0L
+        var count = 0
+        for (f in files) {
+            totalBytes += f.length()
+            if (f.name.endsWith(".json")) count++
+        }
+        return CacheStats(fileCount = count, totalBytes = totalBytes)
+    }
+
+    /**
+     * 💡 清空 L1 内存缓存与 L2 磁盘歌词缓存文件
+     */
+    fun clearAll(): CacheStats {
+        synchronized(memoryCache) {
+            memoryCache.clear()
+        }
+        val files = diskCacheDir.listFiles { f -> f.isFile } ?: return CacheStats(0, 0L)
+        var clearedBytes = 0L
+        var clearedCount = 0
+        for (f in files) {
+            val len = f.length()
+            if (f.delete()) {
+                clearedBytes += len
+                if (f.name.endsWith(".json")) clearedCount++
+            }
+        }
+        Logger.lyrics.i(TAG, "已清空歌词两级缓存: count=$clearedCount, bytes=$clearedBytes")
+        return CacheStats(fileCount = clearedCount, totalBytes = clearedBytes)
     }
 
     /**

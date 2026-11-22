@@ -58,11 +58,11 @@ class TtmlParserTest {
         assertFalse(timeline!!.isInstrumental)
         assertEquals(2, timeline.lines.size)
 
-        // 验证第 1 行
+        // 验证第 1 行（逐字行优先以主唱末字 endMs 作为行结束时间，避免被背景和声拖尾拉长）
         val line1 = timeline.lines[0]
         assertEquals(0, line1.lineIndex)
         assertEquals(10000L, line1.startMs)
-        assertEquals(15000L, line1.endMs)
+        assertEquals(13000L, line1.endMs)
         assertEquals("故事的小黄花", line1.mainText)
         assertEquals("The little yellow flowers of the story", line1.translationText)
         assertNotNull(line1.words)
@@ -88,5 +88,46 @@ class TtmlParserTest {
         val badXml = "<tt><body><div><p begin='00:10'>unclosed tag"
         val result = TtmlParser.parse(badXml)
         assertNull(result)
+    }
+
+    @Test
+    fun `parse preserves english inter-span spaces filters whitespace spans and trims edges without inserting CJK spaces`() {
+        val ttml = """
+            <?xml version="1.0" encoding="utf-8"?>
+            <tt xmlns="http://www.w3.org/ns/ttml">
+                <body>
+                    <div>
+                        <p begin="00:01.000" end="00:05.000">
+                            <span begin="00:01.000" end="00:01.500">  Hello</span> <span begin="00:01.500" end="00:02.000">   </span><span begin="00:02.000" end="00:03.000">world</span>
+                            <span begin="00:03.000" end="00:04.000">again  </span>
+                        </p>
+                        <p begin="00:06.000" end="00:09.000">
+                            <span begin="00:06.000" end="00:07.000">夜空中</span>
+                            <span begin="00:07.000" end="00:08.500">最亮的星</span>
+                        </p>
+                    </div>
+                </body>
+            </tt>
+        """.trimIndent()
+
+        val timeline = TtmlParser.parse(ttml, "AMLL")
+        assertNotNull(timeline)
+        assertEquals(2, timeline!!.lines.size)
+
+        // 英文行：保留水平空格与换行缩进触发的拉丁词空格，过滤纯空白 span，去除首尾空格
+        val enLine = timeline.lines[0]
+        assertEquals("Hello world again", enLine.mainText)
+        assertEquals(3, enLine.words?.size)
+        assertEquals("Hello ", enLine.words?.get(0)?.text)
+        assertEquals("world ", enLine.words?.get(1)?.text)
+        assertEquals("again", enLine.words?.get(2)?.text)
+        assertEquals(4000L, enLine.endMs)
+
+        // 中文行：XML 换行缩进绝不误插空格
+        val zhLine = timeline.lines[1]
+        assertEquals("夜空中最亮的星", zhLine.mainText)
+        assertEquals(2, zhLine.words?.size)
+        assertEquals("夜空中", zhLine.words?.get(0)?.text)
+        assertEquals("最亮的星", zhLine.words?.get(1)?.text)
     }
 }

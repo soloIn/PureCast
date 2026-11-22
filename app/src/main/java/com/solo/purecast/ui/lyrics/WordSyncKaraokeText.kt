@@ -34,8 +34,8 @@ import com.solo.purecast.model.LyricLine
  * 1. 常驻单一稳定节点（传入 isActive），彻底消除切句首帧 Text ⇄ WordSyncKaraokeText 销毁重建与 TextLayout 重排卡顿；
  * 2. 0 重组纯 Draw 阶段渲染：完全隔离在 drawWithContent 内部读取时间，重组次数彻底归 0；
  * 3. 直接复用父级 SmoothLyricLineRow 的 1:1 刚性常驻 Offscreen 层执行 SrcIn 扫光，非激活态自动关闭 VSYNC 循环（CPU 归 0）；
- * 4. 零堆内存分配优化：复用预分配的 LinearGradient、Matrix 与 Native Paint，彻底消除 60fps 下每帧临时 Brush 堆内存分配；
- * 5. 实现真正的 Apple Music 卡拉 OK 逐像素平滑扫光与抗锯齿羽化边缘。
+ * 4. 退场无缝衔接：失活淡出期冻结最后一次扫光位置并保持未唱尾部单调衰减，彻底杜绝进度不同步时行尾闪白；
+ * 5. 行尾羽化平滑收口：扫光区间覆盖至词尾 + halfFeather，彻底消除行尾最后一帧硬切全亮的轻微跳闪。
  */
 @Composable
 fun WordSyncKaraokeText(
@@ -45,7 +45,8 @@ fun WordSyncKaraokeText(
     primaryColor: Color,
     modifier: Modifier = Modifier,
     isPlaying: Boolean = true,
-    isActive: Boolean = true
+    isActive: Boolean = true,
+    exitingRowAlphaProvider: () -> Float = { 0f }
 ) {
     val words = line.words ?: return
     val fullText = line.mainText
@@ -73,6 +74,8 @@ fun WordSyncKaraokeText(
     }
 
     var layoutResult by remember { mutableStateOf<TextLayoutResult?>(null) }
+    // 💡 记录最近一次激活帧的时间戳，供失活退场淡出期冻结扫光进度使用（防止行尾未唱字符闪白）
+    val lastActiveTimeMsRef = remember(line) { longArrayOf(Long.MIN_VALUE) }
 
     // 预先计算各词在 fullText 中的字符索引范围
     val wordRanges = remember(words, fullText) {
@@ -87,7 +90,8 @@ fun WordSyncKaraokeText(
 
     val density = LocalDensity.current
     val feather = with(density) { 10.dp.toPx() }
-    val unlitColor = remember(primaryColor) { primaryColor.copy(alpha = 0.45f) }
+    val baseUnlitAlpha = 0.45f
+    val unlitColor = remember(primaryColor) { primaryColor.copy(alpha = baseUnlitAlpha) }
 
     // 💡 单一预分配 LinearGradient 与 Matrix 平移复用机制
     // 杜绝在 Draw 阶段每帧分配 Brush.horizontalGradient、ColorStops、List 等高频临时堆对象
@@ -103,6 +107,12 @@ fun WordSyncKaraokeText(
     val sweepPaint = remember(sweepShader) {
         android.graphics.Paint().apply {
             shader = sweepShader
+            xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC_IN)
+        }
+    }
+    // 💡 退场淡出期专用复用 Paint，按行当前 alpha 动态补偿 unlitAlpha，保证实际亮度严格单调不回弹
+    val exitingSweepPaint = remember {
+        android.graphics.Paint().apply {
             xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC_IN)
         }
     }
@@ -167,31 +177,63 @@ fun WordSyncKaraokeText(
         fontWeight = FontWeight.Bold,
         lineHeight = 42.sp,
         onTextLayout = { layoutResult = it },
-        color = if (isActive) Color.White else primaryColor,
+        color = primaryColor,
         modifier = modifier
             .fillMaxWidth()
             .drawWithContent {
                 drawContent()
-                if (!isActive) return@drawWithContent
+
+                val exitingAlpha = if (!isActive) exitingRowAlphaProvider() else 1.0f
+                val isExitingActive = !isActive &&
+                    exitingAlpha > baseUnlitAlpha &&
+                    lastActiveTimeMsRef[0] != Long.MIN_VALUE
+
+                if (!isActive && !isExitingActive) return@drawWithContent
 
                 val lr = layoutResult ?: return@drawWithContent
+                val effectiveUnlitAlpha = if (isExitingActive) {
+                    // 💡 退场时保持 unlit 尾部实测亮度 = effectiveUnlitAlpha * exitingAlpha <= baseUnlitAlpha，
+                    // 等 exitingAlpha 跌破 0.45f 时自然汇合到 1.0f，做到 0 闪白、0 跳变！
+                    (baseUnlitAlpha / exitingAlpha.coerceAtLeast(0.01f)).coerceAtMost(1.0f)
+                } else {
+                    baseUnlitAlpha
+                }
+                val activeUnlitColor = if (effectiveUnlitAlpha == baseUnlitAlpha) {
+                    unlitColor
+                } else {
+                    primaryColor.copy(alpha = effectiveUnlitAlpha)
+                }
+
+                // 若退场已汇合至统一亮度，直接复用普通文字绘制即可，无需再叠加 SrcIn 渐变
+                if (isExitingActive && effectiveUnlitAlpha >= 0.995f) {
+                    return@drawWithContent
+                }
+
                 val geom = cachedGeometry ?: run {
-                    drawRect(color = unlitColor, blendMode = BlendMode.SrcIn)
+                    drawRect(color = activeUnlitColor, blendMode = BlendMode.SrcIn)
                     return@drawWithContent
                 }
 
                 // 💡 在 Draw 阶段读取 frameTrigger，注册每帧 60fps 重绘监听，彻底跳过 Composition 与 Layout 阶段
-                frameTrigger.let { }
+                if (isActive) {
+                    frameTrigger.let { }
+                }
 
-                val now = currentTimeProvider()
+                val now = if (isActive) {
+                    val t = currentTimeProvider()
+                    lastActiveTimeMsRef[0] = t
+                    t
+                } else {
+                    lastActiveTimeMsRef[0]
+                }
                 val lineCount = geom.lineCount
 
                 if (now < words.first().startMs) {
-                    drawRect(color = unlitColor, blendMode = BlendMode.SrcIn)
+                    drawRect(color = activeUnlitColor, blendMode = BlendMode.SrcIn)
                     return@drawWithContent
                 }
                 if (now >= words.last().endMs) {
-                    drawRect(color = primaryColor, blendMode = BlendMode.SrcIn)
+                    // drawContent() 已完整绘制纯亮 primaryColor 文本，无需再叠加一次多余的 SrcIn 矩形
                     return@drawWithContent
                 }
 
@@ -211,13 +253,14 @@ fun WordSyncKaraokeText(
                 }
 
                 if (activeWordIndex !in words.indices) {
-                    drawRect(color = unlitColor, blendMode = BlendMode.SrcIn)
+                    drawRect(color = activeUnlitColor, blendMode = BlendMode.SrcIn)
                     return@drawWithContent
                 }
 
                 val activeWord = words[activeWordIndex]
                 val safeStart = geom.safeStarts[activeWordIndex]
                 val endChar = geom.endChars[activeWordIndex]
+                val halfFeather = (feather * 0.5f).coerceAtLeast(1f)
 
                 val activeVisualLine: Int
                 val currentSweepX: Float
@@ -231,12 +274,15 @@ fun WordSyncKaraokeText(
                     val endLine = geom.endLines[activeWordIndex]
 
                     if (startLine == endLine) {
-                        // 单词处于同一视觉行：直接读取扁平预缓存边界（0 堆分配）
+                        // 单词处于同一视觉行：仅对当前视觉行末词延伸 +halfFeather，消除行尾硬切跳闪且不串亮下一个中日文字符
                         activeVisualLine = startLine
                         val wordLeft = geom.wordLefts[activeWordIndex]
                         val wordRight = geom.wordRights[activeWordIndex]
+                        val isLastWordOnVisualLine = activeWordIndex == words.lastIndex ||
+                            geom.startLines[activeWordIndex + 1] > activeVisualLine
+                        val endExtra = if (isLastWordOnVisualLine) halfFeather else 0f
                         currentWordLeft = wordLeft
-                        currentSweepX = wordLeft + (wordRight - wordLeft) * progress
+                        currentSweepX = wordLeft + ((wordRight - wordLeft) + endExtra) * progress
                     } else {
                         // 💡 Finding 6: 折行跨行单词匀速线性扫光
                         val seg = LyricsRenderingMath.calculateWrappedLineSegment(
@@ -248,35 +294,54 @@ fun WordSyncKaraokeText(
                         activeVisualLine = seg.visualLine
                         val segLeft = lr.getBoundingBox(seg.segStartChar).left
                         val segRight = lr.getBoundingBox(seg.segEndChar).right
+                        val isLastWordOnVisualLine = activeWordIndex == words.lastIndex ||
+                            geom.startLines[activeWordIndex + 1] > activeVisualLine
+                        val endExtra = if (isLastWordOnVisualLine && seg.visualLine == endLine) halfFeather else 0f
                         currentWordLeft = segLeft
-                        currentSweepX = segLeft + (segRight - segLeft) * seg.segProgress
+                        currentSweepX = segLeft + ((segRight - segLeft) + endExtra) * seg.segProgress
                     }
                 } else {
-                    // 词间间隙：已完整唱完 activeWord，直接读取预缓存末端边界（0 堆分配）
+                    // 词间间隙：已完整唱完 activeWord，羽化起点锚定在词尾右侧，保持 100% 纯亮无暗尾
                     activeVisualLine = geom.endLines[activeWordIndex]
                     currentSweepX = geom.endCharRights[activeWordIndex]
                     currentWordLeft = geom.endCharLefts[activeWordIndex]
                     wordProgress = 0f
                 }
 
-                // 💡 内联零分配羽化计算（与 LyricsRenderingMath.calculateEffectiveFeather 数学严格等价，避免每帧分配 Pair）
-                val halfFeather = (feather * 0.5f).coerceAtLeast(1f)
                 val maxSweepFromWordLeft = (currentSweepX - currentWordLeft).coerceAtLeast(0f)
                 val effectiveHalfFeather = if (wordProgress <= 0f) {
                     0f
                 } else {
                     minOf(halfFeather, maxSweepFromWordLeft)
                 }
+                val useHardEdgeSplit = effectiveHalfFeather < 1f
                 val sweepStart = currentSweepX - effectiveHalfFeather
-                val effectiveFeather = (effectiveHalfFeather * 2f).coerceAtLeast(0.001f)
+                val effectiveFeather = (effectiveHalfFeather * 2f).coerceAtLeast(2f)
 
-                // 💡 Finding 3: 设置平移与缩放矩阵并更新 Shader，零对象分配
-                sweepMatrix.reset()
-                sweepMatrix.setScale(effectiveFeather / feather, 1f)
-                sweepMatrix.postTranslate(sweepStart, 0f)
-                sweepShader.setLocalMatrix(sweepMatrix)
-                // 💡 Finding 5: 显式重绑 Paint.shader 确保底层 dirty 标记刷新，彻底消除部分设备本地矩阵缓存滞后
-                sweepPaint.shader = sweepShader
+                val activePaint = if (useHardEdgeSplit) {
+                    null
+                } else {
+                    // 💡 仅在 effectiveFeather >= 2px 时更新局部矩阵（scaleX >= 0.1f，远高于 Skia SK_ScalarNearlyZero=2.44e-4），
+                    // 彻底根除词间间隙 / 词首帧 5e-5 奇异矩阵导致 Skia invert() 失败引发的整行闪烁！
+                    sweepMatrix.reset()
+                    sweepMatrix.setScale(effectiveFeather / feather, 1f)
+                    sweepMatrix.postTranslate(sweepStart, 0f)
+                    if (!isExitingActive) {
+                        sweepShader.setLocalMatrix(sweepMatrix)
+                        sweepPaint.shader = sweepShader
+                        sweepPaint
+                    } else {
+                        val exitShader = android.graphics.LinearGradient(
+                            0f, 0f, feather, 0f,
+                            primaryColor.toArgb(),
+                            activeUnlitColor.toArgb(),
+                            Shader.TileMode.CLAMP
+                        )
+                        exitShader.setLocalMatrix(sweepMatrix)
+                        exitingSweepPaint.shader = exitShader
+                        exitingSweepPaint
+                    }
+                }
 
                 val nativeCanvas = drawContext.canvas.nativeCanvas
 
@@ -295,28 +360,46 @@ fun WordSyncKaraokeText(
                             )
                         } else if (lineIdx > activeVisualLine) {
                             drawRect(
-                                color = unlitColor,
+                                color = activeUnlitColor,
                                 blendMode = BlendMode.SrcIn
                             )
                         } else {
-                            val sweep = currentSweepX.coerceIn(lineLeft, lineRight)
-                            if (sweep <= lineLeft) {
+                            if (currentSweepX <= lineLeft) {
                                 drawRect(
-                                    color = unlitColor,
+                                    color = activeUnlitColor,
                                     blendMode = BlendMode.SrcIn
                                 )
-                            } else if (sweep >= lineRight) {
+                            } else if (sweepStart >= lineRight) {
                                 drawRect(
                                     color = primaryColor,
                                     blendMode = BlendMode.SrcIn
                                 )
+                            } else if (activePaint == null) {
+                                // 💡 无羽化硬切分界（词间间隙 / 词首 0 进度帧）：直接画左右两个纯色 SrcIn 矩形，零奇异矩阵风险
+                                val splitX = currentSweepX.coerceIn(0f, size.width)
+                                if (splitX > 0f) {
+                                    drawRect(
+                                        color = primaryColor,
+                                        topLeft = androidx.compose.ui.geometry.Offset(0f, lineTop),
+                                        size = androidx.compose.ui.geometry.Size(splitX, lineBottom - lineTop),
+                                        blendMode = BlendMode.SrcIn
+                                    )
+                                }
+                                if (splitX < size.width) {
+                                    drawRect(
+                                        color = activeUnlitColor,
+                                        topLeft = androidx.compose.ui.geometry.Offset(splitX, lineTop),
+                                        size = androidx.compose.ui.geometry.Size(size.width - splitX, lineBottom - lineTop),
+                                        blendMode = BlendMode.SrcIn
+                                    )
+                                }
                             } else {
                                 nativeCanvas.drawRect(
-                                    lineLeft,
+                                    0f,
                                     lineTop,
-                                    lineRight,
+                                    size.width,
                                     lineBottom,
-                                    sweepPaint
+                                    activePaint
                                 )
                             }
                         }

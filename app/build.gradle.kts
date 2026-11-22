@@ -1,9 +1,37 @@
+import java.io.File
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
     jacoco
 }
+
+val localProperties = Properties().apply {
+    val localPropsFile = rootProject.file("local.properties")
+    if (localPropsFile.exists()) {
+        localPropsFile.inputStream().use { load(it) }
+    }
+}
+
+fun resolveSigningProp(envName: String, propName: String): String? {
+    return System.getenv(envName)?.takeIf { it.isNotBlank() }
+        ?: localProperties.getProperty(propName)?.takeIf { it.isNotBlank() }
+}
+
+val releaseStoreFilePath = resolveSigningProp("RELEASE_STORE_FILE", "release.storeFile")
+val releaseStorePassword = resolveSigningProp("RELEASE_STORE_PASSWORD", "release.storePassword")
+val releaseKeyAlias = resolveSigningProp("RELEASE_KEY_ALIAS", "release.keyAlias")
+val releaseKeyPassword = resolveSigningProp("RELEASE_KEY_PASSWORD", "release.keyPassword")
+val releaseStoreFileResolved = releaseStoreFilePath?.let { path ->
+    val rawFile = File(path)
+    if (rawFile.isAbsolute) rawFile else rootProject.file(path)
+}?.takeIf { it.exists() }
+val hasReleaseSigning = releaseStoreFileResolved != null &&
+    releaseStorePassword != null &&
+    releaseKeyAlias != null &&
+    releaseKeyPassword != null
 
 base {
     archivesName.set("PureCast")
@@ -46,11 +74,33 @@ android {
         }
     }
 
+    signingConfigs {
+        if (hasReleaseSigning) {
+            create("release") {
+                storeFile = releaseStoreFileResolved
+                storePassword = releaseStorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = true
             isShrinkResources = true
-            signingConfig = signingConfigs.getByName("debug")
+            val isOfficialCiRelease = System.getenv("CI") == "true" &&
+                System.getenv("GITHUB_EVENT_NAME") == "release"
+            if (isOfficialCiRelease && !hasReleaseSigning) {
+                throw org.gradle.api.GradleException(
+                    "正式 GitHub Release 构建缺少签名配置 (RELEASE_KEYSTORE_BASE64 / RELEASE_STORE_PASSWORD / RELEASE_KEY_ALIAS / RELEASE_KEY_PASSWORD)，禁止静默回退 debug 签名"
+                )
+            }
+            signingConfig = if (hasReleaseSigning) {
+                signingConfigs.getByName("release")
+            } else {
+                signingConfigs.getByName("debug")
+            }
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"

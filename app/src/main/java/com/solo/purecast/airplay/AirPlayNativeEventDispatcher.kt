@@ -35,6 +35,7 @@ internal class AirPlayNativeEventDispatcher(
     private val onUpdateDacpTarget: (clientIp: String, dacpId: String, activeRemoteToken: String, dacpPort: Int) -> Unit,
     private val onSolveChallenge: (challengeBase64: String) -> String?,
     private val onRtpActiveChanged: (Boolean) -> Unit = {},
+    private val onStreamTeardownRequested: ((globalSessionId: Long) -> Unit)? = null,
     private val clockMs: () -> Long = { System.currentTimeMillis() }
 ) : NativeAirPlayCallback {
 
@@ -94,6 +95,12 @@ internal class AirPlayNativeEventDispatcher(
     @Volatile
     private var lastClientIp: String? = null
 
+    @Volatile
+    private var lastGlobalSessionId: Long = 0L
+
+    @Volatile
+    private var dacpRemovedNotified: Boolean = false
+
     fun resetSessions() {
         nativeToGlobalSessionMap.clear()
         lastStateSequenceByNative.clear()
@@ -109,8 +116,35 @@ internal class AirPlayNativeEventDispatcher(
         pendingOrphanCoverTimestampMs = 0L
         lastActiveMetadata = null
         lastClientIp = null
+        lastGlobalSessionId = 0L
+        dacpRemovedNotified = false
         onRtpActiveChanged(false)
     }
+
+    /**
+     * 💡 由 DACP 探活裁决器在 TEARDOWN 后或休眠期调用，向状态机发射最终的暂停休眠 (hardStop=false)
+     * 或硬停止断开会话 (hardStop=true) 事件，并确保不会重复发射或误伤新会话。
+     */
+    fun emitTeardownDecision(globalSessionId: Long, hardStop: Boolean, reason: String = "") {
+        synchronized(eventDispatchLock) {
+            if (globalSessionId <= 0L || lastGlobalSessionId != globalSessionId) return
+            if (hardStop) {
+                if (dacpRemovedNotified) return
+                dacpRemovedNotified = true
+            }
+            val desc = if (reason.isNotEmpty()) " ($reason)" else ""
+            Logger.airplay.i(TAG, "AirPlay TEARDOWN 裁决: sid=$globalSessionId, hardStop=$hardStop$desc")
+            emitLocked(
+                sessionId = globalSessionId,
+                payload = StreamTeardownEvent(hardStop = hardStop)
+            )
+        }
+    }
+
+    /**
+     * 💡 获取当前最新会话 ID（供 DACP 探活器在收到 mDNS 下线辅助事件时关联目标会话）
+     */
+    fun getCurrentGlobalSessionId(): Long = synchronized(eventDispatchLock) { lastGlobalSessionId }
 
     /**
      * 💡 标记 TV 本机触发了寻道请求，在 4000ms 窗口期内将紧随其后的 FLUSH 标记为 isSeekFlush = true，
@@ -121,13 +155,15 @@ internal class AirPlayNativeEventDispatcher(
     }
 
     /**
-     * 💡 校验给定全局会话是否仍属于当前最新活跃 AirPlay 原生会话，防止延迟到达的抢占清理误杀后续新会话
+     * 💡 校验给定全局会话是否仍属于当前最新活跃或刚 TEARDOWN 待清理的 AirPlay 会话，
+     * 既防止延迟到达的抢占清理误杀后续新会话，也确保 TEARDOWN 后的清理能正常回收 DACP 与元数据缓存。
      */
     fun hasSession(globalSessionId: Long): Boolean {
         if (globalSessionId <= 0L) return false
         synchronized(eventDispatchLock) {
             val latestNative = latestNativeSessionId.get()
-            return nativeToGlobalSessionMap[latestNative] == globalSessionId
+            return nativeToGlobalSessionMap[latestNative] == globalSessionId ||
+                lastGlobalSessionId == globalSessionId
         }
     }
 
@@ -145,12 +181,15 @@ internal class AirPlayNativeEventDispatcher(
         activeRemoteToken: String,
         dacpPort: Int
     ): Long {
+        // 💡 在硬件申请与 DACP 目标更新前即标记 RTP 通道建链中，防止 ~15ms SETUP 窗口内 JmDNS 瞬态 _dacp._tcp 抖动误触发挂起断开
+        onRtpActiveChanged(true)
         onDecryptAndInjectCryptoKey(aesKeyBase64, aesIvBase64)
         onUpdateDacpTarget(clientIp, dacpId, activeRemoteToken, dacpPort)
 
         val resolvedCodec = codec.ifBlank { "ALAC" }
         val acquiredEpoch = onAcquireHardwareForStream(sampleRate, bitDepth, channels, resolvedCodec)
         if (acquiredEpoch <= 0L) {
+            onRtpActiveChanged(false)
             Logger.airplay.w(TAG, "AirPlay 推流请求被拒绝或硬件未就绪: nativeSid=$nativeSessionId")
             return -1L
         }
@@ -164,6 +203,8 @@ internal class AirPlayNativeEventDispatcher(
             val isSameNativeSession = (latestNativeSessionId.get() == nativeSessionId) || isSameClient
             latestNativeSessionId.set(nativeSessionId)
             nativeToGlobalSessionMap[nativeSessionId] = globalSessionId
+            lastGlobalSessionId = globalSessionId
+            dacpRemovedNotified = false
             lastStateSequenceByNative[nativeSessionId] = sequence
 
             // 💡 修复 Finding 5: 续播识别支持同客户端跨 SETUP 重连保持已有元数据，杜绝暂停续播时歌名封面被刷空
@@ -226,18 +267,21 @@ internal class AirPlayNativeEventDispatcher(
     }
 
     override fun onStreamStopped(nativeSessionId: Long, sequence: Long, epoch: Long) {
-        onRtpActiveChanged(false)
+        val teardownSid: Long
         synchronized(eventDispatchLock) {
             val globalSid = acceptActiveStateEventLocked(nativeSessionId, sequence) ?: return
             nativeToGlobalSessionMap.remove(nativeSessionId)
             lastStateSequenceByNative.remove(nativeSessionId)
-            // 💡 契约修复：RTSP TEARDOWN 属于传输通道挂起，由状态机转入 10 分钟 PAUSED 挂起 (hardStop = false)，
-            // 严禁作为 hardStop 硬停止导致大屏闪烁跳回等待投屏与 10s 误释放声卡。
-            emitLocked(
-                sessionId = globalSid,
-                payload = StreamTeardownEvent(hardStop = false)
-            )
+            teardownSid = globalSid
+            onRtpActiveChanged(false)
+            if (onStreamTeardownRequested == null) {
+                emitLocked(
+                    sessionId = globalSid,
+                    payload = StreamTeardownEvent(hardStop = false)
+                )
+            }
         }
+        onStreamTeardownRequested?.invoke(teardownSid)
     }
 
     override fun onStreamPaused(nativeSessionId: Long, sequence: Long, epoch: Long) {

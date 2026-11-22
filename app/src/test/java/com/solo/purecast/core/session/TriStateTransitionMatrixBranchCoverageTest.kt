@@ -385,4 +385,278 @@ class TriStateTransitionMatrixBranchCoverageTest {
         )
         assertEquals(50L, allowedNonZero.nextContext.snapshot.progressPositionMs)
     }
+
+    @Test
+    fun remotePlayCommandAndRollbackCoverAllHardwareAndTransportBranches() {
+        val tm = TrackTransactionManager()
+
+        // 1. PLAYING 态收到 PLAY 直接忽略，防止卡在 TRANSITIONING 5 秒报错
+        val playingCtx = TransitionContext(
+            snapshot = PlayerSessionSnapshot(
+                sessionId = 1L,
+                activeProtocol = StreamProtocol.AIRPLAY_1,
+                transportState = TransportPipeState.STREAMING,
+                businessState = BusinessSessionState.PLAYING,
+                hardwareState = HardwarePipelineState.EXCLUSIVE_ACTIVE
+            )
+        )
+        val ignoredPlay = TriStateTransitionMatrix.reduce(
+            ctx = playingCtx,
+            envelope = envelope(RemoteSkipNextEvent(RemoteCommandType.PLAY, commandId = 101L), origin = EventOrigin.USER_ACTION),
+            trackManager = tm,
+            nowMs = 1000L
+        )
+        assertEquals(playingCtx, ignoredPlay.nextContext)
+        assertTrue(ignoredPlay.effects.isEmpty())
+
+        // 2. PAUSED + DISCONNECTED -> 发 DACP PLAY 但不发 OpenDeviceOnResume / ResumeNativeOutput
+        val disconnectedPausedCtx = TransitionContext(
+            snapshot = PlayerSessionSnapshot(
+                sessionId = 1L,
+                activeProtocol = StreamProtocol.AIRPLAY_1,
+                transportState = TransportPipeState.DISCONNECTED,
+                businessState = BusinessSessionState.PAUSED,
+                hardwareState = HardwarePipelineState.EXCLUSIVE_MUTED
+            )
+        )
+        val outDisconnected = TriStateTransitionMatrix.reduce(
+            ctx = disconnectedPausedCtx,
+            envelope = envelope(RemoteSkipNextEvent(RemoteCommandType.PLAY, commandId = 102L), origin = EventOrigin.USER_ACTION),
+            trackManager = tm,
+            nowMs = 1000L
+        )
+        assertEquals(BusinessSessionState.TRANSITIONING, outDisconnected.nextContext.snapshot.businessState)
+        assertEquals(RemoteCommandType.PLAY, outDisconnected.nextContext.activeRemoteCommandType)
+        assertFalse(outDisconnected.effects.contains(TransitionEffect.ResumeNativeOutput))
+        assertTrue(outDisconnected.effects.none { it is TransitionEffect.OpenDeviceOnResume })
+
+        // 2b. DISCONNECTED 态下 PLAY 超时 -> 直接断开会话归 IDLE 并附带错误与通知协议层
+        val outDisconnectedTimeout = TriStateTransitionMatrix.reduce(
+            ctx = outDisconnected.nextContext,
+            envelope = envelope(RemoteCommandTimeoutEvent(commandId = 102L), origin = EventOrigin.SERVICE),
+            trackManager = tm,
+            nowMs = 6000L
+        )
+        assertEquals(BusinessSessionState.IDLE, outDisconnectedTimeout.nextContext.snapshot.businessState)
+        assertEquals(0L, outDisconnectedTimeout.nextContext.snapshot.sessionId)
+        assertTrue(outDisconnectedTimeout.nextContext.snapshot.errors.containsKey(ErrorCode.REMOTE_COMMAND_TIMEOUT))
+        assertTrue(outDisconnectedTimeout.effects.any { it is TransitionEffect.NotifyPreemptedProtocol })
+
+        // 3. PAUSED + INTERRUPTED + DISCONNECTED(硬件拔出) -> 不发硬件恢复副作用
+        val detachedHwCtx = TransitionContext(
+            snapshot = PlayerSessionSnapshot(
+                sessionId = 2L,
+                activeProtocol = StreamProtocol.AIRPLAY_1,
+                transportState = TransportPipeState.INTERRUPTED,
+                businessState = BusinessSessionState.PAUSED,
+                hardwareState = HardwarePipelineState.DISCONNECTED
+            )
+        )
+        val outDetachedHw = TriStateTransitionMatrix.reduce(
+            ctx = detachedHwCtx,
+            envelope = envelope(RemoteSkipNextEvent(RemoteCommandType.PLAY, commandId = 103L), origin = EventOrigin.USER_ACTION, sessionId = 2L),
+            trackManager = tm,
+            nowMs = 1000L
+        )
+        assertFalse(outDetachedHw.effects.contains(TransitionEffect.ResumeNativeOutput))
+        assertTrue(outDetachedHw.effects.none { it is TransitionEffect.OpenDeviceOnResume })
+
+        // 4. PAUSED + INTERRUPTED + RELEASED -> 发射 OpenDeviceOnResume
+        val releasedHwCtx = TransitionContext(
+            snapshot = PlayerSessionSnapshot(
+                sessionId = 3L,
+                activeProtocol = StreamProtocol.AIRPLAY_1,
+                transportState = TransportPipeState.INTERRUPTED,
+                businessState = BusinessSessionState.PAUSED,
+                hardwareState = HardwarePipelineState.RELEASED
+            )
+        )
+        val outReleasedHw = TriStateTransitionMatrix.reduce(
+            ctx = releasedHwCtx,
+            envelope = envelope(RemoteSkipNextEvent(RemoteCommandType.PLAY, commandId = 104L), origin = EventOrigin.USER_ACTION, sessionId = 3L),
+            trackManager = tm,
+            nowMs = 1000L
+        )
+        assertTrue(outReleasedHw.effects.any { it is TransitionEffect.OpenDeviceOnResume })
+
+        // 5. PAUSED + INTERRUPTED + AUDIO_RECONFIGURING -> 不提前发 ResumeNativeOutput
+        val reconfigHwCtx = TransitionContext(
+            snapshot = PlayerSessionSnapshot(
+                sessionId = 4L,
+                activeProtocol = StreamProtocol.AIRPLAY_1,
+                transportState = TransportPipeState.INTERRUPTED,
+                businessState = BusinessSessionState.PAUSED,
+                hardwareState = HardwarePipelineState.AUDIO_RECONFIGURING
+            )
+        )
+        val outReconfigHw = TriStateTransitionMatrix.reduce(
+            ctx = reconfigHwCtx,
+            envelope = envelope(RemoteSkipNextEvent(RemoteCommandType.PLAY, commandId = 105L), origin = EventOrigin.USER_ACTION, sessionId = 4L),
+            trackManager = tm,
+            nowMs = 1000L
+        )
+        assertFalse(outReconfigHw.effects.contains(TransitionEffect.ResumeNativeOutput))
+
+        // 6. PAUSED + INTERRUPTED + EXCLUSIVE_MUTED -> 发射 ResumeNativeOutput；期间收到 TrackBoundaryEvent 不提前结束 TRANSITIONING；超时回退 PAUSED 并重设 SuspendTimeout
+        val mutedHwCtx = TransitionContext(
+            snapshot = PlayerSessionSnapshot(
+                sessionId = 5L,
+                trackGeneration = 1L,
+                activeProtocol = StreamProtocol.AIRPLAY_1,
+                transportState = TransportPipeState.INTERRUPTED,
+                businessState = BusinessSessionState.PAUSED,
+                hardwareState = HardwarePipelineState.EXCLUSIVE_MUTED
+            )
+        )
+        val outMutedHw = TriStateTransitionMatrix.reduce(
+            ctx = mutedHwCtx,
+            envelope = envelope(RemoteSkipNextEvent(RemoteCommandType.PLAY, commandId = 106L), origin = EventOrigin.USER_ACTION, sessionId = 5L),
+            trackManager = tm,
+            nowMs = 1000L
+        )
+        assertTrue(outMutedHw.effects.contains(TransitionEffect.ResumeNativeOutput))
+
+        val outBoundaryDuringPlay = TriStateTransitionMatrix.reduce(
+            ctx = outMutedHw.nextContext,
+            envelope = envelope(TrackBoundaryEvent(trackKey = "k_play", trackGeneration = 2L), sessionId = 5L),
+            trackManager = tm,
+            nowMs = 1500L
+        )
+        assertEquals(BusinessSessionState.TRANSITIONING, outBoundaryDuringPlay.nextContext.snapshot.businessState)
+        assertEquals(RemoteCommandType.PLAY, outBoundaryDuringPlay.nextContext.activeRemoteCommandType)
+
+        val outTimeoutPaused = TriStateTransitionMatrix.reduce(
+            ctx = outBoundaryDuringPlay.nextContext,
+            envelope = envelope(RemoteCommandTimeoutEvent(commandId = 106L), origin = EventOrigin.SERVICE, sessionId = 5L),
+            trackManager = tm,
+            nowMs = 6000L
+        )
+        assertEquals(BusinessSessionState.PAUSED, outTimeoutPaused.nextContext.snapshot.businessState)
+        assertEquals("远端设备未响应播放指令", outTimeoutPaused.nextContext.snapshot.errors[ErrorCode.REMOTE_COMMAND_TIMEOUT]?.message)
+        assertTrue(outTimeoutPaused.effects.any { it is TransitionEffect.ScheduleSuspendTimeout })
+
+        // 7. NEXT 指令超时使用“远端设备未响应切歌指令”文案
+        val nextSkipCtx = TransitionContext(
+            snapshot = PlayerSessionSnapshot(
+                sessionId = 6L,
+                activeProtocol = StreamProtocol.AIRPLAY_1,
+                transportState = TransportPipeState.STREAMING,
+                businessState = BusinessSessionState.TRANSITIONING,
+                hardwareState = HardwarePipelineState.EXCLUSIVE_MUTED
+            ),
+            activeRemoteCommandId = 107L,
+            activeRemoteCommandType = RemoteCommandType.NEXT,
+            preCommandBusinessState = BusinessSessionState.PLAYING
+        )
+        val outNextTimeout = TriStateTransitionMatrix.reduce(
+            ctx = nextSkipCtx,
+            envelope = envelope(RemoteCommandTimeoutEvent(commandId = 107L), origin = EventOrigin.SERVICE, sessionId = 6L),
+            trackManager = tm,
+            nowMs = 6000L
+        )
+        assertEquals("远端设备未响应切歌指令", outNextTimeout.nextContext.snapshot.errors[ErrorCode.REMOTE_COMMAND_TIMEOUT]?.message)
+    }
+
+    @Test
+    fun hardwareIdleTimeoutStoppedCompatAndDisconnectNotifyGuardsAndUpnpResumeDisconnected() {
+        val tm = TrackTransactionManager()
+
+        // 1. HardwareIdleTimeoutEvent 在兼容 STOPPED 态下正常释放硬件；在 PLAYING 态下直接忽略
+        val stoppedCtx = TransitionContext(
+            snapshot = PlayerSessionSnapshot(
+                businessState = BusinessSessionState.STOPPED,
+                hardwareState = HardwarePipelineState.EXCLUSIVE_MUTED
+            )
+        )
+        val outStoppedIdle = TriStateTransitionMatrix.reduce(
+            ctx = stoppedCtx,
+            envelope = envelope(HardwareIdleTimeoutEvent, origin = EventOrigin.SERVICE, sessionId = 0L),
+            trackManager = tm,
+            nowMs = 1000L
+        )
+        assertEquals(HardwarePipelineState.RELEASED, outStoppedIdle.nextContext.snapshot.hardwareState)
+        assertTrue(outStoppedIdle.effects.contains(TransitionEffect.ReleaseHardwareDevice))
+
+        val playingIdleCtx = TransitionContext(
+            snapshot = PlayerSessionSnapshot(
+                sessionId = 8L,
+                businessState = BusinessSessionState.PLAYING,
+                hardwareState = HardwarePipelineState.EXCLUSIVE_ACTIVE
+            )
+        )
+        val outPlayingIdle = TriStateTransitionMatrix.reduce(
+            ctx = playingIdleCtx,
+            envelope = envelope(HardwareIdleTimeoutEvent, origin = EventOrigin.SERVICE, sessionId = 8L),
+            trackManager = tm,
+            nowMs = 1000L
+        )
+        assertEquals(playingIdleCtx, outPlayingIdle.nextContext)
+        assertTrue(outPlayingIdle.effects.isEmpty())
+
+        // 2. StreamTeardownEvent(hardStop=true) 在 sessionId == 0L 或 protocol == NONE 时不发射 NotifyPreemptedProtocol
+        val zeroSidCtx = TransitionContext(
+            snapshot = PlayerSessionSnapshot(
+                sessionId = 0L,
+                activeProtocol = StreamProtocol.NONE,
+                businessState = BusinessSessionState.PAUSED
+            )
+        )
+        val outZeroSid = TriStateTransitionMatrix.reduce(
+            ctx = zeroSidCtx,
+            envelope = envelope(StreamTeardownEvent(hardStop = true), sessionId = 0L),
+            trackManager = tm,
+            nowMs = 1000L
+        )
+        assertTrue(outZeroSid.effects.none { it is TransitionEffect.NotifyPreemptedProtocol })
+
+        val noneProtoCtx = TransitionContext(
+            snapshot = PlayerSessionSnapshot(
+                sessionId = 9L,
+                activeProtocol = StreamProtocol.NONE,
+                businessState = BusinessSessionState.PAUSED
+            )
+        )
+        val outNoneProto = TriStateTransitionMatrix.reduce(
+            ctx = noneProtoCtx,
+            envelope = envelope(StreamTeardownEvent(hardStop = true), sessionId = 9L),
+            trackManager = tm,
+            nowMs = 1000L
+        )
+        assertTrue(outNoneProto.effects.none { it is TransitionEffect.NotifyPreemptedProtocol })
+
+        // 3. StreamResumeEvent: STOPPED 态忽略；UPNP_DLNA + DISCONNECTED 允许恢复
+        val stoppedResumeCtx = TransitionContext(
+            snapshot = PlayerSessionSnapshot(
+                sessionId = 10L,
+                activeProtocol = StreamProtocol.UPNP_DLNA,
+                businessState = BusinessSessionState.STOPPED,
+                hardwareState = HardwarePipelineState.EXCLUSIVE_MUTED
+            )
+        )
+        val outStoppedResume = TriStateTransitionMatrix.reduce(
+            ctx = stoppedResumeCtx,
+            envelope = envelope(StreamResumeEvent(StreamProtocol.UPNP_DLNA, resumedEpoch = 19L), origin = EventOrigin.UPNP, sessionId = 10L),
+            trackManager = tm,
+            nowMs = 1000L
+        )
+        assertEquals(stoppedResumeCtx, outStoppedResume.nextContext)
+        assertTrue(outStoppedResume.effects.isEmpty())
+
+        val upnpDisconnectedCtx = TransitionContext(
+            snapshot = PlayerSessionSnapshot(
+                sessionId = 10L,
+                activeProtocol = StreamProtocol.UPNP_DLNA,
+                transportState = TransportPipeState.DISCONNECTED,
+                businessState = BusinessSessionState.PAUSED,
+                hardwareState = HardwarePipelineState.EXCLUSIVE_MUTED
+            )
+        )
+        val outUpnpResume = TriStateTransitionMatrix.reduce(
+            ctx = upnpDisconnectedCtx,
+            envelope = envelope(StreamResumeEvent(StreamProtocol.UPNP_DLNA, resumedEpoch = 20L), origin = EventOrigin.UPNP, sessionId = 10L),
+            trackManager = tm,
+            nowMs = 1000L
+        )
+        assertEquals(BusinessSessionState.PLAYING, outUpnpResume.nextContext.snapshot.businessState)
+    }
 }

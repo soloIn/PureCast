@@ -107,6 +107,13 @@ public:
     void reset_buffer();
 
     /**
+     * 💡 原子执行 RTSP FLUSH 切歌/寻道排空：在 audio_packet_mutex_ 锁内一次性完成
+     * AudioEngine emergency_mute_and_flush、active_epoch 更新、JitterBuffer 重置与静音门控开启，
+     * 彻底消除 FLUSH 期间 sync_drain_thread 抢跑补写快晶振静音垫步或首包错拿旧 epoch 的竞态窗口。
+     */
+    uint64_t on_rtsp_flush();
+
+    /**
      * 获取最新已写入 AudioEngine 环形缓冲的音频帧尾部 RTP 时间戳
      */
     bool get_last_written_rtp_ts(uint32_t& out_ts) const {
@@ -269,6 +276,7 @@ private:
     static int64_t get_monotonic_time_us();
     static uint64_t mono_us_to_ntp(int64_t us);
     static int64_t ntp_to_us(uint64_t ntp);
+    static bool is_pcm_frame_silent(const uint8_t* data, size_t size, int bit_depth);
 
 private:
     std::atomic<bool> is_running_{false};
@@ -326,6 +334,14 @@ private:
     int64_t sync_local_mono_us_{0};
     bool has_sync_anchor_{false};
     bool sync_playback_started_{false}; // 仅在 audio_packet_mutex_ 下访问
+
+    // 💡 RTSP FLUSH 后静音拦截门控（仅在 audio_packet_mutex_ 下访问）：
+    // iOS 暂停时发 FLUSH 并持续推 44B 全 0 静音包，拦截静音包不入队/不触发起播，
+    // 连续静音达 ~240ms (30 帧) 即主动通知上层切 PAUSED，直到收到真实有声帧再恢复播放。
+    static constexpr uint32_t POST_FLUSH_SILENCE_PAUSE_FRAMES = 30U;
+    bool awaiting_post_flush_audio_{false};
+    bool post_flush_silence_paused_{false};
+    uint32_t post_flush_silence_frames_{0};
 
     // 💡 音频推流状态与首包状态监测 (单静音保活防爆音，控制面由显式信令 100% 驱动)
     std::mutex state_mutex_;

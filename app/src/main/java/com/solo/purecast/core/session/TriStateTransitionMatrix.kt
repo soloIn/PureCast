@@ -17,6 +17,7 @@ internal data class TransitionContext(
     val pendingDebounceToken: Long = 0L,
     val activeUiProtectionToken: Long = 0L,
     val activeRemoteCommandId: Long = 0L,
+    val activeRemoteCommandType: RemoteCommandType? = null,
     val preCommandBusinessState: BusinessSessionState = BusinessSessionState.PLAYING
 )
 
@@ -157,7 +158,8 @@ internal object TriStateTransitionMatrix {
                     ctx.copy(
                         snapshot = nextSnap,
                         pendingDebounceToken = 0L,
-                        activeRemoteCommandId = 0L
+                        activeRemoteCommandId = 0L,
+                        activeRemoteCommandType = null
                     ),
                     effects
                 )
@@ -208,7 +210,8 @@ internal object TriStateTransitionMatrix {
                         snapshot = nextSnap,
                         pendingDebounceToken = 0L,
                         activeUiProtectionToken = 0L,
-                        activeRemoteCommandId = 0L
+                        activeRemoteCommandId = 0L,
+                        activeRemoteCommandType = null
                     ),
                     effects
                 )
@@ -287,44 +290,75 @@ internal object TriStateTransitionMatrix {
             }
 
             is TrackCompleteEvent ->
-                return transitionToStopped(ctx, effects, ev.newEpoch, scheduleIdleRelease = true)
+                return disconnectSessionToIdle(
+                    ctx = ctx,
+                    trackManager = trackManager,
+                    effects = effects,
+                    newEpoch = ev.newEpoch,
+                    scheduleIdleRelease = true,
+                    notifyProtocol = false
+                )
 
             is StreamStopEvent ->
-                return transitionToStopped(ctx, effects, ev.newEpoch, scheduleIdleRelease = !ev.isPreempted)
+                return disconnectSessionToIdle(
+                    ctx = ctx,
+                    trackManager = trackManager,
+                    effects = effects,
+                    newEpoch = ev.newEpoch,
+                    scheduleIdleRelease = !ev.isPreempted,
+                    notifyProtocol = false
+                )
 
             is StreamTeardownEvent -> {
                 effects += TransitionEffect.CancelDebouncePause
                 effects += TransitionEffect.CancelRemoteCommandTimeout
-                val nextHw = muteIfExclusive(snap.hardwareState)
-                // 💡 契约修复：若当前业务态已经处于 PAUSED（例如用户或系统触发了显式暂停），即使收到底层 hardStop 信号，
-                // 也绝不能退化为 STOPPED 并启动 10s 让渡，必须严格保持 PAUSED 业务态并维持 10 分钟挂起倒计时！
-                val shouldKeepPaused = !ev.hardStop || snap.businessState == BusinessSessionState.PAUSED
-                return if (!shouldKeepPaused) {
-                    effects += TransitionEffect.ScheduleHardwareIdleTimeout
-                    val nextSnap = snap.copy(
-                        transportState = TransportPipeState.DISCONNECTED,
-                        businessState = BusinessSessionState.STOPPED,
-                        hardwareState = nextHw,
-                        uiProtectionActive = false
+                effects += TransitionEffect.CancelTransitionTimeout
+                // 💡 由 DACP 探活裁决器统一裁定：
+                // 1) hardStop == true（停止/对端已断）-> 不管停止前是什么状态（PLAYING / TRANSITIONING / PAUSED），直接断开会话归 IDLE；
+                // 2) hardStop == false（DACP 仍存活，仅暂停休眠）-> 统一转入/保持 PAUSED 并启动 10 分钟会话保持超时。
+                return if (ev.hardStop) {
+                    disconnectSessionToIdle(
+                        ctx = ctx,
+                        trackManager = trackManager,
+                        effects = effects,
+                        newEpoch = snap.currentEpoch,
+                        scheduleIdleRelease = true,
+                        notifyProtocol = true
                     )
-                    TransitionOutput(ctx.copy(snapshot = nextSnap, pendingDebounceToken = 0L), effects)
                 } else {
                     effects += TransitionEffect.ScheduleSuspendTimeout(snap.sessionId)
                     val nextSnap = snap.copy(
                         transportState = TransportPipeState.DISCONNECTED,
                         businessState = BusinessSessionState.PAUSED,
-                        hardwareState = nextHw,
-                        uiProtectionActive = false
+                        hardwareState = muteIfExclusive(snap.hardwareState),
+                        uiProtectionActive = false,
+                        transitionOriginState = null
                     )
-                    TransitionOutput(ctx.copy(snapshot = nextSnap, pendingDebounceToken = 0L), effects)
+                    TransitionOutput(
+                        ctx.copy(
+                            snapshot = nextSnap,
+                            pendingDebounceToken = 0L,
+                            activeRemoteCommandId = 0L,
+                            activeRemoteCommandType = null
+                        ),
+                        effects
+                    )
                 }
             }
 
             is HardwareIdleTimeoutEvent -> {
-                if (snap.businessState != BusinessSessionState.STOPPED) {
+                // 💡 硬件空闲让渡与业务会话解耦：仅在会话已归 IDLE（或兼容 STOPPED）时释放声卡硬件，不影响会话字段
+                if (snap.businessState != BusinessSessionState.IDLE &&
+                    snap.businessState != BusinessSessionState.STOPPED
+                ) {
                     return TransitionOutput(ctx, emptyList())
                 }
-                return resetSessionToIdle(ctx, trackManager, effects)
+                effects += TransitionEffect.ReleaseHardwareDevice
+                val nextSnap = snap.copy(
+                    hardwareState = releaseUnlessDisconnected(snap.hardwareState),
+                    audioPath = snap.audioPath.copy(isExclusive = false)
+                )
+                return TransitionOutput(ctx.copy(snapshot = nextSnap), effects)
             }
 
             is SuspendTimeoutEvent -> {
@@ -342,9 +376,16 @@ internal object TriStateTransitionMatrix {
                 }
                 effects += TransitionEffect.CancelTransitionTimeout
                 // 💡 B-3 防御：区分初始建流超时 (PREPARING) 与 切歌换代超时 (INTERRUPTED)
-                // 若在 PREPARING 阶段超时（从未收到过首包有效数据），直接安全停止并启动 10s 硬件空闲让渡释放声卡，杜绝伪暂停占住声卡 10 分钟！
+                // 若在 PREPARING 阶段超时（从未收到过首包有效数据），直接断开会话归 IDLE 并启动硬件空闲让渡，杜绝伪暂停占住声卡 10 分钟！
                 if (snap.transportState == TransportPipeState.PREPARING) {
-                    return transitionToStopped(ctx, effects, snap.currentEpoch, scheduleIdleRelease = true)
+                    return disconnectSessionToIdle(
+                        ctx = ctx,
+                        trackManager = trackManager,
+                        effects = effects,
+                        newEpoch = snap.currentEpoch,
+                        scheduleIdleRelease = true,
+                        notifyProtocol = true
+                    )
                 }
                 effects += TransitionEffect.ScheduleSuspendTimeout(snap.sessionId)
                 val nextSnap = snap.copy(
@@ -377,6 +418,10 @@ internal object TriStateTransitionMatrix {
                     return TransitionOutput(ctx, emptyList())
                 }
 
+                val isPlayResumeCommand = ev.commandType == RemoteCommandType.PLAY
+                if (isPlayResumeCommand && snap.businessState == BusinessSessionState.PLAYING) {
+                    return TransitionOutput(ctx, emptyList())
+                }
                 val preState = if (snap.businessState != BusinessSessionState.TRANSITIONING) {
                     snap.businessState
                 } else {
@@ -384,13 +429,32 @@ internal object TriStateTransitionMatrix {
                 }
                 val cmdId = ev.commandId
                 val windowToken = envelope.sequence
+                if (isPlayResumeCommand) {
+                    effects += TransitionEffect.CancelSuspendTimeout
+                    if (snap.transportState != TransportPipeState.DISCONNECTED && !isDetachedOrPendingPermission(snap.hardwareState)) {
+                        if (snap.hardwareState == HardwarePipelineState.RELEASED) {
+                            effects += TransitionEffect.OpenDeviceOnResume(
+                                sampleRate = snap.audioPath.sampleRate,
+                                bitDepth = snap.audioPath.bitDepth,
+                                channels = snap.audioPath.channels,
+                                fallbackPausedEpoch = snap.currentEpoch,
+                                protocol = snap.activeProtocol,
+                                sessionId = snap.sessionId
+                            )
+                        } else if (snap.hardwareState == HardwarePipelineState.EXCLUSIVE_MUTED) {
+                            // 💡 未 TEARDOWN 的暂停恢复：先解除 Native 显式暂停标记以放行新到音频帧进 Sync 门控，
+                            // 但业务态停留在 TRANSITIONING，等真实有声帧过 Sync 门控触发 FirstDataPacketEvent 再切 PLAYING！
+                            effects += TransitionEffect.ResumeNativeOutput
+                        }
+                    }
+                }
                 effects += TransitionEffect.EnqueueDacpCommand(ev.commandType, cmdId)
                 effects += TransitionEffect.ScheduleUiProtection(windowToken)
                 effects += TransitionEffect.ScheduleRemoteCommandTimeout(cmdId)
 
                 val nextSnap = snap.copy(
                     businessState = BusinessSessionState.TRANSITIONING,
-                    hardwareState = muteIfExclusive(snap.hardwareState),
+                    hardwareState = if (isPlayResumeCommand) snap.hardwareState else muteIfExclusive(snap.hardwareState),
                     uiProtectionActive = true,
                     errors = clearTransientCommandErrors(snap.errors),
                     transitionOriginState = preState
@@ -400,6 +464,7 @@ internal object TriStateTransitionMatrix {
                         snapshot = nextSnap,
                         activeUiProtectionToken = windowToken,
                         activeRemoteCommandId = cmdId,
+                        activeRemoteCommandType = ev.commandType,
                         preCommandBusinessState = preState
                     ),
                     effects
@@ -421,15 +486,17 @@ internal object TriStateTransitionMatrix {
 
             is RemoteCommandTimeoutEvent -> return rollbackRemoteCommandFailure(
                 ctx = ctx,
+                trackManager = trackManager,
                 commandId = ev.commandId,
                 errorCode = ErrorCode.REMOTE_COMMAND_TIMEOUT,
-                message = "远端设备未响应切歌指令",
+                message = if (ctx.activeRemoteCommandType == RemoteCommandType.PLAY) "远端设备未响应播放指令" else "远端设备未响应切歌指令",
                 nowMs = nowMs,
                 cancelTimeout = false
             )
 
             is RemoteCommandFailedEvent -> return rollbackRemoteCommandFailure(
                 ctx = ctx,
+                trackManager = trackManager,
                 commandId = ev.commandId,
                 errorCode = ev.errorCode,
                 message = ev.message,
@@ -440,6 +507,12 @@ internal object TriStateTransitionMatrix {
             is StreamResumeEvent -> {
                 if (snap.businessState == BusinessSessionState.IDLE ||
                     snap.businessState == BusinessSessionState.STOPPED
+                ) {
+                    return TransitionOutput(ctx, emptyList())
+                }
+                // 💡 严禁在 AirPlay 传输通道已断开 (TEARDOWN DISCONNECTED) 时直接强切 STREAMING/PLAYING 引发虚空播放
+                if (snap.activeProtocol == StreamProtocol.AIRPLAY_1 &&
+                    snap.transportState == TransportPipeState.DISCONNECTED
                 ) {
                     return TransitionOutput(ctx, emptyList())
                 }
@@ -471,7 +544,15 @@ internal object TriStateTransitionMatrix {
                             uiProtectionActive = false,
                             transitionOriginState = null
                         )
-                        TransitionOutput(ctx.copy(snapshot = nextSnap, pendingDebounceToken = 0L), effects)
+                        TransitionOutput(
+                            ctx.copy(
+                                snapshot = nextSnap,
+                                pendingDebounceToken = 0L,
+                                activeRemoteCommandId = 0L,
+                                activeRemoteCommandType = null
+                            ),
+                            effects
+                        )
                     }
                 }
             }
@@ -655,6 +736,7 @@ internal object TriStateTransitionMatrix {
                 // 一旦确立新曲目边界 (result.accepted)，立即结束遥控切歌过渡态、取消 5 秒超时并恢复声卡输出与播放时钟！
                 val isCompletingRemoteSkip = result.accepted &&
                     snap.businessState == BusinessSessionState.TRANSITIONING &&
+                    ctx.activeRemoteCommandType != RemoteCommandType.PLAY &&
                     (ctx.activeRemoteCommandId != 0L || snap.transitionOriginState != null) &&
                     snap.transportState != TransportPipeState.PREPARING
 
@@ -701,6 +783,7 @@ internal object TriStateTransitionMatrix {
                     ctx.copy(
                         snapshot = nextSnap,
                         activeRemoteCommandId = if (isCompletingRemoteSkip) 0L else ctx.activeRemoteCommandId,
+                        activeRemoteCommandType = if (isCompletingRemoteSkip) null else ctx.activeRemoteCommandType,
                         activeUiProtectionToken = if (isCompletingRemoteSkip) 0L else ctx.activeUiProtectionToken
                     ),
                     effects
@@ -783,30 +866,66 @@ internal object TriStateTransitionMatrix {
         }
     }
 
-    private fun transitionToStopped(
+    /**
+     * 💡 停止播放 / 确认断联的统一收敛入口：
+     * 不管停止前处于何种状态（PLAYING / TRANSITIONING / PAUSED），立即断开会话直达 IDLE，
+     * 清理元数据与进度并通知协议层回收凭据；USB 声卡保持 EXCLUSIVE_MUTED，独立按空闲让渡定时器释放。
+     */
+    private fun disconnectSessionToIdle(
         ctx: TransitionContext,
+        trackManager: TrackTransactionManager,
         effects: MutableList<TransitionEffect>,
         newEpoch: Long,
-        scheduleIdleRelease: Boolean
+        scheduleIdleRelease: Boolean,
+        notifyProtocol: Boolean,
+        extraError: Pair<ErrorCode, PlaybackError>? = null
     ): TransitionOutput {
+        val snap = ctx.snapshot
         effects += TransitionEffect.CancelDebouncePause
         effects += TransitionEffect.CancelSuspendTimeout
         effects += TransitionEffect.CancelRemoteCommandTimeout
         effects += TransitionEffect.CancelCoverGraceTimeout
         effects += TransitionEffect.CancelTransitionTimeout
+        if (notifyProtocol && snap.sessionId != 0L && snap.activeProtocol != StreamProtocol.NONE) {
+            effects += TransitionEffect.NotifyPreemptedProtocol(snap.activeProtocol, snap.sessionId)
+        }
         if (scheduleIdleRelease) {
             effects += TransitionEffect.ScheduleHardwareIdleTimeout
         }
-        val nextSnap = ctx.snapshot.copy(
+        trackManager.reset()
+        val nextHw = muteIfExclusive(snap.hardwareState)
+        val baseErrors = clearTransientCommandErrors(snap.errors)
+        val nextErrors = if (extraError != null) baseErrors + extraError else baseErrors
+        val nextSnap = snap.copy(
+            sessionId = 0L,
             transportState = TransportPipeState.DISCONNECTED,
-            businessState = BusinessSessionState.STOPPED,
-            hardwareState = muteIfExclusive(ctx.snapshot.hardwareState),
+            businessState = BusinessSessionState.IDLE,
+            hardwareState = nextHw,
+            activeProtocol = StreamProtocol.NONE,
             currentEpoch = newEpoch,
-            errors = clearTransientCommandErrors(ctx.snapshot.errors),
+            metadata = trackManager.currentMetadata,
+            audioPath = snap.audioPath.copy(
+                isExclusive = isExclusiveActiveOrReconfiguring(nextHw),
+                protocol = StreamProtocol.NONE
+            ),
+            progressPositionMs = 0L,
+            progressDurationMs = 0L,
+            progressRevision = snap.progressRevision + 1L,
+            lastProgressFromUserSeek = false,
+            errors = nextErrors,
             uiProtectionActive = false,
             transitionOriginState = null
         )
-        return TransitionOutput(ctx.copy(snapshot = nextSnap, pendingDebounceToken = 0L), effects)
+        return TransitionOutput(
+            ctx.copy(
+                snapshot = nextSnap,
+                pendingDebounceToken = 0L,
+                activeRemoteCommandId = 0L,
+                activeRemoteCommandType = null,
+                activeUiProtectionToken = 0L
+            ),
+            effects
+        )
     }
 
     private fun resetSessionToIdle(
@@ -843,6 +962,7 @@ internal object TriStateTransitionMatrix {
      */
     private fun rollbackRemoteCommandFailure(
         ctx: TransitionContext,
+        trackManager: TrackTransactionManager,
         commandId: Long,
         errorCode: ErrorCode,
         message: String,
@@ -858,7 +978,32 @@ internal object TriStateTransitionMatrix {
             effects += TransitionEffect.CancelRemoteCommandTimeout
         }
         effects += TransitionEffect.CancelTransitionTimeout
+        // 💡 若在 TEARDOWN 断开挂起态点击播放 (RemoteCommandType.PLAY) 但 DACP 失败或超时，
+        // 说明 iPhone 已彻底断开，直接断开会话归 IDLE 避免僵尸挂起与虚空播放！
+        if (ctx.activeRemoteCommandType == RemoteCommandType.PLAY &&
+            snap.transportState == TransportPipeState.DISCONNECTED
+        ) {
+            val err = PlaybackError(
+                code = errorCode,
+                message = "发送端已断开连接",
+                recoverable = true,
+                timestampMs = nowMs
+            )
+            effects += TransitionEffect.ScheduleTransientErrorDismiss(errorCode, nowMs)
+            return disconnectSessionToIdle(
+                ctx = ctx,
+                trackManager = trackManager,
+                effects = effects,
+                newEpoch = snap.currentEpoch,
+                scheduleIdleRelease = true,
+                notifyProtocol = true,
+                extraError = errorCode to err
+            )
+        }
         val fallbackState = ctx.preCommandBusinessState
+        if (fallbackState == BusinessSessionState.PAUSED) {
+            effects += TransitionEffect.ScheduleSuspendTimeout(snap.sessionId)
+        }
         val nextHw = if (fallbackState == BusinessSessionState.PLAYING &&
             isExclusiveActiveOrReconfiguring(snap.hardwareState)
         ) {
@@ -885,6 +1030,7 @@ internal object TriStateTransitionMatrix {
             ctx.copy(
                 snapshot = nextSnap,
                 activeRemoteCommandId = 0L,
+                activeRemoteCommandType = null,
                 activeUiProtectionToken = 0L
             ),
             effects

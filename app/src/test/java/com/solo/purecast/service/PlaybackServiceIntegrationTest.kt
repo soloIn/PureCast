@@ -272,12 +272,13 @@ class PlaybackServiceIntegrationTest {
         assertFalse(fx.wifiLockHeld)
         assertTrue(fx.audioFocusHeld)
 
-        // 4. 停止 -> 进入 STOPPED，放弃音频焦点并在 10s 后归还硬件进入 IDLE
+        // 4. 停止 -> 立即断开会话归 IDLE，放弃音频焦点并在 10s 后独立归还硬件
         host.stopPlayback()
         testScheduler.runCurrent()
-        assertEquals(PlaybackStatus.STOPPED, fx.lastStatus)
+        assertEquals(PlaybackStatus.IDLE, fx.lastStatus)
         assertFalse(fx.wifiLockHeld)
         assertFalse(fx.audioFocusHeld)
+        assertEquals(0, hw.releaseCalls)
 
         testScheduler.advanceTimeBy(10_500L)
         testScheduler.runCurrent()
@@ -322,14 +323,24 @@ class PlaybackServiceIntegrationTest {
         testScheduler.runCurrent()
         assertTrue(fx.preempted.contains(StreamProtocol.UPNP_DLNA to upnpSid))
 
-        // 3. AirPlay TEARDOWN 软挂起 -> 10 分钟后触发彻底清理释放硬件并终止 AirPlay DACP
+        // 3. AirPlay 暂停后 TEARDOWN 软挂起 -> 10 分钟后触发彻底清理释放硬件并终止 AirPlay DACP
+        coord.dispatch(
+            SessionEventEnvelope(
+                origin = EventOrigin.USER_ACTION,
+                sessionId = airSid,
+                deviceGeneration = 0L,
+                sequence = coord.allocateSequence(),
+                timestampElapsedMs = 3L,
+                payload = com.solo.purecast.core.session.ExplicitPauseEvent(epoch = 11L)
+            )
+        )
         coord.dispatch(
             SessionEventEnvelope(
                 origin = EventOrigin.AIRPLAY,
                 sessionId = airSid,
                 deviceGeneration = 0L,
                 sequence = coord.allocateSequence(),
-                timestampElapsedMs = 3L,
+                timestampElapsedMs = 4L,
                 payload = StreamTeardownEvent(hardStop = false)
             )
         )
@@ -543,12 +554,12 @@ class PlaybackServiceIntegrationTest {
             )
         )
         testScheduler.runCurrent()
-        assertEquals(BusinessSessionState.STOPPED, coord.snapshot.value.businessState)
+        assertEquals(BusinessSessionState.IDLE, coord.snapshot.value.businessState)
 
         val resBefore = hw.resumeCalls
         host.resumePlayback()
         testScheduler.runCurrent()
-        assertEquals(BusinessSessionState.STOPPED, coord.snapshot.value.businessState)
+        assertEquals(BusinessSessionState.IDLE, coord.snapshot.value.businessState)
         assertEquals(resBefore, hw.resumeCalls)
 
         host.stop()
@@ -642,6 +653,59 @@ class PlaybackServiceIntegrationTest {
         testScheduler.runCurrent()
         assertEquals(PlaybackStatus.PAUSED, fx.lastStatus)
         assertEquals(HardwarePipelineState.EXCLUSIVE_MUTED, coord.snapshot.value.hardwareState)
+
+        host.stop()
+    }
+
+    @Test
+    fun `AirPlay resumePlayback ignores PLAYING state and routes PAUSED via tracked DACP PLAY`() = runTest {
+        val hw = FakeHardwareBridge()
+        val fx = FakeSystemEffects()
+        val testScope = TestScope(StandardTestDispatcher(testScheduler))
+        val (host, coord) = testScope.createHost(hw, fx)
+
+        val ep = host.acquireHardwareForStream(StreamProtocol.AIRPLAY_1, 44100, 16, 2, "ALAC")
+        val sid = host.nextSessionId()
+        coord.dispatch(
+            SessionEventEnvelope(
+                origin = EventOrigin.AIRPLAY,
+                sessionId = sid,
+                deviceGeneration = 0L,
+                sequence = coord.allocateSequence(),
+                timestampElapsedMs = 1L,
+                payload = StreamSetupEvent(StreamProtocol.AIRPLAY_1, 44100, 16, 2, "ALAC", ep)
+            )
+        )
+        coord.dispatch(
+            SessionEventEnvelope(
+                origin = EventOrigin.AIRPLAY,
+                sessionId = sid,
+                deviceGeneration = 0L,
+                sequence = coord.allocateSequence(),
+                timestampElapsedMs = 2L,
+                payload = FirstDataPacketEvent(StreamProtocol.AIRPLAY_1, ep, 44100, 16, 2, "ALAC")
+            )
+        )
+        testScheduler.runCurrent()
+        assertEquals(BusinessSessionState.PLAYING, coord.snapshot.value.businessState)
+
+        // PLAYING 态误按播放键或音频焦点恢复 -> 直接忽略，不切 TRANSITIONING、不发 DACP
+        fx.dacpSent.clear()
+        host.resumePlayback()
+        testScheduler.runCurrent()
+        assertEquals(BusinessSessionState.PLAYING, coord.snapshot.value.businessState)
+        assertTrue(fx.dacpSent.isEmpty())
+
+        // 暂停进入 PAUSED 后再调用 resumePlayback() -> 走受追踪 DACP PLAY 进入 TRANSITIONING
+        host.pausePlayback()
+        testScheduler.runCurrent()
+        assertEquals(BusinessSessionState.PAUSED, coord.snapshot.value.businessState)
+
+        fx.dacpSent.clear()
+        host.resumePlayback()
+        testScheduler.runCurrent()
+        assertEquals(BusinessSessionState.TRANSITIONING, coord.snapshot.value.businessState)
+        assertEquals(listOf("PLAY"), fx.dacpSent.toList())
 
         host.stop()
     }

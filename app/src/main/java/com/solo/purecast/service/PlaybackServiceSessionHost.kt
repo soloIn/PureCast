@@ -209,7 +209,8 @@ class PlaybackServiceSessionHost(
         if (snap.sessionId == 0L ||
             snap.activeProtocol == StreamProtocol.NONE ||
             snap.businessState == BusinessSessionState.IDLE ||
-            snap.businessState == BusinessSessionState.STOPPED
+            snap.businessState == BusinessSessionState.STOPPED ||
+            snap.businessState == BusinessSessionState.PLAYING
         ) {
             Logger.service.d(
                 TAG,
@@ -220,7 +221,11 @@ class PlaybackServiceSessionHost(
 
         systemEffects.requestAudioFocus()
         if (snap.activeProtocol == StreamProtocol.AIRPLAY_1) {
-            coordinator.sendDacpFireAndForget(RemoteCommandType.PLAY)
+            // 💡 AirPlay 1 恢复播放严禁同步乐观强切 PLAYING（防止 TEARDOWN 断开后虚空播放与 1.75s 预充抢跑）：
+            // 通过受追踪的串行 DACP PLAY 指令进入 TRANSITIONING，等真实有声帧过 Sync 门控再切 PLAYING；
+            // 若对端已断开导致 DACP PLAY 失败/超时，由状态机自动终止会话。
+            dispatchRemoteCommand(RemoteCommandType.PLAY)
+            return
         } else if (snap.activeProtocol == StreamProtocol.UPNP_DLNA) {
             systemEffects.notifyUpnpTransportState("PLAYING")
         }

@@ -48,7 +48,9 @@ class LyricsTriggerManager(
     @Volatile
     private var latestSnapshot: PlayerSessionSnapshot? = null
 
+    @Volatile
     private var inFlightFetchJob: Job? = null
+    @Volatile
     private var inFlightRecalibrateJob: Job? = null
 
     // 💡 30 秒失败退避黑名单 (Key -> ExpirationTimestampMs)
@@ -202,27 +204,42 @@ class LyricsTriggerManager(
 
         if (hasSignificantDurationChange && inFlightRecalibrateJob == null) {
             val generation = snapshot.trackGeneration
-            val artist = snapshot.metadata.artist
-            val title = snapshot.metadata.title
-            val album = snapshot.metadata.album
+            val expectedSignature = lastTriggeredSignature
             val currentTimeline = currentState.timeline
-
-            Logger.lyrics.i(TAG, "检测到时长延迟补丁更新 ($currentActiveDurationMs -> ${newDurationMs}ms)，启动静默重校准比分")
 
             inFlightRecalibrateJob = scope.launch {
                 try {
-                    val recalibrated = waterfallFetcher.fetch(artist, title, newDurationMs, album)
+                    // 💡 防抖等待：AirPlay 切歌时 TrackBoundaryEvent 先更新 generation 与新曲时长，数毫秒后 MetadataPatchEvent 才更新新歌名；
+                    // 若在防抖期内歌名变更（handleMetadataReady 会取消本协程），可彻底避免以“旧歌名 + 新时长”发起无效网络检索。
+                    delay(debounceDelayMs)
 
-                    if (generation == currentTrackGeneration) {
+                    if (generation != currentTrackGeneration) return@launch
+                    val latestMeta = latestSnapshot?.metadata ?: snapshot.metadata
+                    if (buildMetadataSignature(latestMeta) != expectedSignature) return@launch
+
+                    val confirmedDurationMs = latestMeta.durationMs
+                    val stillSignificant = (currentActiveDurationMs <= 0L && confirmedDurationMs > 0L) ||
+                        (currentActiveDurationMs > 0L && confirmedDurationMs > 0L && abs(currentActiveDurationMs - confirmedDurationMs) > 3000L)
+                    if (!stillSignificant) return@launch
+
+                    val artist = if (MetadataNormalizer.isPlaceholderArtist(latestMeta.artist)) "" else latestMeta.artist
+                    val title = latestMeta.title
+                    val album = latestMeta.album
+
+                    Logger.lyrics.i(TAG, "检测到时长延迟补丁更新 ($currentActiveDurationMs -> ${confirmedDurationMs}ms)，启动静默重校准比分")
+
+                    val recalibrated = waterfallFetcher.fetch(artist, title, confirmedDurationMs, album)
+
+                    if (generation == currentTrackGeneration && expectedSignature == lastTriggeredSignature) {
                         // 💡 标记该目标时长已完成重校准评估，避免未胜出或返回空时在后续快照上反复重触发
-                        currentActiveDurationMs = newDurationMs
+                        currentActiveDurationMs = confirmedDurationMs
 
                         if (recalibrated != null) {
                             // 💡 Finding 7 修复：严格打分比对，只有新抓取歌词得分高于当前歌词才予以平滑置换
                             val oldScore = LyricCandidateScorer.evaluate(
                                 expectedArtist = artist,
                                 expectedTitle = title,
-                                expectedDurationMs = newDurationMs,
+                                expectedDurationMs = confirmedDurationMs,
                                 candidateArtist = artist,
                                 candidateTitle = title,
                                 candidateDurationMs = currentTimeline.durationMs,
@@ -231,7 +248,7 @@ class LyricsTriggerManager(
                             val newScore = LyricCandidateScorer.evaluate(
                                 expectedArtist = artist,
                                 expectedTitle = title,
-                                expectedDurationMs = newDurationMs,
+                                expectedDurationMs = confirmedDurationMs,
                                 candidateArtist = artist,
                                 candidateTitle = title,
                                 candidateDurationMs = recalibrated.durationMs,

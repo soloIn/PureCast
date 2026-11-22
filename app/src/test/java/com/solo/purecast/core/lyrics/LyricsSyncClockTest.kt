@@ -581,4 +581,62 @@ class LyricsSyncClockTest {
         assertEquals(1, stateSwitched.lineIndex)
         assertEquals(1, stateSwitched.scrollLineIndex)
     }
+
+    @Test
+    fun `overlapping previous line endMs never bounces activeLineIndex backward after current line finishes`() {
+        val timeline = LyricTimeline(
+            source = "test",
+            format = LyricFormat.TTML_SYLLABLE,
+            lines = listOf(
+                // 模拟上一行带有长和声拖尾，其 endMs 覆盖并超过下一行
+                LyricLine(
+                    lineIndex = 0,
+                    startMs = 10_000L,
+                    endMs = 16_000L,
+                    mainText = "Previous line with long tail",
+                    words = listOf(LyricWord("Previous", 10_000L, 12_500L))
+                ),
+                LyricLine(
+                    lineIndex = 1,
+                    startMs = 13_000L,
+                    endMs = 14_500L,
+                    mainText = "Current short line",
+                    words = listOf(LyricWord("Current", 13_000L, 14_500L))
+                ),
+                LyricLine(
+                    lineIndex = 2,
+                    startMs = 15_500L,
+                    endMs = 18_000L,
+                    mainText = "Next line",
+                    words = listOf(LyricWord("Next", 15_500L, 18_000L))
+                )
+            )
+        )
+
+        // 14_501ms：第 1 行刚唱完，尚未到第 2 行激活点；绝不能因第 0 行 endMs=16_000ms 而倒跳回 0 引发闪暗回跳
+        assertEquals(1, syncClock.calculateActiveLineIndex(timeline, 14_501L))
+        assertEquals(1, syncClock.calculateActiveLineIndex(timeline, 15_000L))
+    }
+
+    @Test
+    fun `line-sync lead-in constants provide settle gap between scroll start and highlight`() {
+        val timeline = LyricTimeline(
+            source = "lrc",
+            format = LyricFormat.LRC_LINE_SYNC,
+            lines = listOf(
+                LyricLine(lineIndex = 0, startMs = 5_000L, endMs = 10_000L, mainText = "Line 0"),
+                LyricLine(lineIndex = 1, startMs = 10_000L, endMs = 15_000L, mainText = "Line 1")
+            )
+        )
+
+        // 9_450ms (startMs - 550ms)：非逐字行开始上滑，但此时尚未高亮（仍保持第 0 行高亮）
+        assertEquals(1, syncClock.calculateScrollLineIndex(timeline, 9_450L, LyricsSyncClock.LINE_SYNC_SCROLL_LEAD_IN_MS))
+        assertEquals(0, syncClock.calculateActiveLineIndex(timeline, 9_450L, LyricsSyncClock.LINE_SYNC_HIGHLIGHT_LEAD_IN_MS))
+
+        // 9_850ms：弹簧已基本落位停稳，仍留有短暂静止间隙
+        assertEquals(0, syncClock.calculateActiveLineIndex(timeline, 9_850L, LyricsSyncClock.LINE_SYNC_HIGHLIGHT_LEAD_IN_MS))
+
+        // 9_900ms (startMs - 100ms)：落位后干脆点亮第 1 行
+        assertEquals(1, syncClock.calculateActiveLineIndex(timeline, 9_900L, LyricsSyncClock.LINE_SYNC_HIGHLIGHT_LEAD_IN_MS))
+    }
 }

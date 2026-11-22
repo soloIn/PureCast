@@ -79,6 +79,7 @@ class PlaybackService : LifecycleService() {
     private lateinit var settingsRepository: SettingsRepository
     private lateinit var coordinator: PlaybackSessionCoordinator
     private lateinit var sessionHost: PlaybackServiceSessionHost
+    private lateinit var lyricsCacheRepository: LyricsCacheRepository
     private lateinit var lyricsTriggerManager: LyricsTriggerManager
 
     private val fastPath = HardwareFastPathController.default
@@ -276,7 +277,7 @@ class PlaybackService : LifecycleService() {
         )
 
         // 💡 初始化歌词多源检索与生命周期防抖触发器 (U4, U7)
-        val lyricsCacheRepo = LyricsCacheRepository(
+        lyricsCacheRepository = LyricsCacheRepository(
             diskCacheDir = java.io.File(cacheDir, "lyrics")
         )
         val lyricsHttpClient = DefaultLyricsHttpClient()
@@ -284,14 +285,14 @@ class PlaybackService : LifecycleService() {
         val lrclibSource = LrclibDataSource(lyricsHttpClient)
         val neteaseSource = NeteaseDataSource(lyricsHttpClient)
         val waterfallFetcher = LyricsWaterfallFetcher(
-            cacheRepository = lyricsCacheRepo,
+            cacheRepository = lyricsCacheRepository,
             amllDataSource = amllSource,
             lrclibDataSource = lrclibSource,
             neteaseDataSource = neteaseSource
         )
         lyricsTriggerManager = LyricsTriggerManager(
             scope = serviceEffectsScope,
-            cacheRepository = lyricsCacheRepo,
+            cacheRepository = lyricsCacheRepository,
             waterfallFetcher = waterfallFetcher
         )
 
@@ -358,6 +359,42 @@ class PlaybackService : LifecycleService() {
     }
 
     /**
+     * 💡 获取当前歌词缓存条目数与占用字节数（请在 IO 线程调用）
+     */
+    fun getLyricsCacheStats(): LyricsCacheRepository.CacheStats {
+        return if (::lyricsCacheRepository.isInitialized) {
+            lyricsCacheRepository.getCacheStats()
+        } else {
+            LyricsCacheRepository.CacheStats(0, 0L)
+        }
+    }
+
+    /**
+     * 💡 清空 L1/L2 歌词缓存及临时文件，并触发当前正在播放曲目重新检索最新歌词（请在 IO 线程调用）
+     */
+    fun clearAllCaches(): LyricsCacheRepository.CacheStats {
+        // 💡 先取消并重置在途歌词检索任务，防止在途网络结果在清盘瞬间回写旧缓存
+        if (::lyricsTriggerManager.isInitialized) {
+            lyricsTriggerManager.reset()
+        }
+        val stats = if (::lyricsCacheRepository.isInitialized) {
+            lyricsCacheRepository.clearAll()
+        } else {
+            LyricsCacheRepository.CacheStats(0, 0L)
+        }
+        if (::lyricsTriggerManager.isInitialized && ::coordinator.isInitialized) {
+            val currentSnap = coordinator.snapshot.value
+            serviceEffectsScope.launch {
+                if (currentSnap.sessionId != 0L) {
+                    lyricsTriggerManager.onSessionSnapshotChanged(currentSnap)
+                }
+            }
+        }
+        Logger.service.i(TAG, "用户主动清空缓存完成: count=${stats.fileCount}, bytes=${stats.totalBytes}")
+        return stats
+    }
+
+    /**
      * 💡 开机冷启动阶段 Wi-Fi 就绪兜底守护：前 60 秒定期自检并刷新网络广播
      */
     private fun startBootNetworkWatchdog() {
@@ -365,15 +402,21 @@ class PlaybackService : LifecycleService() {
             val checkDelays = listOf(2000L, 3000L, 5000L, 5000L, 10000L, 15000L, 20000L)
             for (d in checkDelays) {
                 delay(d)
+                val airplayEnabled = settingsRepository.isAirPlayEnabled()
+                val upnpEnabled = settingsRepository.isUpnpEnabled()
                 val airplayBound = airPlayServer?.getCurrentBoundIp()
                 val upnpBound = upnpServer?.getActiveIpAddress()
 
-                val isAirplayOk = airplayBound != null &&
-                    airplayBound.hostAddress?.startsWith("192.168.48.") != true &&
-                    airplayBound.hostAddress?.startsWith("127.") != true
-                val isUpnpOk = upnpBound != null &&
-                    !upnpBound.startsWith("192.168.48.") &&
-                    upnpBound != "127.0.0.1"
+                val isAirplayOk = !airplayEnabled || (
+                    airplayBound != null &&
+                        airplayBound.hostAddress?.startsWith("192.168.48.") != true &&
+                        airplayBound.hostAddress?.startsWith("127.") != true
+                    )
+                val isUpnpOk = !upnpEnabled || (
+                    upnpBound != null &&
+                        !upnpBound.startsWith("192.168.48.") &&
+                        upnpBound != "127.0.0.1"
+                    )
 
                 if (!isAirplayOk || !isUpnpOk) {
                     Logger.service.i(

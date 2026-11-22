@@ -64,6 +64,22 @@ object LyricCandidateScorer {
         val cleanCandArtist = MetadataNormalizer.normalizeArtist(candidateArtist)
         val isArtistUnknown = MetadataNormalizer.isPlaceholderArtist(expectedArtist)
 
+        // 💡 续集/分部编号强校验（例如 "Love the Way You Lie, Pt. 2" 绝不允许命中 "Love the Way You Lie" Part 1）
+        val expPartTag = extractPartTag(cleanExpTitle)
+        val candPartTag = extractPartTag(cleanCandTitle)
+        if (expPartTag != candPartTag) {
+            return ScoreResult(
+                totalScore = 0.0f,
+                isPassed = false,
+                isInstrumental = false,
+                titleScore = 0.0f,
+                artistScore = 0.0f,
+                durationScore = 0.0f,
+                formatScore = 0.0f,
+                vetoReason = "续集/分部编号不匹配: expected=$expPartTag, candidate=$candPartTag"
+            )
+        }
+
         // 2. 歌名相似度 (若歌手已知为 40 分；若歌手未知，自适应提升权重至 60 分)
         val titleSim = MetadataNormalizer.calculateSimilarity(cleanExpTitle, cleanCandTitle)
         val titleScore = if (isArtistUnknown) titleSim * 60.0f else titleSim * 40.0f
@@ -156,5 +172,19 @@ object LyricCandidateScorer {
             lower.contains("karaoke") ||
             lower.contains("off vocal") ||
             lower.contains("backing track")
+    }
+
+    private val PART_TAG_REGEX = Regex("""\b(?:pt|part)\s*(\d+|ii|iii|iv|v)\b""", RegexOption.IGNORE_CASE)
+
+    private fun extractPartTag(normalizedTitle: String): String? {
+        val match = PART_TAG_REGEX.find(normalizedTitle) ?: return null
+        return when (val raw = match.groupValues[1].lowercase()) {
+            "1", "i" -> null
+            "ii" -> "2"
+            "iii" -> "3"
+            "iv" -> "4"
+            "v" -> "5"
+            else -> raw
+        }
     }
 }

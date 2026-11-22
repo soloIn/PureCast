@@ -149,18 +149,19 @@ internal class MacTextureView(
         private var outputWidth = -1
         private var outputHeight = -1
         private var renderer: MacRenderer? = null
+        @Volatile private var rendererAnimating = false
         private var uploaded: Bitmap? = null
         private var contextRestarts = 0
 
-        private var choreographer: Choreographer? = null
-        private val vsyncFrame = Choreographer.FrameCallback { onVsync() }
-        private var vsyncFrameCount = 0L
-
-        private fun shouldContinueVsync(state: FluidRenderState): Boolean =
-            !stopping.get() && !closed && active && state.quality.animated && (state.playing || renderer?.isAnimating == true)
-
-        private fun onVsync() {
-            if (!stopping.get() && !closed && active) {
+        private val mainHandler = Handler(android.os.Looper.getMainLooper())
+        private val frameQueued = AtomicBoolean(false)
+        private val vsyncRunning = AtomicBoolean(false)
+        private val vsyncFrame = object : Choreographer.FrameCallback {
+            override fun doFrame(frameTimeNanos: Long) {
+                if (stopping.get() || closed || !active || !vsyncRunning.get()) {
+                    vsyncRunning.set(false)
+                    return
+                }
                 val state = renderState
 
                 // 💡 帧率节流：按 60Hz VSYNC 精确分频（例如 30fps -> 每 2 帧渲染 1 次，20fps -> 每 3 帧渲染 1 次）
@@ -170,27 +171,57 @@ internal class MacTextureView(
                     1L
                 }
                 vsyncFrameCount++
-                if (stride > 1L && (vsyncFrameCount % stride != 0L)) {
-                    if (shouldContinueVsync(state)) {
-                        choreographer?.postFrameCallback(vsyncFrame)
+                val shouldDrawThisTick = stride <= 1L || (vsyncFrameCount % stride == 0L)
+                if (shouldDrawThisTick && ::handler.isInitialized && frameQueued.compareAndSet(false, true)) {
+                    if (!handler.post(frame)) {
+                        frameQueued.set(false)
                     }
-                    return
                 }
 
-                render()
+                // 💡 当 state.playing == false（暂停或停止）且无材质交叉淡入渐变或已被取消时，停止主线程 choreographer 回调，GPU 占用直接降至 0%
+                if (vsyncRunning.get() && shouldContinueVsync(state)) {
+                    Choreographer.getInstance().postFrameCallback(this)
+                } else {
+                    vsyncRunning.set(false)
+                }
+            }
+        }
+        private var vsyncFrameCount = 0L
 
-                // 💡 当 state.playing == false（暂停或停止）且无材质交叉淡入渐变时，停止 choreographer 回调，GPU 占用直接降至 0%
-                if (shouldContinueVsync(state)) {
-                    choreographer?.postFrameCallback(vsyncFrame)
+        private fun shouldContinueVsync(state: FluidRenderState): Boolean =
+            !stopping.get() && !closed && active && state.quality.animated && (state.playing || rendererAnimating)
+
+        private val frame = Runnable {
+            frameQueued.set(false)
+            render()
+            // 💡 首帧或 wake() 唤醒渲染后，若主线程 VSYNC 尚未启动且仍需持续动画，启动主线程 Choreographer 续订
+            val state = renderState
+            if (shouldContinueVsync(state) && !vsyncRunning.get()) {
+                scheduleMainVsync()
+            }
+        }
+
+        private fun scheduleMainVsync() {
+            if (!vsyncRunning.compareAndSet(false, true)) return
+            mainHandler.post {
+                if (!stopping.get() && !closed && active && vsyncRunning.get()) {
+                    val c = Choreographer.getInstance()
+                    c.removeFrameCallback(vsyncFrame)
+                    c.postFrameCallback(vsyncFrame)
+                } else {
+                    vsyncRunning.set(false)
                 }
             }
         }
 
-        private val frame = Runnable {
-            render()
-            val state = renderState
-            if (shouldContinueVsync(state)) {
-                choreographer?.postFrameCallback(vsyncFrame)
+        private fun cancelMainVsync() {
+            vsyncRunning.set(false)
+            if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+                Choreographer.getInstance().removeFrameCallback(vsyncFrame)
+            } else {
+                mainHandler.post {
+                    Choreographer.getInstance().removeFrameCallback(vsyncFrame)
+                }
             }
         }
 
@@ -199,7 +230,6 @@ internal class MacTextureView(
             handler = Handler(thread.looper)
             handler.post {
                 try {
-                    choreographer = Choreographer.getInstance()
                     createEgl()
                     schedule()
                 } catch (e: Exception) {
@@ -216,10 +246,15 @@ internal class MacTextureView(
 
         private fun schedule() {
             handler.removeCallbacks(frame)
-            choreographer?.removeFrameCallback(vsyncFrame)
+            frameQueued.set(false)
+            cancelMainVsync()
             if (!stopping.get() && !closed && active && renderer != null) {
                 renderer?.resetFrameClock()
-                handler.post(frame)
+                if (frameQueued.compareAndSet(false, true)) {
+                    if (!handler.post(frame)) {
+                        frameQueued.set(false)
+                    }
+                }
             }
         }
 
@@ -239,6 +274,7 @@ internal class MacTextureView(
                 val state = renderState
                 ensureOutputSurface(w, h)
                 visibleFrame = r.render(w, h, state, now, w, h)
+                rendererAnimating = r.isAnimating
                 // 💡 仅在成功完成有效帧渲染时才交换缓冲区，避免未就绪时向大屏输出黑底或残留帧
                 if (visibleFrame) {
                     if (!EGL14.eglSwapBuffers(display, eglSurface)) {
@@ -314,6 +350,7 @@ internal class MacTextureView(
         }
 
         private fun destroyEgl() {
+            rendererAnimating = false
             runCatching { renderer?.release() }
             renderer = null
             uploaded = null
@@ -346,9 +383,10 @@ internal class MacTextureView(
 
         fun stopAsync() {
             if (stopping.compareAndSet(false, true) && ::handler.isInitialized) {
+                cancelMainVsync()
                 handler.post {
                     handler.removeCallbacks(frame)
-                    choreographer?.removeFrameCallback(vsyncFrame)
+                    frameQueued.set(false)
                     destroyEgl()
                     thread.quitSafely()
                 }
@@ -357,11 +395,12 @@ internal class MacTextureView(
 
         fun stopSync() {
             if (stopping.compareAndSet(false, true) && ::handler.isInitialized) {
+                cancelMainVsync()
                 val latch = CountDownLatch(1)
                 val posted = handler.post {
                     try {
                         handler.removeCallbacks(frame)
-                        choreographer?.removeFrameCallback(vsyncFrame)
+                        frameQueued.set(false)
                         destroyEgl()
                     } finally {
                         latch.countDown()

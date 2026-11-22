@@ -31,6 +31,10 @@ class AirPlayServerManager(
     companion object {
         private const val TAG = "AirPlayServerManager"
         const val DEFAULT_RTSP_PORT = 5000
+        private const val TEARDOWN_INITIAL_PROBE_DELAY_MS = 300L
+        private const val SUSPEND_HEARTBEAT_INTERVAL_MS = 3_000L
+        private const val DACP_RECONNECT_GRACE_MS = 1_500L
+        private const val DACP_PROBE_TIMEOUT_MS = 500L
     }
 
     constructor(
@@ -67,13 +71,109 @@ class AirPlayServerManager(
     private var currentPort = DEFAULT_RTSP_PORT
     private var currentDeviceName = "PureCast"
     private val serverLock = Any()
+    private val dacpLivenessLock = Any()
     private var broadcastJob: Job? = null
+    private var dacpLivenessJob: Job? = null
+    private var dacpRemovedVerifyJob: Job? = null
+    @Volatile
+    private var probingSessionId: Long = 0L
+    @Volatile
+    private var pendingBroadcastIp: java.net.InetAddress? = null
 
     @Volatile
     var isRtpActive: Boolean = false
         private set
 
-    private val nativeDispatcher = AirPlayNativeEventDispatcher(
+    private fun cancelDacpLivenessMonitor() {
+        synchronized(dacpLivenessLock) {
+            probingSessionId = 0L
+            dacpLivenessJob?.cancel()
+            dacpLivenessJob = null
+            dacpRemovedVerifyJob?.cancel()
+            dacpRemovedVerifyJob = null
+        }
+    }
+
+    /**
+     * 💡 DACP 存活探活裁决器：
+     * RTSP TEARDOWN 到达后，不依赖不确定的前置状态与时间间隔，统一由 DACP 端口存活状态裁决：
+     * 1) 无已解析 DACP 端点（不支持 DACP 的发端）-> 立即 hardStop=true 断开会话；
+     * 2) 延迟 300ms 首次探活失败 -> 约 0.3s 立即 hardStop=true 断开会话；
+     * 3) 首次探活成功 -> 发射 hardStop=false 进入/维持 10 分钟 PAUSED 保持态，并每 3s 轻探一次；
+     * 4) 休眠期探活失败或收到 mDNS _dacp._tcp 下线 -> 经 1500ms 换 ID 续播宽限确认后立即 hardStop=true 断开会话。
+     */
+    private fun startDacpLivenessDecision(globalSessionId: Long) {
+        if (globalSessionId <= 0L) return
+        if (!dacpClient.hasResolvedDacpEndpoint()) {
+            Logger.airplay.i(TAG, "TEARDOWN 时无可用 DACP 端点，直接判定为停止: sid=$globalSessionId")
+            nativeDispatcher.emitTeardownDecision(globalSessionId, hardStop = true, reason = "no-dacp-endpoint")
+            return
+        }
+        synchronized(dacpLivenessLock) {
+            dacpLivenessJob?.cancel()
+            dacpRemovedVerifyJob?.cancel()
+            dacpRemovedVerifyJob = null
+            probingSessionId = globalSessionId
+            dacpLivenessJob = scope.launch {
+                try {
+                    kotlinx.coroutines.delay(TEARDOWN_INITIAL_PROBE_DELAY_MS)
+                    if (isRtpActive || !nativeDispatcher.hasSession(globalSessionId)) {
+                        return@launch
+                    }
+                    val initialAlive = dacpClient.probeSessionAlive(DACP_PROBE_TIMEOUT_MS)
+                    if (isRtpActive || !nativeDispatcher.hasSession(globalSessionId)) {
+                        return@launch
+                    }
+                    if (!initialAlive) {
+                        nativeDispatcher.emitTeardownDecision(
+                            globalSessionId = globalSessionId,
+                            hardStop = true,
+                            reason = "teardown-dacp-dead"
+                        )
+                        return@launch
+                    }
+                } finally {
+                    synchronized(dacpLivenessLock) {
+                        if (probingSessionId == globalSessionId) {
+                            probingSessionId = 0L
+                        }
+                    }
+                }
+
+                // 💡 DACP 存活：确认为仅暂停休眠，进入/保持 10 分钟 PAUSED 会话并启动低频心跳
+                nativeDispatcher.emitTeardownDecision(
+                    globalSessionId = globalSessionId,
+                    hardStop = false,
+                    reason = "teardown-dacp-alive"
+                )
+
+                while (!isRtpActive && nativeDispatcher.hasSession(globalSessionId)) {
+                    kotlinx.coroutines.delay(SUSPEND_HEARTBEAT_INTERVAL_MS)
+                    if (isRtpActive || !nativeDispatcher.hasSession(globalSessionId)) {
+                        break
+                    }
+                    val alive = dacpClient.probeSessionAlive(DACP_PROBE_TIMEOUT_MS)
+                    if (!alive) {
+                        // 💡 1500ms 换 DACP-ID 续播宽限窗口，覆盖 iOS 暂停恢复前 ~0.98s 重连窗口
+                        kotlinx.coroutines.delay(DACP_RECONNECT_GRACE_MS)
+                        if (!isRtpActive && nativeDispatcher.hasSession(globalSessionId)) {
+                            val retryAlive = dacpClient.probeSessionAlive(DACP_PROBE_TIMEOUT_MS)
+                            if (!retryAlive && !isRtpActive && nativeDispatcher.hasSession(globalSessionId)) {
+                                nativeDispatcher.emitTeardownDecision(
+                                    globalSessionId = globalSessionId,
+                                    hardStop = true,
+                                    reason = "suspend-heartbeat-dead"
+                                )
+                                break
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private val nativeDispatcher: AirPlayNativeEventDispatcher = AirPlayNativeEventDispatcher(
         dispatchEvent = dispatchEvent,
         allocateSessionId = allocateSessionId,
         allocateSequence = allocateSequence,
@@ -82,11 +182,45 @@ class AirPlayServerManager(
             injectCryptoKey(aesKeyBase64, aesIvBase64)
         },
         onUpdateDacpTarget = { clientIp, dacpId, activeRemoteToken, dacpPort ->
+            cancelDacpLivenessMonitor()
             if (clientIp.isNotEmpty()) {
                 dacpClient.updateSession(clientIp, dacpPort, activeRemoteToken)
-                jmdnsDiscoveryService.resolveDacpPort(dacpId, clientIp) { resolvedPort ->
-                    dacpClient.updatePort(resolvedPort)
-                }
+                jmdnsDiscoveryService.resolveDacpPort(
+                    dacpId = dacpId,
+                    clientIp = clientIp,
+                    onPortResolved = { resolvedPort ->
+                        dacpClient.updatePort(resolvedPort)
+                    },
+                    onServiceRemoved = { serviceName ->
+                        // 💡 仅在 RTSP/RTP 通道已拆且已度过首次 300ms 探测期的休眠保持态作为快速触发通道：
+                        // 立即主动探活核验，确认不可达后走 1500ms 换 ID 续播宽限，过滤 mDNS 假抖动与续播误杀
+                        if (!isRtpActive && probingSessionId == 0L) {
+                            val targetSid = nativeDispatcher.getCurrentGlobalSessionId()
+                            if (targetSid > 0L) {
+                                synchronized(dacpLivenessLock) {
+                                    if (isRtpActive || probingSessionId != 0L) return@synchronized
+                                    dacpRemovedVerifyJob?.cancel()
+                                    dacpRemovedVerifyJob = scope.launch {
+                                        if (dacpClient.probeSessionAlive(DACP_PROBE_TIMEOUT_MS)) {
+                                            Logger.airplay.d(TAG, "忽略 mDNS 瞬态下线抖动（DACP 探活仍在线）: $serviceName")
+                                            return@launch
+                                        }
+                                        kotlinx.coroutines.delay(DACP_RECONNECT_GRACE_MS)
+                                        if (!isRtpActive && nativeDispatcher.hasSession(targetSid)) {
+                                            if (!dacpClient.probeSessionAlive(DACP_PROBE_TIMEOUT_MS)) {
+                                                nativeDispatcher.emitTeardownDecision(
+                                                    globalSessionId = targetSid,
+                                                    hardStop = true,
+                                                    reason = "mdns-removed-verified:$serviceName"
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                )
             }
         },
         onSolveChallenge = { challengeBase64 ->
@@ -94,10 +228,12 @@ class AirPlayServerManager(
         },
         onRtpActiveChanged = { active ->
             isRtpActive = active
-            // 💡 契约修复：推流 RTP/RTSP 挂起时严禁清除 DACP 会话与凭据！
-            // 在 iOS AirPlay 1 中，暂停推流时发送端会主动下发 TEARDOWN 拆除音频通道进入休眠；
-            // 必须保留 DACP 凭据，使 TV 遥控器与大屏能在 10 分钟挂起期间随时发送 PLAY 指令唤醒发送端恢复推流。
-            // DACP 凭据仅在会话彻底超时 (SuspendTimeoutEvent)、新流抢占或用户显式 Stop 时由协调器统一回收。
+            if (active) {
+                cancelDacpLivenessMonitor()
+            }
+        },
+        onStreamTeardownRequested = { globalSid ->
+            startDacpLivenessDecision(globalSid)
         },
         clockMs = clockMs
     )
@@ -119,7 +255,8 @@ class AirPlayServerManager(
             return false
         }
 
-        // 💡 修复 Finding 1: 启动 JmDns Bonjour 广播前取消未完成任务，杜绝并发竞争与实例泄漏
+        // 💡 修复 Finding 1: 启动 JmDns Bonjour 广播前取消未完成任务，并记录目标 IP 防止冷启动 NetworkCallback 重复打断
+        pendingBroadcastIp = jmdnsDiscoveryService.getLocalIpv4Address()
         broadcastJob?.cancel()
         broadcastJob = scope.launch(Dispatchers.IO) {
             jmdnsDiscoveryService.startBroadcast(deviceName, 7000, port)
@@ -132,9 +269,11 @@ class AirPlayServerManager(
     fun stop() = synchronized(serverLock) {
         if (!isRunning) return
         Logger.airplay.i(TAG, "正在停止 AirPlay 1 服务...")
+        cancelDacpLivenessMonitor()
         nativeDispatcher.resetSessions()
         broadcastJob?.cancel()
         broadcastJob = null
+        pendingBroadcastIp = null
         // 💡 使用独立于 lifecycleScope 的下线线程发送 mDNS Goodbye 包，避免 Service.onDestroy() 取消协程导致下线广播被中断
         jmdnsDiscoveryService.stopBroadcastDetached()
         NativeAudioEngine.stopAirPlayServer()
@@ -189,6 +328,7 @@ class AirPlayServerManager(
     fun updateDeviceName(newName: String) = synchronized(serverLock) {
         currentDeviceName = newName
         if (isRunning) {
+            pendingBroadcastIp = jmdnsDiscoveryService.getLocalIpv4Address()
             broadcastJob?.cancel()
             broadcastJob = scope.launch(Dispatchers.IO) {
                 jmdnsDiscoveryService.stopBroadcast()
@@ -215,9 +355,15 @@ class AirPlayServerManager(
         val currentBoundIp = jmdnsDiscoveryService.getCurrentBoundIp()
         val newIp = jmdnsDiscoveryService.getLocalIpv4Address()
 
+        // 💡 若针对同一目标 IP 的启动/重启任务已在执行中，严禁反复取消重来（否则冷启动 10ms 内触发多次注册→立刻 Goodbye 毒化 iOS mDNS 缓存）
+        if (newIp != null && broadcastJob?.isActive == true && pendingBroadcastIp == newIp) {
+            return
+        }
+
         val needRestart = newIp != null && (newIp != currentBoundIp || !jmdnsDiscoveryService.isRunning())
         if (needRestart) {
             Logger.airplay.i(TAG, "检测到有效局域网 IP 变动 (${currentBoundIp?.hostAddress} -> ${newIp?.hostAddress})，重新启动 AirPlay 广播...")
+            pendingBroadcastIp = newIp
             broadcastJob?.cancel()
             broadcastJob = scope.launch(Dispatchers.IO) {
                 jmdnsDiscoveryService.stopBroadcast()
@@ -232,6 +378,7 @@ class AirPlayServerManager(
      */
     fun clearDacpSession() {
         Logger.airplay.i(TAG, "彻底清理 DACP 会话凭据与目标监听")
+        cancelDacpLivenessMonitor()
         jmdnsDiscoveryService.clearDacpTarget()
         dacpClient.clearSession()
     }
@@ -244,11 +391,16 @@ class AirPlayServerManager(
             Logger.airplay.d(TAG, "忽略过期 AirPlay 抢占指令: targetSid=$targetGlobalSessionId")
             return
         }
-        Logger.airplay.i(TAG, "中止当前活跃 AirPlay 会话并保留 mDNS/RTSP 监听 (targetSid=$targetGlobalSessionId)")
-        NativeAudioEngine.preemptAirPlayClient()
-        NativeAudioEngine.emergencyMuteAndFlush(FlushReason.PREEMPT.nativeCode)
+        val wasRtpActive = isRtpActive
+        Logger.airplay.i(TAG, "中止当前活跃 AirPlay 会话并保留 mDNS/RTSP 监听 (targetSid=$targetGlobalSessionId, wasRtpActive=$wasRtpActive)")
+        // 💡 仅在 RTP/RTSP 仍活跃（如跨协议抢占或播放中主动停止）时才强制拆连接、刷静音并通知对端 stop；
+        // 若对端已主动 TEARDOWN（wasRtpActive=false），底层已完成停流与静音，避免与 TEARDOWN 200 OK 竞态或误停手机播放。
+        if (wasRtpActive) {
+            NativeAudioEngine.preemptAirPlayClient()
+            NativeAudioEngine.emergencyMuteAndFlush(FlushReason.PREEMPT.nativeCode)
+            dacpClient.stop()
+        }
         nativeDispatcher.resetSessions()
-        dacpClient.stop()
         clearDacpSession()
     }
 

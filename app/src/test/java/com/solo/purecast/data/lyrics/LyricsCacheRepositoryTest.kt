@@ -144,6 +144,30 @@ class LyricsCacheRepositoryTest {
         assertEquals(2000L, line.words?.get(0)?.endMs)
     }
 
+    @Test
+    fun `getCacheStats and clearAll count and wipe both L1 and L2 including tmp files`() {
+        assertEquals(LyricsCacheRepository.CacheStats(0, 0L), repository.getCacheStats())
+
+        val k1 = repository.computeCacheKey("Artist", "Song 1", 100_000L)
+        val k2 = repository.computeCacheKey("Artist", "Song 2", 200_000L)
+        repository.put(k1, sampleTimeline("Song 1"))
+        repository.put(k2, sampleTimeline("Song 2"))
+
+        val tmpFile = File(cacheDir, "orphan.tmp_12345")
+        tmpFile.writeText("temp-payload")
+
+        val stats = repository.getCacheStats()
+        assertEquals(2, stats.fileCount)
+        assertTrue("总字节数应包含 .json 与 .tmp_ 文件", stats.totalBytes > tmpFile.length())
+
+        val cleared = repository.clearAll()
+        assertEquals(2, cleared.fileCount)
+        assertEquals(stats.totalBytes, cleared.totalBytes)
+        assertEquals(LyricsCacheRepository.CacheStats(0, 0L), repository.getCacheStats())
+        assertNull("L1 与 L2 均应已清空", repository.get(k1))
+        assertFalse(tmpFile.exists())
+    }
+
     private fun sampleTimeline(title: String = "Welcome to the Hotel California"): LyricTimeline {
         return LyricTimeline(
             source = "AMLL",

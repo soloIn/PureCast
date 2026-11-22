@@ -45,9 +45,11 @@ bool wait_until(Pred pred, std::chrono::milliseconds timeout = std::chrono::mill
 int find_free_tcp_port() {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     PROTO_ASSERT(fd >= 0, "socket");
+    int opt = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
     addr.sin_port = 0;
     PROTO_ASSERT(bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0, "bind ephemeral");
     socklen_t len = sizeof(addr);
@@ -55,6 +57,17 @@ int find_free_tcp_port() {
     int port = ntohs(addr.sin_port);
     close(fd);
     return port;
+}
+
+int start_raop_server_on_free_port(RaopServer& server) {
+    for (int attempt = 0; attempt < 16; ++attempt) {
+        const int port = find_free_tcp_port();
+        if (server.start(port)) {
+            return port;
+        }
+    }
+    PROTO_ASSERT(false, "RaopServer start");
+    return -1;
 }
 
 std::string rtsp_exchange(int sock, const std::string& req) {
@@ -97,7 +110,6 @@ void test_raop_pause_guard_reopen_and_preempt() {
     PROTO_ASSERT(engine.open_device(42, 44100, 16, 2) == 0, "open AudioEngine");
     PROTO_ASSERT(wait_until([&] { return engine.get_active_transfers() > 0; }), "engine URBs active");
 
-    const int rtsp_port = find_free_tcp_port();
     RaopServer server;
 
     std::atomic<int64_t> active_ep{0};
@@ -116,7 +128,7 @@ void test_raop_pause_guard_reopen_and_preempt() {
         first_pkt_events.fetch_add(1, std::memory_order_acq_rel);
     });
 
-    PROTO_ASSERT(server.start(rtsp_port), "RaopServer start");
+    const int rtsp_port = start_raop_server_on_free_port(server);
 
     int client_sock = socket(AF_INET, SOCK_STREAM, 0);
     PROTO_ASSERT(client_sock >= 0, "client socket");
@@ -361,7 +373,6 @@ void test_raop_silence_packet_handling_and_signaling_lifecycle() {
     PROTO_ASSERT(engine.open_device(43, 44100, 16, 2) == 0, "open AudioEngine");
     PROTO_ASSERT(wait_until([&] { return engine.get_active_transfers() > 0; }), "engine URBs active");
 
-    const int rtsp_port = find_free_tcp_port();
     RaopServer server;
 
     std::atomic<int> pause_callbacks{0};
@@ -382,7 +393,7 @@ void test_raop_silence_packet_handling_and_signaling_lifecycle() {
         first_pkt_events.fetch_add(1, std::memory_order_acq_rel);
     });
 
-    PROTO_ASSERT(server.start(rtsp_port), "RaopServer start");
+    const int rtsp_port = start_raop_server_on_free_port(server);
 
     int client_sock = socket(AF_INET, SOCK_STREAM, 0);
     PROTO_ASSERT(client_sock >= 0, "socket");
@@ -492,7 +503,6 @@ void test_raop_pause_flush_record_clean_resume() {
     PROTO_ASSERT(engine.open_device(44, 44100, 16, 2) == 0, "open AudioEngine");
     PROTO_ASSERT(wait_until([&] { return engine.get_active_transfers() > 0; }), "engine URBs active");
 
-    const int rtsp_port = find_free_tcp_port();
     RaopServer server;
 
     std::atomic<int> resume_events{0};
@@ -509,7 +519,7 @@ void test_raop_pause_flush_record_clean_resume() {
         first_pkt_events.fetch_add(1, std::memory_order_acq_rel);
     });
 
-    PROTO_ASSERT(server.start(rtsp_port), "RaopServer start");
+    const int rtsp_port = start_raop_server_on_free_port(server);
 
     int client_sock = socket(AF_INET, SOCK_STREAM, 0);
     PROTO_ASSERT(client_sock >= 0, "socket");
@@ -632,8 +642,7 @@ void test_set_empty_crypto_key_clears_has_crypto() {
 void test_raop_announce_l24_sample_rate_and_channels() {
     std::printf("Running test_raop_announce_l24_sample_rate_and_channels...\n");
     RaopServer server;
-    const int rtsp_port = 25055;
-    PROTO_ASSERT(server.start(rtsp_port), "RaopServer start");
+    const int rtsp_port = start_raop_server_on_free_port(server);
 
     int received_sample_rate = 0;
     int received_bit_depth = 0;
@@ -696,7 +705,6 @@ void test_raop_pure_signaling_no_udp_pause_guessing() {
     PROTO_ASSERT(engine.open_device(45, 44100, 16, 2) == 0, "open AudioEngine");
     PROTO_ASSERT(wait_until([&] { return engine.get_active_transfers() > 0; }), "engine URBs active");
 
-    const int rtsp_port = find_free_tcp_port();
     RaopServer server;
 
     std::atomic<int> first_pkt_events{0};
@@ -713,7 +721,7 @@ void test_raop_pure_signaling_no_udp_pause_guessing() {
         pause_events.fetch_add(1, std::memory_order_acq_rel);
     });
 
-    PROTO_ASSERT(server.start(rtsp_port), "RaopServer start");
+    const int rtsp_port = start_raop_server_on_free_port(server);
 
     int client_sock = socket(AF_INET, SOCK_STREAM, 0);
     PROTO_ASSERT(client_sock >= 0, "client_sock");
@@ -885,7 +893,6 @@ void test_raop_sync_gating_holds_early_audio_until_due() {
     PROTO_ASSERT(engine.open_device(46, 44100, 16, 2) == 0, "open AudioEngine");
     PROTO_ASSERT(wait_until([&] { return engine.get_active_transfers() > 0; }), "engine URBs active");
 
-    const int rtsp_port = find_free_tcp_port();
     RaopServer server;
 
     std::atomic<int> first_pkt_events{0};
@@ -897,7 +904,7 @@ void test_raop_sync_gating_holds_early_audio_until_due() {
         first_pkt_events.fetch_add(1, std::memory_order_acq_rel);
     });
 
-    PROTO_ASSERT(server.start(rtsp_port), "RaopServer start");
+    const int rtsp_port = start_raop_server_on_free_port(server);
 
     int client_sock = socket(AF_INET, SOCK_STREAM, 0);
     PROTO_ASSERT(client_sock >= 0, "client_sock");
@@ -1009,7 +1016,6 @@ void test_raop_flush_preserves_sync_anchor_and_gates_post_flush_audio() {
     PROTO_ASSERT(engine.open_device(47, 44100, 16, 2) == 0, "open AudioEngine");
     PROTO_ASSERT(wait_until([&] { return engine.get_active_transfers() > 0; }), "engine URBs active");
 
-    const int rtsp_port = find_free_tcp_port();
     RaopServer server;
 
     std::atomic<int> first_pkt_events{0};
@@ -1021,7 +1027,7 @@ void test_raop_flush_preserves_sync_anchor_and_gates_post_flush_audio() {
         first_pkt_events.fetch_add(1, std::memory_order_acq_rel);
     });
 
-    PROTO_ASSERT(server.start(rtsp_port), "RaopServer start");
+    const int rtsp_port = start_raop_server_on_free_port(server);
 
     int client_sock = socket(AF_INET, SOCK_STREAM, 0);
     PROTO_ASSERT(client_sock >= 0, "client_sock");
@@ -1198,12 +1204,11 @@ void test_raop_ntp_timing_lock_and_sync_offset_alignment() {
         }
     });
 
-    const int rtsp_port = find_free_tcp_port();
     RaopServer server;
     server.set_stream_request_callback([&](int64_t, int64_t, const RaopStreamParams&) -> int64_t {
         return static_cast<int64_t>(engine.emergency_mute_and_flush(FlushReason::PREEMPT));
     });
-    PROTO_ASSERT(server.start(rtsp_port), "RaopServer start");
+    const int rtsp_port = start_raop_server_on_free_port(server);
 
     int client_sock = socket(AF_INET, SOCK_STREAM, 0);
     PROTO_ASSERT(client_sock >= 0, "client_sock");
@@ -1304,7 +1309,6 @@ void test_raop_sync_local_pause_does_not_shred_or_accumulate_frames() {
     PROTO_ASSERT(engine.open_device(49, 44100, 16, 2) == 0, "open AudioEngine");
     PROTO_ASSERT(wait_until([&] { return engine.get_active_transfers() > 0; }), "engine URBs active");
 
-    const int rtsp_port = find_free_tcp_port();
     RaopServer server;
     std::atomic<int> first_pkt_events{0};
     server.set_stream_request_callback([&](int64_t, int64_t, const RaopStreamParams&) -> int64_t {
@@ -1313,7 +1317,7 @@ void test_raop_sync_local_pause_does_not_shred_or_accumulate_frames() {
     server.set_first_data_packet_callback([&](int64_t, int64_t, int64_t, int, int, int, const std::string&) {
         first_pkt_events.fetch_add(1, std::memory_order_acq_rel);
     });
-    PROTO_ASSERT(server.start(rtsp_port), "RaopServer start");
+    const int rtsp_port = start_raop_server_on_free_port(server);
 
     int client_sock = socket(AF_INET, SOCK_STREAM, 0);
     PROTO_ASSERT(client_sock >= 0, "client_sock");
@@ -1433,7 +1437,6 @@ void test_raop_sync_buffered_audio_flushes_only_on_explicit_signal() {
     PROTO_ASSERT(engine.open_device(50, 44100, 16, 2) == 0, "open AudioEngine");
     PROTO_ASSERT(wait_until([&] { return engine.get_active_transfers() > 0; }), "engine URBs active");
 
-    const int rtsp_port = find_free_tcp_port();
     RaopServer server;
     std::atomic<int> first_pkt_events{0};
     server.set_stream_request_callback([&](int64_t, int64_t, const RaopStreamParams&) -> int64_t {
@@ -1442,7 +1445,7 @@ void test_raop_sync_buffered_audio_flushes_only_on_explicit_signal() {
     server.set_first_data_packet_callback([&](int64_t, int64_t, int64_t, int, int, int, const std::string&) {
         first_pkt_events.fetch_add(1, std::memory_order_acq_rel);
     });
-    PROTO_ASSERT(server.start(rtsp_port), "RaopServer start");
+    const int rtsp_port = start_raop_server_on_free_port(server);
 
     int client_sock = socket(AF_INET, SOCK_STREAM, 0);
     PROTO_ASSERT(client_sock >= 0, "client_sock");
@@ -1535,6 +1538,210 @@ void test_raop_sync_buffered_audio_flushes_only_on_explicit_signal() {
     std::printf("PASS test_raop_sync_buffered_audio_flushes_only_on_explicit_signal\n");
 }
 
+// 用例 16 (反回归): 校验 RTSP FLUSH 后若持续收到全 0 静音包（iOS 暂停行为），
+// 静音包绝不入队 JitterBuffer 且绝不触发 FirstDataPacket 假复活；连续静音 30 帧 (~240ms) 主动触发暂停回调；
+// 后续真正有声音频帧到达后，正常过 Sync 门控并触发 FirstDataPacket + 恢复回调
+void test_raop_post_flush_silence_pauses_and_resumes_on_real_audio() {
+    std::printf("Running test_raop_post_flush_silence_pauses_and_resumes_on_real_audio...\n");
+    auto& mock = MockLibusbController::instance();
+    mock.reset();
+
+    auto& engine = AudioEngine::instance();
+    PROTO_ASSERT(engine.open_device(51, 44100, 16, 2) == 0, "open AudioEngine");
+    PROTO_ASSERT(wait_until([&] { return engine.get_active_transfers() > 0; }), "engine URBs active");
+
+    RaopServer server;
+    std::atomic<int> first_pkt_events{0};
+    std::atomic<int> pause_events{0};
+    std::atomic<int> resume_events{0};
+    server.set_stream_request_callback([&](int64_t, int64_t, const RaopStreamParams&) -> int64_t {
+        return static_cast<int64_t>(engine.emergency_mute_and_flush(FlushReason::PREEMPT));
+    });
+    server.set_first_data_packet_callback([&](int64_t, int64_t, int64_t, int, int, int, const std::string&) {
+        first_pkt_events.fetch_add(1, std::memory_order_acq_rel);
+    });
+    server.set_stream_pause_callback([&](int64_t, int64_t, int64_t) {
+        pause_events.fetch_add(1, std::memory_order_acq_rel);
+    });
+    server.set_stream_resume_callback([&](int64_t, int64_t, int64_t) {
+        resume_events.fetch_add(1, std::memory_order_acq_rel);
+    });
+    const int rtsp_port = start_raop_server_on_free_port(server);
+
+    int client_sock = socket(AF_INET, SOCK_STREAM, 0);
+    PROTO_ASSERT(client_sock >= 0, "client_sock");
+    sockaddr_in server_addr{};
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    server_addr.sin_port = htons(static_cast<uint16_t>(rtsp_port));
+    PROTO_ASSERT(connect(client_sock, reinterpret_cast<sockaddr*>(&server_addr), sizeof(server_addr)) == 0, "connect");
+
+    const std::string sdp =
+        "v=0\r\n"
+        "m=audio 0 RTP/AVP 10\r\n"
+        "a=rtpmap:10 L16/44100/2\r\n";
+    rtsp_exchange(client_sock,
+                  "ANNOUNCE rtsp://127.0.0.1/test RTSP/1.0\r\nCSeq: 1\r\nContent-Type: application/sdp\r\nContent-Length: " +
+                      std::to_string(sdp.size()) + "\r\n\r\n" + sdp);
+    std::string setup_resp = rtsp_exchange(
+        client_sock,
+        "SETUP rtsp://127.0.0.1/test RTSP/1.0\r\nCSeq: 2\r\nTransport: RTP/AVP/UDP;unicast;mode=record;control_port=6001;timing_port=6002\r\n\r\n");
+    const int udp_data_port = parse_server_port(setup_resp);
+    rtsp_exchange(client_sock, "RECORD rtsp://127.0.0.1/test RTSP/1.0\r\nCSeq: 3\r\n\r\n");
+
+    int udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    PROTO_ASSERT(udp_sock >= 0, "udp_sock");
+    sockaddr_in data_dest{};
+    data_dest.sin_family = AF_INET;
+    data_dest.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    data_dest.sin_port = htons(static_cast<uint16_t>(udp_data_port));
+
+    // 1. 正常播流
+    std::vector<uint8_t> audio_pkt(12 + 1408, 0x42);
+    audio_pkt[0] = 0x80;
+    audio_pkt[1] = 10;
+    for (int i = 0; i < 30; ++i) {
+        const uint16_t seq = static_cast<uint16_t>(1 + i);
+        audio_pkt[2] = static_cast<uint8_t>((seq >> 8) & 0xFF);
+        audio_pkt[3] = static_cast<uint8_t>(seq & 0xFF);
+        sendto(udp_sock, audio_pkt.data(), audio_pkt.size(), 0, reinterpret_cast<sockaddr*>(&data_dest), sizeof(data_dest));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    PROTO_ASSERT(wait_until([&] { return first_pkt_events.load() >= 1; }), "Initial playback started");
+
+    // 2. 模拟 iOS 暂停：发送 RTSP FLUSH 后连续推送 40 帧全 0 静音包
+    const int fp_before = first_pkt_events.load();
+    PROTO_ASSERT(rtsp_exchange(client_sock, "FLUSH rtsp://127.0.0.1/test RTSP/1.0\r\nCSeq: 4\r\nRTP-Info: seq=31;rtptime=20000\r\n\r\n")
+                     .find("200 OK") != std::string::npos,
+                 "FLUSH 200");
+
+    std::vector<uint8_t> silence_pkt(12 + 1408, 0);
+    silence_pkt[0] = 0x80;
+    silence_pkt[1] = 10;
+    for (int i = 0; i < 40; ++i) {
+        const uint16_t seq = static_cast<uint16_t>(31 + i);
+        silence_pkt[2] = static_cast<uint8_t>((seq >> 8) & 0xFF);
+        silence_pkt[3] = static_cast<uint8_t>(seq & 0xFF);
+        sendto(udp_sock, silence_pkt.data(), silence_pkt.size(), 0, reinterpret_cast<sockaddr*>(&data_dest), sizeof(data_dest));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    // 断言：连续静音包必须触发暂停回调，且绝不进入 JitterBuffer 或触发 FirstDataPacket 假复活
+    PROTO_ASSERT(wait_until([&] { return pause_events.load() == 1; }),
+                 "Post-FLUSH continuous silence must emit pause callback");
+    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+    PROTO_ASSERT(first_pkt_events.load() == fp_before,
+                 "Post-FLUSH silence must NOT trigger FirstDataPacket fake resume");
+    PROTO_ASSERT(server.rtp().buffered_jitter_packets() == 0,
+                 "Post-FLUSH silence must NOT be queued in JitterBuffer");
+
+    // 3. 模拟 iPhone 取消暂停：直接推送真实有声帧（无 RECORD），必须触发 FirstDataPacket 与恢复回调
+    for (int i = 0; i < 30; ++i) {
+        const uint16_t seq = static_cast<uint16_t>(71 + i);
+        audio_pkt[2] = static_cast<uint8_t>((seq >> 8) & 0xFF);
+        audio_pkt[3] = static_cast<uint8_t>(seq & 0xFF);
+        sendto(udp_sock, audio_pkt.data(), audio_pkt.size(), 0, reinterpret_cast<sockaddr*>(&data_dest), sizeof(data_dest));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    PROTO_ASSERT(wait_until([&] { return first_pkt_events.load() > fp_before && resume_events.load() >= 1; }),
+                 "Real audio after FLUSH silence pause must emit FirstDataPacket and resume callback");
+
+    close(udp_sock);
+    close(client_sock);
+    server.stop();
+    engine.release_device();
+    std::printf("PASS test_raop_post_flush_silence_pauses_and_resumes_on_real_audio\n");
+}
+
+// 用例 17: 校验 TV 端暂停 (AudioEngine::is_paused()==true) 后，FLUSH + 24-bit 全 0 静音包拦截与随后 24-bit 真实有声帧自动恢复
+void test_raop_post_flush_24bit_silence_and_tv_pause_auto_resume() {
+    std::printf("Running test_raop_post_flush_24bit_silence_and_tv_pause_auto_resume...\n");
+    auto& mock = MockLibusbController::instance();
+    mock.reset();
+
+    auto& engine = AudioEngine::instance();
+    PROTO_ASSERT(engine.open_device(52, 44100, 24, 2) == 0, "open 24-bit AudioEngine");
+    PROTO_ASSERT(wait_until([&] { return engine.get_active_transfers() > 0; }), "engine URBs active");
+
+    RaopServer server;
+    std::atomic<int> resume_events{0};
+    server.set_stream_request_callback([&](int64_t, int64_t, const RaopStreamParams&) -> int64_t {
+        return static_cast<int64_t>(engine.emergency_mute_and_flush(FlushReason::PREEMPT));
+    });
+    server.set_stream_resume_callback([&](int64_t, int64_t, int64_t) {
+        resume_events.fetch_add(1, std::memory_order_acq_rel);
+    });
+    const int rtsp_port = start_raop_server_on_free_port(server);
+
+    int client_sock = socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in server_addr{};
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    server_addr.sin_port = htons(static_cast<uint16_t>(rtsp_port));
+    PROTO_ASSERT(connect(client_sock, reinterpret_cast<sockaddr*>(&server_addr), sizeof(server_addr)) == 0, "connect");
+
+    const std::string sdp =
+        "v=0\r\n"
+        "m=audio 0 RTP/AVP 96\r\n"
+        "a=rtpmap:96 L24/44100/2\r\n";
+    rtsp_exchange(client_sock,
+                  "ANNOUNCE rtsp://127.0.0.1/test RTSP/1.0\r\nCSeq: 1\r\nContent-Type: application/sdp\r\nContent-Length: " +
+                      std::to_string(sdp.size()) + "\r\n\r\n" + sdp);
+    std::string setup_resp = rtsp_exchange(
+        client_sock,
+        "SETUP rtsp://127.0.0.1/test RTSP/1.0\r\nCSeq: 2\r\nTransport: RTP/AVP/UDP;unicast;mode=record;control_port=6011;timing_port=6012\r\n\r\n");
+    const int udp_data_port = parse_server_port(setup_resp);
+    rtsp_exchange(client_sock, "RECORD rtsp://127.0.0.1/test RTSP/1.0\r\nCSeq: 3\r\n\r\n");
+
+    // 模拟 TV 端主动暂停 AudioEngine，随后收到 iOS FLUSH
+    engine.emergency_mute_and_flush(FlushReason::EXPLICIT_PAUSE);
+    PROTO_ASSERT(engine.is_paused(), "AudioEngine must be paused after EXPLICIT_PAUSE");
+    PROTO_ASSERT(rtsp_exchange(client_sock, "FLUSH rtsp://127.0.0.1/test RTSP/1.0\r\nCSeq: 4\r\n\r\n")
+                     .find("200 OK") != std::string::npos,
+                 "FLUSH 200");
+
+    int udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    sockaddr_in data_dest{};
+    data_dest.sin_family = AF_INET;
+    data_dest.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    data_dest.sin_port = htons(static_cast<uint16_t>(udp_data_port));
+
+    // 发送 24-bit 静音包，应保持暂停态不入队
+    std::vector<uint8_t> silence24(12 + 300, 0);
+    silence24[0] = 0x80;
+    silence24[1] = 96;
+    for (int i = 0; i < 10; ++i) {
+        const uint16_t seq = static_cast<uint16_t>(1 + i);
+        silence24[2] = static_cast<uint8_t>((seq >> 8) & 0xFF);
+        silence24[3] = static_cast<uint8_t>(seq & 0xFF);
+        sendto(udp_sock, silence24.data(), silence24.size(), 0, reinterpret_cast<sockaddr*>(&data_dest), sizeof(data_dest));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    PROTO_ASSERT(engine.is_paused(), "24-bit silence must keep AudioEngine paused");
+    PROTO_ASSERT(server.rtp().buffered_jitter_packets() == 0, "24-bit silence must not enter JitterBuffer");
+
+    // 发送 24-bit 真实有声帧（超过 JitterBuffer 25 包预充阈值），自动解除 AudioEngine 暂停并触发恢复回调
+    std::vector<uint8_t> audio24(12 + 300, 0x20);
+    audio24[0] = 0x80;
+    audio24[1] = 96;
+    for (int i = 0; i < 30; ++i) {
+        const uint16_t seq = static_cast<uint16_t>(11 + i);
+        audio24[2] = static_cast<uint8_t>((seq >> 8) & 0xFF);
+        audio24[3] = static_cast<uint8_t>(seq & 0xFF);
+        sendto(udp_sock, audio24.data(), audio24.size(), 0, reinterpret_cast<sockaddr*>(&data_dest), sizeof(data_dest));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    PROTO_ASSERT(wait_until([&] { return !engine.is_paused() && resume_events.load() >= 1; }),
+                 "24-bit real audio after TV pause + FLUSH must auto-resume");
+
+    close(udp_sock);
+    close(client_sock);
+    server.stop();
+    engine.release_device();
+    std::printf("PASS test_raop_post_flush_24bit_silence_and_tv_pause_auto_resume\n");
+}
+
 } // namespace
 
 int main() {
@@ -1553,6 +1760,8 @@ int main() {
     test_raop_ntp_timing_lock_and_sync_offset_alignment();
     test_raop_sync_local_pause_does_not_shred_or_accumulate_frames();
     test_raop_sync_buffered_audio_flushes_only_on_explicit_signal();
+    test_raop_post_flush_silence_pauses_and_resumes_on_real_audio();
+    test_raop_post_flush_24bit_silence_and_tv_pause_auto_resume();
     std::printf("All purecast native protocol tests PASSED!\n");
     return 0;
 }

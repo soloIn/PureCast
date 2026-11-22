@@ -73,7 +73,36 @@ class DacpClient(
 
     fun hasActiveSession(): Boolean = !clientIp.isNullOrEmpty()
 
+    fun hasResolvedDacpEndpoint(): Boolean = !clientIp.isNullOrEmpty() && dacpPort > 0
+
     fun getCurrentPort(): Int = dacpPort
+
+    /**
+     * 💡 轻量级纯 TCP DACP 存活探活：
+     * 真机实测表明 iOS 精简 DACP 服务对未实现的 getproperty 会返回 HTTP 400，
+     * 而每次会话绑定的专属随机 DACP TCP 端口在暂停休眠期间持续监听（TCP connect 秒通），
+     * 取消隔空播放/断开时立即关闭（TCP connect 毫秒级返回 ECONNREFUSED）。
+     * 纯 TCP 探活零 HTTP 路径兼容性风险、零播放态副作用，且开销最低。
+     */
+    suspend fun probeSessionAlive(timeoutMs: Long = 500L): Boolean {
+        val ip = clientIp
+        val port = dacpPort
+        if (ip.isNullOrEmpty() || port <= 0) {
+            return false
+        }
+        return withContext(Dispatchers.IO) {
+            try {
+                java.net.Socket().use { socket ->
+                    socket.connect(java.net.InetSocketAddress(ip, port), timeoutMs.toInt())
+                }
+                Logger.airplay.d(TAG, "DACP TCP 存活探活 [$ip:$port] 连通 (alive=true)")
+                true
+            } catch (e: Exception) {
+                Logger.airplay.d(TAG, "DACP TCP 存活探活 [$ip:$port] 不可达 (alive=false): ${e.message}")
+                false
+            }
+        }
+    }
 
     fun clearSession() {
         clientIp = null

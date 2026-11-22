@@ -515,4 +515,72 @@ class AirPlayServerEventDispatchTest {
         assertEquals(1, boundaries.size)
         assertEquals("4ever in U|Artist", boundaries.single().trackKey)
     }
+
+    @Test
+    fun `teardown delegates to DACP liveness probe hook and emitTeardownDecision deduplicates hardStop`() {
+        val events = mutableListOf<SessionEventEnvelope<SessionEventPayload>>()
+        val teardownRequests = mutableListOf<Long>()
+        val globalSessionGen = AtomicLong(200L)
+        val seqGen = AtomicLong(0L)
+        val dispatcher = AirPlayNativeEventDispatcher(
+            dispatchEvent = { events += it },
+            allocateSessionId = { globalSessionGen.incrementAndGet() },
+            allocateSequence = { seqGen.incrementAndGet() },
+            onAcquireHardwareForStream = { _, _, _, _ -> 11L },
+            onDecryptAndInjectCryptoKey = { _, _ -> },
+            onUpdateDacpTarget = { _, _, _, _ -> },
+            onSolveChallenge = { "mock-resp" },
+            onStreamTeardownRequested = { sid -> teardownRequests += sid },
+            clockMs = { 5000L }
+        )
+
+        dispatcher.onStreamRequested(1L, 1L, 44100, 16, 2, "ALAC", "192.168.2.113", "", "", "DACP1", "TOK1", 63721)
+        val sid = events.last().sessionId
+        val countBeforeTeardown = events.size
+
+        // 收到 TEARDOWN 时交由 DACP 探活裁决器，不直接发 StreamTeardownEvent
+        dispatcher.onStreamStopped(1L, 2L, 12L)
+        assertEquals(listOf(sid), teardownRequests)
+        assertEquals(countBeforeTeardown, events.size)
+
+        // 首次探活存活 -> 发射 hardStop=false 保持 PAUSED
+        dispatcher.emitTeardownDecision(sid, hardStop = false, reason = "alive")
+        assertEquals(StreamTeardownEvent(hardStop = false), events.last().payload)
+
+        // 后续探活断开 -> 发射 hardStop=true 直接断开会话，且重复发射自动去重
+        dispatcher.emitTeardownDecision(sid, hardStop = true, reason = "dead")
+        dispatcher.emitTeardownDecision(sid, hardStop = true, reason = "dead-dup")
+        val hardStops = events.map { it.payload }.filterIsInstance<StreamTeardownEvent>().filter { it.hardStop }
+        assertEquals(1, hardStops.size)
+    }
+
+    @Test
+    fun `stale native session onStreamStopped does not clear active RTP flag of newer session`() {
+        val rtpStates = mutableListOf<Boolean>()
+        val globalSessionGen = AtomicLong(300L)
+        val seqGen = AtomicLong(0L)
+        val dispatcher = AirPlayNativeEventDispatcher(
+            dispatchEvent = {},
+            allocateSessionId = { globalSessionGen.incrementAndGet() },
+            allocateSequence = { seqGen.incrementAndGet() },
+            onAcquireHardwareForStream = { _, _, _, _ -> 21L },
+            onDecryptAndInjectCryptoKey = { _, _ -> },
+            onUpdateDacpTarget = { _, _, _, _ -> },
+            onSolveChallenge = { "mock-resp" },
+            onRtpActiveChanged = { active -> rtpStates += active },
+            clockMs = { 5000L }
+        )
+
+        dispatcher.onStreamRequested(1L, 1L, 44100, 16, 2, "ALAC", "192.168.2.10", "", "", "D1", "T1", 5001)
+        dispatcher.onStreamRequested(2L, 1L, 44100, 16, 2, "ALAC", "192.168.2.10", "", "", "D2", "T2", 5002)
+        rtpStates.clear()
+
+        // 旧会话 nativeSessionId=1 的迟到 onStreamStopped 不得把新会话的 rtpActive 误置为 false
+        dispatcher.onStreamStopped(1L, 2L, 22L)
+        assertTrue("过期会话的 onStreamStopped 严禁回调 onRtpActiveChanged(false)", rtpStates.isEmpty())
+
+        // 当前活跃会话 nativeSessionId=2 正常 onStreamStopped 才会回调 false
+        dispatcher.onStreamStopped(2L, 2L, 23L)
+        assertEquals(listOf(false), rtpStates)
+    }
 }
