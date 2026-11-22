@@ -89,13 +89,6 @@ android {
         release {
             isMinifyEnabled = true
             isShrinkResources = true
-            val isOfficialCiRelease = System.getenv("CI") == "true" &&
-                System.getenv("GITHUB_EVENT_NAME") == "release"
-            if (isOfficialCiRelease && !hasReleaseSigning) {
-                throw org.gradle.api.GradleException(
-                    "正式 GitHub Release 构建缺少签名配置 (RELEASE_KEYSTORE_BASE64 / RELEASE_STORE_PASSWORD / RELEASE_KEY_ALIAS / RELEASE_KEY_PASSWORD)，禁止静默回退 debug 签名"
-                )
-            }
             signingConfig = if (hasReleaseSigning) {
                 signingConfigs.getByName("release")
             } else {
@@ -272,4 +265,20 @@ val runNativeSanitizerTests by tasks.registering(Exec::class) {
 tasks.named("check") {
     dependsOn(jacocoTestCoverageVerification)
     dependsOn(runNativeSanitizerTests)
+}
+
+val isOfficialCiRelease = System.getenv("CI") == "true" &&
+    System.getenv("GITHUB_EVENT_NAME") == "release"
+
+tasks.matching {
+    it.name.endsWith("Release") &&
+        (it.name.startsWith("assemble") || it.name.startsWith("bundle") || it.name.startsWith("package"))
+}.configureEach {
+    doFirst {
+        if (isOfficialCiRelease && !hasReleaseSigning) {
+            throw org.gradle.api.GradleException(
+                "正式 GitHub Release 构建缺少签名配置 (RELEASE_KEYSTORE_BASE64 / RELEASE_STORE_PASSWORD / RELEASE_KEY_ALIAS / RELEASE_KEY_PASSWORD)，禁止静默回退 debug 签名"
+            )
+        }
+    }
 }

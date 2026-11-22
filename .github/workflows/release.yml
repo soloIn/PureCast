@@ -32,6 +32,11 @@ jobs:
   android-build:
     name: Android Build & Test
     runs-on: ubuntu-latest
+    env:
+      RELEASE_STORE_FILE: ${{ secrets.RELEASE_KEYSTORE_BASE64 != '' && format('{0}/purecast-release.jks', runner.temp) || '' }}
+      RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
+      RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+      RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -65,11 +70,6 @@ jobs:
         run: ./gradlew testDebugUnitTest
 
       - name: Build Release APKs (Split by ABI + Universal)
-        env:
-          RELEASE_STORE_FILE: ${{ secrets.RELEASE_KEYSTORE_BASE64 != '' && format('{0}/purecast-release.jks', runner.temp) || '' }}
-          RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
-          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
-          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
         run: ./gradlew assembleRelease
 
       - name: Upload Release APKs (arm64-v8a, armeabi-v7a, universal)
