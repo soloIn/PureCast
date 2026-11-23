@@ -238,8 +238,11 @@ fun WordSyncKaraokeText(
                     drawRect(color = activeUnlitColor, blendMode = BlendMode.SrcIn)
                     return@drawWithContent
                 }
-                if (now >= words.last().endMs) {
-                    // drawContent() 已完整绘制纯亮 primaryColor 文本，无需再叠加一次多余的 SrcIn 矩形
+                val isVocalFinished = now >= words.last().endMs ||
+                    (isExitingActive && now >= words.last().endMs - 50L)
+                if (isVocalFinished) {
+                    // 💡 维持与扫光阶段一致的 SRC_IN 合成路径，彻底消除唱完瞬间切回裸 Text 引起的字形亮度/抗锯齿微闪
+                    drawRect(color = primaryColor, blendMode = BlendMode.SrcIn)
                     return@drawWithContent
                 }
 
@@ -279,16 +282,22 @@ fun WordSyncKaraokeText(
                     val startLine = geom.startLines[activeWordIndex]
                     val endLine = geom.endLines[activeWordIndex]
 
+                    val isLastWordOfLine = activeWordIndex == words.lastIndex
                     if (startLine == endLine) {
-                        // 单词处于同一视觉行：仅对当前视觉行末词延伸 +halfFeather，消除行尾硬切跳闪且不串亮下一个中日文字符
+                        // 单词处于同一视觉行：整句末词延伸至行尾右边界（覆盖行尾标点）+ halfFeather，消除唱完瞬间尾标点突亮
                         activeVisualLine = startLine
                         val wordLeft = geom.wordLefts[activeWordIndex]
                         val wordRight = geom.wordRights[activeWordIndex]
-                        val isLastWordOnVisualLine = activeWordIndex == words.lastIndex ||
+                        val isLastWordOnVisualLine = isLastWordOfLine ||
                             geom.startLines[activeWordIndex + 1] > activeVisualLine
+                        val effectiveRight = if (isLastWordOfLine) {
+                            maxOf(wordRight, geom.lineRights[activeVisualLine])
+                        } else {
+                            wordRight
+                        }
                         val endExtra = if (isLastWordOnVisualLine) halfFeather else 0f
                         currentWordLeft = wordLeft
-                        currentSweepX = wordLeft + ((wordRight - wordLeft) + endExtra) * progress
+                        currentSweepX = wordLeft + ((effectiveRight - wordLeft) + endExtra) * progress
                     } else {
                         // 💡 Finding 6: 折行跨行单词匀速线性扫光
                         val seg = LyricsRenderingMath.calculateWrappedLineSegment(
@@ -300,11 +309,16 @@ fun WordSyncKaraokeText(
                         activeVisualLine = seg.visualLine
                         val segLeft = lr.getBoundingBox(seg.segStartChar).left
                         val segRight = lr.getBoundingBox(seg.segEndChar).right
-                        val isLastWordOnVisualLine = activeWordIndex == words.lastIndex ||
+                        val isLastWordOnVisualLine = isLastWordOfLine ||
                             geom.startLines[activeWordIndex + 1] > activeVisualLine
+                        val effectiveSegRight = if (isLastWordOfLine && seg.visualLine == endLine) {
+                            maxOf(segRight, geom.lineRights[activeVisualLine])
+                        } else {
+                            segRight
+                        }
                         val endExtra = if (isLastWordOnVisualLine && seg.visualLine == endLine) halfFeather else 0f
                         currentWordLeft = segLeft
-                        currentSweepX = segLeft + ((segRight - segLeft) + endExtra) * seg.segProgress
+                        currentSweepX = segLeft + ((effectiveSegRight - segLeft) + endExtra) * seg.segProgress
                     }
                 } else {
                     // 词间间隙：已完整唱完 activeWord，羽化起点锚定在词尾右侧，保持 100% 纯亮无暗尾
