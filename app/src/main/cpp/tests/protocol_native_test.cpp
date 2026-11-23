@@ -1742,6 +1742,101 @@ void test_raop_post_flush_24bit_silence_and_tv_pause_auto_resume() {
     std::printf("PASS test_raop_post_flush_24bit_silence_and_tv_pause_auto_resume\n");
 }
 
+// 用例 18: 校验 SET_PARAMETER progress: 的 LF(\n) 截断、Sync 门控期回退 target_speaker_ts 与新曲排队负延迟 (-queue_delay_ms)
+void test_raop_progress_calibration_queue_delay_and_sync_fallback() {
+    std::printf("Running test_raop_progress_calibration_queue_delay_and_sync_fallback...\n");
+    auto& mock = MockLibusbController::instance();
+    mock.reset();
+
+    auto& engine = AudioEngine::instance();
+    PROTO_ASSERT(engine.open_device(53, 44100, 16, 2) == 0, "open AudioEngine");
+    PROTO_ASSERT(wait_until([&] { return engine.get_active_transfers() > 0; }), "engine URBs active");
+
+    RaopServer server;
+    std::atomic<int64_t> last_pos{999999};
+    std::atomic<int64_t> last_dur{0};
+    std::atomic<int> progress_count{0};
+    server.set_stream_request_callback([&](int64_t, int64_t, const RaopStreamParams&) -> int64_t {
+        return static_cast<int64_t>(engine.emergency_mute_and_flush(FlushReason::PREEMPT));
+    });
+    server.set_progress_callback([&](int64_t, int64_t, int64_t pos_ms, int64_t dur_ms) {
+        last_pos.store(pos_ms, std::memory_order_release);
+        last_dur.store(dur_ms, std::memory_order_release);
+        progress_count.fetch_add(1, std::memory_order_acq_rel);
+    });
+    const int rtsp_port = start_raop_server_on_free_port(server);
+
+    int client_sock = socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in server_addr{};
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    server_addr.sin_port = htons(static_cast<uint16_t>(rtsp_port));
+    PROTO_ASSERT(connect(client_sock, reinterpret_cast<sockaddr*>(&server_addr), sizeof(server_addr)) == 0, "connect");
+
+    const std::string sdp =
+        "v=0\r\n"
+        "m=audio 0 RTP/AVP 10\r\n"
+        "a=rtpmap:10 L16/44100/2\r\n";
+    rtsp_exchange(client_sock,
+                  "ANNOUNCE rtsp://127.0.0.1/test RTSP/1.0\r\nCSeq: 1\r\nContent-Type: application/sdp\r\nContent-Length: " +
+                      std::to_string(sdp.size()) + "\r\n\r\n" + sdp);
+    std::string setup_resp = rtsp_exchange(
+        client_sock,
+        "SETUP rtsp://127.0.0.1/test RTSP/1.0\r\nCSeq: 2\r\nTransport: RTP/AVP/UDP;unicast;mode=record;control_port=6021;timing_port=6022\r\n\r\n");
+    auto ctrl_pos = setup_resp.find("control_port=");
+    PROTO_ASSERT(ctrl_pos != std::string::npos, "control_port present");
+    const int udp_ctrl_port = std::atoi(setup_resp.c_str() + ctrl_pos + 13);
+    rtsp_exchange(client_sock, "RECORD rtsp://127.0.0.1/test RTSP/1.0\r\nCSeq: 3\r\n\r\n");
+
+    // 1. Sync 尚未锁定且未写入首帧时，发 LF 结尾 progress：必须上报 -1（仅同步 dur）而绝不裸用发端 curr_ts 虚报进度
+    const std::string body1 = "progress: 100000/144100/1000000\n";
+    rtsp_exchange(client_sock,
+                  "SET_PARAMETER rtsp://127.0.0.1/test RTSP/1.0\r\nCSeq: 4\r\nContent-Type: text/parameters\r\nContent-Length: " +
+                      std::to_string(body1.size()) + "\r\n\r\n" + body1);
+    PROTO_ASSERT(wait_until([&] { return progress_count.load() == 1; }), "progress 1 received");
+    PROTO_ASSERT(last_pos.load() == -1, "Without speaker_ts or Sync anchor, pos must be -1 instead of raw curr_ts");
+    PROTO_ASSERT(last_dur.load() > 20000, "Duration must still be synced");
+
+    // 2. 发送 Sync 包锁定 target_speaker_ts = rtp_now - 11025 = 200000 - 11025 = 188975
+    int udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    const uint32_t rtp_now = 200000U;
+    const uint32_t rtp_next = rtp_now + 77175U;
+    uint8_t sync_pkt[20]{};
+    sync_pkt[0] = 0x90;
+    sync_pkt[1] = 0xD4;
+    sync_pkt[4] = static_cast<uint8_t>((rtp_now >> 24) & 0xFF);
+    sync_pkt[5] = static_cast<uint8_t>((rtp_now >> 16) & 0xFF);
+    sync_pkt[6] = static_cast<uint8_t>((rtp_now >> 8) & 0xFF);
+    sync_pkt[7] = static_cast<uint8_t>(rtp_now & 0xFF);
+    sync_pkt[16] = static_cast<uint8_t>((rtp_next >> 24) & 0xFF);
+    sync_pkt[17] = static_cast<uint8_t>((rtp_next >> 16) & 0xFF);
+    sync_pkt[18] = static_cast<uint8_t>((rtp_next >> 8) & 0xFF);
+    sync_pkt[19] = static_cast<uint8_t>(rtp_next & 0xFF);
+    sockaddr_in ctrl_dest{};
+    ctrl_dest.sin_family = AF_INET;
+    ctrl_dest.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ctrl_dest.sin_port = htons(static_cast<uint16_t>(udp_ctrl_port));
+    sendto(udp_sock, sync_pkt, sizeof(sync_pkt), 0, reinterpret_cast<sockaddr*>(&ctrl_dest), sizeof(ctrl_dest));
+    uint32_t dummy_ts = 0;
+    PROTO_ASSERT(wait_until([&] { return server.rtp().get_target_speaker_rtp_ts(dummy_ts); }), "Sync target ready");
+
+    // 3. 发送新曲目 progress，其 start_ts = 211025 (比 target_speaker_ts=188975 晚约 500ms)：必须返回精确负延迟 (~-500ms)
+    const std::string body2 = "progress: 211025/212000/1100000\n";
+    rtsp_exchange(client_sock,
+                  "SET_PARAMETER rtsp://127.0.0.1/test RTSP/1.0\r\nCSeq: 5\r\nContent-Type: text/parameters\r\nContent-Length: " +
+                      std::to_string(body2.size()) + "\r\n\r\n" + body2);
+    PROTO_ASSERT(wait_until([&] { return progress_count.load() == 2; }), "progress 2 received");
+    const int64_t queued_pos = last_pos.load();
+    PROTO_ASSERT(queued_pos <= -300 && queued_pos >= -600,
+                 "Queued new track must report negative lead-in delay (~-500ms) via Sync target_speaker_ts");
+
+    close(udp_sock);
+    close(client_sock);
+    server.stop();
+    engine.release_device();
+    std::printf("PASS test_raop_progress_calibration_queue_delay_and_sync_fallback\n");
+}
+
 } // namespace
 
 int main() {
@@ -1762,6 +1857,7 @@ int main() {
     test_raop_sync_buffered_audio_flushes_only_on_explicit_signal();
     test_raop_post_flush_silence_pauses_and_resumes_on_real_audio();
     test_raop_post_flush_24bit_silence_and_tv_pause_auto_resume();
+    test_raop_progress_calibration_queue_delay_and_sync_fallback();
     std::printf("All purecast native protocol tests PASSED!\n");
     return 0;
 }

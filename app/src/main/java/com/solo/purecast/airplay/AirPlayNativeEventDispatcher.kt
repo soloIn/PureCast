@@ -73,9 +73,15 @@ internal class AirPlayNativeEventDispatcher(
     @Volatile
     private var lastTrackSwitchFlushedTimestampMs: Long = 0L
 
+    @Volatile
+    private var lastTrackBoundaryTimestampMs: Long = 0L
+
     // 💡 记录最近一次无 FLUSH 场景（任意位置首次投屏 / 自然自动切歌）到达的协议进度，防止紧随其后的 DMAP 边界事件误归零
     @Volatile
     private var recentProgressPositionMs: Long = -1L
+
+    @Volatile
+    private var recentProgressAnchorDelayMs: Long = 0L
 
     @Volatile
     private var recentProgressDurationMs: Long = 0L
@@ -109,7 +115,9 @@ internal class AirPlayNativeEventDispatcher(
         postFlushProgressPositionMs = -1L
         postFlushProgressTimestampMs = 0L
         lastTrackSwitchFlushedTimestampMs = 0L
+        lastTrackBoundaryTimestampMs = 0L
         recentProgressPositionMs = -1L
+        recentProgressAnchorDelayMs = 0L
         recentProgressDurationMs = 0L
         recentProgressTimestampMs = 0L
         pendingOrphanCoverBytes = null
@@ -244,7 +252,9 @@ internal class AirPlayNativeEventDispatcher(
             currentTrackDurationFixed = initialMetadata.durationMs > 0L
             currentTrackMarkedLive = false
             if (!isResuming) {
+                lastTrackBoundaryTimestampMs = clockMs()
                 recentProgressPositionMs = -1L
+                recentProgressAnchorDelayMs = 0L
                 recentProgressDurationMs = 0L
                 recentProgressTimestampMs = 0L
             }
@@ -319,6 +329,7 @@ internal class AirPlayNativeEventDispatcher(
                 postFlushProgressPositionMs = -1L // 💡 切歌换代重置已知初始进度缓存
                 postFlushProgressTimestampMs = 0L
                 recentProgressPositionMs = -1L
+                recentProgressAnchorDelayMs = 0L
                 recentProgressDurationMs = 0L
                 recentProgressTimestampMs = 0L
             }
@@ -436,8 +447,17 @@ internal class AirPlayNativeEventDispatcher(
                 canInheritRecentProgressOnNoFlush && recentProgressDurationMs > 0L -> recentProgressDurationMs
                 else -> 0L
             }
+            val inheritedAnchorDelayMs = if (canInheritRecentProgressOnNoFlush && recentProgressAnchorDelayMs > 0L) {
+                (recentProgressAnchorDelayMs - recentElapsedMs.coerceAtLeast(0L)).coerceAtLeast(0L)
+            } else {
+                0L
+            }
             val effectivePositionMs = when {
                 canInheritPostFlushProgress && postFlushProgressPositionMs >= 0L -> postFlushProgressPositionMs
+                canInheritRecentProgressOnNoFlush && recentProgressAnchorDelayMs > 0L -> {
+                    val elapsedBeyondQueue = (recentElapsedMs.coerceAtLeast(0L) - recentProgressAnchorDelayMs).coerceAtLeast(0L)
+                    if (effectiveDurationMs > 0L) elapsedBeyondQueue.coerceAtMost(effectiveDurationMs) else elapsedBeyondQueue
+                }
                 canInheritRecentProgressOnNoFlush -> {
                     val advanced = recentProgressPositionMs + recentElapsedMs.coerceAtLeast(0L)
                     if (effectiveDurationMs > 0L) advanced.coerceAtMost(effectiveDurationMs) else advanced
@@ -448,11 +468,12 @@ internal class AirPlayNativeEventDispatcher(
             if (isBoundarySwitch) {
                 val nextTxGen = trackGenerationGenerator.incrementAndGet()
                 currentTrackGeneration = nextTxGen
+                lastTrackBoundaryTimestampMs = now
                 currentTrackDurationFixed = effectiveDurationMs > 0L
                 currentTrackMarkedLive = false
                 Logger.airplay.i(
                     TAG,
-                    "确立新曲目边界: gen=$nextTxGen, title=$trimmedTitle, artist=$trimmedArtist, initialPos=${effectivePositionMs}ms, initialDur=${effectiveDurationMs}ms"
+                    "确立新曲目边界: gen=$nextTxGen, title=$trimmedTitle, artist=$trimmedArtist, initialPos=${effectivePositionMs}ms, initialDur=${effectiveDurationMs}ms, initialDelay=${inheritedAnchorDelayMs}ms"
                 )
                 emitLocked(
                     sessionId = globalSid,
@@ -462,13 +483,15 @@ internal class AirPlayNativeEventDispatcher(
                         initialDurationState = if (effectiveDurationMs > 0L) DurationState.FIXED else DurationState.UNKNOWN,
                         seekCapability = if (effectiveDurationMs > 0L) SeekCapability.SEEKABLE else SeekCapability.UNKNOWN,
                         initialPositionMs = effectivePositionMs,
-                        initialDurationMs = effectiveDurationMs
+                        initialDurationMs = effectiveDurationMs,
+                        initialAnchorDelayMs = inheritedAnchorDelayMs
                     )
                 )
                 postFlushProgressDurationMs = 0L // 💡 消费后清空
                 postFlushProgressPositionMs = -1L // 💡 消费后清空
                 postFlushProgressTimestampMs = 0L
                 recentProgressPositionMs = -1L
+                recentProgressAnchorDelayMs = 0L
                 recentProgressDurationMs = 0L
                 recentProgressTimestampMs = 0L
                 lastTrackSwitchFlushedTimestampMs = 0L
@@ -540,13 +563,14 @@ internal class AirPlayNativeEventDispatcher(
     }
 
     override fun onProgressUpdated(nativeSessionId: Long, sequence: Long, positionMs: Long, durationMs: Long) {
-        if (positionMs <= 0L && durationMs <= 0L) {
+        if (positionMs in -1L..0L && durationMs <= 0L) {
             return
         }
         synchronized(eventDispatchLock) {
             if (nativeSessionId != latestNativeSessionId.get()) return
             val globalSid = nativeToGlobalSessionMap[nativeSessionId] ?: return
 
+            val queueDelayMs = if (positionMs < -1L) -positionMs else 0L
             val timeSinceFlush = if (lastTrackSwitchFlushedTimestampMs > 0L) {
                 clockMs() - lastTrackSwitchFlushedTimestampMs
             } else {
@@ -561,9 +585,13 @@ internal class AirPlayNativeEventDispatcher(
                 }
                 postFlushProgressTimestampMs = clockMs()
             }
-            if (positionMs >= 0L || durationMs > 0L) {
+            if (positionMs >= 0L || queueDelayMs > 0L || durationMs > 0L) {
                 if (positionMs >= 0L) {
                     recentProgressPositionMs = positionMs
+                    recentProgressAnchorDelayMs = 0L
+                } else if (queueDelayMs > 0L) {
+                    recentProgressPositionMs = 0L
+                    recentProgressAnchorDelayMs = queueDelayMs
                 }
                 if (durationMs > 0L) {
                     recentProgressDurationMs = durationMs
@@ -573,13 +601,19 @@ internal class AirPlayNativeEventDispatcher(
 
             Logger.airplay.d(
                 TAG,
-                "AirPlay 进度上报: pos=${positionMs}ms, dur=${durationMs}ms, trackGen=$currentTrackGeneration, timeSinceFlush=$timeSinceFlush"
+                "AirPlay 进度上报: pos=${positionMs}ms, dur=${durationMs}ms, queueDelay=${queueDelayMs}ms, trackGen=$currentTrackGeneration, timeSinceFlush=$timeSinceFlush"
+            )
+
+            val prevMetaDurationMs = lastActiveMetadata?.durationMs ?: 0L
+            val matchesCurrentTrackDuration = durationMs > 0L && (
+                prevMetaDurationMs <= 0L ||
+                    kotlin.math.abs(prevMetaDurationMs - durationMs) <= 2000L
             )
 
             if (durationMs > 0L) {
-                // 💡 同步更新活跃会话快照中的时长与寻道能力
+                // 💡 同步更新活跃会话快照中的时长与寻道能力（仅在匹配当前曲目或当前时长未知时覆写，防旧曲尾声被新曲时长污染）
                 val prev = lastActiveMetadata ?: TrackMetadata()
-                if (prev.durationMs != durationMs) {
+                if (matchesCurrentTrackDuration && prev.durationMs != durationMs) {
                     lastActiveMetadata = prev.copy(
                         durationMs = durationMs,
                         durationState = DurationState.FIXED,
@@ -600,22 +634,46 @@ internal class AirPlayNativeEventDispatcher(
                         )
                     )
                 }
-                try {
-                    com.solo.purecast.core.nativebridge.NativeAudioEngine.updateAirPlayTrackProgress(positionMs, durationMs)
-                } catch (t: Throwable) {
-                    Logger.airplay.w(TAG, "同步 Native 曲目进度异常: ${t.message}")
+                if (matchesCurrentTrackDuration) {
+                    try {
+                        val nativePosMs = if (positionMs >= 0L) positionMs else -1L
+                        com.solo.purecast.core.nativebridge.NativeAudioEngine.updateAirPlayTrackProgress(nativePosMs, durationMs)
+                    } catch (t: Throwable) {
+                        Logger.airplay.w(TAG, "同步 Native 曲目进度异常: ${t.message}")
+                    }
                 }
             }
 
-            // 💡 修复 Finding 5: 当 positionMs < 0L 时说明首帧尚在本地缓冲区排队，已通过上方 MetadataPatchEvent 校准了总时长，
-            // 绝不发射 ProgressUpdateEvent，杜绝将已走字进度归零
+            // 💡 排队延迟语义分派：
+            // 1) positionMs >= 0L：正常实时进度，直接发射；
+            // 2) positionMs < -1L (精确排队延迟) 且时长匹配当前曲目且处于新曲边界确立后的 4s 窗口内：
+            //    发射 0ms + anchorDelayMs 将提前抢跑的新曲时钟锚定到扬声器出声时刻；
+            //    超过 4s 说明当前曲目已在稳态播放（可能是同长度下首曲目提前发包），仅保留缓存绝不把旧歌尾声归零。
+            // 3) positionMs == -1L（未知等待态）：仅同步时长，不发射 ProgressUpdateEvent。
+            val sinceTrackBoundaryMs = if (lastTrackBoundaryTimestampMs > 0L) {
+                clockMs() - lastTrackBoundaryTimestampMs
+            } else {
+                Long.MAX_VALUE
+            }
+            val isWithinNewTrackWindow = sinceTrackBoundaryMs in 0L..4000L
             if (positionMs >= 0L) {
                 emitLocked(
                     sessionId = globalSid,
                     payload = ProgressUpdateEvent(
                         positionMs = positionMs,
                         durationMs = durationMs.coerceAtLeast(0L),
-                        trackGeneration = currentTrackGeneration
+                        trackGeneration = currentTrackGeneration,
+                        anchorDelayMs = 0L
+                    )
+                )
+            } else if (queueDelayMs > 0L && matchesCurrentTrackDuration && isWithinNewTrackWindow) {
+                emitLocked(
+                    sessionId = globalSid,
+                    payload = ProgressUpdateEvent(
+                        positionMs = 0L,
+                        durationMs = durationMs.coerceAtLeast(0L),
+                        trackGeneration = currentTrackGeneration,
+                        anchorDelayMs = queueDelayMs
                     )
                 )
             }

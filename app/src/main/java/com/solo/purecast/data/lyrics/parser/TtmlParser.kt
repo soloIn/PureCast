@@ -22,6 +22,15 @@ object TtmlParser {
 
     private const val TAG = "TtmlParser"
 
+    data class TtmlParseResult(
+        val timeline: LyricTimeline,
+        val metadataTitle: String = "",
+        val metadataArtists: List<String> = emptyList()
+    ) {
+        val metadataArtist: String
+            get() = metadataArtists.joinToString(" ")
+    }
+
     private data class SpanContext(
         val role: String,
         val startMs: Long,
@@ -30,7 +39,10 @@ object TtmlParser {
         val isTranslation: Boolean
     )
 
-    fun parse(xmlContent: String, sourceName: String = "AMLL"): LyricTimeline? {
+    fun parse(xmlContent: String, sourceName: String = "AMLL"): LyricTimeline? =
+        parseWithMetadata(xmlContent, sourceName)?.timeline
+
+    fun parseWithMetadata(xmlContent: String, sourceName: String = "AMLL"): TtmlParseResult? {
         if (xmlContent.isBlank()) return null
 
         try {
@@ -40,6 +52,8 @@ object TtmlParser {
             parser.setInput(StringReader(xmlContent))
 
             val lines = mutableListOf<LyricLine>()
+            var metadataTitle = ""
+            val metadataArtists = mutableListOf<String>()
             var eventType = parser.eventType
 
             var currentLineIndex = 0
@@ -62,7 +76,16 @@ object TtmlParser {
                         val rawTagName = parser.name ?: ""
                         val localTagName = rawTagName.substringAfter(':').lowercase()
 
-                        if (localTagName == "p") {
+                        if (localTagName == "meta") {
+                            val metaKey = getAttr(parser, "key")?.trim().orEmpty()
+                            val metaValue = getAttr(parser, "value")?.trim().orEmpty()
+                            if (metaValue.isNotEmpty()) {
+                                when (metaKey) {
+                                    "musicName" -> if (metadataTitle.isEmpty()) metadataTitle = metaValue
+                                    "artists" -> metadataArtists.add(metaValue)
+                                }
+                            }
+                        } else if (localTagName == "p") {
                             inParagraph = true
                             spanStack.clear()
                             val beginAttr = getAttr(parser, "begin")
@@ -238,12 +261,17 @@ object TtmlParser {
             if (lines.isEmpty()) return null
 
             val totalDurationMs = lines.lastOrNull()?.endMs ?: 0L
-            return LyricTimeline(
+            val timeline = LyricTimeline(
                 source = sourceName,
                 format = LyricFormat.TTML_SYLLABLE,
                 isInstrumental = false,
                 lines = lines,
                 durationMs = totalDurationMs
+            )
+            return TtmlParseResult(
+                timeline = timeline,
+                metadataTitle = metadataTitle,
+                metadataArtists = metadataArtists
             )
         } catch (e: Exception) {
             Logger.lyrics.w(TAG, "解析 TTML 歌词异常", e)

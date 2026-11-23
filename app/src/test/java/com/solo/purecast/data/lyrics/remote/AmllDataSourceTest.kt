@@ -121,4 +121,127 @@ class AmllDataSourceTest {
         val brokenJsonClient = FakeHttpClient { LyricsHttpClient.HttpResponse(200, "not-json") }
         assertNull(AmllDataSource(brokenJsonClient).fetch("Jay Chou", "晴天"))
     }
+
+    @Test
+    fun `fetchWithMetadata parses real AMLL plural array fields and unescaped apostrophe in TTML meta`() = runBlocking {
+        val client = FakeHttpClient { url ->
+            when {
+                url.contains("/v1/lyrics/search?musicName=") -> LyricsHttpClient.HttpResponse(
+                    200,
+                    """
+                    {
+                      "status": 200,
+                      "data": [
+                        {
+                          "id": 999999,
+                          "musicNames": ["Completely Unrelated Remix"],
+                          "artistNames": ["DJ Nobody"]
+                        },
+                        {
+                          "id": 2295120713663679,
+                          "filename": "1755596075179-160724575-0b7029a6.ttml",
+                          "createdAt": 1755596075179,
+                          "musicNames": ["We Don't Talk Anymore (feat. Selena Gomez)"],
+                          "artistNames": ["Charlie Puth", "Selena Gomez"],
+                          "albumNames": ["Nine Track Mind"]
+                        }
+                      ]
+                    }
+                    """.trimIndent()
+                )
+                url.endsWith("/v1/lyrics/get?id=2295120713663679") -> LyricsHttpClient.HttpResponse(
+                    200,
+                    """
+                    {
+                      "data": {
+                        "lyrics": "<tt xmlns=\"http://www.w3.org/ns/ttml\" xmlns:amll=\"http://www.example.com/ns/amll\"><head><metadata><amll:meta key=\"musicName\" value=\"We Don't Talk Anymore (feat. Selena Gomez)\"/><amll:meta key=\"artists\" value=\"Charlie Puth\"/><amll:meta key=\"artists\" value=\"Selena Gomez\"/></metadata></head><body><div><p begin=\"00:05.00\" end=\"00:08.00\"><span begin=\"00:05.00\" end=\"00:06.00\">We</span> <span begin=\"00:06.00\" end=\"00:08.00\">don't</span></p></div></body></tt>"
+                      }
+                    }
+                    """.trimIndent()
+                )
+                else -> LyricsHttpClient.HttpResponse(404, "")
+            }
+        }
+
+        val source = AmllDataSource(client)
+        val result = source.fetchWithMetadata(
+            artist = "Charlie Puth",
+            title = "We Don't Talk Anymore (feat. Selena Gomez)",
+            expectedDurationMs = 217_710L
+        )
+        assertNotNull(result)
+        assertEquals("Charlie Puth Selena Gomez", result!!.candidateArtist)
+        assertEquals("We Don't Talk Anymore (feat. Selena Gomez)", result.candidateTitle)
+        assertTrue(client.urls.any { it.endsWith("/v1/lyrics/get?id=2295120713663679") })
+    }
+
+    @Test
+    fun `fetchWithMetadata preserves raw apostrophe in TTML metadata when search fields are absent`() = runBlocking {
+        val client = FakeHttpClient { url ->
+            when {
+                url.contains("/v1/lyrics/search?musicName=") -> LyricsHttpClient.HttpResponse(
+                    200,
+                    """{"data":[{"id":2295120713663679}]}"""
+                )
+                url.endsWith("/v1/lyrics/get?id=2295120713663679") -> LyricsHttpClient.HttpResponse(
+                    200,
+                    """
+                    {
+                      "data": {
+                        "lyrics": "<tt xmlns=\"http://www.w3.org/ns/ttml\" xmlns:amll=\"http://www.example.com/ns/amll\"><head><metadata><amll:meta key=\"musicName\" value=\"We Don't Talk Anymore (feat. Selena Gomez)\"/><amll:meta key=\"artists\" value=\"Charlie Puth\"/><amll:meta key=\"artists\" value=\"Selena Gomez\"/></metadata></head><body><div><p begin=\"00:05.00\" end=\"00:08.00\"><span begin=\"00:05.00\" end=\"00:06.00\">We</span></p></div></body></tt>"
+                      }
+                    }
+                    """.trimIndent()
+                )
+                else -> LyricsHttpClient.HttpResponse(404, "")
+            }
+        }
+
+        val result = AmllDataSource(client).fetchWithMetadata("Charlie Puth", "We Don't Talk Anymore", 217_710L)
+        assertNotNull(result)
+        assertEquals("Charlie Puth Selena Gomez", result!!.candidateArtist)
+        assertEquals("We Don't Talk Anymore (feat. Selena Gomez)", result.candidateTitle)
+    }
+
+    @Test
+    fun `fetchWithMetadata ignores explicit JSON null scalar fields and falls back to valid title and artist`() = runBlocking {
+        val client = FakeHttpClient { url ->
+            when {
+                url.contains("/v1/lyrics/search?musicName=") -> LyricsHttpClient.HttpResponse(
+                    200,
+                    """
+                    {
+                      "data": [
+                        {
+                          "id": 5001,
+                          "musicNames": null,
+                          "musicName": null,
+                          "title": "Shape of You",
+                          "artistNames": null,
+                          "artistName": null,
+                          "artist": "Ed Sheeran"
+                        }
+                      ]
+                    }
+                    """.trimIndent()
+                )
+                url.endsWith("/v1/lyrics/get?id=5001") -> LyricsHttpClient.HttpResponse(
+                    200,
+                    """
+                    {
+                      "data": {
+                        "lyrics": "<tt xmlns=\"http://www.w3.org/ns/ttml\"><body><div><p begin=\"00:01.00\" end=\"00:05.00\"><span begin=\"00:01.00\" end=\"00:05.00\">The club</span></p></div></body></tt>"
+                      }
+                    }
+                    """.trimIndent()
+                )
+                else -> LyricsHttpClient.HttpResponse(404, "")
+            }
+        }
+
+        val result = AmllDataSource(client).fetchWithMetadata("Ed Sheeran", "Shape of You", 233_000L)
+        assertNotNull(result)
+        assertEquals("Shape of You", result!!.candidateTitle)
+        assertEquals("Ed Sheeran", result.candidateArtist)
+    }
 }

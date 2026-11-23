@@ -310,6 +310,38 @@ bool RaopRtp::get_target_speaker_rtp_ts(uint32_t& out_ts) const {
     return true;
 }
 
+bool RaopRtp::resolve_speaker_rtp_ts(uint32_t& out_ts, bool& is_live_audio) const {
+    if (has_written_rtp_ts_.load(std::memory_order_acquire)) {
+        const uint32_t written_ts = last_written_rtp_ts_.load(std::memory_order_acquire);
+        int ch = 2;
+        int bits = 16;
+        {
+            std::lock_guard<std::mutex> flock(format_mutex_);
+            if (format_channels_ > 0) ch = format_channels_;
+            if (format_bit_depth_ > 0) bits = format_bit_depth_;
+        }
+        const uint32_t bps = static_cast<uint32_t>(bits / 8);
+        const uint32_t bytes_per_frame = static_cast<uint32_t>(ch) * (bps > 0 ? bps : 2U);
+        const size_t ring_bytes = AudioEngine::instance().get_available_read();
+        const uint32_t ring_unplayed_samples = (bytes_per_frame > 0)
+            ? static_cast<uint32_t>(ring_bytes / bytes_per_frame)
+            : 0U;
+        out_ts = written_ts - ring_unplayed_samples;
+        is_live_audio = true;
+        return true;
+    }
+
+    uint32_t target_ts = 0;
+    if (get_target_speaker_rtp_ts(target_ts)) {
+        out_ts = target_ts;
+        is_live_audio = false;
+        return true;
+    }
+
+    is_live_audio = false;
+    return false;
+}
+
 void RaopRtp::send_resend_request(uint16_t first_seq, uint16_t count) {
     if (!has_client_ctrl_.load(std::memory_order_acquire) || ctrl_fd_ < 0 || count == 0) {
         return;

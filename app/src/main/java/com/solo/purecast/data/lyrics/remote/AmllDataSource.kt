@@ -101,17 +101,16 @@ class AmllDataSource(
             return null
         }
 
-        val timeline = TtmlParser.parse(ttmlContent, sourceName = "AMLL")
-        if (timeline != null) {
-            val (ttmlArtist, ttmlTitle) = extractTtmlMetadata(ttmlContent)
-            val resolvedArtist = bestCandidate.artist.ifBlank { ttmlArtist }
-            val resolvedTitle = bestCandidate.title.ifBlank { ttmlTitle }
+        val parsed = TtmlParser.parseWithMetadata(ttmlContent, sourceName = "AMLL")
+        if (parsed != null) {
+            val resolvedArtist = bestCandidate.artist.ifBlank { parsed.metadataArtist }
+            val resolvedTitle = bestCandidate.title.ifBlank { parsed.metadataTitle }
             Logger.lyrics.i(
                 TAG,
-                "AMLL 官方 API 成功命中: $cleanArtist - $cleanTitle -> cand=$resolvedArtist - $resolvedTitle (id=${bestCandidate.id}, lines=${timeline.lineCount})"
+                "AMLL 官方 API 成功命中: $cleanArtist - $cleanTitle -> cand=$resolvedArtist - $resolvedTitle (id=${bestCandidate.id}, lines=${parsed.timeline.lineCount})"
             )
             return AmllFetchResult(
-                timeline = timeline,
+                timeline = parsed.timeline,
                 candidateArtist = resolvedArtist.ifBlank { cleanArtist },
                 candidateTitle = resolvedTitle.ifBlank { cleanTitle }
             )
@@ -130,15 +129,7 @@ class AmllDataSource(
                 val id = obj.optLong("id", 0L).takeIf { it > 0L }
                     ?: obj.optString("id", "").toLongOrNull()?.takeIf { it > 0L }
                     ?: continue
-                val title = obj.optString("musicName", "")
-                    .ifBlank { obj.optString("music_name", "") }
-                    .ifBlank { obj.optString("name", "") }
-                    .ifBlank { obj.optString("title", "") }
-                    .ifBlank { obj.optString("songName", "") }
-                    .ifBlank { obj.optString("song_name", "") }
-                    .ifBlank { obj.optString("trackName", "") }
-                    .ifBlank { obj.optString("track_name", "") }
-                    .trim()
+                val title = extractTitleString(obj)
                 val artist = extractArtistString(obj)
                 val rawDur = obj.optLong("duration", 0L)
                     .takeIf { it > 0L }
@@ -161,67 +152,52 @@ class AmllDataSource(
         }
     }
 
+    private fun extractTitleString(obj: JSONObject): String {
+        val titlesArr = obj.optJSONArray("musicNames")
+            ?: obj.optJSONArray("titles")
+            ?: obj.optJSONArray("names")
+        if (titlesArr != null) {
+            for (j in 0 until titlesArr.length()) {
+                val name = extractJsonDisplayString(titlesArr.opt(j))
+                if (name.isNotEmpty()) return name
+            }
+        }
+        for (key in TITLE_SCALAR_KEYS) {
+            val value = optCleanString(obj, key)
+            if (value.isNotEmpty()) return value
+        }
+        return ""
+    }
+
     private fun extractArtistString(obj: JSONObject): String {
-        val artistsArr: JSONArray? = obj.optJSONArray("artists") ?: obj.optJSONArray("singers")
+        val artistsArr: JSONArray? = obj.optJSONArray("artistNames")
+            ?: obj.optJSONArray("artists")
+            ?: obj.optJSONArray("singers")
         if (artistsArr != null && artistsArr.length() > 0) {
             val parts = ArrayList<String>(artistsArr.length())
             for (j in 0 until artistsArr.length()) {
-                val item = artistsArr.opt(j)
-                val name = when (item) {
-                    is String -> item.trim()
-                    is JSONObject -> item.optString("name", "").trim()
-                    else -> ""
-                }
+                val name = extractJsonDisplayString(artistsArr.opt(j))
                 if (name.isNotEmpty()) parts.add(name)
             }
             if (parts.isNotEmpty()) return parts.joinToString(" ")
         }
-        return obj.optString("artistName", "")
-            .ifBlank { obj.optString("artist_name", "") }
-            .ifBlank { obj.optString("artist", "") }
-            .ifBlank { obj.optString("singer", "") }
-            .trim()
+        for (key in ARTIST_SCALAR_KEYS) {
+            val value = optCleanString(obj, key)
+            if (value.isNotEmpty()) return value
+        }
+        return ""
     }
 
-    /**
-     * 💡 从 AMLL TTML 头部 `<amll:meta key="musicName"/"artists" value="..."/>` 提取真实元数据，
-     * 当搜索接口响应未回传歌名/歌手字段时作为权威回退，供上层打分器与续集/Part 门禁校验。
-     */
-    private fun extractTtmlMetadata(ttmlContent: String): Pair<String, String> {
-        val headerSlice = if (ttmlContent.length > 8192) ttmlContent.substring(0, 8192) else ttmlContent
-        var title = ""
-        val artists = ArrayList<String>(2)
-        for (tagMatch in AMLL_META_TAG_REGEX.findAll(headerSlice)) {
-            val attrs = tagMatch.groupValues[1]
-            val key = AMLL_META_KEY_REGEX.find(attrs)?.groupValues?.get(1) ?: continue
-            val rawAttrVal = AMLL_META_VALUE_REGEX.find(attrs)?.groupValues?.get(1) ?: continue
-            val rawVal = unescapeXmlAttr(rawAttrVal).trim()
-            if (rawVal.isEmpty()) continue
-            when (key) {
-                "musicName" -> if (title.isEmpty()) title = rawVal
-                "artists" -> artists.add(rawVal)
-            }
-        }
-        return artists.joinToString(" ") to title
+    private fun extractJsonDisplayString(item: Any?): String = when (item) {
+        is String -> item.trim().takeUnless { it.equals("null", ignoreCase = true) }.orEmpty()
+        is JSONObject -> optCleanString(item, "name")
+        else -> ""
     }
 
-    private fun unescapeXmlAttr(value: String): String {
-        val withNumericDecoded = XML_NUMERIC_ENTITY_REGEX.replace(value) { match ->
-            val isHex = match.groupValues[1].isNotEmpty()
-            val digits = match.groupValues[2]
-            val codePoint = digits.toIntOrNull(if (isHex) 16 else 10)
-            if (codePoint != null && Character.isValidCodePoint(codePoint)) {
-                String(Character.toChars(codePoint))
-            } else {
-                match.value
-            }
-        }
-        return withNumericDecoded
-            .replace("&amp;", "&")
-            .replace("&apos;", "'")
-            .replace("&quot;", "\"")
-            .replace("&lt;", "<")
-            .replace("&gt;", ">")
+    private fun optCleanString(obj: JSONObject, key: String): String {
+        if (!obj.has(key) || obj.isNull(key)) return ""
+        val value = obj.optString(key, "").trim()
+        return if (value.isEmpty() || value.equals("null", ignoreCase = true)) "" else value
     }
 
     private fun selectBestCandidate(
@@ -261,7 +237,7 @@ class AmllDataSource(
     private fun extractTtmlContent(jsonStr: String): String? {
         return try {
             val root = JSONObject(jsonStr)
-            root.optJSONObject("data")?.optString("lyrics")?.takeIf { it.isNotBlank() }
+            root.optJSONObject("data")?.let { optCleanString(it, "lyrics") }?.takeIf { it.isNotBlank() }
         } catch (e: Exception) {
             Logger.lyrics.w(TAG, "解析 AMLL 歌词内容异常", e)
             null
@@ -279,9 +255,11 @@ class AmllDataSource(
         private const val TAG = "AmllDataSource"
         const val DEFAULT_API_BASE_URL = "https://api.amll.dev"
         const val TIMEOUT_MS = 1500
-        private val AMLL_META_TAG_REGEX = Regex("""<amll:meta\b([^>]*)>""")
-        private val AMLL_META_KEY_REGEX = Regex("""\bkey=["'](musicName|artists)["']""")
-        private val AMLL_META_VALUE_REGEX = Regex("""\bvalue=["']([^"']*)["']""")
-        private val XML_NUMERIC_ENTITY_REGEX = Regex("""&#(x?)([0-9a-fA-F]+);""")
+        private val TITLE_SCALAR_KEYS = arrayOf(
+            "musicName", "music_name", "name", "title", "songName", "song_name", "trackName", "track_name"
+        )
+        private val ARTIST_SCALAR_KEYS = arrayOf(
+            "artistName", "artist_name", "artist", "singer"
+        )
     }
 }

@@ -149,6 +149,7 @@ internal object TriStateTransitionMatrix {
                     ),
                     progressPositionMs = if (isResumingPausedSession) snap.progressPositionMs else 0L,
                     progressDurationMs = nextMeta.durationMs,
+                    progressAnchorDelayMs = 0L,
                     progressRevision = snap.progressRevision + 1L,
                     lastProgressFromUserSeek = false,
                     errors = clearTransientCommandErrors(snap.errors),
@@ -202,6 +203,7 @@ internal object TriStateTransitionMatrix {
                         protocol = ev.protocol,
                         isExclusive = isExclusiveActiveOrReconfiguring(nextHw)
                     ),
+                    progressAnchorDelayMs = 0L,
                     errors = clearTransientCommandErrors(snap.errors),
                     uiProtectionActive = false
                 )
@@ -234,7 +236,8 @@ internal object TriStateTransitionMatrix {
                         transportState = TransportPipeState.INTERRUPTED,
                         hardwareState = muteIfExclusive(snap.hardwareState),
                         currentEpoch = ev.newEpoch,
-                        progressPositionMs = nextPositionMs
+                        progressPositionMs = nextPositionMs,
+                        progressAnchorDelayMs = 0L
                     )
                     return TransitionOutput(ctx.copy(snapshot = pausedSnap, pendingDebounceToken = 0L), effects)
                 }
@@ -247,7 +250,8 @@ internal object TriStateTransitionMatrix {
                     businessState = BusinessSessionState.TRANSITIONING,
                     hardwareState = muteIfExclusive(snap.hardwareState),
                     currentEpoch = ev.newEpoch,
-                    progressPositionMs = nextPositionMs
+                    progressPositionMs = nextPositionMs,
+                    progressAnchorDelayMs = 0L
                 )
                 return TransitionOutput(ctx.copy(snapshot = nextSnap, pendingDebounceToken = 0L), effects)
             }
@@ -263,6 +267,7 @@ internal object TriStateTransitionMatrix {
                         transportState = TransportPipeState.INTERRUPTED,
                         businessState = BusinessSessionState.PAUSED,
                         hardwareState = muteIfExclusive(snap.hardwareState),
+                        progressAnchorDelayMs = 0L,
                         uiProtectionActive = false
                     )
                     return TransitionOutput(ctx.copy(snapshot = nextSnap, pendingDebounceToken = 0L), effects)
@@ -271,7 +276,8 @@ internal object TriStateTransitionMatrix {
                     effects += TransitionEffect.ScheduleDebouncePause(token)
                     val nextSnap = snap.copy(
                         transportState = TransportPipeState.INTERRUPTED,
-                        hardwareState = muteIfExclusive(snap.hardwareState)
+                        hardwareState = muteIfExclusive(snap.hardwareState),
+                        progressAnchorDelayMs = 0L
                     )
                     return TransitionOutput(ctx.copy(snapshot = nextSnap, pendingDebounceToken = token), effects)
                 }
@@ -331,6 +337,7 @@ internal object TriStateTransitionMatrix {
                         transportState = TransportPipeState.DISCONNECTED,
                         businessState = BusinessSessionState.PAUSED,
                         hardwareState = muteIfExclusive(snap.hardwareState),
+                        progressAnchorDelayMs = 0L,
                         uiProtectionActive = false,
                         transitionOriginState = null
                     )
@@ -541,6 +548,7 @@ internal object TriStateTransitionMatrix {
                             hardwareState = HardwarePipelineState.EXCLUSIVE_ACTIVE,
                             currentEpoch = ev.resumedEpoch,
                             audioPath = snap.audioPath.copy(isExclusive = true, protocol = ev.protocol),
+                            progressAnchorDelayMs = 0L,
                             uiProtectionActive = false,
                             transitionOriginState = null
                         )
@@ -770,6 +778,7 @@ internal object TriStateTransitionMatrix {
                     metadata = result.metadata,
                     progressPositionMs = nextPosMs,
                     progressDurationMs = nextDurMs,
+                    progressAnchorDelayMs = if (result.accepted) ev.initialAnchorDelayMs.coerceAtLeast(0L) else snap.progressAnchorDelayMs,
                     progressRevision = if (result.accepted) snap.progressRevision + 1L else snap.progressRevision,
                     lastProgressFromUserSeek = false,
                     uiProtectionActive = if (isCompletingRemoteSkip) false else snap.uiProtectionActive,
@@ -820,9 +829,10 @@ internal object TriStateTransitionMatrix {
                 ) {
                     return TransitionOutput(ctx, emptyList())
                 }
-                // 💡 防倒流保护：仅拦截开播前 3.5 秒内非用户显式寻道的 0ms 未就绪占位空包；
-                // 真实非零协议进度（如自然切歌后 1~2s 到达的 7ms / 104ms）必须放行，杜绝本地 Ticker 带着 +1~2s 偏差空跑整首歌。
+                // 💡 防倒流保护：仅拦截开播前 3.5 秒内非用户显式寻道且无排队延迟的 0ms 未就绪占位空包；
+                // 携带明确 anchorDelayMs > 0L 的排队延迟事件与真实非零协议进度必须放行，精准消除自然切歌抢跑。
                 if (envelope.origin != EventOrigin.USER_ACTION &&
+                    ev.anchorDelayMs <= 0L &&
                     snap.businessState == BusinessSessionState.PLAYING &&
                     snap.progressPositionMs in 1L..3500L &&
                     ev.positionMs == 0L
@@ -836,11 +846,13 @@ internal object TriStateTransitionMatrix {
                     ev.positionMs.coerceAtLeast(0L)
                 }
                 val isAuthoritativeProgress = envelope.origin != EventOrigin.SERVICE
+                val nextAnchorDelay = if (isAuthoritativeProgress) ev.anchorDelayMs.coerceAtLeast(0L) else 0L
                 return TransitionOutput(
                     ctx.copy(
                         snapshot = snap.copy(
                             progressPositionMs = clampedPosition,
                             progressDurationMs = clampedDuration,
+                            progressAnchorDelayMs = nextAnchorDelay,
                             progressRevision = if (isAuthoritativeProgress) snap.progressRevision + 1L else snap.progressRevision,
                             lastProgressFromUserSeek = envelope.origin == EventOrigin.USER_ACTION
                         )
@@ -910,6 +922,7 @@ internal object TriStateTransitionMatrix {
             ),
             progressPositionMs = 0L,
             progressDurationMs = 0L,
+            progressAnchorDelayMs = 0L,
             progressRevision = snap.progressRevision + 1L,
             lastProgressFromUserSeek = false,
             errors = nextErrors,
@@ -948,6 +961,7 @@ internal object TriStateTransitionMatrix {
             audioPath = snap.audioPath.copy(isExclusive = false, protocol = StreamProtocol.NONE),
             progressPositionMs = 0L,
             progressDurationMs = 0L,
+            progressAnchorDelayMs = 0L,
             progressRevision = snap.progressRevision + 1L,
             lastProgressFromUserSeek = false,
             errors = clearTransientCommandErrors(snap.errors),

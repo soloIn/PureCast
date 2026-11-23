@@ -68,6 +68,9 @@ class JmDnsDiscoveryService(private val context: Context) {
     private var lastNotifiedDacpName: String? = null
     @Volatile
     private var lastNotifiedDacpPort: Int = -1
+    @Volatile
+    private var cachedMacAddress: String? = null
+    private val macAddressLock = Any()
 
     @Volatile
     private var isBroadcasting = false
@@ -352,32 +355,22 @@ class JmDnsDiscoveryService(private val context: Context) {
     fun getLocalIpv4Address(): InetAddress? = Companion.getLocalIpv4Address()
 
     /**
-     * 获取格式化的 MAC 地址（12 位大写无分隔符，如 1485540BCBC4）
-     * 💡 优先从 Linux sysfs 直接读取真实物理网卡 MAC（避开 Android 11+ NetworkInterface.getHardwareAddress() 隐私屏蔽）
+     * 获取格式化的 AirPlay 6 字节设备标识 MAC（12 位大写无分隔符，如 1485540BCBC4）
+     * 💡 遵循 Android SELinux 规范，绝不直接读取受限 sysfs (/sys/class/net/ * /address) 触发 avc: denied；
+     * 进程内单次解析并缓存，保证 mDNS 广播与所有 Apple-Challenge 握手严格复用同一稳定 MAC。
      */
     fun getMacAddressFormatted(): String {
-        // 1. 优先尝试从 Linux sysfs 直接读取真机真实物理网卡 MAC
-        val sysPaths = listOf(
-            "/sys/class/net/wlan0/address",
-            "/sys/class/net/eth0/address"
-        )
-        for (path in sysPaths) {
-            try {
-                val file = java.io.File(path)
-                if (file.exists() && file.canRead()) {
-                    val raw = file.readText().trim()
-                    val cleaned = raw.replace(":", "").replace("-", "").uppercase()
-                    if (cleaned.length == 12 && cleaned.matches(Regex("^[0-9A-F]{12}$"))) {
-                        Logger.service.i(TAG, "通过 sysfs [$path] 成功获取真实物理 MAC: $cleaned")
-                        return cleaned
-                    }
-                }
-            } catch (e: Exception) {
-                Logger.service.w(TAG, "读取 $path 异常: ${e.message}")
-            }
+        cachedMacAddress?.let { return it }
+        synchronized(macAddressLock) {
+            cachedMacAddress?.let { return it }
+            val resolved = resolveAirPlayMacAddress()
+            cachedMacAddress = resolved
+            return resolved
         }
+    }
 
-        // 2. 尝试从 NetworkInterface 读取
+    private fun resolveAirPlayMacAddress(): String {
+        // 1. 优先尝试通过标准 NetworkInterface API 读取（仅当系统允许访问时有效）
         try {
             val interfaces = Collections.list(NetworkInterface.getNetworkInterfaces())
             val sortedInterfaces = interfaces.sortedWith(compareByDescending { intf ->
@@ -390,14 +383,15 @@ class JmDnsDiscoveryService(private val context: Context) {
             for (intf in sortedInterfaces) {
                 if (intf.isLoopback || !intf.isUp) continue
                 val mac = intf.hardwareAddress ?: continue
-                if (mac.isNotEmpty()) {
-                    val sb = StringBuilder()
+                if (mac.size == 6 && mac.any { it.toInt() != 0 }) {
+                    val sb = StringBuilder(12)
                     for (b in mac) {
                         sb.append(String.format("%02X", b))
                     }
-                    if (sb.length == 12) {
-                        Logger.service.i(TAG, "通过 NetworkInterface [${intf.name}] 成功获取 MAC: $sb")
-                        return sb.toString()
+                    val candidate = sb.toString()
+                    if (candidate != "020000000000") {
+                        Logger.service.i(TAG, "通过 NetworkInterface [${intf.name}] 获取并缓存 AirPlay MAC: $candidate")
+                        return candidate
                     }
                 }
             }
@@ -405,17 +399,17 @@ class JmDnsDiscoveryService(private val context: Context) {
             Logger.service.w(TAG, "读取 NetworkInterface MAC 异常: ${e.message}")
         }
 
-        // 3. 兜底策略：使用持久化本地管理 MAC (LAA)，避免多台 PureCast 设备在局域网内冲突
+        // 2. Android 11+ 标准合规路径：使用持久化本地管理 MAC (LAA)，保证局域网唯一且无 SELinux 拒绝审计
         val fallbackMac = try {
             com.solo.purecast.data.SettingsRepository.getInstance(context).getOrCreateFallbackMacAddress()
         } catch (e: Exception) {
-            Logger.service.w(TAG, "读取持久化兜底 MAC 失败，使用一次性随机 LAA MAC: ${e.message}")
+            Logger.service.w(TAG, "读取持久化 LAA MAC 失败，使用会话级随机 LAA MAC: ${e.message}")
             val bytes = ByteArray(6)
             java.security.SecureRandom().nextBytes(bytes)
             bytes[0] = ((bytes[0].toInt() and 0xFC) or 0x02).toByte()
             bytes.joinToString("") { "%02X".format(it) }
         }
-        Logger.service.w(TAG, "无法动态获取物理 MAC，回退至持久化本地管理 MAC: $fallbackMac")
+        Logger.service.i(TAG, "使用并缓存持久化 AirPlay 本地管理 MAC: $fallbackMac")
         return fallbackMac
     }
 
@@ -448,10 +442,6 @@ class JmDnsDiscoveryService(private val context: Context) {
 
             override fun serviceResolved(event: javax.jmdns.ServiceEvent) {
                 val info = event.info ?: return
-                // 💡 待机空闲态（无活跃 AirPlay 会话目标）不刷屏打印多条 DNS 记录的重复解析日志
-                if (targetDacpId != null || targetClientIp != null) {
-                    Logger.service.d(TAG, "已解析 _dacp._tcp 服务: Name=${info.name}, Port=${info.port}")
-                }
                 inspectDacpServiceInfo(info)
             }
         }
@@ -537,6 +527,9 @@ class JmDnsDiscoveryService(private val context: Context) {
             Logger.service.i(TAG, "🎉 成功锁定 DACP 真实端口: $port (Name=${info.name}, IPs=[$ips])")
             onDacpPortResolvedCallback?.invoke(port)
             return true
+        }
+        if (targetDacpId != null || targetClientIp != null) {
+            Logger.service.d(TAG, "已解析非目标 _dacp._tcp 服务: Name=${info.name}, Port=$port")
         }
         return false
     }

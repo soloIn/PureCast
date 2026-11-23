@@ -270,17 +270,19 @@ fun MainTvScreen(
 
             if (snapshot.trackGeneration != lastObservedTrackGen) {
                 lastObservedTrackGen = snapshot.trackGeneration
-                // 💡 切歌换代：坚决瞬时排空旧代时钟并硬对齐目标进度，杜绝上一首歌残留时间对新歌产生干扰
+                // 💡 切歌换代：坚决瞬时排空旧代时钟并硬对齐目标进度与排队延迟，杜绝上一首歌残留或提前抢跑
                 lyricsSyncClock.hardAlign(
                     targetPositionMs = snapshot.progressPositionMs,
-                    playing = isTrulyPlaying
+                    playing = isTrulyPlaying,
+                    startDelayMs = snapshot.progressAnchorDelayMs
                 )
             } else {
                 lyricsSyncClock.updatePosition(
                     newPositionMs = snapshot.progressPositionMs,
                     playing = isTrulyPlaying,
                     isUserSeek = snapshot.lastProgressFromUserSeek,
-                    allowSeekJump = isAuthoritativeProgress
+                    allowSeekJump = isAuthoritativeProgress,
+                    anchorDelayMs = snapshot.progressAnchorDelayMs
                 )
             }
         }

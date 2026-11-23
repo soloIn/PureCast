@@ -87,20 +87,34 @@ class LyricsSyncClock(
      * 用于切歌换代、显式 Seek 寻道完成或重连时，瞬时排空历史插值缓存，
      * 毫秒级硬重置锚点时间，彻底杜绝向前拖动滞后与跨曲目残存。
      */
-    fun hardAlign(targetPositionMs: Long, playing: Boolean, nowNanoTime: Long = System.nanoTime()) {
+    fun hardAlign(
+        targetPositionMs: Long,
+        playing: Boolean,
+        nowNanoTime: Long = System.nanoTime(),
+        startDelayMs: Long = 0L
+    ) {
         val clamped = targetPositionMs.coerceAtLeast(0L)
         val ringDelayMs = getEffectiveRingDelayMs(nowNanoTime)
         reportedPositionMs = clamped
         // 💡 统一时间基准 (Finding 11)：将 lastInterpolatedTimeMs 统一初始化为 (targetPositionMs - ringDelayMs).coerceAtLeast(0L)
         // 确保与播放推演中的 hardwareAdjustedTime 基准严格咬合，杜绝硬对齐瞬间时钟断层与滞后
         lastInterpolatedTimeMs = (clamped - ringDelayMs).coerceAtLeast(0L)
-        // 💡 硬件出声延迟对齐：开播时 (pos == 0L 且处于播放态) 锚点推迟 100ms，对齐声卡 100ms 硬件预充出声时钟
+        // 💡 硬件/发端缓冲延迟对齐：若协议显式告知新曲排队延迟 (startDelayMs > 0)，锚点精准延后至扬声器出声时刻；
+        // 否则开播时 (pos == 0L 且处于播放态) 锚点默认推迟 100ms，对齐声卡 100ms 硬件预充出声时钟
+        val effectiveDelayMs = when {
+            startDelayMs > 0L -> startDelayMs
+            clamped == 0L -> 100L
+            else -> 0L
+        }
         anchorNanoTime = if (playing) {
-            if (clamped == 0L) nowNanoTime + 100_000_000L else nowNanoTime
+            nowNanoTime + effectiveDelayMs * 1_000_000L
         } else 0L
         isPlaying = playing
         notifyMutation()
-        Logger.lyrics.i(TAG, "时钟硬对齐完成 (Hard Align): target=${clamped}ms, playing=$playing, ringDelay=${ringDelayMs}ms")
+        Logger.lyrics.i(
+            TAG,
+            "时钟硬对齐完成 (Hard Align): target=${clamped}ms, playing=$playing, delay=${effectiveDelayMs}ms, ringDelay=${ringDelayMs}ms"
+        )
     }
 
     /**
@@ -112,8 +126,15 @@ class LyricsSyncClock(
         playing: Boolean,
         nowNanoTime: Long = System.nanoTime(),
         isUserSeek: Boolean = false,
-        allowSeekJump: Boolean = true
+        allowSeekJump: Boolean = true,
+        anchorDelayMs: Long = 0L
     ) {
+        // 💡 新曲目排队延迟锚定：协议明确告知首帧尚需 anchorDelayMs 才到达扬声器，立即将时钟按回 0ms 并延后锚点
+        if (allowSeekJump && anchorDelayMs > 0L && newPositionMs == 0L && playing) {
+            hardAlign(0L, playing = true, nowNanoTime = nowNanoTime, startDelayMs = anchorDelayMs)
+            return
+        }
+
         val currentEstimatedTime = if (isPlaying && anchorNanoTime > 0L) {
             val elapsedMs = (nowNanoTime - anchorNanoTime).coerceAtLeast(0L) / 1_000_000L
             reportedPositionMs + elapsedMs.coerceIn(0L, maxExtrapolationMs)
@@ -165,14 +186,15 @@ class LyricsSyncClock(
             val ringDelayMs = getEffectiveRingDelayMs(nowNanoTime)
             reportedPositionMs = newPositionMs
             lastInterpolatedTimeMs = (newPositionMs - ringDelayMs).coerceAtLeast(0L)
-            anchorNanoTime = if (newPositionMs == 0L) nowNanoTime + 100_000_000L else nowNanoTime
+            val resumeDelayMs = if (anchorDelayMs > 0L) anchorDelayMs else if (newPositionMs == 0L) 100L else 0L
+            anchorNanoTime = nowNanoTime + resumeDelayMs * 1_000_000L
         } else if (!playing && !isPlaying) {
             // 💡 保持暂停状态：底层上报可能随网络心跳微调 reportedPositionMs，保持 anchorNanoTime = 0L 且 lastInterpolatedTimeMs 原地冻结
             reportedPositionMs = newPositionMs
             anchorNanoTime = 0L
         } else {
             // 正常连续推流更新基准：加入 50ms 负向微抖动保护，防止网络或调度偶发抖动引发扫光顿挫
-            // 💡 若仍处于 100ms 预充期 (newPositionMs == 0L 且 nowNanoTime < anchorNanoTime)，保留未来锚点不被提前覆盖
+            // 💡 若仍处于 100ms/排队 预充期 (newPositionMs == 0L 且 nowNanoTime < anchorNanoTime)，保留未来锚点不被提前覆盖
             val isPrefillStillPending = (newPositionMs == 0L && nowNanoTime < anchorNanoTime)
             reportedPositionMs = maxOf(newPositionMs, currentEstimatedTime - 50L)
             if (!isPrefillStillPending) {

@@ -140,6 +140,14 @@ public:
     bool get_target_speaker_rtp_ts(uint32_t& out_ts) const;
 
     /**
+     * 💡 统一解析当前扬声器权威 RTP 参考时间戳（Single Source of Truth）：
+     * 1) 已写入 AudioEngine 环形缓冲时：返回 last_written_rtp_ts_ - ring_unplayed_samples (is_live_audio=true)；
+     * 2) 尚未起播但 Sync 锚点已就绪时：回退返回 target_speaker_rtp_ts (is_live_audio=false)；
+     * 3) 均不可用时返回 false，禁止上层裸用发端超前 1.75s 的 curr_ts 虚报进度。
+     */
+    bool resolve_speaker_rtp_ts(uint32_t& out_ts, bool& is_live_audio) const;
+
+    /**
      * 💡 是否已通过 NTP Timing 锁定发射端时钟偏移（供诊断与单元测试使用）
      */
     bool is_ntp_clock_locked() const {

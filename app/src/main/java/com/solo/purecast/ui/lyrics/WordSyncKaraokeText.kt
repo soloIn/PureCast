@@ -110,10 +110,16 @@ fun WordSyncKaraokeText(
             xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC_IN)
         }
     }
-    // 💡 退场淡出期专用复用 Paint，按行当前 alpha 动态补偿 unlitAlpha，保证实际亮度严格单调不回弹
+    // 💡 退场淡出期专用复用 Paint 与量化 Shader 缓存，彻底消除退场 60fps 帧循环中每帧 new LinearGradient 分配
     val exitingSweepPaint = remember {
         android.graphics.Paint().apply {
             xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC_IN)
+        }
+    }
+    val exitShaderCache = remember(primaryColor, feather) {
+        object {
+            var lastQuantizedAlphaStep: Int = -1
+            var shader: android.graphics.LinearGradient? = null
         }
     }
 
@@ -331,12 +337,21 @@ fun WordSyncKaraokeText(
                         sweepPaint.shader = sweepShader
                         sweepPaint
                     } else {
-                        val exitShader = android.graphics.LinearGradient(
-                            0f, 0f, feather, 0f,
-                            primaryColor.toArgb(),
-                            activeUnlitColor.toArgb(),
-                            Shader.TileMode.CLAMP
-                        )
+                        val quantizedStep = (effectiveUnlitAlpha * 25f).toInt().coerceIn(0, 25)
+                        val exitShader = if (exitShaderCache.shader != null && exitShaderCache.lastQuantizedAlphaStep == quantizedStep) {
+                            exitShaderCache.shader!!
+                        } else {
+                            val quantizedColor = primaryColor.copy(alpha = quantizedStep / 25f).toArgb()
+                            android.graphics.LinearGradient(
+                                0f, 0f, feather, 0f,
+                                primaryColor.toArgb(),
+                                quantizedColor,
+                                Shader.TileMode.CLAMP
+                            ).also { created ->
+                                exitShaderCache.lastQuantizedAlphaStep = quantizedStep
+                                exitShaderCache.shader = created
+                            }
+                        }
                         exitShader.setLocalMatrix(sweepMatrix)
                         exitingSweepPaint.shader = exitShader
                         exitingSweepPaint

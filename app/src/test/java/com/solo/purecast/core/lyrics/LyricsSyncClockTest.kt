@@ -639,4 +639,29 @@ class LyricsSyncClockTest {
         // 9_900ms (startMs - 100ms)：落位后干脆点亮第 1 行
         assertEquals(1, syncClock.calculateActiveLineIndex(timeline, 9_900L, LyricsSyncClock.LINE_SYNC_HIGHLIGHT_LEAD_IN_MS))
     }
+
+    @Test
+    fun `queue anchorDelayMs holds clock at 0ms until speaker playback starts without jumping`() {
+        val baseNano = 1_000_000_000L
+        // 1. 新曲目 DMAP 先行到达并开始走表
+        syncClock.hardAlign(targetPositionMs = 0L, playing = true, nowNanoTime = baseNano)
+        assertEquals(400L, syncClock.getCurrentInterpolatedTimeMs(baseNano + 500_000_000L))
+
+        // 2. 500ms 后收到协议上报精确排队延迟 1200ms (ref_ts 仍早于 start_ts 1200ms)
+        val anchorNano = baseNano + 500_000_000L
+        syncClock.updatePosition(
+            newPositionMs = 0L,
+            playing = true,
+            nowNanoTime = anchorNano,
+            allowSeekJump = true,
+            anchorDelayMs = 1_200L
+        )
+
+        // 3. 在 1200ms 排队等待期间，时钟严格保持 0ms 不抢跑
+        assertEquals(0L, syncClock.getCurrentInterpolatedTimeMs(anchorNano + 600_000_000L))
+        assertEquals(0L, syncClock.getCurrentInterpolatedTimeMs(anchorNano + 1_199_000_000L))
+
+        // 4. 超过 1200ms 到达扬声器出声时刻后无缝推进
+        assertEquals(250L, syncClock.getCurrentInterpolatedTimeMs(anchorNano + 1_450_000_000L))
+    }
 }

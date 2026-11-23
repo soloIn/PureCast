@@ -680,15 +680,29 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
                 std::string body(reinterpret_cast<const char*>(payload), payload_len);
                 LOGI("SET_PARAMETER 收到文本参数推送:\n%s", body.c_str());
 
+                auto extract_param_line = [&](const char* key, size_t key_len) -> std::string {
+                    size_t search_from = 0;
+                    while (search_from < body.size()) {
+                        size_t pos = body.find(key, search_from);
+                        if (pos == std::string::npos) return {};
+                        if (pos == 0 || body[pos - 1] == '\n') {
+                            size_t vstart = pos + key_len;
+                            while (vstart < body.size() && (body[vstart] == ' ' || body[vstart] == '\t')) vstart++;
+                            size_t vend = body.find_first_of("\r\n", vstart);
+                            if (vend == std::string::npos) vend = body.size();
+                            while (vend > vstart && (body[vend - 1] == ' ' || body[vend - 1] == '\t')) vend--;
+                            return body.substr(vstart, vend - vstart);
+                        }
+                        search_from = pos + 1;
+                    }
+                    return {};
+                };
+
                 // 3.1 音量调节: volume: -15.000000 (单位 dB, -144.0 为静音 MUTE, 0.0 为最大)
-                size_t vol_pos = body.find("volume:");
-                if (vol_pos != std::string::npos) {
-                    size_t vstart = vol_pos + 7;
-                    while (vstart < body.size() && (body[vstart] == ' ' || body[vstart] == '\t')) vstart++;
-                    size_t vend = body.find("\r\n", vstart);
-                    if (vend == std::string::npos) vend = body.size();
+                std::string vol_val = extract_param_line("volume:", 7);
+                if (!vol_val.empty()) {
                     try {
-                        float vol_db = std::stof(body.substr(vstart, vend - vstart));
+                        float vol_db = std::stof(vol_val);
                         current_volume_db_.store(vol_db, std::memory_order_relaxed);
                         rtp_.set_volume(vol_db);
                         LOGI("AirPlay 客户端设置音量: %.2f dB %s", vol_db, (vol_db <= -143.0f ? "(MUTE 静音)" : ""));
@@ -698,14 +712,8 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
                 }
 
                 // 3.2 播放时间进度: progress: start/curr/end
-                size_t prog_pos = body.find("progress:");
-                if (prog_pos != std::string::npos) {
-                    size_t start_pos = prog_pos + 9;
-                    while (start_pos < body.size() && body[start_pos] == ' ') start_pos++;
-                    size_t line_end = body.find("\r\n", start_pos);
-                    if (line_end == std::string::npos) line_end = body.size();
-                    std::string prog_val = body.substr(start_pos, line_end - start_pos);
-
+                std::string prog_val = extract_param_line("progress:", 9);
+                if (!prog_val.empty()) {
                     // 格式: start/curr/end (RTP 时间戳)
                     uint64_t start_ts = 0, curr_ts = 0, end_ts = 0;
                     char s1 = 0, s2 = 0;
@@ -729,24 +737,17 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
                                     ? static_cast<long>(static_cast<int64_t>(dur_samples) * 1000LL / rate)
                                     : 0L;
 
-                                // 💡 扬声器真实出声位置校准：
-                                // iOS AirPlay 1 默认接收端缓存 2.0s (max-latency: 88200)，其下发的 curr_ts 恒落后于发送端实时 RTP ~2.0s；
-                                // PureCast 仅缓冲 ~200ms 即直通 USB DAC 出声。利用 RaopRtp 写入环形缓冲的最新 RTP 尾时间戳减去环形缓冲未消费采样，
-                                // 直接得出此刻扬声器真实出声的 speaker_ts，消除暂停恢复与 Seek 后的 1.8~2.0s 固定滞后！
-                                uint32_t written_ts = 0;
+                                // 💡 扬声器真实出声位置统一校准：
+                                // 优先使用已写入环形缓冲扣除未消费采样后的 live speaker_ts；
+                                // 在 FLUSH/重连后 Sync 门控等待期（尚未写入首帧）自动回退到 NTP+Sync 推导的 target_speaker_ts，
+                                // 杜绝裸用发端超前 1.75s 的 curr_ts 虚报进度引发重连断崖回跳。
+                                uint32_t speaker_ts = 0;
+                                bool is_live_audio = false;
                                 uint32_t ref_ts = curr32;
                                 bool used_speaker_ts = false;
-                                if (rtp_.get_last_written_rtp_ts(written_ts)) {
-                                    const uint32_t ch = current_params_.channels > 0 ? static_cast<uint32_t>(current_params_.channels) : 2U;
-                                    const uint32_t bps = (current_params_.bit_depth > 0 ? static_cast<uint32_t>(current_params_.bit_depth) : 16U) / 8U;
-                                    const uint32_t bytes_per_frame = ch * (bps > 0 ? bps : 2U);
-                                    const size_t ring_bytes = AudioEngine::instance().get_available_read();
-                                    const uint32_t ring_unplayed_samples = (bytes_per_frame > 0)
-                                        ? static_cast<uint32_t>(ring_bytes / bytes_per_frame)
-                                        : 0U;
-                                    const uint32_t speaker_ts = written_ts - ring_unplayed_samples;
+                                if (rtp_.resolve_speaker_rtp_ts(speaker_ts, is_live_audio)) {
                                     const int32_t speaker_ahead_samples = static_cast<int32_t>(speaker_ts - curr32);
-                                    const int32_t min_valid = -static_cast<int32_t>(rate / 2U);      // -500ms
+                                    const int32_t min_valid = -static_cast<int32_t>(rate * 5U / 2U); // -2500ms
                                     const int32_t max_valid = static_cast<int32_t>(rate * 7U / 2U);  // +3500ms
                                     if (speaker_ahead_samples >= min_valid && speaker_ahead_samples <= max_valid) {
                                         ref_ts = speaker_ts;
@@ -754,20 +755,32 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
                                     }
                                 }
 
-                                // 💡 AirPlay 预充时钟契约：
-                                // 当 ref_ts 仍早于 start32（新曲目尚未到达扬声器）时返回 pos_ms = -1L，仅同步总时长而不拉偏上一曲进度。
+                                // 💡 AirPlay 排队延迟语义契约：
+                                // 1) 当 ref_ts 早于 start32（新曲目仍在发端/本地缓冲排队）时，上报精确负偏移 (-queue_delay_ms, 范围 -5000..-2ms)，
+                                //    供 Kotlin 协调器将新曲目时钟锚点精准延后至扬声器出声时刻，彻底消除无 FLUSH 切歌 ~2.2s 抢跑回跳；
+                                // 2) 当尚未起播且 Sync 锚点不可用 (used_speaker_ts=0 && !is_live_audio) 时上报 -1L 仅同步时长，不发射虚高进度。
                                 const int32_t ref_diff_samples = static_cast<int32_t>(ref_ts - start32);
-                                const bool is_initial_queueing = (ref_diff_samples < 0);
-                                const long raw_pos_ms = is_initial_queueing
-                                    ? 0L
-                                    : static_cast<long>(static_cast<int64_t>(ref_diff_samples) * 1000LL / rate);
-                                long pos_ms = is_initial_queueing ? -1L : std::max(0L, raw_pos_ms);
-                                if (!is_initial_queueing && has_valid_duration && dur_ms > 0L && pos_ms > dur_ms) {
-                                    pos_ms = dur_ms;
+                                long pos_ms = -1L;
+                                if (!used_speaker_ts && !is_live_audio && rtp_.is_running()) {
+                                    pos_ms = -1L;
+                                } else if (ref_diff_samples < 0) {
+                                    const long queue_delay_ms = static_cast<long>(
+                                        (static_cast<int64_t>(-ref_diff_samples) * 1000LL) / rate
+                                    );
+                                    pos_ms = -std::clamp(queue_delay_ms, 2L, 5000L);
+                                } else {
+                                    const long raw_pos_ms = static_cast<long>(
+                                        (static_cast<int64_t>(ref_diff_samples) * 1000LL) / rate
+                                    );
+                                    pos_ms = std::max(0L, raw_pos_ms);
+                                    if (has_valid_duration && dur_ms > 0L && pos_ms > dur_ms) {
+                                        pos_ms = dur_ms;
+                                    }
                                 }
 
-                                LOGD("AirPlay %s进度实时校准: pos=%ld ms, dur=%ld ms (used_speaker_ts=%d, ref_ts=%u, curr_ts=%u, RTP: %s)",
-                                     has_valid_duration ? "" : "直播流", pos_ms, dur_ms, used_speaker_ts ? 1 : 0,
+                                LOGD("AirPlay %s进度实时校准: pos=%ld ms, dur=%ld ms (used_speaker_ts=%d, live=%d, ref_ts=%u, curr_ts=%u, RTP: %s)",
+                                     has_valid_duration ? "" : "直播流", pos_ms, dur_ms,
+                                     used_speaker_ts ? 1 : 0, is_live_audio ? 1 : 0,
                                      ref_ts, curr32, prog_val.c_str());
                                 rtp_.update_track_progress(pos_ms, dur_ms);
                                 if (progress_cb_) {

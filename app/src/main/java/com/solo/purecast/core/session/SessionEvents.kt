@@ -152,7 +152,8 @@ data class TrackBoundaryEvent(
     val seekCapability: SeekCapability = SeekCapability.UNKNOWN,
     val trackUri: String? = null,
     val initialPositionMs: Long = 0L,
-    val initialDurationMs: Long = 0L
+    val initialDurationMs: Long = 0L,
+    val initialAnchorDelayMs: Long = 0L
 ) : SessionEventPayload
 
 /**
@@ -219,7 +220,8 @@ data class ProgressUpdateEvent(
     val positionMs: Long,
     val durationMs: Long,
     val trackGeneration: Long = 0L,
-    val expectedProgressRevision: Long = -1L
+    val expectedProgressRevision: Long = -1L,
+    val anchorDelayMs: Long = 0L
 ) : SessionEventPayload
 
 /**

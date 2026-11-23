@@ -414,11 +414,12 @@ class PlaybackServiceSessionHost(
             next.businessState == BusinessSessionState.PLAYING &&
             next.progressPositionMs == 0L
 
-        // 💡 开播保护：仅拦截开播前 3.5 秒内协议补发的 0ms 未就绪空包；
-        // 真实非零协议进度（如切歌后到达的 7ms / 104ms）必须刷新锚点，防止 Ticker 持续偏快。
+        // 💡 开播保护：仅拦截开播前 3.5 秒内无排队延迟的 0ms 未就绪空包；
+        // 携带明确 progressAnchorDelayMs > 0L 或真实非零协议进度必须刷新锚点，防止 Ticker 持续偏快。
         val currentServiceElapsed = (nowMs - lastAnchorClockMs).coerceAtLeast(0L)
         val currentServicePos = lastAnchorPosMs + currentServiceElapsed
         val isInitialProtocolLag = !next.lastProgressFromUserSeek &&
+            next.progressAnchorDelayMs <= 0L &&
             prev != null &&
             prev.trackGeneration == next.trackGeneration &&
             prev.businessState == BusinessSessionState.PLAYING &&
@@ -433,10 +434,14 @@ class PlaybackServiceSessionHost(
             hasAuthoritativeRevisionChange
         )) {
             lastAnchorPosMs = next.progressPositionMs
-            // 💡 修复 FirstDataPacketEvent 早于 DAC 真实出声 100ms：
-            // 首帧写入环形缓冲区触发 PLAYING 时，声卡正处于 100ms 预充阶段，将时钟锚点精准推迟 100ms，
-            // 确保进度走字与扬声器真实出声毫秒级完美同步；正常协议进度包则以当前物理时钟对齐。
-            lastAnchorClockMs = if (isFirstPlayAtZero) clockMs() + 100L else clockMs()
+            // 💡 精准对齐扬声器真实出声时刻：
+            // 优先使用 C++ 协议层计算的发端/本地排队延迟 (progressAnchorDelayMs)，否则首帧 0ms 开播默认推迟 100ms 硬件预充。
+            val anchorDelayMs = when {
+                next.progressAnchorDelayMs > 0L -> next.progressAnchorDelayMs
+                isFirstPlayAtZero -> 100L
+                else -> 0L
+            }
+            lastAnchorClockMs = clockMs() + anchorDelayMs
             anchoredProgressRevision = next.progressRevision
         } else if (hasAuthoritativeRevisionChange) {
             // 即使被开播防倒流拦截，也同步更新已观察版本号，防止 ticker 永久停摆
