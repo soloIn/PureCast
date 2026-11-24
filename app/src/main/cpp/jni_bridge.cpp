@@ -797,4 +797,33 @@ Java_com_solo_purecast_core_nativebridge_NativeAudioEngine_updateAirPlayTrackPro
     return JNI_TRUE;
 }
 
+JNIEXPORT jlong JNICALL
+Java_com_solo_purecast_core_nativebridge_NativeAudioEngine_getAirPlayRealtimePositionMs(
+    JNIEnv* /* env */,
+    jobject /* thiz */
+) {
+    std::shared_ptr<purecast::raop::RaopServer> server;
+    {
+        std::lock_guard<std::recursive_mutex> slock(g_server_mutex);
+        server = g_raop_server;
+    }
+    if (!server) return -1;
+    return static_cast<jlong>(server->get_realtime_track_position_ms());
+}
+
+JNIEXPORT void JNICALL
+Java_com_solo_purecast_core_nativebridge_NativeAudioEngine_invalidateAirPlayProgressAnchor(
+    JNIEnv* /* env */,
+    jobject /* thiz */
+) {
+    std::shared_ptr<purecast::raop::RaopServer> server;
+    {
+        std::lock_guard<std::recursive_mutex> slock(g_server_mutex);
+        server = g_raop_server;
+    }
+    if (server) {
+        server->invalidate_track_rtp_anchor();
+    }
+}
+
 } // extern "C"

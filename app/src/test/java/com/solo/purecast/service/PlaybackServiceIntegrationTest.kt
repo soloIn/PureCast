@@ -165,6 +165,7 @@ class PlaybackServiceIntegrationTest {
     private fun TestScope.createHost(
         hw: FakeHardwareBridge = FakeHardwareBridge(),
         fx: FakeSystemEffects = FakeSystemEffects(),
+        airPlayRealtimePositionProvider: () -> Long = { -1L },
         dacpSender: suspend (RemoteCommandType, Long) -> Result<Unit> = { cmd, _ ->
             fx.dacpSent += cmd.name
             Result.success(Unit)
@@ -184,7 +185,8 @@ class PlaybackServiceIntegrationTest {
             coordinator = coordinator,
             hardwareBridge = hw,
             systemEffects = fx,
-            clockMs = { testScheduler.currentTime }
+            clockMs = { testScheduler.currentTime },
+            airPlayRealtimePositionProvider = airPlayRealtimePositionProvider
         )
         preemptHook = { proto, sid -> fx.preemptProtocol(proto, sid) }
         host.startObserving()
@@ -706,6 +708,79 @@ class PlaybackServiceIntegrationTest {
         testScheduler.runCurrent()
         assertEquals(BusinessSessionState.TRANSITIONING, coord.snapshot.value.businessState)
         assertEquals(listOf("PLAY"), fx.dacpSent.toList())
+
+        host.stop()
+    }
+
+    @Test
+    fun `AirPlay ticker uses closed-loop realtime position and skips during optimistic user seek`() = runTest {
+        val hw = FakeHardwareBridge()
+        val fx = FakeSystemEffects()
+        var nativeRealtimePos = 15_000L
+        val testScope = TestScope(StandardTestDispatcher(testScheduler))
+        val (host, coord) = testScope.createHost(
+            hw = hw,
+            fx = fx,
+            airPlayRealtimePositionProvider = { nativeRealtimePos }
+        )
+
+        val ep = host.acquireHardwareForStream(StreamProtocol.AIRPLAY_1, 44100, 16, 2, "ALAC")
+        val sid = host.nextSessionId()
+        coord.dispatch(
+            SessionEventEnvelope(
+                origin = EventOrigin.AIRPLAY,
+                sessionId = sid,
+                deviceGeneration = 0L,
+                sequence = coord.allocateSequence(),
+                timestampElapsedMs = 1L,
+                payload = StreamSetupEvent(
+                    protocol = StreamProtocol.AIRPLAY_1,
+                    sampleRate = 44100,
+                    bitDepth = 16,
+                    channels = 2,
+                    codec = "ALAC",
+                    initialEpoch = ep,
+                    trackGeneration = 1L,
+                    initialMetadata = TrackMetadata(
+                        title = "Like a Rolling Stone",
+                        durationMs = 371_714L,
+                        durationState = DurationState.FIXED,
+                        seekCapability = SeekCapability.SEEKABLE
+                    )
+                )
+            )
+        )
+        coord.dispatch(
+            SessionEventEnvelope(
+                origin = EventOrigin.AIRPLAY,
+                sessionId = sid,
+                deviceGeneration = 0L,
+                sequence = coord.allocateSequence(),
+                timestampElapsedMs = 2L,
+                payload = FirstDataPacketEvent(StreamProtocol.AIRPLAY_1, ep, 44100, 16, 2, "ALAC")
+            )
+        )
+        testScheduler.runCurrent()
+
+        // 1. 500ms Ticker 应优先闭环采纳底层扬声器真实位置 (15_000ms)，而非开环推演的 ~400ms
+        testScheduler.advanceTimeBy(550L)
+        testScheduler.runCurrent()
+        assertEquals(15_000L, coord.snapshot.value.progressPositionMs)
+
+        // 2. 底层锚点暂时不可用 (-1L) 时，基于上一拍闭环锚点平滑线性推演 (+500ms)
+        nativeRealtimePos = -1L
+        testScheduler.advanceTimeBy(500L)
+        testScheduler.runCurrent()
+        assertTrue(coord.snapshot.value.progressPositionMs in 15_450L..15_550L)
+
+        // 3. 用户主动 Seek 至 120_000ms 乐观期：即使底层仍返回旧位置 16_000ms，Ticker 绝不回弹覆盖
+        nativeRealtimePos = 16_000L
+        host.seekTo(120_000L)
+        testScheduler.runCurrent()
+        assertEquals(120_000L, coord.snapshot.value.progressPositionMs)
+        testScheduler.advanceTimeBy(500L)
+        testScheduler.runCurrent()
+        assertTrue(coord.snapshot.value.progressPositionMs >= 120_000L)
 
         host.stop()
     }

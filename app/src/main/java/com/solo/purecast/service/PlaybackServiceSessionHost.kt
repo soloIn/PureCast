@@ -85,7 +85,8 @@ class PlaybackServiceSessionHost(
     val coordinator: PlaybackSessionCoordinator,
     private val hardwareBridge: SessionHardwareBridge,
     private val systemEffects: ServiceSystemEffects,
-    private val clockMs: () -> Long = { System.currentTimeMillis() }
+    private val clockMs: () -> Long = { System.currentTimeMillis() },
+    private val airPlayRealtimePositionProvider: () -> Long = { -1L }
 ) : ProtocolSessionBridge {
     private var snapshotObserverJob: Job? = null
     private var airPlayTickerJob: Job? = null
@@ -476,9 +477,19 @@ class PlaybackServiceSessionHost(
                 if (snap.progressRevision != anchorRev) {
                     continue
                 }
-                val elapsed = (clockMs() - lastAnchorClockMs).coerceAtLeast(0L)
-                var pos = lastAnchorPosMs + elapsed
+                val now = clockMs()
                 val dur = snap.progressDurationMs
+                // 💡 优先闭环读取 C++ 扬声器真实出声进度 (speaker_ts - start_ts)，仅在本机 Seek 乐观期、排队延迟期或锚点未就绪时回退系统时钟推演
+                val canQueryRealtime = !snap.lastProgressFromUserSeek && now >= lastAnchorClockMs
+                val realtimePos = if (canQueryRealtime) airPlayRealtimePositionProvider() else -1L
+                var pos = if (realtimePos >= 0L) {
+                    lastAnchorPosMs = realtimePos
+                    lastAnchorClockMs = now
+                    realtimePos
+                } else {
+                    val elapsed = (now - lastAnchorClockMs).coerceAtLeast(0L)
+                    lastAnchorPosMs + elapsed
+                }
                 if (dur > 0L && pos > dur) {
                     pos = dur
                 }

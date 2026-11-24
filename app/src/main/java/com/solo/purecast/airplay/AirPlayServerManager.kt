@@ -235,6 +235,9 @@ class AirPlayServerManager(
         onStreamTeardownRequested = { globalSid ->
             startDacpLivenessDecision(globalSid)
         },
+        onInvalidateProgressAnchor = {
+            NativeAudioEngine.invalidateAirPlayProgressAnchor()
+        },
         clockMs = clockMs
     )
 

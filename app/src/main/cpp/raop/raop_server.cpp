@@ -782,6 +782,11 @@ void RaopServer::handle_rtsp_request(int client_fd, const std::string& request) 
                                      has_valid_duration ? "" : "直播流", pos_ms, dur_ms,
                                      used_speaker_ts ? 1 : 0, is_live_audio ? 1 : 0,
                                      ref_ts, curr32, prog_val.c_str());
+                                if (has_valid_duration && dur_ms > 0L) {
+                                    rtp_.set_track_rtp_anchor(start32, dur_ms);
+                                } else {
+                                    rtp_.invalidate_track_rtp_anchor();
+                                }
                                 rtp_.update_track_progress(pos_ms, dur_ms);
                                 if (progress_cb_) {
                                     progress_cb_(active_session_id_.load(std::memory_order_acquire), next_seq(), pos_ms, dur_ms);

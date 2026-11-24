@@ -196,4 +196,14 @@ object NativeAudioEngine {
      * 💡 向底层 Native RAOP 同步当前播放进度与曲目总时长，用于曲目尾部静音免疫窗口判定
      */
     external fun updateAirPlayTrackProgress(positionMs: Long, durationMs: Long): Boolean
+
+    /**
+     * 💡 闭环读取底层 Native RAOP 扬声器当前真实出声曲目进度 (毫秒)，未就绪或排队期返回 -1L
+     */
+    external fun getAirPlayRealtimePositionMs(): Long
+
+    /**
+     * 💡 失效底层 Native RAOP 当前曲目 RTP 起点锚点（切歌边界或本机 Seek 前调用，防止旧曲起点污染新曲）
+     */
+    external fun invalidateAirPlayProgressAnchor()
 }

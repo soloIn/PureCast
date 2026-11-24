@@ -170,15 +170,20 @@ void RaopRtp::stop() {
         std::lock_guard<std::mutex> lock(sync_mutex_);
         sync_rtp_ts_ = 0;
         sync_local_mono_us_ = 0;
+        sync_phase_offset_samples_ = 0;
         has_sync_anchor_ = false;
     }
+    late_sync_handover_pending_.store(false, std::memory_order_release);
+    drift_drop_count_.store(0U, std::memory_order_release);
     {
         std::lock_guard<std::mutex> lock(audio_packet_mutex_);
         sync_playback_started_ = false;
+        last_drift_drop_mono_us_ = 0;
         awaiting_post_flush_audio_ = false;
         post_flush_silence_paused_ = false;
         post_flush_silence_frames_ = 0;
     }
+    invalidate_track_rtp_anchor();
     resend_req_seq_.store(0, std::memory_order_relaxed);
     is_manually_paused_.store(false, std::memory_order_relaxed);
     emitted_first_epoch_.store(0ULL, std::memory_order_release);
@@ -204,9 +209,16 @@ void RaopRtp::reset_buffer() {
     jitter_buffer_.reset();
     has_written_rtp_ts_.store(false, std::memory_order_release);
     sync_playback_started_ = false;
+    last_drift_drop_mono_us_ = 0;
     awaiting_post_flush_audio_ = false;
     post_flush_silence_paused_ = false;
     post_flush_silence_frames_ = 0;
+    {
+        std::lock_guard<std::mutex> slock(sync_mutex_);
+        sync_phase_offset_samples_ = 0;
+    }
+    late_sync_handover_pending_.store(false, std::memory_order_release);
+    invalidate_track_rtp_anchor();
 }
 
 uint64_t RaopRtp::on_rtsp_flush() {
@@ -216,9 +228,16 @@ uint64_t RaopRtp::on_rtsp_flush() {
     jitter_buffer_.reset();
     has_written_rtp_ts_.store(false, std::memory_order_release);
     sync_playback_started_ = false;
+    last_drift_drop_mono_us_ = 0;
     awaiting_post_flush_audio_ = true;
     post_flush_silence_paused_ = false;
     post_flush_silence_frames_ = 0;
+    {
+        std::lock_guard<std::mutex> slock(sync_mutex_);
+        sync_phase_offset_samples_ = 0;
+    }
+    late_sync_handover_pending_.store(false, std::memory_order_release);
+    invalidate_track_rtp_anchor();
     return new_epoch;
 }
 
@@ -280,6 +299,7 @@ void RaopRtp::set_client_timing_endpoint(const std::string& client_ip, int clien
 bool RaopRtp::get_target_speaker_rtp_ts(uint32_t& out_ts) const {
     uint32_t anchor_rtp = 0;
     int64_t anchor_mono_us = 0;
+    int32_t phase_offset = 0;
     {
         std::lock_guard<std::mutex> lock(sync_mutex_);
         if (!has_sync_anchor_) {
@@ -287,6 +307,7 @@ bool RaopRtp::get_target_speaker_rtp_ts(uint32_t& out_ts) const {
         }
         anchor_rtp = sync_rtp_ts_;
         anchor_mono_us = sync_local_mono_us_;
+        phase_offset = sync_phase_offset_samples_;
     }
 
     const int64_t now_us = get_monotonic_time_us();
@@ -302,10 +323,11 @@ bool RaopRtp::get_target_speaker_rtp_ts(uint32_t& out_ts) const {
         if (format_sample_rate_ > 0) sr = format_sample_rate_;
     }
     const int64_t elapsed_samples = (elapsed_us * static_cast<int64_t>(sr)) / 1000000LL;
-    // 💡 精确扣除 RECORD 响应申报的 Audio-Latency (11025 采样 = 250ms)：
-    // iPhone 会将 Sync.rtp_now 提前 11025 采样下发以预留硬件延迟；扣除后扬声器真实出声时刻精准对齐 iPhone curr_ts。
+    // 💡 精确扣除 RECORD 响应申报的 Audio-Latency (11025 采样 = 250ms)，并叠加迟到 Sync 的会话相位基线偏移
     out_ts = static_cast<uint32_t>(
-        static_cast<int64_t>(anchor_rtp) + elapsed_samples - static_cast<int64_t>(REPORTED_AUDIO_LATENCY_SAMPLES)
+        static_cast<int64_t>(anchor_rtp) + elapsed_samples -
+        static_cast<int64_t>(REPORTED_AUDIO_LATENCY_SAMPLES) +
+        static_cast<int64_t>(phase_offset)
     );
     return true;
 }
@@ -340,6 +362,63 @@ bool RaopRtp::resolve_speaker_rtp_ts(uint32_t& out_ts, bool& is_live_audio) cons
 
     is_live_audio = false;
     return false;
+}
+
+void RaopRtp::set_track_rtp_anchor(uint32_t start_rtp_ts, int64_t duration_ms) {
+    std::lock_guard<std::mutex> lock(track_anchor_mutex_);
+    if (duration_ms > 0) {
+        track_start_rtp_ts_ = start_rtp_ts;
+        track_anchor_duration_ms_ = duration_ms;
+        has_track_start_rtp_ts_ = true;
+    } else {
+        has_track_start_rtp_ts_ = false;
+        track_anchor_duration_ms_ = 0;
+    }
+}
+
+void RaopRtp::invalidate_track_rtp_anchor() {
+    std::lock_guard<std::mutex> lock(track_anchor_mutex_);
+    has_track_start_rtp_ts_ = false;
+    track_anchor_duration_ms_ = 0;
+}
+
+int64_t RaopRtp::get_realtime_track_position_ms() const {
+    if (!is_running_.load(std::memory_order_acquire)) {
+        return -1;
+    }
+    uint32_t start_ts = 0;
+    int64_t dur_ms = 0;
+    {
+        std::lock_guard<std::mutex> lock(track_anchor_mutex_);
+        if (!has_track_start_rtp_ts_ || track_anchor_duration_ms_ <= 0) {
+            return -1;
+        }
+        start_ts = track_start_rtp_ts_;
+        dur_ms = track_anchor_duration_ms_;
+    }
+
+    uint32_t speaker_ts = 0;
+    bool is_live_audio = false;
+    if (!resolve_speaker_rtp_ts(speaker_ts, is_live_audio) || !is_live_audio) {
+        return -1;
+    }
+
+    const int32_t diff_samples = static_cast<int32_t>(speaker_ts - start_ts);
+    // 排队期（无 FLUSH 自动切歌提前推送下首 progress）返回 -1，严禁归零覆盖上层 anchorDelayMs
+    if (diff_samples < 0) {
+        return -1;
+    }
+
+    int sr = 44100;
+    {
+        std::lock_guard<std::mutex> flock(format_mutex_);
+        if (format_sample_rate_ > 0) sr = format_sample_rate_;
+    }
+    const int64_t pos_ms = (static_cast<int64_t>(diff_samples) * 1000LL) / static_cast<int64_t>(sr);
+    if (pos_ms > dur_ms + 3000LL) {
+        return -1;
+    }
+    return std::min(pos_ms, dur_ms);
 }
 
 void RaopRtp::send_resend_request(uint16_t first_seq, uint16_t count) {
@@ -462,22 +541,29 @@ void RaopRtp::drain_jitter_buffer_locked() {
                     : 0U;
 
                 if (!sync_playback_started_) {
-                    // 💡 阶段 1 (起播门控)：在 head_ts 真正到达扬声器出声时刻 (减去 ~8ms USB URB 管线延迟) 前，
-                    // 将音频帧压在 RaopJitterBuffer 中等待，杜绝比 iPhone 提前 1.7~2.0s 出声！
-                    if (ahead_of_speaker > usb_urb_samples) {
-                        break;
+                    if (late_sync_handover_pending_.exchange(false, std::memory_order_acq_rel)) {
+                        // 💡 迟到 Sync 一次性平滑接管：已无门控开播时切入稳态水门，不影响后续排空后的起播门控重入
+                        sync_playback_started_ = true;
+                    } else {
+                        // 💡 阶段 1 (起播门控)：在 head_ts 真正到达扬声器出声时刻 (减去 ~8ms USB URB 管线延迟) 前，
+                        // 将音频帧压在 RaopJitterBuffer 中等待，杜绝比 iPhone 提前 1.7~2.0s 出声！
+                        if (ahead_of_speaker > usb_urb_samples) {
+                            break;
+                        }
+                        if (ahead_of_speaker < -max_drift_late_samples) {
+                            // 首包已严重滞后于目标出声时刻，丢弃过期帧快速对齐
+                            jitter_buffer_.pop(ready_frame, nullptr, nullptr);
+                            continue;
+                        }
+                        sync_playback_started_ = true;
+                        LOGI("🎯 Sync 精准起播对齐: head_ts=%u, target_speaker_ts=%u (偏差=%d 采样 / %.1f ms, buffered=%zu)",
+                             head_ts, target_speaker_ts, ahead_of_speaker,
+                             static_cast<double>(ahead_of_speaker) * 1000.0 / static_cast<double>(sr),
+                             jitter_buffer_.buffered_packets());
                     }
-                    if (ahead_of_speaker < -max_drift_late_samples) {
-                        // 首包已严重滞后于目标出声时刻，丢弃过期帧快速对齐
-                        jitter_buffer_.pop(ready_frame, nullptr, nullptr);
-                        continue;
-                    }
-                    sync_playback_started_ = true;
-                    LOGI("🎯 Sync 精准起播对齐: head_ts=%u, target_speaker_ts=%u (偏差=%d 采样 / %.1f ms, buffered=%zu)",
-                         head_ts, target_speaker_ts, ahead_of_speaker,
-                         static_cast<double>(ahead_of_speaker) * 1000.0 / static_cast<double>(sr),
-                         jitter_buffer_.buffered_packets());
-                } else {
+                }
+
+                if (sync_playback_started_) {
                     if (ring_unplayed_samples == 0 && ahead_of_speaker > max_drift_late_samples) {
                         // 缓冲已完全排空且后续帧仍远在未来，重新进入起播门控
                         sync_playback_started_ = false;
@@ -487,17 +573,21 @@ void RaopRtp::drain_jitter_buffer_locked() {
                     if (ahead_of_speaker > target_ring_samples + usb_urb_samples) {
                         break;
                     }
-                    // 💡 慢晶振漂移收敛：若实测扬声器滞后于 iPhone 超 45ms 且环形缓冲高于目标水位，静默丢弃 1 帧 (8ms) 追平
+                    // 💡 慢晶振漂移收敛：若实测扬声器滞后超 45ms 且环形缓冲高于目标水位，单次最多丢弃 1 帧 (8ms) 并进入 300ms 冷却，杜绝单轮雪崩丢帧
                     if (has_written_rtp_ts_.load(std::memory_order_acquire)) {
                         const uint32_t written_ts = last_written_rtp_ts_.load(std::memory_order_acquire);
                         const uint32_t actual_speaker_ts = written_ts - ring_unplayed_samples;
                         const int32_t speaker_lag = static_cast<int32_t>(target_speaker_ts - actual_speaker_ts);
+                        const int64_t now_us = get_monotonic_time_us();
                         if (speaker_lag > max_drift_late_samples &&
-                            ring_unplayed_samples > static_cast<uint32_t>(target_ring_samples)) {
+                            ring_unplayed_samples > static_cast<uint32_t>(target_ring_samples) &&
+                            (last_drift_drop_mono_us_ == 0 || (now_us - last_drift_drop_mono_us_) >= DRIFT_DROP_COOLDOWN_US)) {
                             LOGD("Sync 慢晶振漂移收敛: 滞后 %d 采样 (%.1f ms)，丢弃 1 帧追平",
                                  speaker_lag, static_cast<double>(speaker_lag) * 1000.0 / static_cast<double>(sr));
                             jitter_buffer_.pop(ready_frame, nullptr, nullptr);
-                            continue;
+                            last_drift_drop_mono_us_ = now_us;
+                            drift_drop_count_.fetch_add(1U, std::memory_order_relaxed);
+                            break;
                         }
                     }
                 }
@@ -927,27 +1017,68 @@ void RaopRtp::handle_sync_packet(const uint8_t* data, ssize_t len) {
         }
     }
 
-    {
-        std::lock_guard<std::mutex> lock(sync_mutex_);
-        sync_rtp_ts_ = rtp_now;
-        sync_local_mono_us_ = sync_local_mono_us;
-        has_sync_anchor_ = true;
-    }
-
     int sr = 44100;
     {
         std::lock_guard<std::mutex> flock(format_mutex_);
         if (format_sample_rate_ > 0) sr = format_sample_rate_;
     }
+
+    // 💡 在获取 sync_mutex_ 之前预采样 live_speaker_ts，杜绝持锁期间反向调用 resolve_speaker_rtp_ts 引发重入锁序问题
+    uint32_t live_speaker_ts = 0;
+    bool has_live_speaker = false;
+    if (has_written_rtp_ts_.load(std::memory_order_acquire)) {
+        bool is_live = false;
+        if (resolve_speaker_rtp_ts(live_speaker_ts, is_live) && is_live) {
+            has_live_speaker = true;
+        }
+    }
+
+    bool captured_late_phase = false;
+    int32_t late_phase_samples = 0;
+    uint32_t raw_target_ts = 0;
+    {
+        std::lock_guard<std::mutex> lock(sync_mutex_);
+        const bool was_inactive_anchor = !has_sync_anchor_ || (recv_mono_us - sync_local_mono_us_) > 15000000LL;
+        sync_rtp_ts_ = rtp_now;
+        sync_local_mono_us_ = sync_local_mono_us;
+        has_sync_anchor_ = true;
+        if (was_inactive_anchor && has_live_speaker) {
+            const int64_t elapsed_us = recv_mono_us - sync_local_mono_us;
+            const int64_t elapsed_samples = (elapsed_us * static_cast<int64_t>(sr)) / 1000000LL;
+            raw_target_ts = static_cast<uint32_t>(
+                static_cast<int64_t>(rtp_now) + elapsed_samples -
+                static_cast<int64_t>(REPORTED_AUDIO_LATENCY_SAMPLES)
+            );
+            const int32_t offset = static_cast<int32_t>(live_speaker_ts - raw_target_ts);
+            const int32_t max_offset = static_cast<int32_t>(sr) * 4;
+            if (offset >= -max_offset && offset <= max_offset) {
+                sync_phase_offset_samples_ = offset;
+                late_phase_samples = offset;
+                captured_late_phase = true;
+            }
+        }
+    }
+    if (captured_late_phase) {
+        late_sync_handover_pending_.store(true, std::memory_order_release);
+    }
+
     const int32_t sender_latency_samples = static_cast<int32_t>(rtp_next - rtp_now);
     const double sender_latency_ms = static_cast<double>(sender_latency_samples) * 1000.0 / static_cast<double>(sr);
 
+    if (captured_late_phase) {
+        LOGI("⚡ 迟到 Sync 相位基线接管: live_speaker_ts=%u, raw_target_ts=%u, phase_offset=%d 采样 (%.1f ms)",
+             live_speaker_ts, raw_target_ts, late_phase_samples,
+             static_cast<double>(late_phase_samples) * 1000.0 / static_cast<double>(sr));
+    }
     if (is_first_sync) {
         LOGI("⏱️ 收到首帧 Sync 同步包: rtp_now=%u, rtp_next=%u (发端缓冲=%.1f ms), ntp_locked=%d",
              rtp_now, rtp_next, sender_latency_ms, used_ntp ? 1 : 0);
     } else {
-        LOGD("收到客户端 Sync 控制包 (len=%zd): rtp_now=%u, rtp_next=%u (发端缓冲=%.1f ms), ntp_locked=%d",
-             len, rtp_now, rtp_next, sender_latency_ms, used_ntp ? 1 : 0);
+        static std::atomic<uint32_t> sync_log_counter{0};
+        if ((sync_log_counter.fetch_add(1, std::memory_order_relaxed) % 5U) == 0U) {
+            LOGD("收到客户端 Sync 控制包 (len=%zd): rtp_now=%u, rtp_next=%u (发端缓冲=%.1f ms), ntp_locked=%d",
+                 len, rtp_now, rtp_next, sender_latency_ms, used_ntp ? 1 : 0);
+        }
     }
 
     // 同步锚点更新后立即检查是否到达放行时刻

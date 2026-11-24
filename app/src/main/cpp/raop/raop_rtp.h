@@ -233,6 +233,9 @@ public:
     size_t buffered_jitter_packets() const {
         return jitter_buffer_.buffered_packets();
     }
+    uint32_t drift_drop_count() const {
+        return drift_drop_count_.load(std::memory_order_acquire);
+    }
 
     /**
      * 💡 尝试排空 JitterBuffer 中堆积的就绪音频帧至 AudioEngine (防突发推流填满后暂停导致的卡滞欠载)
@@ -253,6 +256,22 @@ public:
             track_position_ms_.store(0, std::memory_order_release);
         }
     }
+
+    /**
+     * 💡 锚定当前曲目在 RTP 时间轴上的起始采样戳与有效时长（供 Kotlin 500ms Ticker 闭环回读真实扬声器进度）
+     */
+    void set_track_rtp_anchor(uint32_t start_rtp_ts, int64_t duration_ms);
+
+    /**
+     * 💡 失效当前曲目 RTP 起点锚点（切歌边界、FLUSH、本机 Seek 或停流时调用，防止旧曲起点污染新曲）
+     */
+    void invalidate_track_rtp_anchor();
+
+    /**
+     * 💡 闭环计算当前扬声器真实出声曲目进度 (毫秒)：
+     * 仅在已写入音频且曲目起点锚点有效且已越过起点时返回 [0, dur_ms]；排队期、直播流或未就绪统一返回 -1。
+     */
+    int64_t get_realtime_track_position_ms() const;
 
     int64_t get_track_duration_ms() const {
         return track_duration_ms_.load(std::memory_order_acquire);
@@ -336,12 +355,23 @@ private:
     int64_t ntp_offset_us_{0}; // sender_ntp_us - local_mono_us
     std::atomic<bool> has_ntp_offset_{false};
 
-    // 💡 RAOP Sync 控制包 (PT=84) 精准出声同步锚点
+    // 💡 RAOP Sync 控制包 (PT=84) 精准出声同步锚点与迟到相位基线偏移
+    static constexpr int64_t DRIFT_DROP_COOLDOWN_US = 300000LL; // 慢晶振单帧丢弃最小冷却 300ms，杜绝连环雪崩丢帧
     mutable std::mutex sync_mutex_;
     uint32_t sync_rtp_ts_{0};
     int64_t sync_local_mono_us_{0};
+    int32_t sync_phase_offset_samples_{0};
     bool has_sync_anchor_{false};
+    std::atomic<bool> late_sync_handover_pending_{false}; // 一次性迟到 Sync 平滑接管标记
+    std::atomic<uint32_t> drift_drop_count_{0};
     bool sync_playback_started_{false}; // 仅在 audio_packet_mutex_ 下访问
+    int64_t last_drift_drop_mono_us_{0}; // 仅在 audio_packet_mutex_ 下访问
+
+    // 💡 当前曲目 RTP 起点锚点（支持播放期闭环进度查询）
+    mutable std::mutex track_anchor_mutex_;
+    uint32_t track_start_rtp_ts_{0};
+    int64_t track_anchor_duration_ms_{0};
+    bool has_track_start_rtp_ts_{false};
 
     // 💡 RTSP FLUSH 后静音拦截门控（仅在 audio_packet_mutex_ 下访问）：
     // iOS 暂停时发 FLUSH 并持续推 44B 全 0 静音包，拦截静音包不入队/不触发起播，

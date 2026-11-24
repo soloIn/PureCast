@@ -36,6 +36,7 @@ internal class AirPlayNativeEventDispatcher(
     private val onSolveChallenge: (challengeBase64: String) -> String?,
     private val onRtpActiveChanged: (Boolean) -> Unit = {},
     private val onStreamTeardownRequested: ((globalSessionId: Long) -> Unit)? = null,
+    private val onInvalidateProgressAnchor: () -> Unit = {},
     private val clockMs: () -> Long = { System.currentTimeMillis() }
 ) : NativeAirPlayCallback {
 
@@ -126,6 +127,7 @@ internal class AirPlayNativeEventDispatcher(
         lastClientIp = null
         lastGlobalSessionId = 0L
         dacpRemovedNotified = false
+        onInvalidateProgressAnchor()
         onRtpActiveChanged(false)
     }
 
@@ -160,6 +162,7 @@ internal class AirPlayNativeEventDispatcher(
      */
     fun markPendingSeek() {
         lastSeekTimestampMs.set(clockMs())
+        onInvalidateProgressAnchor()
     }
 
     /**
@@ -466,6 +469,10 @@ internal class AirPlayNativeEventDispatcher(
             }
 
             if (isBoundarySwitch) {
+                if (!canInheritPostFlushProgress && !canInheritRecentProgressOnNoFlush) {
+                    // 💡 新曲目边界确立但新曲 progress 尚未到达：立即失效 C++ 旧曲 RTP 起点锚点，杜绝旧曲进度泄漏给新歌
+                    onInvalidateProgressAnchor()
+                }
                 val nextTxGen = trackGenerationGenerator.incrementAndGet()
                 currentTrackGeneration = nextTxGen
                 lastTrackBoundaryTimestampMs = now

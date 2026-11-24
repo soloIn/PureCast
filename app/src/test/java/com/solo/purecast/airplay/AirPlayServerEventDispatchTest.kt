@@ -583,4 +583,44 @@ class AirPlayServerEventDispatchTest {
         dispatcher.onStreamStopped(2L, 2L, 23L)
         assertEquals(listOf(false), rtpStates)
     }
+
+    @Test
+    fun `progress anchor invalidates on seek and uninherited track switch but preserves inherited new track progress`() {
+        var mockClock = 1000L
+        var invalidateCount = 0
+        val globalSessionGen = AtomicLong(400L)
+        val seqGen = AtomicLong(0L)
+        val dispatcher = AirPlayNativeEventDispatcher(
+            dispatchEvent = {},
+            allocateSessionId = { globalSessionGen.incrementAndGet() },
+            allocateSequence = { seqGen.incrementAndGet() },
+            onAcquireHardwareForStream = { _, _, _, _ -> 31L },
+            onDecryptAndInjectCryptoKey = { _, _ -> },
+            onUpdateDacpTarget = { _, _, _, _ -> },
+            onSolveChallenge = { "mock-resp" },
+            onInvalidateProgressAnchor = { invalidateCount++ },
+            clockMs = { mockClock }
+        )
+
+        dispatcher.onStreamRequested(1L, 1L, 44100, 16, 2, "ALAC", "192.168.2.124", "", "", "", "", 0)
+        // 1. 冷启动无前置 progress 到达首曲 DMAP：触发失效清除可能残留的锚点
+        dispatcher.onMetadataReceived(1L, 2L, "Song A", "Artist A", "", 200_000L, null)
+        assertEquals(1, invalidateCount)
+
+        // 2. 本机 Seek：立即失效旧锚点防止 500ms Ticker 回弹
+        dispatcher.markPendingSeek()
+        assertEquals(2, invalidateCount)
+
+        // 3. 新曲 progress 先于 DMAP 到达且时长匹配：切歌边界不得误清除刚写入的新曲锚点
+        mockClock = 5000L
+        dispatcher.onProgressUpdated(1L, 3L, 0L, 180_000L)
+        mockClock = 5200L
+        dispatcher.onMetadataReceived(1L, 4L, "Song B", "Artist B", "", 180_000L, null)
+        assertEquals(2, invalidateCount)
+
+        // 4. 新曲 DMAP 先于 progress 到达（时长不匹配）：必须立即失效旧曲锚点防污染
+        mockClock = 6000L
+        dispatcher.onMetadataReceived(1L, 5L, "Song C", "Artist C", "", 240_000L, null)
+        assertEquals(3, invalidateCount)
+    }
 }

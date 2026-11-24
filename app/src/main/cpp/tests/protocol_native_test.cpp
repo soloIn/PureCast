@@ -1837,6 +1837,266 @@ void test_raop_progress_calibration_queue_delay_and_sync_fallback() {
     std::printf("PASS test_raop_progress_calibration_queue_delay_and_sync_fallback\n");
 }
 
+// 用例 19: 校验无 Sync 自由起播后迟到 Sync 的相位基线平滑接管（不中途断音），以及闭环实时进度查询与排队/失效保护
+void test_raop_late_sync_phase_handover_and_realtime_progress_anchor() {
+    std::printf("Running test_raop_late_sync_phase_handover_and_realtime_progress_anchor...\n");
+    auto& mock = MockLibusbController::instance();
+    mock.reset();
+
+    auto& engine = AudioEngine::instance();
+    PROTO_ASSERT(engine.open_device(54, 44100, 16, 2) == 0, "open AudioEngine");
+    PROTO_ASSERT(wait_until([&] { return engine.get_active_transfers() > 0; }), "engine URBs active");
+
+    RaopServer server;
+    std::atomic<int> first_pkt_events{0};
+    server.set_stream_request_callback([&](int64_t, int64_t, const RaopStreamParams&) -> int64_t {
+        return static_cast<int64_t>(engine.emergency_mute_and_flush(FlushReason::PREEMPT));
+    });
+    server.set_first_data_packet_callback([&](int64_t, int64_t, int64_t, int, int, int, const std::string&) {
+        first_pkt_events.fetch_add(1, std::memory_order_acq_rel);
+    });
+    const int rtsp_port = start_raop_server_on_free_port(server);
+
+    int client_sock = socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in server_addr{};
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    server_addr.sin_port = htons(static_cast<uint16_t>(rtsp_port));
+    PROTO_ASSERT(connect(client_sock, reinterpret_cast<sockaddr*>(&server_addr), sizeof(server_addr)) == 0, "connect");
+
+    const std::string sdp =
+        "v=0\r\n"
+        "m=audio 0 RTP/AVP 10\r\n"
+        "a=rtpmap:10 L16/44100/2\r\n";
+    rtsp_exchange(client_sock,
+                  "ANNOUNCE rtsp://127.0.0.1/test RTSP/1.0\r\nCSeq: 1\r\nContent-Type: application/sdp\r\nContent-Length: " +
+                      std::to_string(sdp.size()) + "\r\n\r\n" + sdp);
+    std::string setup_resp = rtsp_exchange(
+        client_sock,
+        "SETUP rtsp://127.0.0.1/test RTSP/1.0\r\nCSeq: 2\r\nTransport: RTP/AVP/UDP;unicast;mode=record;control_port=6031;timing_port=6032\r\n\r\n");
+    const int udp_data_port = parse_server_port(setup_resp);
+    auto ctrl_pos = setup_resp.find("control_port=");
+    PROTO_ASSERT(ctrl_pos != std::string::npos, "control_port present");
+    const int udp_ctrl_port = std::atoi(setup_resp.c_str() + ctrl_pos + 13);
+    rtsp_exchange(client_sock, "RECORD rtsp://127.0.0.1/test RTSP/1.0\r\nCSeq: 3\r\n\r\n");
+
+    int udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    sockaddr_in data_dest{};
+    data_dest.sin_family = AF_INET;
+    data_dest.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    data_dest.sin_port = htons(static_cast<uint16_t>(udp_data_port));
+
+    // 1. 无 Sync 直接推 35 帧音频进入 live 自由起播（ts 从 600000 开始）
+    const uint32_t first_ts = 600000U;
+    std::vector<uint8_t> rtp_pkt(12 + 1408, 0x3C);
+    rtp_pkt[0] = 0x80;
+    rtp_pkt[1] = 10;
+    for (int i = 0; i < 35; ++i) {
+        const uint16_t seq = static_cast<uint16_t>(1 + i);
+        const uint32_t ts = first_ts + static_cast<uint32_t>(i * 352);
+        rtp_pkt[2] = static_cast<uint8_t>((seq >> 8) & 0xFF);
+        rtp_pkt[3] = static_cast<uint8_t>(seq & 0xFF);
+        rtp_pkt[4] = static_cast<uint8_t>((ts >> 24) & 0xFF);
+        rtp_pkt[5] = static_cast<uint8_t>((ts >> 16) & 0xFF);
+        rtp_pkt[6] = static_cast<uint8_t>((ts >> 8) & 0xFF);
+        rtp_pkt[7] = static_cast<uint8_t>(ts & 0xFF);
+        sendto(udp_sock, rtp_pkt.data(), rtp_pkt.size(), 0, reinterpret_cast<sockaddr*>(&data_dest), sizeof(data_dest));
+    }
+    PROTO_ASSERT(wait_until([&] { return first_pkt_events.load() >= 1; }), "Free-run start without Sync");
+
+    // 2. 下发 progress 建立曲目起点锚点 (start = 584640, 比 first_ts 早 ~348ms)
+    const uint32_t start_ts = first_ts - 15360U;
+    const uint32_t end_ts = start_ts + 44100U * 180U;
+    const std::string prog1 = "progress: " + std::to_string(start_ts) + "/" + std::to_string(first_ts) + "/" + std::to_string(end_ts) + "\r\n";
+    rtsp_exchange(client_sock,
+                  "SET_PARAMETER rtsp://127.0.0.1/test RTSP/1.0\r\nCSeq: 4\r\nContent-Type: text/parameters\r\nContent-Length: " +
+                      std::to_string(prog1.size()) + "\r\n\r\n" + prog1);
+    const int64_t rt_pos = server.get_realtime_track_position_ms();
+    PROTO_ASSERT(rt_pos >= 300 && rt_pos <= 1200, "Realtime closed-loop position must reflect live speaker_ts - start_ts");
+
+    // 3. 发送迟到 Sync 包（rtp_now 比当前 live_speaker_ts 落后约 1.75s = 77175 采样）
+    uint32_t written_before_sync = 0;
+    PROTO_ASSERT(server.rtp().get_last_written_rtp_ts(written_before_sync), "written_ts before late sync");
+    const uint32_t late_rtp_now = first_ts - 66150U; // 扣除 11025 后约落后 1.75s
+    const uint32_t late_rtp_next = first_ts + 35U * 352U;
+    uint8_t sync_pkt[20]{};
+    sync_pkt[0] = 0x80;
+    sync_pkt[1] = 0xD4;
+    sync_pkt[4] = static_cast<uint8_t>((late_rtp_now >> 24) & 0xFF);
+    sync_pkt[5] = static_cast<uint8_t>((late_rtp_now >> 16) & 0xFF);
+    sync_pkt[6] = static_cast<uint8_t>((late_rtp_now >> 8) & 0xFF);
+    sync_pkt[7] = static_cast<uint8_t>(late_rtp_now & 0xFF);
+    sync_pkt[16] = static_cast<uint8_t>((late_rtp_next >> 24) & 0xFF);
+    sync_pkt[17] = static_cast<uint8_t>((late_rtp_next >> 16) & 0xFF);
+    sync_pkt[18] = static_cast<uint8_t>((late_rtp_next >> 8) & 0xFF);
+    sync_pkt[19] = static_cast<uint8_t>(late_rtp_next & 0xFF);
+    sockaddr_in ctrl_dest{};
+    ctrl_dest.sin_family = AF_INET;
+    ctrl_dest.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ctrl_dest.sin_port = htons(static_cast<uint16_t>(udp_ctrl_port));
+    sendto(udp_sock, sync_pkt, sizeof(sync_pkt), 0, reinterpret_cast<sockaddr*>(&ctrl_dest), sizeof(ctrl_dest));
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    // 4. 继续推送后续帧：迟到 Sync 已完成相位基线接管，新帧必须继续顺畅写入 AudioEngine，绝不能被闸断 1.75s！
+    for (int i = 35; i < 45; ++i) {
+        const uint16_t seq = static_cast<uint16_t>(1 + i);
+        const uint32_t ts = first_ts + static_cast<uint32_t>(i * 352);
+        rtp_pkt[2] = static_cast<uint8_t>((seq >> 8) & 0xFF);
+        rtp_pkt[3] = static_cast<uint8_t>(seq & 0xFF);
+        rtp_pkt[4] = static_cast<uint8_t>((ts >> 24) & 0xFF);
+        rtp_pkt[5] = static_cast<uint8_t>((ts >> 16) & 0xFF);
+        rtp_pkt[6] = static_cast<uint8_t>((ts >> 8) & 0xFF);
+        rtp_pkt[7] = static_cast<uint8_t>(ts & 0xFF);
+        sendto(udp_sock, rtp_pkt.data(), rtp_pkt.size(), 0, reinterpret_cast<sockaddr*>(&data_dest), sizeof(data_dest));
+        std::this_thread::sleep_for(std::chrono::milliseconds(4));
+    }
+    PROTO_ASSERT(wait_until([&] {
+        uint32_t w = 0;
+        return server.rtp().get_last_written_rtp_ts(w) && static_cast<int32_t>(w - written_before_sync) > 0;
+    }, std::chrono::milliseconds(400)), "Late Sync phase handover must not stall subsequent frames");
+
+    // 5. 排队期新曲（start_ts 位于未来）必须返回 -1，严禁归零覆盖 anchorDelayMs
+    const uint32_t future_start = first_ts + 44100U * 2U;
+    const uint32_t future_end = future_start + 44100U * 180U;
+    const std::string prog_future = "progress: " + std::to_string(future_start) + "/" + std::to_string(future_start) + "/" + std::to_string(future_end) + "\r\n";
+    rtsp_exchange(client_sock,
+                  "SET_PARAMETER rtsp://127.0.0.1/test RTSP/1.0\r\nCSeq: 5\r\nContent-Type: text/parameters\r\nContent-Length: " +
+                      std::to_string(prog_future.size()) + "\r\n\r\n" + prog_future);
+    PROTO_ASSERT(server.get_realtime_track_position_ms() == -1, "Queued future track must return -1");
+
+    // 6. 显式失效锚点后必须立即返回 -1
+    server.rtp().set_track_rtp_anchor(start_ts, 180000);
+    PROTO_ASSERT(server.get_realtime_track_position_ms() >= 0, "Re-anchored track returns valid position");
+    server.invalidate_track_rtp_anchor();
+    PROTO_ASSERT(server.get_realtime_track_position_ms() == -1, "Invalidated track anchor must return -1");
+
+    close(udp_sock);
+    close(client_sock);
+    server.stop();
+    engine.release_device();
+    std::printf("PASS test_raop_late_sync_phase_handover_and_realtime_progress_anchor\n");
+}
+
+// 用例 20: 校验慢晶振漂移收敛在滞后 > 45ms 且环形缓冲高于目标水位时，受 300ms 冷却保护，单轮最多丢 1 帧，绝不雪崩丢空队列
+void test_raop_slow_clock_drift_drop_rate_limited() {
+    std::printf("Running test_raop_slow_clock_drift_drop_rate_limited...\n");
+    auto& mock = MockLibusbController::instance();
+    mock.reset();
+
+    auto& engine = AudioEngine::instance();
+    PROTO_ASSERT(engine.open_device(55, 44100, 16, 2) == 0, "open AudioEngine");
+    PROTO_ASSERT(wait_until([&] { return engine.get_active_transfers() > 0; }), "engine URBs active");
+
+    RaopServer server;
+    std::atomic<int> first_pkt_events{0};
+    server.set_stream_request_callback([&](int64_t, int64_t, const RaopStreamParams&) -> int64_t {
+        return static_cast<int64_t>(engine.emergency_mute_and_flush(FlushReason::PREEMPT));
+    });
+    server.set_first_data_packet_callback([&](int64_t, int64_t, int64_t, int, int, int, const std::string&) {
+        first_pkt_events.fetch_add(1, std::memory_order_acq_rel);
+    });
+    const int rtsp_port = start_raop_server_on_free_port(server);
+
+    int client_sock = socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in server_addr{};
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    server_addr.sin_port = htons(static_cast<uint16_t>(rtsp_port));
+    PROTO_ASSERT(connect(client_sock, reinterpret_cast<sockaddr*>(&server_addr), sizeof(server_addr)) == 0, "connect");
+
+    const std::string sdp =
+        "v=0\r\n"
+        "m=audio 0 RTP/AVP 10\r\n"
+        "a=rtpmap:10 L16/44100/2\r\n";
+    rtsp_exchange(client_sock,
+                  "ANNOUNCE rtsp://127.0.0.1/test RTSP/1.0\r\nCSeq: 1\r\nContent-Type: application/sdp\r\nContent-Length: " +
+                      std::to_string(sdp.size()) + "\r\n\r\n" + sdp);
+    std::string setup_resp = rtsp_exchange(
+        client_sock,
+        "SETUP rtsp://127.0.0.1/test RTSP/1.0\r\nCSeq: 2\r\nTransport: RTP/AVP/UDP;unicast;mode=record;control_port=6041;timing_port=6042\r\n\r\n");
+    const int udp_data_port = parse_server_port(setup_resp);
+    auto ctrl_pos = setup_resp.find("control_port=");
+    PROTO_ASSERT(ctrl_pos != std::string::npos, "control_port present");
+    const int udp_ctrl_port = std::atoi(setup_resp.c_str() + ctrl_pos + 13);
+    rtsp_exchange(client_sock, "RECORD rtsp://127.0.0.1/test RTSP/1.0\r\nCSeq: 3\r\n\r\n");
+
+    int udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    const uint32_t rtp_now = 700000U;
+    const uint32_t target_ts = rtp_now - RaopRtp::REPORTED_AUDIO_LATENCY_SAMPLES;
+    auto send_sync = [&](uint32_t now_ts, uint32_t next_ts) {
+        uint8_t pkt[20]{};
+        pkt[0] = 0x90;
+        pkt[1] = 0xD4;
+        pkt[4] = static_cast<uint8_t>((now_ts >> 24) & 0xFF);
+        pkt[5] = static_cast<uint8_t>((now_ts >> 16) & 0xFF);
+        pkt[6] = static_cast<uint8_t>((now_ts >> 8) & 0xFF);
+        pkt[7] = static_cast<uint8_t>(now_ts & 0xFF);
+        pkt[16] = static_cast<uint8_t>((next_ts >> 24) & 0xFF);
+        pkt[17] = static_cast<uint8_t>((next_ts >> 16) & 0xFF);
+        pkt[18] = static_cast<uint8_t>((next_ts >> 8) & 0xFF);
+        pkt[19] = static_cast<uint8_t>(next_ts & 0xFF);
+        sockaddr_in ctrl_dest{};
+        ctrl_dest.sin_family = AF_INET;
+        ctrl_dest.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        ctrl_dest.sin_port = htons(static_cast<uint16_t>(udp_ctrl_port));
+        sendto(udp_sock, pkt, sizeof(pkt), 0, reinterpret_cast<sockaddr*>(&ctrl_dest), sizeof(ctrl_dest));
+    };
+
+    // 1. 先无 Sync 推入 25 帧 (~199ms) 触发 JitterBuffer 预充并充满 AudioEngine 环形缓冲 (> 130ms 目标水位)
+    sockaddr_in data_dest{};
+    data_dest.sin_family = AF_INET;
+    data_dest.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    data_dest.sin_port = htons(static_cast<uint16_t>(udp_data_port));
+    std::vector<uint8_t> rtp_pkt(12 + 1408, 0x2F);
+    rtp_pkt[0] = 0x80;
+    rtp_pkt[1] = 10;
+    for (int i = 0; i < 25; ++i) {
+        const uint16_t seq = static_cast<uint16_t>(1 + i);
+        const uint32_t ts = target_ts + static_cast<uint32_t>(i * 352);
+        rtp_pkt[2] = static_cast<uint8_t>((seq >> 8) & 0xFF);
+        rtp_pkt[3] = static_cast<uint8_t>(seq & 0xFF);
+        rtp_pkt[4] = static_cast<uint8_t>((ts >> 24) & 0xFF);
+        rtp_pkt[5] = static_cast<uint8_t>((ts >> 16) & 0xFF);
+        rtp_pkt[6] = static_cast<uint8_t>((ts >> 8) & 0xFF);
+        rtp_pkt[7] = static_cast<uint8_t>(ts & 0xFF);
+        sendto(udp_sock, rtp_pkt.data(), rtp_pkt.size(), 0, reinterpret_cast<sockaddr*>(&data_dest), sizeof(data_dest));
+    }
+    PROTO_ASSERT(wait_until([&] {
+        return first_pkt_events.load() >= 1 && engine.get_available_read() > 44100U * 4U * 130U / 1000U;
+    }, std::chrono::milliseconds(500)), "Ring buffer must exceed 130ms threshold");
+
+    // 2. 在 Warmup / 高水位窗口内先发首个 Sync 完成相位基线接管，再发第 2 个 Sync 向前推 100ms (+4410 采样)：
+    //    此时 ahead_of_speaker (~99ms) <= 138ms 通过水门，speaker_lag (~100ms) > 45ms 且 ring > 130ms，必然命中慢晶振丢帧分支
+    send_sync(rtp_now, target_ts);
+    uint32_t dummy_target = 0;
+    PROTO_ASSERT(wait_until([&] { return server.rtp().get_target_speaker_rtp_ts(dummy_target); }, std::chrono::milliseconds(100)),
+                 "First Sync anchor must lock promptly");
+    send_sync(rtp_now + 4410U, target_ts + 4410U);
+    for (int i = 25; i < 40; ++i) {
+        const uint16_t seq = static_cast<uint16_t>(1 + i);
+        const uint32_t ts = target_ts + static_cast<uint32_t>(i * 352);
+        rtp_pkt[2] = static_cast<uint8_t>((seq >> 8) & 0xFF);
+        rtp_pkt[3] = static_cast<uint8_t>(seq & 0xFF);
+        rtp_pkt[4] = static_cast<uint8_t>((ts >> 24) & 0xFF);
+        rtp_pkt[5] = static_cast<uint8_t>((ts >> 16) & 0xFF);
+        rtp_pkt[6] = static_cast<uint8_t>((ts >> 8) & 0xFF);
+        rtp_pkt[7] = static_cast<uint8_t>(ts & 0xFF);
+        sendto(udp_sock, rtp_pkt.data(), rtp_pkt.size(), 0, reinterpret_cast<sockaddr*>(&data_dest), sizeof(data_dest));
+    }
+    PROTO_ASSERT(wait_until([&] { return server.rtp().drift_drop_count() >= 1U; }, std::chrono::milliseconds(200)),
+                 "Slow-clock drift drop branch must be triggered when ring > 130ms and lag > 45ms");
+    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+    // 300ms 冷却期内严格最多只允许丢 1 帧，绝不允许单轮雪崩丢空队列
+    PROTO_ASSERT(server.rtp().drift_drop_count() == 1U,
+                 "300ms cooldown must limit slow-clock drift drops to exactly 1 frame");
+
+    close(udp_sock);
+    close(client_sock);
+    server.stop();
+    engine.release_device();
+    std::printf("PASS test_raop_slow_clock_drift_drop_rate_limited\n");
+}
+
 } // namespace
 
 int main() {
@@ -1858,6 +2118,8 @@ int main() {
     test_raop_post_flush_silence_pauses_and_resumes_on_real_audio();
     test_raop_post_flush_24bit_silence_and_tv_pause_auto_resume();
     test_raop_progress_calibration_queue_delay_and_sync_fallback();
+    test_raop_late_sync_phase_handover_and_realtime_progress_anchor();
+    test_raop_slow_clock_drift_drop_rate_limited();
     std::printf("All purecast native protocol tests PASSED!\n");
     return 0;
 }

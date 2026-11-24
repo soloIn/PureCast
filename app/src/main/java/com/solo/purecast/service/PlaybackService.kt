@@ -28,6 +28,7 @@ import com.solo.purecast.R
 import com.solo.purecast.airplay.AirPlayServerManager
 import com.solo.purecast.core.audio.AudioFocusManager
 import com.solo.purecast.core.lyrics.LyricsTriggerManager
+import com.solo.purecast.core.nativebridge.NativeAudioEngine
 import com.solo.purecast.core.session.HardwareFastPathController
 import com.solo.purecast.core.session.PlaybackSessionCoordinator
 import com.solo.purecast.core.session.ProtocolResumeReopenResult
@@ -273,7 +274,8 @@ class PlaybackService : LifecycleService() {
             coordinator = coordinator,
             hardwareBridge = usbDeviceManager,
             systemEffects = systemEffects,
-            clockMs = { SystemClock.elapsedRealtime() }
+            clockMs = { SystemClock.elapsedRealtime() },
+            airPlayRealtimePositionProvider = { NativeAudioEngine.getAirPlayRealtimePositionMs() }
         )
 
         // 💡 初始化歌词多源检索与生命周期防抖触发器 (U4, U7)

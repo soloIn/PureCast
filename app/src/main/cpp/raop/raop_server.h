@@ -80,6 +80,14 @@ public:
         rtp_.update_track_progress(position_ms, duration_ms);
     }
 
+    int64_t get_realtime_track_position_ms() const {
+        return rtp_.get_realtime_track_position_ms();
+    }
+
+    void invalidate_track_rtp_anchor() {
+        rtp_.invalidate_track_rtp_anchor();
+    }
+
     RaopRtp& rtp() { return rtp_; }
     const RaopStreamParams& current_params() const { return current_params_; }
 
