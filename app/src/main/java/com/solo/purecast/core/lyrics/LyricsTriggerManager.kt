@@ -282,7 +282,8 @@ class LyricsTriggerManager(
     }
 
     private fun buildMetadataSignature(metadata: TrackMetadata): String {
-        val normTitle = MetadataNormalizer.normalizeTitle(metadata.title)
+        val exactTitle = MetadataNormalizer.normalizeForExact(metadata.title).lowercase()
+        val normTitle = exactTitle.ifEmpty { MetadataNormalizer.normalizeTitle(metadata.title) }
         val normArtist = if (MetadataNormalizer.isPlaceholderArtist(metadata.artist)) "" else MetadataNormalizer.normalizeArtist(metadata.artist)
         return "$normTitle|$normArtist"
     }

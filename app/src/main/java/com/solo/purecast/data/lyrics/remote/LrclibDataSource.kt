@@ -1,6 +1,7 @@
 package com.solo.purecast.data.lyrics.remote
 
 import com.solo.purecast.data.lyrics.LyricCandidateScorer
+import com.solo.purecast.data.lyrics.LyricsQuerySpec
 import com.solo.purecast.data.lyrics.MetadataNormalizer
 import com.solo.purecast.data.lyrics.parser.LrcParser
 import com.solo.purecast.model.LyricFormat
@@ -9,10 +10,11 @@ import com.solo.purecast.util.Logger
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URLEncoder
+import kotlin.math.abs
 
 /**
  * 💡 LRCLIB 官方 RESTful 远端数据源
- * 遵循官方规范：支持 /api/get 精确多元匹配与 /api/search 候选打分决胜
+ * 遵循官方规范：支持 /api/get 两段精确匹配（先原文版本，未命中再降级清洗名）与 /api/search 候选打分决胜
  * 严格使用 RFC 3986 百分号编码 (空格转为 %20)。
  */
 class LrclibDataSource(
@@ -20,33 +22,70 @@ class LrclibDataSource(
     private val baseUrl: String = DEFAULT_BASE_URL
 ) {
 
+    private data class ExactAttemptResult(
+        val timeline: LyricTimeline?,
+        val shouldFallback: Boolean
+    )
+
     /**
      * 💡 精确匹配检索 (/api/get)
-     * 支持 track_name, artist_name, album_name 及 duration 四元组精确匹配
+     * 1. 优先使用保留版本标签与标点的原文（如 `Come Together (2019 Mix)` / `Abbey Road (2019 Mix)`）；
+     * 2. 若未命中（且非网络超时/5xx 故障）且清洗后名称与原文存在差异，降级使用清洗后的四元组再精确查一次。
      */
+    suspend fun getExact(spec: LyricsQuerySpec): LyricTimeline? {
+        var allowCleanedFallback = true
+        if (spec.exactArtist.isNotBlank() && spec.exactTitle.isNotBlank()) {
+            val rawAttempt = fetchExactOnce(
+                artist = spec.exactArtist,
+                title = spec.exactTitle,
+                album = spec.exactAlbum,
+                durationMs = spec.durationMs,
+                spec = spec,
+                modeLabel = "exact"
+            )
+            if (rawAttempt.timeline != null) return rawAttempt.timeline
+            allowCleanedFallback = rawAttempt.shouldFallback
+        }
+
+        if (allowCleanedFallback && spec.hasDistinctCleanedForm && spec.cleanArtist.isNotBlank() && spec.cleanTitle.isNotBlank()) {
+            return fetchExactOnce(
+                artist = spec.cleanArtist,
+                title = spec.cleanTitle,
+                album = spec.cleanAlbum,
+                durationMs = spec.durationMs,
+                spec = spec,
+                modeLabel = "cleaned"
+            ).timeline
+        }
+        return null
+    }
+
     suspend fun getExact(
         artist: String,
         title: String,
         album: String? = null,
         durationMs: Long = 0L
-    ): LyricTimeline? {
-        val cleanArtist = MetadataNormalizer.normalizeArtist(artist)
-        val cleanTitle = MetadataNormalizer.normalizeTitle(title)
+    ): LyricTimeline? = getExact(
+        MetadataNormalizer.buildQuerySpec(
+            artist = artist,
+            title = title,
+            album = album.orEmpty(),
+            durationMs = durationMs
+        )
+    )
 
-        if (cleanArtist.isBlank() || cleanTitle.isBlank()) return null
-
-        val encArtist = rfc3986Encode(cleanArtist)
-        val encTitle = rfc3986Encode(cleanTitle)
-
-        val queryParams = StringBuilder("track_name=$encTitle&artist_name=$encArtist")
-
-        if (!album.isNullOrBlank()) {
-            val cleanAlbum = MetadataNormalizer.normalizeTitle(album)
-            if (cleanAlbum.isNotBlank()) {
-                queryParams.append("&album_name=").append(rfc3986Encode(cleanAlbum))
-            }
+    private suspend fun fetchExactOnce(
+        artist: String,
+        title: String,
+        album: String,
+        durationMs: Long,
+        spec: LyricsQuerySpec,
+        modeLabel: String
+    ): ExactAttemptResult {
+        val queryParams = StringBuilder("track_name=${rfc3986Encode(title)}&artist_name=${rfc3986Encode(artist)}")
+        if (album.isNotBlank()) {
+            queryParams.append("&album_name=").append(rfc3986Encode(album))
         }
-
         if (durationMs > 0L) {
             val durationSec = (durationMs / 1000L).toInt()
             queryParams.append("&duration=").append(durationSec)
@@ -56,32 +95,30 @@ class LrclibDataSource(
         val resp = httpClient.get(url, timeoutMs = EXACT_TIMEOUT_MS)
 
         if (!resp.isSuccessful || resp.body.isBlank()) {
-            Logger.lyrics.d(TAG, "LRCLIB /api/get 精确未命中: $cleanArtist - $cleanTitle (HTTP ${resp.statusCode})")
-            return null
+            val isTransientNetworkError = resp.statusCode <= 0 || resp.statusCode >= 500
+            Logger.lyrics.d(TAG, "LRCLIB /api/get [$modeLabel] 未命中: $artist - $title (HTTP ${resp.statusCode})")
+            return ExactAttemptResult(timeline = null, shouldFallback = !isTransientNetworkError)
         }
 
-        return parseSingleEntry(resp.body, cleanArtist, cleanTitle, durationMs)
+        return ExactAttemptResult(timeline = parseSingleEntry(resp.body, spec, modeLabel), shouldFallback = true)
     }
 
     /**
      * 💡 模糊搜索回退检索 (/api/search)
      * 支持精准参数 -> 复合全文 q -> 纯歌名 q 三级渐进决胜，评估前 10 条候选
      */
-    suspend fun searchFuzzy(
-        artist: String,
-        title: String,
-        album: String? = null,
-        durationMs: Long = 0L
-    ): LyricTimeline? {
-        val cleanArtist = MetadataNormalizer.normalizeArtist(artist)
-        val cleanTitle = MetadataNormalizer.normalizeTitle(title)
+    suspend fun searchFuzzy(spec: LyricsQuerySpec): LyricTimeline? {
+        val cleanArtist = spec.cleanArtist
+        val cleanTitle = spec.cleanTitle
+        val scoringArtist = spec.exactArtist.ifBlank { cleanArtist }
+        val scoringTitle = spec.exactTitle.ifBlank { cleanTitle }
 
         if (cleanArtist.isBlank() && cleanTitle.isBlank()) return null
 
         // 1. 若歌手已知，优先使用精准参数组合搜索
         if (cleanArtist.isNotBlank()) {
             val url = "$baseUrl/api/search?track_name=${rfc3986Encode(cleanTitle)}&artist_name=${rfc3986Encode(cleanArtist)}"
-            val hit = queryAndEvaluate(url, cleanArtist, cleanTitle, durationMs)
+            val hit = queryAndEvaluate(url, scoringArtist, scoringTitle, spec.durationMs)
             if (hit != null) return hit
         }
 
@@ -89,14 +126,14 @@ class LrclibDataSource(
         val combinedQuery = "$cleanTitle $cleanArtist".trim()
         if (combinedQuery.isNotBlank()) {
             val url = "$baseUrl/api/search?q=${rfc3986Encode(combinedQuery)}"
-            val hit = queryAndEvaluate(url, cleanArtist, cleanTitle, durationMs)
+            val hit = queryAndEvaluate(url, scoringArtist, scoringTitle, spec.durationMs)
             if (hit != null) return hit
         }
 
         // 3. 纯歌名 q 兜底检索（依靠时长与标题相似度强约束过滤决胜）
         if (cleanTitle.isNotBlank()) {
             val url = "$baseUrl/api/search?q=${rfc3986Encode(cleanTitle)}"
-            val hit = queryAndEvaluate(url, cleanArtist, cleanTitle, durationMs)
+            val hit = queryAndEvaluate(url, scoringArtist, scoringTitle, spec.durationMs)
             if (hit != null) return hit
         }
 
@@ -104,10 +141,24 @@ class LrclibDataSource(
         return null
     }
 
+    suspend fun searchFuzzy(
+        artist: String,
+        title: String,
+        album: String? = null,
+        durationMs: Long = 0L
+    ): LyricTimeline? = searchFuzzy(
+        MetadataNormalizer.buildQuerySpec(
+            artist = artist,
+            title = title,
+            album = album.orEmpty(),
+            durationMs = durationMs
+        )
+    )
+
     private suspend fun queryAndEvaluate(
         url: String,
-        cleanArtist: String,
-        cleanTitle: String,
+        expectedArtist: String,
+        expectedTitle: String,
         durationMs: Long
     ): LyricTimeline? {
         val resp = httpClient.get(url, timeoutMs = SEARCH_TIMEOUT_MS)
@@ -129,7 +180,6 @@ class LrclibDataSource(
                 val candDurationMs = (candDurationSec * 1000).toLong()
                 val isInst = item.optBoolean("instrumental", false)
                 val syncedLrc = item.optCleanString("syncedLyrics")
-                val plainLrc = item.optCleanString("plainLyrics")
 
                 // 💡 瀑布流分级择优调度：彻底屏蔽无时间戳纯文本歌词候选，不予打分采纳
                 if (!isInst && syncedLrc.isNullOrBlank()) {
@@ -143,8 +193,8 @@ class LrclibDataSource(
                 }
 
                 val scoreResult = LyricCandidateScorer.evaluate(
-                    expectedArtist = cleanArtist,
-                    expectedTitle = cleanTitle,
+                    expectedArtist = expectedArtist,
+                    expectedTitle = expectedTitle,
                     expectedDurationMs = durationMs,
                     candidateArtist = candArtist,
                     candidateTitle = candTitle,
@@ -154,7 +204,7 @@ class LrclibDataSource(
                 )
 
                 if (scoreResult.accepted && scoreResult.totalScore > bestScore) {
-                    val timeline = if (isInst) {
+                    val timeline = if (isInst || scoreResult.isInstrumental) {
                         LyricTimeline(
                             source = "LRCLIB",
                             format = candFormat,
@@ -182,18 +232,32 @@ class LrclibDataSource(
 
     private fun parseSingleEntry(
         jsonStr: String,
-        cleanArtist: String,
-        cleanTitle: String,
-        expectedDurationMs: Long
+        spec: LyricsQuerySpec,
+        modeLabel: String
     ): LyricTimeline? {
         return try {
             val json = JSONObject(jsonStr)
-            val isInst = json.optBoolean("instrumental", false)
+            val id = json.optLong("id", -1L)
+            val trackName = json.optCleanString("trackName") ?: ""
+            val albumName = json.optCleanString("albumName") ?: ""
+            val isInst = json.optBoolean("instrumental", false) || spec.isInstrumentalHint
             val candDurationSec = json.optDouble("duration", 0.0)
             val candDurationMs = (candDurationSec * 1000).toLong()
             val syncedLrc = json.optCleanString("syncedLyrics")
 
+            if (spec.durationMs > 0L && candDurationMs > 0L && abs(spec.durationMs - candDurationMs) > MAX_EXACT_DURATION_DELTA_MS) {
+                Logger.lyrics.w(
+                    TAG,
+                    "LRCLIB /api/get [$modeLabel] 返回条目时长偏差超标，拒绝采纳: id=$id, track=$trackName, album=$albumName, cand=${candDurationMs}ms, expected=${spec.durationMs}ms"
+                )
+                return null
+            }
+
             if (isInst) {
+                Logger.lyrics.i(
+                    TAG,
+                    "LRCLIB /api/get [$modeLabel] 命中纯音乐: id=$id, track=$trackName, album=$albumName, duration=${candDurationMs}ms"
+                )
                 return LyricTimeline(
                     source = "LRCLIB",
                     format = LyricFormat.LRC_LINE_SYNC,
@@ -206,6 +270,10 @@ class LrclibDataSource(
             // 💡 严格要求有效时间戳歌词，纯文本直接返回 null 以便瀑布流继续降级至网易云或下一级
             if (syncedLrc.isNullOrBlank()) return null
 
+            Logger.lyrics.i(
+                TAG,
+                "LRCLIB /api/get [$modeLabel] 命中条目: id=$id, track=$trackName, album=$albumName, duration=${candDurationMs}ms (expected=${spec.durationMs}ms)"
+            )
             LrcParser.parse(syncedLrc, sourceName = "LRCLIB", expectedDurationMs = candDurationMs)
         } catch (e: Exception) {
             Logger.lyrics.w(TAG, "解析 LRCLIB 条目异常", e)
@@ -240,5 +308,6 @@ class LrclibDataSource(
         const val DEFAULT_BASE_URL = "https://lrclib.net"
         const val EXACT_TIMEOUT_MS = 1500
         const val SEARCH_TIMEOUT_MS = 2000
+        const val MAX_EXACT_DURATION_DELTA_MS = 5000L
     }
 }

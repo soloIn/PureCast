@@ -272,4 +272,48 @@ class LyricsTriggerManagerTest {
         assertEquals(6L, finalState.trackGeneration)
         assertEquals("New Song Line", finalState.timeline.lines[0].mainText)
     }
+
+    @Test
+    fun `switching to a different mix version of the same track triggers new lyrics lookup`() = testScope.runTest {
+        val originalTimeline = LyricTimeline(
+            source = "cache",
+            format = LyricFormat.LRC_LINE_SYNC,
+            durationMs = 259_000L,
+            lines = listOf(LyricLine(0, 12_000L, 20_000L, "Original Mix"))
+        )
+        val mix2019Timeline = LyricTimeline(
+            source = "cache",
+            format = LyricFormat.LRC_LINE_SYNC,
+            durationMs = 260_000L,
+            lines = listOf(LyricLine(0, 8_500L, 18_000L, "2019 Mix"))
+        )
+        cacheRepo.put(cacheRepo.computeCacheKey("The Beatles", "Come Together", 259_000L), originalTimeline)
+        cacheRepo.put(cacheRepo.computeCacheKey("The Beatles", "Come Together (2019 Mix)", 260_000L), mix2019Timeline)
+
+        triggerManager.onSessionSnapshotChanged(
+            PlayerSessionSnapshot(
+                businessState = BusinessSessionState.PLAYING,
+                trackGeneration = 1L,
+                metadata = TrackMetadata(title = "Come Together", artist = "The Beatles", durationMs = 259_000L)
+            )
+        )
+        advanceTimeBy(400L)
+        advanceUntilIdle()
+        assertEquals("Original Mix", (triggerManager.lyricUiState.value as LyricUiState.Success).timeline.lines[0].mainText)
+
+        // 切到同曲不同混音版本（时长差 1s，不依赖重校准）
+        triggerManager.onSessionSnapshotChanged(
+            PlayerSessionSnapshot(
+                businessState = BusinessSessionState.PLAYING,
+                trackGeneration = 2L,
+                metadata = TrackMetadata(title = "Come Together (2019 Mix)", artist = "The Beatles", durationMs = 260_000L)
+            )
+        )
+        advanceTimeBy(400L)
+        advanceUntilIdle()
+
+        val state = triggerManager.lyricUiState.value as LyricUiState.Success
+        assertEquals(2L, state.trackGeneration)
+        assertEquals("2019 Mix", state.timeline.lines[0].mainText)
+    }
 }

@@ -1,6 +1,7 @@
 package com.solo.purecast.data.lyrics.remote
 
 import com.solo.purecast.data.lyrics.LyricCandidateScorer
+import com.solo.purecast.data.lyrics.LyricsQuerySpec
 import com.solo.purecast.data.lyrics.MetadataNormalizer
 import com.solo.purecast.data.lyrics.parser.TtmlParser
 import com.solo.purecast.model.LyricFormat
@@ -43,9 +44,15 @@ class AmllDataSource(
         artist: String,
         title: String,
         expectedDurationMs: Long = 0L
-    ): AmllFetchResult? {
-        val cleanArtist = MetadataNormalizer.normalizeArtist(artist)
-        val cleanTitle = MetadataNormalizer.normalizeTitle(title)
+    ): AmllFetchResult? = fetchWithMetadata(
+        MetadataNormalizer.buildQuerySpec(artist = artist, title = title, durationMs = expectedDurationMs)
+    )
+
+    suspend fun fetchWithMetadata(spec: LyricsQuerySpec): AmllFetchResult? {
+        val cleanArtist = spec.cleanArtist
+        val cleanTitle = spec.cleanTitle
+        val scoringArtist = spec.exactArtist.ifBlank { cleanArtist }
+        val scoringTitle = spec.exactTitle.ifBlank { cleanTitle }
 
         if (cleanArtist.isBlank() || cleanTitle.isBlank()) return null
 
@@ -78,9 +85,9 @@ class AmllDataSource(
 
         val bestCandidate = selectBestCandidate(
             candidates = candidates,
-            expectedArtist = cleanArtist,
-            expectedTitle = cleanTitle,
-            expectedDurationMs = expectedDurationMs
+            expectedArtist = scoringArtist,
+            expectedTitle = scoringTitle,
+            expectedDurationMs = spec.durationMs
         )
         if (bestCandidate == null) {
             Logger.lyrics.w(TAG, "AMLL 候选列表 (${candidates.size} 条) 均未通过元数据打分校验: $cleanArtist - $cleanTitle")

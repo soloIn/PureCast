@@ -176,6 +176,38 @@ class LrcParserTest {
     }
 
     @Test
+    fun `negative offset clamps startMs to non-negative zero`() {
+        val lrc = """
+            [offset:-5000]
+            [00:02.00]开场句
+            [00:10.00]第二句
+        """.trimIndent()
+        val timeline = LrcParser.parse(lrc, "LRCLIB")
+        assertNotNull(timeline)
+        assertEquals(0L, timeline!!.lines[0].startMs)
+        assertEquals(5000L, timeline.lines[1].startMs)
+    }
+
+    @Test
+    fun `negative offset does not shift enhanced word timestamps forward`() {
+        val lrc = """
+            [offset:-5000]
+            [00:02.00]<00:02.00>Hello <00:03.00>world <00:06.00>end
+            [00:10.00]Next
+        """.trimIndent()
+        val timeline = LrcParser.parse(lrc, "LRCLIB")
+        assertNotNull(timeline)
+        val words = timeline!!.lines[0].words!!
+        assertEquals(3, words.size)
+        assertEquals(0L, words[0].startMs)
+        assertEquals(0L, words[0].endMs)
+        assertEquals(0L, words[1].startMs)
+        assertEquals(1000L, words[1].endMs)
+        assertEquals(1000L, words[2].startMs)
+        assertEquals(5000L, words[2].endMs)
+    }
+
+    @Test
     fun `plain text consisting only of null returns null`() {
         val badContent = """
             null

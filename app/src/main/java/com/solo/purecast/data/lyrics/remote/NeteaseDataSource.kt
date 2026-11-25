@@ -1,6 +1,7 @@
 package com.solo.purecast.data.lyrics.remote
 
 import com.solo.purecast.data.lyrics.ChineseConverter
+import com.solo.purecast.data.lyrics.LyricsQuerySpec
 import com.solo.purecast.data.lyrics.MetadataNormalizer
 import com.solo.purecast.data.lyrics.parser.LrcParser
 import com.solo.purecast.model.LyricTimeline
@@ -23,12 +24,12 @@ class NeteaseDataSource(
     /**
      * 💡 检索网易云完整歌词（包含原文与简体中文逐句翻译）
      */
-    suspend fun fetch(artist: String, title: String, durationMs: Long): LyricTimeline? {
-        val songIds = searchCandidateSongIds(artist, title, durationMs)
+    suspend fun fetch(spec: LyricsQuerySpec): LyricTimeline? {
+        val songIds = searchCandidateSongIds(spec.cleanArtist, spec.cleanTitle, spec.durationMs)
         if (songIds.isEmpty()) return null
 
         for (songId in songIds) {
-            val timeline = fetchLyricsBySongId(songId, durationMs)
+            val timeline = fetchLyricsBySongId(songId, spec.durationMs)
             if (timeline != null && timeline.lines.isNotEmpty()) {
                 return timeline
             }
@@ -36,11 +37,14 @@ class NeteaseDataSource(
         return null
     }
 
+    suspend fun fetch(artist: String, title: String, durationMs: Long): LyricTimeline? =
+        fetch(MetadataNormalizer.buildQuerySpec(artist = artist, title = title, durationMs = durationMs))
+
     /**
      * 💡 检索纯简体中文逐句翻译时间轴 (时间戳 -> 译文)，用于为已有歌词补齐翻译
      */
-    suspend fun fetchTranslationTimeline(artist: String, title: String, durationMs: Long): List<Pair<Long, String>>? {
-        val songIds = searchCandidateSongIds(artist, title, durationMs)
+    suspend fun fetchTranslationTimeline(spec: LyricsQuerySpec): List<Pair<Long, String>>? {
+        val songIds = searchCandidateSongIds(spec.cleanArtist, spec.cleanTitle, spec.durationMs)
         if (songIds.isEmpty()) return null
 
         for (songId in songIds) {
@@ -65,9 +69,10 @@ class NeteaseDataSource(
         return null
     }
 
-    private suspend fun searchCandidateSongIds(artist: String, title: String, durationMs: Long): List<Long> {
-        val cleanArtist = MetadataNormalizer.normalizeArtist(artist)
-        val cleanTitle = MetadataNormalizer.normalizeTitle(title)
+    suspend fun fetchTranslationTimeline(artist: String, title: String, durationMs: Long): List<Pair<Long, String>>? =
+        fetchTranslationTimeline(MetadataNormalizer.buildQuerySpec(artist = artist, title = title, durationMs = durationMs))
+
+    private suspend fun searchCandidateSongIds(cleanArtist: String, cleanTitle: String, durationMs: Long): List<Long> {
         if (cleanTitle.isBlank() && cleanArtist.isBlank()) return emptyList()
 
         val queries = mutableListOf<String>()

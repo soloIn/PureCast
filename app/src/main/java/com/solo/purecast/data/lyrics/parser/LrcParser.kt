@@ -27,7 +27,7 @@ object LrcParser {
     private data class RawLrcLine(
         val startMs: Long,
         val content: String,
-        val originalTimestampMs: Long
+        val repeatDeltaMs: Long
     )
 
     fun parse(
@@ -88,9 +88,9 @@ object LrcParser {
                 for (ts in timestamps) {
                     rawEntries.add(
                         RawLrcLine(
-                            startMs = ts + offsetMs,
+                            startMs = (ts + offsetMs).coerceAtLeast(0L),
                             content = content,
-                            originalTimestampMs = baseTimestamp
+                            repeatDeltaMs = ts - baseTimestamp
                         )
                     )
                 }
@@ -158,7 +158,7 @@ object LrcParser {
                 if (wordMatches.isNotEmpty()) {
                     val wordList = mutableListOf<LyricWord>()
                     val textBuilder = StringBuilder()
-                    val lineTimeDelta = curr.startMs - (curr.originalTimestampMs + offsetMs)
+                    val lineTimeDelta = curr.repeatDeltaMs
 
                     // 💡 修复 Finding 2: 捕获首个逐字时间标签前的引导原词 (如 [01:23.45]Hello <01:24.00>world)
                     val firstMatchStart = wordMatches.first().start()
@@ -189,6 +189,7 @@ object LrcParser {
                         val wFrac = parseFractionMs(wm.group(3))
                         val baseWordStartMs = (wMin * 60 * 1000L) + (wSec * 1000L) + wFrac + offsetMs
                         val wStartMs = baseWordStartMs + lineTimeDelta
+                        val clampedWordStart = wStartMs.coerceAtLeast(0L)
                         val wText = wm.group(4) ?: ""
 
                         val wNextStart = if (j + 1 < wordMatches.size) {
@@ -206,8 +207,8 @@ object LrcParser {
                             wordList.add(
                                 LyricWord(
                                     text = wText,
-                                    startMs = wStartMs.coerceAtLeast(0L),
-                                    endMs = wNextStart.coerceAtLeast(wStartMs)
+                                    startMs = clampedWordStart,
+                                    endMs = wNextStart.coerceAtLeast(clampedWordStart)
                                 )
                             )
                             textBuilder.append(wText)

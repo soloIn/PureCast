@@ -83,4 +83,26 @@ class MetadataNormalizerTest {
         )
         assertTrue("Token set ratio should handle dirty field, actual=$dirtyCandidateScore", dirtyCandidateScore >= 0.9f)
     }
+
+    @Test
+    fun `buildQuerySpec preserves exact version tags and punctuation alongside cleaned view`() {
+        val spec = MetadataNormalizer.buildQuerySpec(
+            artist = "  AC/DC  ",
+            title = "Come Together   (2019 Mix)",
+            album = "Abbey Road (2019 Mix)",
+            durationMs = 260000L
+        )
+        assertEquals("AC/DC", spec.exactArtist)
+        assertEquals("ac dc", spec.cleanArtist)
+        assertEquals("Come Together (2019 Mix)", spec.exactTitle)
+        assertEquals("come together", spec.cleanTitle)
+        assertEquals("Abbey Road (2019 Mix)", spec.exactAlbum)
+        assertEquals("abbey road", spec.cleanAlbum)
+        assertTrue(spec.hasDistinctCleanedForm)
+        assertFalse(spec.isInstrumentalHint)
+
+        val instSpec = MetadataNormalizer.buildQuerySpec("周杰伦", "安静（伴奏版）")
+        assertTrue(instSpec.isInstrumentalHint)
+        assertEquals("安静", instSpec.cleanTitle)
+    }
 }

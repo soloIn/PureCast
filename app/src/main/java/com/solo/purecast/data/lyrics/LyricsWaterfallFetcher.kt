@@ -41,17 +41,32 @@ class LyricsWaterfallFetcher(
         durationMs: Long,
         album: String = ""
     ): LyricTimeline? = coroutineScope {
-        val cleanArtist = MetadataNormalizer.normalizeArtist(artist)
-        val cleanTitle = MetadataNormalizer.normalizeTitle(title)
+        val spec = MetadataNormalizer.buildQuerySpec(
+            artist = artist,
+            title = title,
+            album = album,
+            durationMs = durationMs
+        )
 
-        if (cleanTitle.isBlank()) return@coroutineScope null
+        if (spec.isInstrumentalHint) {
+            Logger.lyrics.i(TAG, "标题命中纯音乐/伴奏特征，直接短路返回纯音乐状态: ${spec.exactArtist} - ${spec.exactTitle}")
+            return@coroutineScope LyricTimeline(
+                source = "Local",
+                format = LyricFormat.LRC_LINE_SYNC,
+                isInstrumental = true,
+                lines = emptyList(),
+                durationMs = spec.durationMs
+            )
+        }
 
-        val cacheKey = cacheRepository.computeCacheKey(cleanArtist, cleanTitle, durationMs)
+        if (spec.cleanTitle.isBlank()) return@coroutineScope null
+
+        val cacheKey = cacheRepository.computeCacheKey(spec)
 
         // 1. 优先查缓存 (L1 内存 0ms / L2 磁盘 10-20ms)
         val cached = cacheRepository.get(cacheKey)
         if (cached != null) {
-            Logger.lyrics.d(TAG, "两级缓存命中: $cleanArtist - $cleanTitle (format=${cached.format})")
+            Logger.lyrics.d(TAG, "两级缓存命中: ${spec.exactArtist} - ${spec.exactTitle} (format=${cached.format})")
             return@coroutineScope cached
         }
 
@@ -63,7 +78,7 @@ class LyricsWaterfallFetcher(
                 existing to true
             } else {
                 val created = async(start = CoroutineStart.LAZY) {
-                    executeWaterfall(cleanArtist, cleanTitle, durationMs, album, cacheKey)
+                    executeWaterfall(spec, cacheKey)
                 }
                 created.invokeOnCompletion {
                     inFlightRequests.remove(cacheKey, created)
@@ -73,7 +88,7 @@ class LyricsWaterfallFetcher(
             }
         }
         if (isReused) {
-            Logger.lyrics.d(TAG, "复用在途 In-flight 请求: $cleanArtist - $cleanTitle")
+            Logger.lyrics.d(TAG, "复用在途 In-flight 请求: ${spec.exactArtist} - ${spec.exactTitle}")
         } else {
             deferred.start()
         }
@@ -81,24 +96,24 @@ class LyricsWaterfallFetcher(
     }
 
     private suspend fun executeWaterfall(
-        cleanArtist: String,
-        cleanTitle: String,
-        durationMs: Long,
-        album: String,
+        spec: LyricsQuerySpec,
         cacheKey: String
     ): LyricTimeline? {
-        Logger.lyrics.i(TAG, "启动严格阶梯瀑布流检索: $cleanArtist - $cleanTitle (duration=${durationMs}ms, album=$album)")
+        Logger.lyrics.i(
+            TAG,
+            "启动严格阶梯瀑布流检索: exact=[${spec.exactArtist} - ${spec.exactTitle}], clean=[${spec.cleanArtist} - ${spec.cleanTitle}] (duration=${spec.durationMs}ms, album=${spec.exactAlbum})"
+        )
 
         // 阶梯 Step 1: AMLL TTML 逐字高精库 (硬超时 1.5s，需已知歌手)
-        if (cleanArtist.isNotBlank()) {
+        if (spec.cleanArtist.isNotBlank()) {
             try {
-                val amllResult = amllDataSource.fetchWithMetadata(cleanArtist, cleanTitle, durationMs)
+                val amllResult = amllDataSource.fetchWithMetadata(spec)
                 if (amllResult != null) {
                     val amllHit = amllResult.timeline
                     val score = LyricCandidateScorer.evaluate(
-                        expectedArtist = cleanArtist,
-                        expectedTitle = cleanTitle,
-                        expectedDurationMs = durationMs,
+                        expectedArtist = spec.exactArtist.ifBlank { spec.cleanArtist },
+                        expectedTitle = spec.exactTitle,
+                        expectedDurationMs = spec.durationMs,
                         candidateArtist = amllResult.candidateArtist,
                         candidateTitle = amllResult.candidateTitle,
                         candidateDurationMs = amllHit.durationMs,
@@ -106,8 +121,20 @@ class LyricsWaterfallFetcher(
                     )
 
                     if (score.isPassed) {
-                        Logger.lyrics.i(TAG, "阶梯 Step 1 (AMLL TTML) 命中且打分通过 (${score.totalScore}分): $cleanArtist - $cleanTitle")
-                        val enriched = enrichWithTranslation(amllHit, cleanArtist, cleanTitle, durationMs)
+                        if (score.isInstrumental) {
+                            Logger.lyrics.i(TAG, "阶梯 Step 1 (AMLL) 候选判定为纯音乐: ${spec.exactArtist} - ${spec.exactTitle}")
+                            val instTimeline = LyricTimeline(
+                                source = "AMLL",
+                                format = amllHit.format,
+                                isInstrumental = true,
+                                lines = emptyList(),
+                                durationMs = amllHit.durationMs.takeIf { it > 0L } ?: spec.durationMs
+                            )
+                            cacheRepository.put(cacheKey, instTimeline)
+                            return instTimeline
+                        }
+                        Logger.lyrics.i(TAG, "阶梯 Step 1 (AMLL TTML) 命中且打分通过 (${score.totalScore}分): ${spec.exactArtist} - ${spec.exactTitle}")
+                        val enriched = enrichWithTranslation(amllHit, spec)
                         cacheRepository.put(cacheKey, enriched)
                         return enriched
                     } else {
@@ -121,18 +148,13 @@ class LyricsWaterfallFetcher(
             }
         }
 
-        // 阶梯 Step 2: LRCLIB 精确匹配四元组 (硬超时 1.5s，需已知歌手)
-        if (cleanArtist.isNotBlank()) {
+        // 阶梯 Step 2: LRCLIB 精确匹配四元组 (优先原文精确，未命中再降级清洗名)
+        if (spec.exactArtist.isNotBlank() || spec.cleanArtist.isNotBlank()) {
             try {
-                val lrclibExactHit = lrclibDataSource.getExact(
-                    artist = cleanArtist,
-                    title = cleanTitle,
-                    durationMs = durationMs,
-                    album = album
-                )
+                val lrclibExactHit = lrclibDataSource.getExact(spec)
                 if (lrclibExactHit != null && (lrclibExactHit.format != LyricFormat.PLAIN_TEXT || lrclibExactHit.isInstrumental)) {
-                    Logger.lyrics.i(TAG, "阶梯 Step 2 (LRCLIB /api/get) 精确命中时间戳歌词: $cleanArtist - $cleanTitle")
-                    val enriched = enrichWithTranslation(lrclibExactHit, cleanArtist, cleanTitle, durationMs)
+                    Logger.lyrics.i(TAG, "阶梯 Step 2 (LRCLIB /api/get) 精确命中时间戳歌词: ${spec.exactArtist} - ${spec.exactTitle}")
+                    val enriched = enrichWithTranslation(lrclibExactHit, spec)
                     cacheRepository.put(cacheKey, enriched)
                     return enriched
                 }
@@ -145,15 +167,10 @@ class LyricsWaterfallFetcher(
 
         // 阶梯 Step 3: LRCLIB 模糊搜索决胜 (硬超时 2.0s)
         try {
-            val lrclibFuzzyHit = lrclibDataSource.searchFuzzy(
-                artist = cleanArtist,
-                title = cleanTitle,
-                album = album,
-                durationMs = durationMs
-            )
+            val lrclibFuzzyHit = lrclibDataSource.searchFuzzy(spec)
             if (lrclibFuzzyHit != null && (lrclibFuzzyHit.format != LyricFormat.PLAIN_TEXT || lrclibFuzzyHit.isInstrumental)) {
-                Logger.lyrics.i(TAG, "阶梯 Step 3 (LRCLIB /api/search) 模糊命中时间戳歌词: $cleanArtist - $cleanTitle")
-                val enriched = enrichWithTranslation(lrclibFuzzyHit, cleanArtist, cleanTitle, durationMs)
+                Logger.lyrics.i(TAG, "阶梯 Step 3 (LRCLIB /api/search) 模糊命中时间戳歌词: ${spec.exactArtist} - ${spec.exactTitle}")
+                val enriched = enrichWithTranslation(lrclibFuzzyHit, spec)
                 cacheRepository.put(cacheKey, enriched)
                 return enriched
             }
@@ -166,9 +183,9 @@ class LyricsWaterfallFetcher(
         // 阶梯 Step 4: 网易云高精中文库兜底检索 (硬超时 2.0s)
         if (neteaseDataSource != null) {
             try {
-                val neteaseHit = neteaseDataSource.fetch(cleanArtist, cleanTitle, durationMs)
+                val neteaseHit = neteaseDataSource.fetch(spec)
                 if (neteaseHit != null && (neteaseHit.format != LyricFormat.PLAIN_TEXT || neteaseHit.isInstrumental)) {
-                    Logger.lyrics.i(TAG, "阶梯 Step 4 (网易云音乐) 命中带翻译歌词: $cleanArtist - $cleanTitle")
+                    Logger.lyrics.i(TAG, "阶梯 Step 4 (网易云音乐) 命中带翻译歌词: ${spec.exactArtist} - ${spec.exactTitle}")
                     cacheRepository.put(cacheKey, neteaseHit)
                     return neteaseHit
                 }
@@ -179,7 +196,7 @@ class LyricsWaterfallFetcher(
             }
         }
 
-        Logger.lyrics.w(TAG, "阶梯瀑布流全链路未命中有效时间戳歌词: $cleanArtist - $cleanTitle")
+        Logger.lyrics.w(TAG, "阶梯瀑布流全链路未命中有效时间戳歌词: ${spec.exactArtist} - ${spec.exactTitle}")
         return null
     }
 
@@ -188,9 +205,7 @@ class LyricsWaterfallFetcher(
      */
     private suspend fun enrichWithTranslation(
         timeline: LyricTimeline,
-        artist: String,
-        title: String,
-        durationMs: Long
+        spec: LyricsQuerySpec
     ): LyricTimeline {
         val netease = neteaseDataSource ?: return timeline
         val hasAnyTranslation = timeline.lines.any { !it.translationText.isNullOrBlank() }
@@ -199,7 +214,7 @@ class LyricsWaterfallFetcher(
         }
 
         return try {
-            val transLines = netease.fetchTranslationTimeline(artist, title, durationMs)
+            val transLines = netease.fetchTranslationTimeline(spec)
             if (!transLines.isNullOrEmpty()) {
                 val enriched = timeline.lines.map { line ->
                     val matched = netease.findBestMatchingTranslation(line.startMs, transLines)
@@ -209,7 +224,7 @@ class LyricsWaterfallFetcher(
                         line
                     }
                 }
-                Logger.lyrics.i(TAG, "成功通过网易云补齐简体中文逐句翻译: $artist - $title (行数=${transLines.size})")
+                Logger.lyrics.i(TAG, "成功通过网易云补齐简体中文逐句翻译: ${spec.cleanArtist} - ${spec.cleanTitle} (行数=${transLines.size})")
                 timeline.copy(lines = enriched)
             } else {
                 timeline

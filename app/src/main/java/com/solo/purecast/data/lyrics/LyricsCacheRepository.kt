@@ -52,15 +52,19 @@ class LyricsCacheRepository(
         val totalBytes: Long
     )
 
-    fun computeCacheKey(artist: String, title: String, durationMs: Long): String {
-        val cleanArtist = MetadataNormalizer.normalizeArtist(artist)
-        val cleanTitle = MetadataNormalizer.normalizeTitle(title)
-        val durationBucket = if (durationMs > 0) durationMs / 3000L else 0L
-        val raw = "v3_${cleanArtist}_${cleanTitle}_$durationBucket"
+    fun computeCacheKey(spec: LyricsQuerySpec): String {
+        val artistKey = spec.cleanArtist
+        val titleKey = spec.exactTitle.lowercase().ifEmpty { spec.cleanTitle }
+        val durationBucket = if (spec.durationMs > 0) spec.durationMs / 3000L else 0L
+        val raw = "v4_${artistKey}_${titleKey}_$durationBucket"
 
         val digest = MessageDigest.getInstance("SHA-256")
         val bytes = digest.digest(raw.toByteArray(Charsets.UTF_8))
         return bytes.joinToString("") { "%02x".format(it) }
+    }
+
+    fun computeCacheKey(artist: String, title: String, durationMs: Long): String {
+        return computeCacheKey(MetadataNormalizer.buildQuerySpec(artist = artist, title = title, durationMs = durationMs))
     }
 
     /**

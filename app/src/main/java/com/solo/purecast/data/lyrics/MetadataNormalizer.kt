@@ -3,9 +3,30 @@ package com.solo.purecast.data.lyrics
 import me.xdrop.fuzzywuzzy.FuzzySearch
 
 /**
+ * 💡 歌词检索双视角查询规格（精确层 + 模糊层）
+ * - 精确层 (`exact*`)：仅整理首尾与连续空白，保留 `(2019 Mix)`、`AC/DC`、`(Instrumental)` 等版本与符号信息，供精确匹配、缓存隔离与纯音乐判定使用；
+ * - 模糊层 (`clean*`)：剥离版本/合作者后缀并归一化标点，专供模糊搜索召回与编辑距离打分使用。
+ */
+data class LyricsQuerySpec(
+    val exactArtist: String,
+    val exactTitle: String,
+    val exactAlbum: String,
+    val cleanArtist: String,
+    val cleanTitle: String,
+    val cleanAlbum: String,
+    val durationMs: Long,
+    val isPlaceholderArtist: Boolean,
+    val isInstrumentalHint: Boolean
+) {
+    val hasDistinctCleanedForm: Boolean
+        get() = !exactTitle.equals(cleanTitle, ignoreCase = true) ||
+            !exactArtist.equals(cleanArtist, ignoreCase = true) ||
+            !exactAlbum.equals(cleanAlbum, ignoreCase = true)
+}
+
+/**
  * 💡 流媒体元数据清洗与归一化工具类
- * 借鉴 Lyrimuse 设计：剥离多源流媒体推流中的版本冗余、合作者标签及特殊括号标点，
- * 并结合工业级 JavaWuzzy NLP 模糊字符串匹配，提升歌词检索命中率与打分稳定性。
+ * 区分“精确匹配保留原文”与“模糊搜索清洗降级”，结合 FuzzyWuzzy 编辑距离与分词比对提升检索命中率与打分稳定性。
  */
 object MetadataNormalizer {
 
@@ -26,6 +47,41 @@ object MetadataNormalizer {
         "unknown", "unknown artist", "<unknown>", "未知", "未知歌手", "群星", "various artists", "va",
         "purecast", "purecast tv"
     )
+
+    /**
+     * 💡 精确查询轻度整理：仅去除首尾空白并折叠连续空格，保留版本后缀与合法标点（如 `(2019 Mix)`、`AC/DC`）
+     */
+    fun normalizeForExact(raw: String): String {
+        val trimmed = raw.trim()
+        if (trimmed.isEmpty()) return ""
+        return MULTI_SPACE_REGEX.replace(trimmed, " ")
+    }
+
+    /**
+     * 💡 构造统一的歌词检索双视角规格
+     */
+    fun buildQuerySpec(
+        artist: String,
+        title: String,
+        album: String = "",
+        durationMs: Long = 0L
+    ): LyricsQuerySpec {
+        val placeholderArtist = isPlaceholderArtist(artist)
+        val exactArtist = if (placeholderArtist) "" else normalizeForExact(artist)
+        val exactTitle = normalizeForExact(title)
+        val exactAlbum = normalizeForExact(album)
+        return LyricsQuerySpec(
+            exactArtist = exactArtist,
+            exactTitle = exactTitle,
+            exactAlbum = exactAlbum,
+            cleanArtist = if (placeholderArtist) "" else normalizeArtist(artist),
+            cleanTitle = normalizeTitle(title),
+            cleanAlbum = normalizeTitle(album),
+            durationMs = durationMs,
+            isPlaceholderArtist = placeholderArtist,
+            isInstrumentalHint = LyricCandidateScorer.isInstrumentalTitle(exactTitle)
+        )
+    }
 
     /**
      * 💡 判断是否为未知或占位歌手

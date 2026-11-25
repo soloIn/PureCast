@@ -54,6 +54,16 @@ class LyricsCacheRepositoryTest {
     }
 
     @Test
+    fun `computeCacheKey isolates distinct mix versions of the same track`() {
+        val originalKey = repository.computeCacheKey("The Beatles", "Come Together", 260000L)
+        val mix2019Key = repository.computeCacheKey("The Beatles", "Come Together (2019 Mix)", 260000L)
+        val mix2019LowerKey = repository.computeCacheKey("the beatles", "  come together (2019 mix) ", 260500L)
+
+        assertTrue("不同混音版本应使用独立缓存键", originalKey != mix2019Key)
+        assertEquals(mix2019Key, mix2019LowerKey)
+    }
+
+    @Test
     fun `L1 cache hits immediately without reading disk`() {
         val timeline = sampleTimeline()
         val key = repository.computeCacheKey("Eagles", "Hotel California", 391000L)
