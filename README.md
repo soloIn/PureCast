@@ -8,7 +8,7 @@ PureCast 是一款专为 Android TV 与智能电视盒子打造的局域网高�
 
 | 播放主屏（42% / 58% 布局 · Bit-Perfect 独占胶囊） | 沉浸式全屏歌词（40% / 60% 布局 · 逐字扫光） |
 | :---: | :---: |
-| ![PureCast 播放主屏](<img width="1920" height="1080" alt="screenshot1" src="https://github.com/user-attachments/assets/9f499964-3bd7-4a3c-bf75-a83e7f042b6e" /> | ![PureCast 沉浸式歌词屏](<img width="1920" height="1080" alt="screenshot2" src="https://github.com/user-attachments/assets/f544a40f-8c0f-491d-8f57-0209df7f9444" /> |
+| (<img width="1920" height="1080" alt="screenshot1" src="https://github.com/user-attachments/assets/9f499964-3bd7-4a3c-bf75-a83e7f042b6e" /> | (<img width="1920" height="1080" alt="screenshot2" src="https://github.com/user-attachments/assets/f544a40f-8c0f-491d-8f57-0209df7f9444" /> |
 
 > **实机截图说明**：左图为标准播放主屏，展示 GLES2 动态材质流光背景、顶部亮绿色硬件独占信号胶囊（`UPnP · WAV · 44.1kHz/24bit | WALKMAN`）、进度条及焦点播控栏；右图为展开后的沉浸式歌词视图，展示 38% 黄金视线锚定与逐字羽化卡拉 OK 扫光效果。
 
