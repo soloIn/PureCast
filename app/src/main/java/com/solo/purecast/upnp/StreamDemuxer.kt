@@ -296,53 +296,53 @@ class StreamDemuxer(
                         }
                     )
 
-                        if (!abortedByEpoch && thisSession == sessionToken.get()) {
-                            Logger.upnp.i(TAG, "Seek 音频流拉取完毕，等待排空 (session=$thisSession)...")
-                            var waitCount = 0
-                            var pausedWaitCount = 0
-                            while (isActive && isDemuxing && thisSession == sessionToken.get() && audioGateway.getAvailableRead() > 0 && waitCount < 120) {
-                                if (audioGateway.isExplicitlyPaused()) {
-                                    delay(50)
-                                    if (++pausedWaitCount > 12000) { // 💡 P1-3 修复：暂停态等待上限 10 分钟 (600s)，对齐协调器挂起回收契约
-                                        abortedByEpoch = true
-                                        break
-                                    }
-                                    continue
-                                }
+                    if (!abortedByEpoch && thisSession == sessionToken.get()) {
+                        Logger.upnp.i(TAG, "Seek 音频流拉取完毕，等待排空 (session=$thisSession)...")
+                        var waitCount = 0
+                        var pausedWaitCount = 0
+                        while (isActive && isDemuxing && thisSession == sessionToken.get() && audioGateway.getAvailableRead() > 0 && waitCount < 120) {
+                            if (audioGateway.isExplicitlyPaused()) {
                                 delay(50)
-                                waitCount++
+                                if (++pausedWaitCount > 12000) { // 💡 P1-3 修复：暂停态等待上限 10 分钟 (600s)，对齐协调器挂起回收契约
+                                    abortedByEpoch = true
+                                    break
+                                }
+                                continue
                             }
-                            delay(25)
+                            delay(50)
+                            waitCount++
                         }
-                    } else {
-                        Logger.upnp.w(TAG, "HTTP Range Seek 返回非 206 状态码: $responseCode")
-                        abortedByEpoch = true
-                        if (thisSession == sessionToken.get()) {
-                            onError("HTTP Range Seek 失败: 响应码 $responseCode")
-                        }
+                        delay(25)
                     }
-                } catch (e: CancellationException) {
-                    abortedByEpoch = true
-                } catch (e: Exception) {
-                    Logger.upnp.w(TAG, "HTTP Range Seek 异常", e)
+                } else {
+                    Logger.upnp.w(TAG, "HTTP Range Seek 返回非 206 状态码: $responseCode")
                     abortedByEpoch = true
                     if (thisSession == sessionToken.get()) {
-                        onError("HTTP Range Seek 传输异常: ${e.message}")
-                    }
-                } finally {
-                    if (activeConnection === connection) activeConnection = null
-                    if (activeInputStream === inputStream) activeInputStream = null
-                    try { inputStream?.close() } catch (e: Exception) { Logger.upnp.d(TAG, "关闭 Seek 输入流异常: ${e.message}") }
-                    try { connection?.disconnect() } catch (e: Exception) { Logger.upnp.d(TAG, "断开 Seek HTTP 连接异常: ${e.message}") }
-                    // 💡 完整收尾：同步重置 isDemuxing 并触发 onStreamEnded，防止 Seek 后自然播完进度冻结 (B-1)
-                    if (thisSession == sessionToken.get()) {
-                        progressJob?.cancel()
-                        progressJob = null
-                        isDemuxing = false
-                        onStreamEnded(abortedByEpoch, seekEpoch)
-                        Logger.upnp.i(TAG, "Seek 活跃会话 (session=$thisSession) 结束 (abortedByEpoch=$abortedByEpoch)")
+                        onError("HTTP Range Seek 失败: 响应码 $responseCode")
                     }
                 }
+            } catch (e: CancellationException) {
+                abortedByEpoch = true
+            } catch (e: Exception) {
+                Logger.upnp.w(TAG, "HTTP Range Seek 异常", e)
+                abortedByEpoch = true
+                if (thisSession == sessionToken.get()) {
+                    onError("HTTP Range Seek 传输异常: ${e.message}")
+                }
+            } finally {
+                if (activeConnection === connection) activeConnection = null
+                if (activeInputStream === inputStream) activeInputStream = null
+                try { inputStream?.close() } catch (e: Exception) { Logger.upnp.d(TAG, "关闭 Seek 输入流异常: ${e.message}") }
+                try { connection?.disconnect() } catch (e: Exception) { Logger.upnp.d(TAG, "断开 Seek HTTP 连接异常: ${e.message}") }
+                // 💡 完整收尾：同步重置 isDemuxing 并触发 onStreamEnded，防止 Seek 后自然播完进度冻结 (B-1)
+                if (thisSession == sessionToken.get()) {
+                    progressJob?.cancel()
+                    progressJob = null
+                    isDemuxing = false
+                    onStreamEnded(abortedByEpoch, seekEpoch)
+                    Logger.upnp.i(TAG, "Seek 活跃会话 (session=$thisSession) 结束 (abortedByEpoch=$abortedByEpoch)")
+                }
+            }
         }
         return true
     }

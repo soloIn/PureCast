@@ -543,4 +543,34 @@ class LyricsRenderingTest {
         )
         assertEquals(false, LyricsRenderingMath.isInInterludeRest(lrcTimeline, 0, 10_000L))
     }
+
+    // ==========================================
+    // 两段式边界唤醒调度决策 (delay + VSYNC)
+    // ==========================================
+
+    @Test
+    fun `calculateNextWakeupDelayMs transitions cleanly from coarse delay to VSYNC handoff and idle outro`() {
+        // 1. 尾奏/空歌词无后续边界：返回 -1L 彻底挂起，0 CPU 空转
+        assertEquals(-1L, LyricsRenderingMath.calculateNextWakeupDelayMs(nowMs = 180_000L, nextBoundaryMs = Long.MAX_VALUE))
+
+        // 2. 远距边界 (> 532ms)：钳位在单次粗睡眠上限 500ms，兼顾低唤醒与非 mutation 进度校时兜底
+        assertEquals(
+            LyricsRenderingMath.WAKEUP_MAX_COARSE_SLEEP_MS,
+            LyricsRenderingMath.calculateNextWakeupDelayMs(nowMs = 10_000L, nextBoundaryMs = 13_000L)
+        )
+        assertEquals(
+            LyricsRenderingMath.WAKEUP_MAX_COARSE_SLEEP_MS,
+            LyricsRenderingMath.calculateNextWakeupDelayMs(nowMs = 10_000L, nextBoundaryMs = 10_532L)
+        )
+
+        // 3. 中距边界 (65ms..531ms)：提前 32ms (~2 帧) 唤醒交由 VSYNC 精控
+        assertEquals(168L, LyricsRenderingMath.calculateNextWakeupDelayMs(nowMs = 10_000L, nextBoundaryMs = 10_200L))
+        assertEquals(33L, LyricsRenderingMath.calculateNextWakeupDelayMs(nowMs = 10_000L, nextBoundaryMs = 10_065L))
+
+        // 4. VSYNC 精控窗口 (<= 64ms) 以及已到达/越过边界 (<= 0ms)：返回 0L 走 withFrameNanos 精确对齐且防忙等
+        assertEquals(0L, LyricsRenderingMath.calculateNextWakeupDelayMs(nowMs = 10_000L, nextBoundaryMs = 10_064L))
+        assertEquals(0L, LyricsRenderingMath.calculateNextWakeupDelayMs(nowMs = 10_000L, nextBoundaryMs = 10_016L))
+        assertEquals(0L, LyricsRenderingMath.calculateNextWakeupDelayMs(nowMs = 10_000L, nextBoundaryMs = 10_000L))
+        assertEquals(0L, LyricsRenderingMath.calculateNextWakeupDelayMs(nowMs = 10_050L, nextBoundaryMs = 10_000L))
+    }
 }

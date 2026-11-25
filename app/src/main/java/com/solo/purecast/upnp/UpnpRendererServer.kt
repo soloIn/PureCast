@@ -807,13 +807,24 @@ class UpnpRendererServer(
 
     private fun handleHttpPost(path: String, headers: Map<String, String>, body: String, out: OutputStream) {
         val soapAction = headers["soapaction"]?.removeSurrounding("\"") ?: ""
-        Logger.upnp.i(TAG, "收到 SOAP Action: $soapAction")
+        if (isHighFrequencyPollingSoapAction(soapAction)) {
+            Logger.upnp.v(TAG) { "收到高频轮询 SOAP Action: $soapAction" }
+        } else {
+            Logger.upnp.i(TAG, "收到 SOAP Action: $soapAction")
+        }
 
         val responseXml = processSoapActionForTest(soapAction, body)
         val isFault = responseXml.contains("<s:Fault>")
         val statusCode = if (isFault) 500 else 200
         val statusMsg = if (isFault) "Internal Server Error" else "OK"
         sendResponse(out, statusCode, statusMsg, "text/xml; charset=\"utf-8\"", responseXml)
+    }
+
+    internal fun isHighFrequencyPollingSoapAction(soapAction: String): Boolean {
+        return soapAction.contains("GetTransportInfo") ||
+            soapAction.contains("GetPositionInfo") ||
+            soapAction.contains("GetProtocolInfo") ||
+            soapAction.contains("GetVolume")
     }
 
     @androidx.annotation.VisibleForTesting

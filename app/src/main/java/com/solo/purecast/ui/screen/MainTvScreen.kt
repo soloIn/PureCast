@@ -2,12 +2,10 @@ package com.solo.purecast.ui.screen
 
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibilityScope
-import androidx.compose.animation.Crossfade
 import androidx.compose.animation.ExperimentalSharedTransitionApi
 import androidx.compose.animation.SharedTransitionLayout
 import androidx.compose.animation.SharedTransitionScope
 import androidx.compose.animation.core.FastOutSlowInEasing
-import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
@@ -51,7 +49,6 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -59,8 +56,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.tv.material3.ExperimentalTvMaterial3Api
 import androidx.tv.material3.Text
-import coil.compose.AsyncImage
-import coil.request.ImageRequest
 import com.solo.purecast.core.lyrics.LyricsSyncClock
 import com.solo.purecast.data.SettingsRepository
 import com.solo.purecast.model.AudioPathState
@@ -79,14 +74,14 @@ import com.solo.purecast.service.PlaybackService
 import com.solo.purecast.ui.components.FluidBackground
 import com.solo.purecast.ui.components.PlaybackControls
 import com.solo.purecast.ui.components.ProgressBarComponent
+import com.solo.purecast.ui.components.StableAlbumCover
 import com.solo.purecast.ui.components.calculateProgressFraction
+import com.solo.purecast.ui.components.rememberResolvedCoverArt
 import com.solo.purecast.ui.components.SignalPathPill
-import com.solo.purecast.ui.screen.LyricsScreen
 import com.solo.purecast.ui.theme.AppPalette
 import com.solo.purecast.util.Logger
 import com.solo.purecast.util.PermissionHelper
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
@@ -335,55 +330,15 @@ fun MainTvScreen(
     // ==========================================
     // 2. 封面与着色器动态流光背景
     // ==========================================
-    val coverData: Any? = metadata.coverBytes ?: metadata.coverUri
     val isPlaying = uiState.isPlaying
     val isIdle = uiState.isIdle
-    val uri = metadata.coverUri
-    val hasValidCover = metadata.coverBytes != null ||
-            (!uri.isNullOrEmpty() &&
-                    (uri.startsWith("http://", ignoreCase = true) || uri.startsWith("https://", ignoreCase = true)))
-    var persistentCover by remember { mutableStateOf<Any?>(null) }
-    var persistentCoverHash by remember { mutableStateOf(0) }
-
-    // 💡 封面占位保护与内容指纹防抖：
-    // 1. 严格使用 contentHash / coverUri 内容指纹对比，彻底消除 ByteArray 对象引用变动引发的 Crossfade 整体闪烁；
-    // 2. 只有在完全空闲 (IDLE/STOPPED) 且无封面时才清空；
-    // 3. 切歌期间若新曲目暂无封面，保留上一曲封面 1.2s 防抖，若持续无封面则优雅过渡到默认占位。
-    LaunchedEffect(
-        metadata.title,
-        metadata.artist,
-        metadata.coverHash,
-        metadata.coverUri,
-        hasValidCover,
-        isIdle
-    ) {
-        if (isIdle) {
-            // 💡 完全空闲待机态：立即清空封面与指纹
-            persistentCover = null
-            persistentCoverHash = 0
-        } else if (hasValidCover && coverData != null) {
-            val incomingHash = if (metadata.coverHash != 0) {
-                metadata.coverHash
-            } else {
-                metadata.coverUri.hashCode()
-            }
-            // 💡 修复 Finding 4: 指纹一致且已存在封面时严格跳过赋值，杜绝相同封面重复触发 Crossfade 动画
-            if (incomingHash != persistentCoverHash || persistentCover == null) {
-                persistentCover = coverData
-                persistentCoverHash = incomingHash
-            }
-        } else {
-            // 💡 修复 Finding 4: 切歌期间若新曲目暂无封面（如 DMAP 文本先于 image/jpeg 到达），
-            // 给予 1200ms 宽限期防抖，杜绝旧封面瞬时闪黑与同一个专辑切歌误触发过渡；若 1200ms 超时仍无封面方优雅清除
-            if (persistentCover != null) {
-                delay(1200L)
-            }
-            persistentCover = null
-            persistentCoverHash = 0
-        }
-    }
-
-    val hasActiveCover = persistentCover != null
+    val resolvedCoverArt = rememberResolvedCoverArt(
+        coverBytes = metadata.coverBytes,
+        coverUri = metadata.coverUri,
+        coverHash = metadata.coverHash,
+        isIdle = isIdle
+    )
+    val hasActiveCover = resolvedCoverArt != null
     val hasDarkBackground = resolveHasDarkBackground(AppPalette.isDark, isIdle, fluidQuality, hasActiveCover)
 
     // 封面放大弹簧动画：TRANSITIONING 切歌过渡期保持 1.0f 放大态，避免闪缩
@@ -409,11 +364,12 @@ fun MainTvScreen(
     ) {
         // 1. GLES2 材质网格动态流光背景 (已内置 22% 文字对比度暗化与底色覆盖，消除 5 层 1080p 全屏过绘)
         FluidBackground(
-            coverData = persistentCover,
+            coverData = null,
+            predecodedBitmap = resolvedCoverArt?.backgroundBitmap,
             isPlaying = isPlaying,
             isIdle = isIdle,
             quality = fluidQuality,
-            coverHash = persistentCoverHash,
+            coverHash = resolvedCoverArt?.revision?.toInt() ?: 0,
             isForeground = isForeground
         )
 
@@ -442,8 +398,7 @@ fun MainTvScreen(
                         syncClock = lyricsSyncClock,
                         metadata = metadata,
                         playbackStatus = playbackStatus,
-                        coverData = persistentCover,
-                        coverHash = persistentCoverHash,
+                        resolvedCoverArt = resolvedCoverArt,
                         hasDarkBackground = hasDarkBackground,
                         isCoverExpanded = uiState.isCoverExpanded,
                         skipButtonsEnabled = !uiState.isIdle && uiState.audioPath.protocol != StreamProtocol.UPNP_DLNA,
@@ -507,44 +462,16 @@ fun MainTvScreen(
                                     ),
                                 contentAlignment = Alignment.Center
                             ) {
-                            // 💡 Finding #10：使用 (resolvedHash, resolvedCover) 解构，使用局部 resolvedHash 构造缓存键，
-                            // 并在 remember 中传入局部 resolvedHash，杜绝闭包捕获外部可变 state 导致切歌动画期间缓存键错乱
-                            Crossfade(
-                                targetState = persistentCoverHash to persistentCover,
-                                animationSpec = tween(300),
-                                label = "coverCrossfade"
-                            ) { (resolvedHash, resolvedCover) ->
-                                if (resolvedCover != null) {
-                                    val coverRequest = remember(context, resolvedCover, resolvedHash) {
-                                        val cacheKey = if (resolvedHash != 0) "cover_$resolvedHash" else null
-                                        ImageRequest.Builder(context)
-                                            .data(resolvedCover)
-                                            .apply {
-                                                if (cacheKey != null) {
-                                                    memoryCacheKey(cacheKey)
-                                                    placeholderMemoryCacheKey(cacheKey)
-                                                }
-                                            }
-                                            .crossfade(false)
-                                            .build()
-                                    }
-                                    AsyncImage(
-                                        model = coverRequest,
-                                        contentDescription = "Album Cover",
-                                        contentScale = ContentScale.Crop,
-                                        modifier = Modifier.fillMaxSize(),
-                                        onError = {
-                                            persistentCover = null
-                                            persistentCoverHash = 0
-                                        }
-                                    )
-                                } else {
-                                    DefaultCoverCard(
-                                        isPlaying = isPlaying,
-                                        album = metadata.album,
-                                        hasDarkBackground = hasDarkBackground
-                                    )
-                                }
+                            StableAlbumCover(
+                                coverArt = resolvedCoverArt,
+                                contentDescription = "Album Cover",
+                                modifier = Modifier.fillMaxSize()
+                            ) {
+                                DefaultCoverCard(
+                                    isPlaying = isPlaying,
+                                    album = metadata.album,
+                                    hasDarkBackground = hasDarkBackground
+                                )
                             }
                         }
                     }

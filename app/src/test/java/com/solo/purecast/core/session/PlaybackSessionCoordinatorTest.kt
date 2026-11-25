@@ -1249,6 +1249,61 @@ class PlaybackSessionCoordinatorTest {
 
         // d. hasUri == false && hasBytes == false
         assertNull(tm5.clearStaleCoverIfUnclaimed(4L))
+
+        // 4. 同专辑显式续期 vs 换专辑清理：
+        val tmSameAlbum = TrackTransactionManager()
+        tmSameAlbum.resetForNewStream(
+            1L,
+            TrackMetadata(title = "Come Together", artist = "The Beatles", album = "Abbey Road", coverBytes = byteArrayOf(1, 2, 3))
+        )
+        tmSameAlbum.onTrackBoundary(TrackBoundaryEvent("track-2", 2L))
+        // 同专辑切歌仅发 DMAP 文本（未重发封面）：应自动续期 coverTrackGeneration，1200ms 超时不清空封面
+        tmSameAlbum.applyMetadataPatch(MetadataPatchEvent(trackGeneration = 2L, title = "Something", album = "Abbey Road"))
+        assertEquals(2L, tmSameAlbum.coverTrackGeneration)
+        assertNull("同专辑切歌未重发封面时 1200ms 宽限期不得误清封面", tmSameAlbum.clearStaleCoverIfUnclaimed(2L))
+        assertNotNull(tmSameAlbum.currentMetadata.coverBytes)
+
+        // 切换到不同专辑且未带封面：1200ms 后仍正常清除旧专辑封面
+        tmSameAlbum.onTrackBoundary(TrackBoundaryEvent("track-3", 3L))
+        tmSameAlbum.applyMetadataPatch(MetadataPatchEvent(trackGeneration = 3L, title = "Yesterday", album = "Help!"))
+        assertEquals(2L, tmSameAlbum.coverTrackGeneration)
+        val clearedDiffAlbum = tmSameAlbum.clearStaleCoverIfUnclaimed(3L)
+        assertNotNull("切换不同专辑且无封面时 1200ms 宽限期必须清除旧封面", clearedDiffAlbum)
+        assertNull(clearedDiffAlbum!!.coverBytes)
+
+        // 同名专辑但切换了不同歌手且未带封面：不得误续期旧歌手封面
+        val tmSameAlbumDiffArtist = TrackTransactionManager()
+        tmSameAlbumDiffArtist.resetForNewStream(
+            1L,
+            TrackMetadata(title = "Track A", artist = "Artist A", album = "Greatest Hits", coverBytes = byteArrayOf(5, 6))
+        )
+        tmSameAlbumDiffArtist.onTrackBoundary(TrackBoundaryEvent("track-b", 2L))
+        tmSameAlbumDiffArtist.applyMetadataPatch(
+            MetadataPatchEvent(trackGeneration = 2L, title = "Track B", artist = "Artist B", album = "Greatest Hits")
+        )
+        assertEquals(1L, tmSameAlbumDiffArtist.coverTrackGeneration)
+        assertNotNull("同名专辑不同歌手且无封面时应清除旧封面", tmSameAlbumDiffArtist.clearStaleCoverIfUnclaimed(2L))
+
+        // 5. 覆盖同代封面先于 DMAP 文本到达补写、同歌手续期、空 coverArtist 续期与 URI 封面续期全分支：
+        val tmBackfill = TrackTransactionManager()
+        tmBackfill.resetForNewStream(1L, TrackMetadata(title = "Init", coverUri = "http://cover-1"))
+        // 同代无 album/artist 补丁（explicitPatchAlbum/Artist 均为空）
+        tmBackfill.applyMetadataPatch(MetadataPatchEvent(trackGeneration = 1L, title = "Init 2"))
+        // 同代补齐 album 与 artist
+        tmBackfill.applyMetadataPatch(MetadataPatchEvent(trackGeneration = 1L, album = "Album X", artist = "Artist X"))
+        // 同代再次补丁（coverAlbum / coverArtist 已非空分支）
+        tmBackfill.applyMetadataPatch(MetadataPatchEvent(trackGeneration = 1L, album = "Album X", artist = "Artist X"))
+        // 切到第 2 代，显式同专辑 + 同歌手续期（URI 封面分支）
+        tmBackfill.onTrackBoundary(TrackBoundaryEvent("k-same-artist", 2L))
+        tmBackfill.applyMetadataPatch(MetadataPatchEvent(trackGeneration = 2L, title = "Song 2", album = "Album X", artist = "Artist X"))
+        assertEquals(2L, tmBackfill.coverTrackGeneration)
+
+        // 空 coverArtist 场景下，第 2 代携带显式 artist 与相同 album 续期
+        val tmNoCoverArtist = TrackTransactionManager()
+        tmNoCoverArtist.resetForNewStream(1L, TrackMetadata(title = "S1", album = "Album Y", artist = "", coverBytes = byteArrayOf(1)))
+        tmNoCoverArtist.onTrackBoundary(TrackBoundaryEvent("k-y2", 2L))
+        tmNoCoverArtist.applyMetadataPatch(MetadataPatchEvent(trackGeneration = 2L, title = "S2", album = "Album Y", artist = "Artist Y"))
+        assertEquals(2L, tmNoCoverArtist.coverTrackGeneration)
     }
 
     @Test
@@ -2141,5 +2196,160 @@ class PlaybackSessionCoordinatorTest {
         val out2 = TriStateTransitionMatrix.reduce(TransitionContext(snapshot = snapAfterTick), realEnv2, tm, 300L)
         assertEquals(104L, out2.nextContext.snapshot.progressPositionMs)
         assertEquals(7L, out2.nextContext.snapshot.progressRevision)
+    }
+
+    @Test
+    fun `TrackTransactionManager cover patch before DMAP text does not inherit previous track album or artist`() {
+        val tm = TrackTransactionManager()
+        val coverA = byteArrayOf(1, 2, 3)
+        val coverB = byteArrayOf(4, 5, 6)
+
+        tm.resetForNewStream(
+            generation = 1L,
+            initialMetadata = TrackMetadata(
+                title = "Track A1",
+                artist = "Artist A",
+                album = "Album A",
+                coverBytes = coverA
+            )
+        )
+
+        tm.onTrackBoundary(TrackBoundaryEvent(trackKey = "track-b1", trackGeneration = 2L))
+        tm.applyMetadataPatch(MetadataPatchEvent(trackGeneration = 2L, coverBytes = coverB))
+        tm.applyMetadataPatch(
+            MetadataPatchEvent(
+                trackGeneration = 2L,
+                title = "Track B1",
+                artist = "Artist B",
+                album = "Album B"
+            )
+        )
+
+        tm.onTrackBoundary(TrackBoundaryEvent(trackKey = "track-b2", trackGeneration = 3L))
+        tm.applyMetadataPatch(
+            MetadataPatchEvent(
+                trackGeneration = 3L,
+                title = "Track B2",
+                artist = "Artist B",
+                album = "Album B"
+            )
+        )
+
+        assertEquals(3L, tm.coverTrackGeneration)
+        assertNull("同专辑 B 后续曲目续期成功后不应被宽限期清除封面", tm.clearStaleCoverIfUnclaimed(3L))
+        assertNotNull(tm.currentMetadata.coverBytes)
+    }
+
+    @Test
+    fun `TrackTransactionManager normalizes all protocol placeholder artists and revokes premature renewal with artist rollback`() {
+        val placeholders = listOf("PureCast TV", "PureCast", "PureCast UPnP / DLNA 接收端", "AirPlay 设备")
+        for (placeholder in placeholders) {
+            val tm = TrackTransactionManager()
+            tm.resetForNewStream(
+                generation = 1L,
+                initialMetadata = TrackMetadata(
+                    title = "Track 1",
+                    artist = placeholder,
+                    album = "Shared Album",
+                    coverUri = "http://cover.test/cover.jpg"
+                )
+            )
+            tm.onTrackBoundary(TrackBoundaryEvent(trackKey = "track-2", trackGeneration = 2L))
+            tm.applyMetadataPatch(
+                MetadataPatchEvent(
+                    trackGeneration = 2L,
+                    title = "Track 2",
+                    artist = "Real Artist",
+                    album = "Shared Album"
+                )
+            )
+            assertEquals("占位歌手 '$placeholder' 应归一化为空串以允许真歌手续期", 2L, tm.coverTrackGeneration)
+            assertNull(tm.clearStaleCoverIfUnclaimed(2L))
+
+            tm.onTrackBoundary(TrackBoundaryEvent(trackKey = "track-3", trackGeneration = 3L))
+            tm.applyMetadataPatch(
+                MetadataPatchEvent(
+                    trackGeneration = 3L,
+                    title = "Track 3",
+                    artist = "Another Artist",
+                    album = "Shared Album"
+                )
+            )
+            assertEquals("已补记真歌手后，异名歌手不得续期", 2L, tm.coverTrackGeneration)
+            assertNotNull(tm.clearStaleCoverIfUnclaimed(3L))
+        }
+
+        // 1. 先发同名专辑（artist 为空）触发提前续期，随后同代到达不匹配歌手 -> 撤销提前续期
+        val tmRevoke = TrackTransactionManager()
+        tmRevoke.resetForNewStream(
+            generation = 1L,
+            initialMetadata = TrackMetadata(
+                title = "Track 1",
+                artist = "Artist A",
+                album = "Greatest Hits",
+                coverBytes = byteArrayOf(9, 8, 7)
+            )
+        )
+        tmRevoke.onTrackBoundary(TrackBoundaryEvent(trackKey = "track-2", trackGeneration = 2L))
+        tmRevoke.applyMetadataPatch(MetadataPatchEvent(trackGeneration = 2L, album = "Greatest Hits"))
+        assertEquals(2L, tmRevoke.coverTrackGeneration)
+
+        tmRevoke.applyMetadataPatch(MetadataPatchEvent(trackGeneration = 2L, artist = "Artist B"))
+        assertEquals(1L, tmRevoke.coverTrackGeneration)
+        val cleared = tmRevoke.clearStaleCoverIfUnclaimed(2L)
+        assertNotNull("撤销提前续期后宽限期应清除旧封面", cleared)
+        assertNull(cleared?.coverBytes)
+
+        // 2. 原封面歌手为空时本代续期补记了 Artist A，随后因专辑更正撤销续期 -> 必须同步回滚 coverArtist 为空
+        val tmRollbackArtist = TrackTransactionManager()
+        tmRollbackArtist.resetForNewStream(
+            generation = 1L,
+            initialMetadata = TrackMetadata(
+                title = "Track 1",
+                artist = "PureCast",
+                album = "Shared Album",
+                coverBytes = byteArrayOf(5, 4, 3)
+            )
+        )
+        tmRollbackArtist.onTrackBoundary(TrackBoundaryEvent(trackKey = "track-2", trackGeneration = 2L))
+        tmRollbackArtist.applyMetadataPatch(MetadataPatchEvent(trackGeneration = 2L, album = "Shared Album", artist = "Artist A"))
+        assertEquals(2L, tmRollbackArtist.coverTrackGeneration)
+        tmRollbackArtist.applyMetadataPatch(MetadataPatchEvent(trackGeneration = 2L, album = "Different Album"))
+        assertEquals(1L, tmRollbackArtist.coverTrackGeneration)
+
+        // 宽限期尚未触发前切回原专辑 Shared Album + Artist B，应仍允许续期（证明 coverArtist 已正确回滚为空）
+        tmRollbackArtist.onTrackBoundary(TrackBoundaryEvent(trackKey = "track-3", trackGeneration = 3L))
+        tmRollbackArtist.applyMetadataPatch(MetadataPatchEvent(trackGeneration = 3L, album = "Shared Album", artist = "Artist B"))
+        assertEquals(3L, tmRollbackArtist.coverTrackGeneration)
+
+        // 3. 覆盖 100% 分支门禁的剩余组合：
+        // a) 原封面歌手为空 -> 仅发相同专辑续期（不带歌手）-> 同代发无歌手补丁 -> 同代发真歌手补记 -> 同代再发相同专辑与相同歌手
+        val tmBranches = TrackTransactionManager()
+        tmBranches.resetForNewStream(
+            generation = 1L,
+            initialMetadata = TrackMetadata(
+                title = "T1",
+                artist = "PureCast",
+                album = "Solo Album",
+                coverBytes = byteArrayOf(1, 1)
+            )
+        )
+        tmBranches.onTrackBoundary(TrackBoundaryEvent(trackKey = "t2", trackGeneration = 2L))
+        tmBranches.applyMetadataPatch(MetadataPatchEvent(trackGeneration = 2L, album = "Solo Album"))
+        assertEquals(2L, tmBranches.coverTrackGeneration)
+        // coverArtist 仍为空，发无歌手无专辑补丁（explicitPatchArtist 为空分支）
+        tmBranches.applyMetadataPatch(MetadataPatchEvent(trackGeneration = 2L, title = "T2"))
+        // 同代补发真歌手（coverArtist.isEmpty() && explicitPatchArtist.isNotEmpty() -> true 分支）
+        tmBranches.applyMetadataPatch(MetadataPatchEvent(trackGeneration = 2L, artist = "Singer X"))
+        // 同代重复发相同专辑与相同歌手（albumMismatched == false && artistMismatched == false && coverArtist 非空分支）
+        tmBranches.applyMetadataPatch(MetadataPatchEvent(trackGeneration = 2L, album = "Solo Album", artist = "Singer X"))
+        assertEquals(2L, tmBranches.coverTrackGeneration)
+
+        // b) 同代先发异名歌手、后发仅专辑（无歌手）：命中 hasArtistInCurrentGen -> normalizeCoverArtist(nextArtist)，阻断误续期
+        tmBranches.onTrackBoundary(TrackBoundaryEvent(trackKey = "t3", trackGeneration = 3L))
+        tmBranches.applyMetadataPatch(MetadataPatchEvent(trackGeneration = 3L, artist = "Singer Y"))
+        tmBranches.applyMetadataPatch(MetadataPatchEvent(trackGeneration = 3L, album = "Solo Album"))
+        assertEquals(2L, tmBranches.coverTrackGeneration)
+        assertNotNull(tmBranches.clearStaleCoverIfUnclaimed(3L))
     }
 }

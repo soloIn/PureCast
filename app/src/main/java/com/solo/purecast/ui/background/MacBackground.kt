@@ -54,6 +54,7 @@ private data class MacArtworkFrame(val source: Bitmap, val fallback: Bitmap?)
 @Composable
 fun MacBackground(
     coverData: Any?,
+    predecodedBitmap: Bitmap? = null,
     quality: FluidQuality = FluidQuality.STANDARD,
     playing: Boolean = true,
     isIdle: Boolean = false,
@@ -91,38 +92,46 @@ fun MacBackground(
     var artwork by remember { mutableStateOf<MacArtworkFrame?>(null) }
     var lastFallback by remember { mutableStateOf<Bitmap?>(null) }
 
-    LaunchedEffect(coverData, isIdle, sceneClock.meshIndex, coverHash) {
-        if (isIdle || coverData == null) {
+    LaunchedEffect(coverData, predecodedBitmap, isIdle, sceneClock.meshIndex, coverHash) {
+        if (isIdle || (predecodedBitmap == null && coverData == null)) {
             // 💡 待机空闲或确定无封面态：彻底释放已有 artwork 位图与离屏渲染资源，优雅回退至自适应纯净背景，杜绝浅色模式文字对比度崩溃
             artwork = null
             lastFallback = null
             return@LaunchedEffect
         }
         try {
-            val result = withContext(Dispatchers.IO) {
-                // 💡 修复 Finding #11: 背景专用的 256x256 模糊图缓存键与前台全分辨率封面彻底隔离，
-                // 避免 Coil 全局缓存命中 256x256 低清图导致 4K TV 主屏大封面分辨率降级变模糊
-                val cacheKey = if (coverHash != 0) "cover_bg_$coverHash" else null
-                val req = ImageRequest.Builder(context)
-                    .data(coverData)
-                    .apply {
-                        if (cacheKey != null) {
-                            memoryCacheKey(cacheKey)
+            val input = if (predecodedBitmap != null) {
+                // 💡 命中主屏预解码 256x256 位图，跳过二次 Coil IO 请求与解码
+                predecodedBitmap
+            } else {
+                val result = withContext(Dispatchers.IO) {
+                    val cacheKey = if (coverHash != 0) "cover_bg_$coverHash" else null
+                    val req = ImageRequest.Builder(context)
+                        .data(coverData)
+                        .apply {
+                            if (cacheKey != null) {
+                                memoryCacheKey(cacheKey)
+                            }
                         }
-                    }
-                    .size(256, 256)
-                    .allowHardware(false)
-                    .bitmapConfig(Bitmap.Config.ARGB_8888)
-                    .build()
-                context.imageLoader.execute(req)
+                        .size(256, 256)
+                        .allowHardware(false)
+                        .bitmapConfig(Bitmap.Config.ARGB_8888)
+                        .build()
+                    context.imageLoader.execute(req)
+                }
+                currentCoroutineContext().ensureActive()
+                ((result as? SuccessResult)?.drawable as? BitmapDrawable)?.bitmap
             }
-            currentCoroutineContext().ensureActive()
-            val input = ((result as? SuccessResult)?.drawable as? BitmapDrawable)?.bitmap
             if (input != null) {
                 val needFallback = !effectiveQuality.animated || failed || !textureOpaque
                 val newFrame = withContext(Dispatchers.Default) {
-                    val copy = Bitmap.createBitmap(256, 256, Bitmap.Config.ARGB_8888)
-                    Canvas(copy).drawBitmap(input, null, Rect(0, 0, 256, 256), Paint(Paint.FILTER_BITMAP_FLAG))
+                    val copy = if (input === predecodedBitmap && input.width == 256 && input.height == 256 && input.config == Bitmap.Config.ARGB_8888) {
+                        input
+                    } else {
+                        Bitmap.createBitmap(256, 256, Bitmap.Config.ARGB_8888).also { dst ->
+                            Canvas(dst).drawBitmap(input, null, Rect(0, 0, 256, 256), Paint(Paint.FILTER_BITMAP_FLAG))
+                        }
+                    }
                     // 💡 当 GLES2 纹理已点亮且不透明 (textureOpaque == true) 时，切歌过渡完全由 GPU 离屏渲染完成，
                     // 直接跳过 CPU fastBoxBlur 与 384x384 fallback 位图分配，零画质损失且大幅降低切歌瞬时 GC。
                     val fallback = if (needFallback) buildBlurredFallbackBitmap(copy) else null
@@ -156,7 +165,7 @@ fun MacBackground(
         }
     }
 
-    if (quality == FluidQuality.OFF || isIdle || (coverData == null && artwork == null)) {
+    if (quality == FluidQuality.OFF || isIdle || (coverData == null && predecodedBitmap == null && artwork == null)) {
         Box(modifier.fillMaxSize().background(AppPalette.background))
         return
     }

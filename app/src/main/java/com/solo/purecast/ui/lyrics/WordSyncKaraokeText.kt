@@ -238,9 +238,7 @@ fun WordSyncKaraokeText(
                     drawRect(color = activeUnlitColor, blendMode = BlendMode.SrcIn)
                     return@drawWithContent
                 }
-                val isVocalFinished = now >= words.last().endMs ||
-                    (isExitingActive && now >= words.last().endMs - 50L)
-                if (isVocalFinished) {
+                if (now >= words.last().endMs) {
                     // 💡 维持与扫光阶段一致的 SRC_IN 合成路径，彻底消除唱完瞬间切回裸 Text 引起的字形亮度/抗锯齿微闪
                     drawRect(color = primaryColor, blendMode = BlendMode.SrcIn)
                     return@drawWithContent

@@ -104,6 +104,8 @@ class LyricsWaterfallFetcher(
             "启动严格阶梯瀑布流检索: exact=[${spec.exactArtist} - ${spec.exactTitle}], clean=[${spec.cleanArtist} - ${spec.cleanTitle}] (duration=${spec.durationMs}ms, album=${spec.exactAlbum})"
         )
 
+        var pendingInstrumental: LyricTimeline? = null
+
         // 阶梯 Step 1: AMLL TTML 逐字高精库 (硬超时 1.5s，需已知歌手)
         if (spec.cleanArtist.isNotBlank()) {
             try {
@@ -122,21 +124,20 @@ class LyricsWaterfallFetcher(
 
                     if (score.isPassed) {
                         if (score.isInstrumental) {
-                            Logger.lyrics.i(TAG, "阶梯 Step 1 (AMLL) 候选判定为纯音乐: ${spec.exactArtist} - ${spec.exactTitle}")
-                            val instTimeline = LyricTimeline(
+                            Logger.lyrics.i(TAG, "阶梯 Step 1 (AMLL) 候选标记为纯音乐，暂存并继续查后续有词源: ${spec.exactArtist} - ${spec.exactTitle}")
+                            pendingInstrumental = LyricTimeline(
                                 source = "AMLL",
                                 format = amllHit.format,
                                 isInstrumental = true,
                                 lines = emptyList(),
                                 durationMs = amllHit.durationMs.takeIf { it > 0L } ?: spec.durationMs
                             )
-                            cacheRepository.put(cacheKey, instTimeline)
-                            return instTimeline
+                        } else {
+                            Logger.lyrics.i(TAG, "阶梯 Step 1 (AMLL TTML) 命中且打分通过 (${score.totalScore}分): ${spec.exactArtist} - ${spec.exactTitle}")
+                            val enriched = enrichWithTranslation(amllHit, spec)
+                            cacheRepository.put(cacheKey, enriched)
+                            return enriched
                         }
-                        Logger.lyrics.i(TAG, "阶梯 Step 1 (AMLL TTML) 命中且打分通过 (${score.totalScore}分): ${spec.exactArtist} - ${spec.exactTitle}")
-                        val enriched = enrichWithTranslation(amllHit, spec)
-                        cacheRepository.put(cacheKey, enriched)
-                        return enriched
                     } else {
                         Logger.lyrics.w(TAG, "AMLL 候选评分未达标 (${score.totalScore}分): ${score.vetoReason}，降级至 Step 2")
                     }
@@ -152,11 +153,18 @@ class LyricsWaterfallFetcher(
         if (spec.exactArtist.isNotBlank() || spec.cleanArtist.isNotBlank()) {
             try {
                 val lrclibExactHit = lrclibDataSource.getExact(spec)
-                if (lrclibExactHit != null && (lrclibExactHit.format != LyricFormat.PLAIN_TEXT || lrclibExactHit.isInstrumental)) {
-                    Logger.lyrics.i(TAG, "阶梯 Step 2 (LRCLIB /api/get) 精确命中时间戳歌词: ${spec.exactArtist} - ${spec.exactTitle}")
-                    val enriched = enrichWithTranslation(lrclibExactHit, spec)
-                    cacheRepository.put(cacheKey, enriched)
-                    return enriched
+                if (lrclibExactHit != null) {
+                    if (lrclibExactHit.isInstrumental) {
+                        Logger.lyrics.i(TAG, "阶梯 Step 2 (LRCLIB /api/get) 命中纯音乐标记，暂存并继续查后续有词源: ${spec.exactArtist} - ${spec.exactTitle}")
+                        if (pendingInstrumental == null) {
+                            pendingInstrumental = lrclibExactHit
+                        }
+                    } else if (lrclibExactHit.format != LyricFormat.PLAIN_TEXT) {
+                        Logger.lyrics.i(TAG, "阶梯 Step 2 (LRCLIB /api/get) 精确命中时间戳歌词: ${spec.exactArtist} - ${spec.exactTitle}")
+                        val enriched = enrichWithTranslation(lrclibExactHit, spec)
+                        cacheRepository.put(cacheKey, enriched)
+                        return enriched
+                    }
                 }
             } catch (e: CancellationException) {
                 throw e
@@ -166,9 +174,10 @@ class LyricsWaterfallFetcher(
         }
 
         // 阶梯 Step 3: LRCLIB 模糊搜索决胜 (硬超时 2.0s)
+        // 💡 模糊搜索仅采纳有效同步歌词，不产出纯音乐结论（避免社区模糊条目误标纯音乐）
         try {
             val lrclibFuzzyHit = lrclibDataSource.searchFuzzy(spec)
-            if (lrclibFuzzyHit != null && (lrclibFuzzyHit.format != LyricFormat.PLAIN_TEXT || lrclibFuzzyHit.isInstrumental)) {
+            if (lrclibFuzzyHit != null && !lrclibFuzzyHit.isInstrumental && lrclibFuzzyHit.format != LyricFormat.PLAIN_TEXT) {
                 Logger.lyrics.i(TAG, "阶梯 Step 3 (LRCLIB /api/search) 模糊命中时间戳歌词: ${spec.exactArtist} - ${spec.exactTitle}")
                 val enriched = enrichWithTranslation(lrclibFuzzyHit, spec)
                 cacheRepository.put(cacheKey, enriched)
@@ -184,16 +193,28 @@ class LyricsWaterfallFetcher(
         if (neteaseDataSource != null) {
             try {
                 val neteaseHit = neteaseDataSource.fetch(spec)
-                if (neteaseHit != null && (neteaseHit.format != LyricFormat.PLAIN_TEXT || neteaseHit.isInstrumental)) {
-                    Logger.lyrics.i(TAG, "阶梯 Step 4 (网易云音乐) 命中带翻译歌词: ${spec.exactArtist} - ${spec.exactTitle}")
-                    cacheRepository.put(cacheKey, neteaseHit)
-                    return neteaseHit
+                if (neteaseHit != null) {
+                    if (!neteaseHit.isInstrumental && neteaseHit.format != LyricFormat.PLAIN_TEXT) {
+                        Logger.lyrics.i(TAG, "阶梯 Step 4 (网易云音乐) 命中带翻译歌词: ${spec.exactArtist} - ${spec.exactTitle}")
+                        cacheRepository.put(cacheKey, neteaseHit)
+                        return neteaseHit
+                    } else if (neteaseHit.isInstrumental && pendingInstrumental == null) {
+                        pendingInstrumental = neteaseHit
+                    }
                 }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
                 Logger.lyrics.w(TAG, "网易云歌词检索异常", e)
             }
+        }
+
+        // 💡 延迟采纳机制：仅当全瀑布流均未找到有效同步歌词，且此前存在高置信度远端纯音乐判定时才返回纯音乐，
+        // 且仅写入 L1 内存缓存（不落盘 L2），避免社区数据修正前永久锁死。
+        if (pendingInstrumental != null) {
+            Logger.lyrics.i(TAG, "全瀑布流未命中同步歌词，采纳暂存纯音乐判定 (source=${pendingInstrumental.source}): ${spec.exactArtist} - ${spec.exactTitle}")
+            cacheRepository.putMemoryOnly(cacheKey, pendingInstrumental)
+            return pendingInstrumental
         }
 
         Logger.lyrics.w(TAG, "阶梯瀑布流全链路未命中有效时间戳歌词: ${spec.exactArtist} - ${spec.exactTitle}")

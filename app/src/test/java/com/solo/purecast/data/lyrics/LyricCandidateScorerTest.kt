@@ -257,4 +257,60 @@ class LyricCandidateScorerTest {
         )
         assertTrue("Pt. 1 与无分部标记应视为等价", part1MatchesUntagged.isPassed)
     }
+
+    @Test
+    fun `vocal track vetoes instrumental or karaoke candidate even when title and artist match`() {
+        val karaokeCand = LyricCandidateScorer.evaluate(
+            expectedArtist = "周杰伦",
+            expectedTitle = "晴天",
+            expectedDurationMs = 269_000L,
+            candidateArtist = "周杰伦",
+            candidateTitle = "晴天 (伴奏)",
+            candidateDurationMs = 269_000L,
+            candidateFormat = LyricFormat.LRC_LINE_SYNC,
+            isInstrumental = true
+        )
+        assertFalse("原唱歌曲绝不能被伴奏版候选劫持", karaokeCand.isPassed)
+        assertFalse(karaokeCand.isInstrumental)
+
+        val unrelatedInst = LyricCandidateScorer.evaluate(
+            expectedArtist = "周杰伦",
+            expectedTitle = "晴天",
+            expectedDurationMs = 269_000L,
+            candidateArtist = "Piano Cover Studio",
+            candidateTitle = "晴天",
+            candidateDurationMs = 190_000L,
+            candidateFormat = LyricFormat.PLAIN_TEXT,
+            isInstrumental = true
+        )
+        assertFalse("不同歌手且时长不符的纯音乐候选不得误通过", unrelatedInst.isPassed)
+        assertFalse(unrelatedInst.isInstrumental)
+    }
+
+    @Test
+    fun `synced lyrics candidate strictly outscores instrumental flag for the same track`() {
+        val syncedScore = LyricCandidateScorer.evaluate(
+            expectedArtist = "周杰伦",
+            expectedTitle = "晴天",
+            expectedDurationMs = 269_000L,
+            candidateArtist = "周杰伦",
+            candidateTitle = "晴天",
+            candidateDurationMs = 269_000L,
+            candidateFormat = LyricFormat.LRC_LINE_SYNC,
+            isInstrumental = false
+        )
+        val instScore = LyricCandidateScorer.evaluate(
+            expectedArtist = "周杰伦",
+            expectedTitle = "晴天",
+            expectedDurationMs = 269_000L,
+            candidateArtist = "周杰伦",
+            candidateTitle = "晴天",
+            candidateDurationMs = 269_000L,
+            candidateFormat = LyricFormat.LRC_LINE_SYNC,
+            isInstrumental = true
+        )
+        assertTrue(syncedScore.isPassed)
+        assertTrue(instScore.isPassed)
+        assertTrue("真实同步歌词总分必须严格高于纯音乐标记", syncedScore.totalScore > instScore.totalScore)
+    }
 }

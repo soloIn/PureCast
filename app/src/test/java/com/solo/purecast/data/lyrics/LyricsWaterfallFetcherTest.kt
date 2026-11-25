@@ -177,7 +177,7 @@ class LyricsWaterfallFetcherTest {
                 {
                     "result": {
                         "songs": [
-                            { "id": 123456, "name": "泪海", "duration": 300000 }
+                            { "id": 123456, "name": "泪海", "artists": [{ "name": "许茹芸" }], "duration": 300000 }
                         ]
                     }
                 }

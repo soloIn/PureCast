@@ -24,7 +24,8 @@ class LyricsSyncClock(
     private val ringBufferDelayMsProvider: () -> Long = { 0L },
     private val lineLeadInMs: Long = DEFAULT_LINE_LEAD_IN_MS,
     private val scrollLeadInMs: Long = DEFAULT_SCROLL_LEAD_IN_MS,
-    private val delayEmaAlpha: Double = DEFAULT_DELAY_EMA_ALPHA
+    private val delayEmaAlpha: Double = DEFAULT_DELAY_EMA_ALPHA,
+    private val nanoTimeProvider: () -> Long = { System.nanoTime() }
 ) {
 
     data class ActiveLineState(
@@ -65,7 +66,7 @@ class LyricsSyncClock(
      * 同一 VSYNC 渲染帧 (16ms) 内多次调用直接复用缓存，杜绝重复 JNI 开销；
      * EMA (alpha = 0.15) 滤除 USB isoc URB 突发读取导致的阶跃锯齿。
      */
-    private fun getEffectiveRingDelayMs(nowNanoTime: Long = System.nanoTime()): Long {
+    private fun getEffectiveRingDelayMs(nowNanoTime: Long = nanoTimeProvider()): Long {
         val elapsedNano = nowNanoTime - lastDelayFetchNanoTime
         val isCacheExpired = lastDelayFetchNanoTime == 0L || elapsedNano >= FRAME_CACHE_WINDOW_NANO || elapsedNano < 0L
         if (isCacheExpired) {
@@ -90,7 +91,7 @@ class LyricsSyncClock(
     fun hardAlign(
         targetPositionMs: Long,
         playing: Boolean,
-        nowNanoTime: Long = System.nanoTime(),
+        nowNanoTime: Long = nanoTimeProvider(),
         startDelayMs: Long = 0L
     ) {
         val clamped = targetPositionMs.coerceAtLeast(0L)
@@ -124,7 +125,7 @@ class LyricsSyncClock(
     fun updatePosition(
         newPositionMs: Long,
         playing: Boolean,
-        nowNanoTime: Long = System.nanoTime(),
+        nowNanoTime: Long = nanoTimeProvider(),
         isUserSeek: Boolean = false,
         allowSeekJump: Boolean = true,
         anchorDelayMs: Long = 0L
@@ -211,7 +212,7 @@ class LyricsSyncClock(
     /**
      * 💡 计算当前 VSYNC 渲染帧的推演毫秒时间 (60fps/120fps)
      */
-    fun getCurrentInterpolatedTimeMs(nowNanoTime: Long = System.nanoTime()): Long {
+    fun getCurrentInterpolatedTimeMs(nowNanoTime: Long = nanoTimeProvider()): Long {
         if (!isPlaying || anchorNanoTime == 0L) {
             // 💡 暂停或未启动推流时，时钟原地单调冻结在 lastInterpolatedTimeMs (Finding 11)
             if (lastInterpolatedTimeMs == 0L && reportedPositionMs > 0L) {

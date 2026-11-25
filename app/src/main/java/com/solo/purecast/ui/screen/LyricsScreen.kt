@@ -2,13 +2,10 @@ package com.solo.purecast.ui.screen
 
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibilityScope
-import androidx.compose.animation.Crossfade
 import androidx.compose.animation.ExperimentalSharedTransitionApi
 import androidx.compose.animation.SharedTransitionScope
-import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.basicMarquee
@@ -36,11 +33,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.focus.FocusRequester
-import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -50,13 +44,13 @@ import androidx.compose.ui.unit.sp
 import androidx.tv.material3.ExperimentalTvMaterial3Api
 import androidx.tv.material3.Icon
 import androidx.tv.material3.Text
-import coil.compose.AsyncImage
-import coil.request.ImageRequest
 import com.solo.purecast.R
 import com.solo.purecast.core.lyrics.LyricsSyncClock
 import com.solo.purecast.model.LyricUiState
 import com.solo.purecast.model.PlaybackStatus
 import com.solo.purecast.model.TrackMetadata
+import com.solo.purecast.ui.components.ResolvedCoverArt
+import com.solo.purecast.ui.components.StableAlbumCover
 import com.solo.purecast.ui.components.TransportIconButton
 import com.solo.purecast.ui.lyrics.InstrumentalStateView
 import com.solo.purecast.ui.lyrics.LoadingShimmerView
@@ -80,8 +74,7 @@ fun LyricsScreen(
     syncClock: LyricsSyncClock,
     metadata: TrackMetadata,
     playbackStatus: PlaybackStatus,
-    coverData: Any?,
-    coverHash: Int = 0,
+    resolvedCoverArt: ResolvedCoverArt? = null,
     hasDarkBackground: Boolean,
     isCoverExpanded: Boolean = true,
     skipButtonsEnabled: Boolean = true,
@@ -94,7 +87,6 @@ fun LyricsScreen(
     sharedTransitionScope: SharedTransitionScope? = null,
     animatedVisibilityScope: AnimatedVisibilityScope? = null
 ) {
-    val context = LocalContext.current
 
     // 💡 仅当全屏歌词位于前台时拦截遥控器返回键，防止叠加设置页退出动画期间误关歌词屏
     BackHandler(enabled = isForeground) {
@@ -187,41 +179,17 @@ fun LyricsScreen(
                     ),
                 contentAlignment = Alignment.Center
             ) {
-                // 💡 Finding #10：使用 (resolvedHash, resolvedCover) 解构，使用局部 resolvedHash 构造缓存键，
-                // 并在 remember 中传入局部 resolvedHash，杜绝闭包捕获外部可变 state 导致切歌动画期间缓存键错乱
-                Crossfade(
-                    targetState = coverHash to coverData,
-                    animationSpec = tween(300),
-                    label = "lyricsCoverCrossfade"
-                ) { (resolvedHash, resolvedCover) ->
-                    if (resolvedCover != null) {
-                        val coverRequest = remember(context, resolvedCover, resolvedHash) {
-                            val cacheKey = if (resolvedHash != 0) "cover_$resolvedHash" else null
-                            ImageRequest.Builder(context)
-                                .data(resolvedCover)
-                                .apply {
-                                    if (cacheKey != null) {
-                                        memoryCacheKey(cacheKey)
-                                        placeholderMemoryCacheKey(cacheKey)
-                                    }
-                                }
-                                .crossfade(false)
-                                .build()
-                        }
-                        AsyncImage(
-                            model = coverRequest,
-                            contentDescription = "Cover",
-                            contentScale = ContentScale.Crop,
-                            modifier = Modifier.fillMaxSize()
-                        )
-                    } else {
-                        Icon(
-                            painter = painterResource(id = R.drawable.ic_waveform),
-                            contentDescription = "Music Placeholder",
-                            tint = if (hasDarkBackground) Color.White.copy(alpha = 0.6f) else Color(0xFF1C1C1E).copy(alpha = 0.6f),
-                            modifier = Modifier.size(64.dp)
-                        )
-                    }
+                StableAlbumCover(
+                    coverArt = resolvedCoverArt,
+                    contentDescription = "Cover",
+                    modifier = Modifier.fillMaxSize()
+                ) {
+                    Icon(
+                        painter = painterResource(id = R.drawable.ic_waveform),
+                        contentDescription = "Music Placeholder",
+                        tint = if (hasDarkBackground) Color.White.copy(alpha = 0.6f) else Color(0xFF1C1C1E).copy(alpha = 0.6f),
+                        modifier = Modifier.size(64.dp)
+                    )
                 }
             }
 

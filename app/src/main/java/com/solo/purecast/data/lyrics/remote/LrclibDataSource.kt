@@ -178,19 +178,15 @@ class LrclibDataSource(
                 val candTitle = item.optCleanString("trackName") ?: ""
                 val candDurationSec = item.optDouble("duration", 0.0)
                 val candDurationMs = (candDurationSec * 1000).toLong()
-                val isInst = item.optBoolean("instrumental", false)
                 val syncedLrc = item.optCleanString("syncedLyrics")
 
-                // 💡 瀑布流分级择优调度：彻底屏蔽无时间戳纯文本歌词候选，不予打分采纳
-                if (!isInst && syncedLrc.isNullOrBlank()) {
+                // 💡 瀑布流分级择优调度：searchFuzzy 仅采纳有效同步歌词，彻底排除纯文本与无有效 syncedLyrics 的纯音乐条目，
+                // 防止精确时长纯音乐 (90分) 压过有轻微时长差/尾奏的真同步歌词并提前阻断后续回退查询。
+                if (syncedLrc.isNullOrBlank()) {
                     continue
                 }
 
-                val candFormat = when {
-                    syncedLrc != null && syncedLrc.contains("<") -> LyricFormat.LRC_WORD_SYNC
-                    syncedLrc != null && syncedLrc.isNotBlank() -> LyricFormat.LRC_LINE_SYNC
-                    else -> LyricFormat.LRC_LINE_SYNC
-                }
+                val candFormat = if (syncedLrc.contains("<")) LyricFormat.LRC_WORD_SYNC else LyricFormat.LRC_LINE_SYNC
 
                 val scoreResult = LyricCandidateScorer.evaluate(
                     expectedArtist = expectedArtist,
@@ -200,22 +196,11 @@ class LrclibDataSource(
                     candidateTitle = candTitle,
                     candidateDurationMs = candDurationMs,
                     candidateFormat = candFormat,
-                    isInstrumental = isInst
+                    isInstrumental = false
                 )
 
                 if (scoreResult.accepted && scoreResult.totalScore > bestScore) {
-                    val timeline = if (isInst || scoreResult.isInstrumental) {
-                        LyricTimeline(
-                            source = "LRCLIB",
-                            format = candFormat,
-                            isInstrumental = true,
-                            lines = emptyList(),
-                            durationMs = candDurationMs
-                        )
-                    } else if (!syncedLrc.isNullOrBlank()) {
-                        LrcParser.parse(syncedLrc, sourceName = "LRCLIB", expectedDurationMs = candDurationMs)
-                    } else null
-
+                    val timeline = LrcParser.parse(syncedLrc, sourceName = "LRCLIB", expectedDurationMs = candDurationMs)
                     if (timeline != null) {
                         bestTimeline = timeline
                         bestScore = scoreResult.totalScore
@@ -244,6 +229,12 @@ class LrclibDataSource(
             val candDurationSec = json.optDouble("duration", 0.0)
             val candDurationMs = (candDurationSec * 1000).toLong()
             val syncedLrc = json.optCleanString("syncedLyrics")
+
+            // 💡 防止清洗降级后的 /api/get 误命中伴奏/纯音乐版本反推原唱为纯音乐
+            if (!spec.isInstrumentalHint && LyricCandidateScorer.isInstrumentalTitle(trackName)) {
+                Logger.lyrics.w(TAG, "LRCLIB /api/get [$modeLabel] 拒绝以伴奏/纯音乐条目匹配原唱: id=$id, track=$trackName")
+                return null
+            }
 
             if (spec.durationMs > 0L && candDurationMs > 0L && abs(spec.durationMs - candDurationMs) > MAX_EXACT_DURATION_DELTA_MS) {
                 Logger.lyrics.w(

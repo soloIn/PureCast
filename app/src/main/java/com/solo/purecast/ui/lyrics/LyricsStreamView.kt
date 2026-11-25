@@ -34,11 +34,15 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import com.solo.purecast.core.lyrics.LyricsSyncClock
 import com.solo.purecast.model.LyricFormat
 import com.solo.purecast.model.LyricTimeline
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlin.math.PI
 import kotlin.math.abs
@@ -147,24 +151,31 @@ fun LyricsStreamView(
         boundaryWindowMs[1] = computeNextBoundaryMs(nowTimeMs, nextActive, nextScroll, rest)
     }
 
-    // 💡 播放态主循环：逐字与逐行歌词统一由 VSYNC 驱动，零重组且切句精准对齐 60Hz 帧边界
-    LaunchedEffect(timeline, isPlaying) {
-        if (!isPlaying) return@LaunchedEffect
-        // 切歌或恢复播放首帧强制对齐一次边界缓存
-        syncPlaybackIndices(syncClock.getCurrentInterpolatedTimeMs(), force = true)
-        while (true) {
-            withFrameNanos {
-                syncPlaybackIndices(syncClock.getCurrentInterpolatedTimeMs())
-            }
-        }
-    }
-
-    // 💡 暂停态副作用：监听 mutationVersionFlow，确保暂停下 Seek 或切歌立即更新高亮行与间奏静息态
-    LaunchedEffect(isPlaying, timeline) {
-        if (!isPlaying) {
+    // 💡 统一播放/暂停态边界同步循环（两段式唤醒）：
+    // 1. 订阅 mutationVersionFlow.collectLatest：切歌、Seek、hardAlign 或暂停/恢复 0ms 打断挂起并强制重算边界；
+    // 2. 暂停态首帧对齐后即挂起；播放态远距边界执行粗睡眠 delay（上限 500ms），距边界 <= 64ms 切回 withFrameNanos 锁死 60Hz 帧边界，
+    //    已过尾奏边界 (Long.MAX_VALUE) 退出循环挂起至 0 CPU 占用。
+    LaunchedEffect(timeline, syncClock, isPlaying) {
+        syncClock.mutationVersionFlow.collectLatest {
             syncPlaybackIndices(syncClock.getCurrentInterpolatedTimeMs(), force = true)
-            syncClock.mutationVersionFlow.collect {
-                syncPlaybackIndices(syncClock.getCurrentInterpolatedTimeMs(), force = true)
+            if (!isPlaying) return@collectLatest
+            while (true) {
+                val delayMs = LyricsRenderingMath.calculateNextWakeupDelayMs(
+                    nowMs = syncClock.getCurrentInterpolatedTimeMs(),
+                    nextBoundaryMs = boundaryWindowMs[1]
+                )
+                when {
+                    delayMs < 0L -> break
+                    delayMs > 0L -> {
+                        delay(delayMs)
+                        syncPlaybackIndices(syncClock.getCurrentInterpolatedTimeMs())
+                    }
+                    else -> {
+                        withFrameNanos {
+                            syncPlaybackIndices(syncClock.getCurrentInterpolatedTimeMs())
+                        }
+                    }
+                }
             }
         }
     }
@@ -428,6 +439,8 @@ fun LyricsStreamView(
                             Box(
                                 modifier = Modifier
                                     .fillMaxWidth()
+                                    .testTag("lyric_line_$index")
+                                    .semantics { selected = isFocused }
                                     .onSizeChanged { size ->
                                         if (size.height > 0) {
                                             val h = size.height.toFloat()

@@ -1,5 +1,6 @@
 package com.solo.purecast.ui.components
 
+import android.graphics.Bitmap
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -13,6 +14,7 @@ import com.solo.purecast.ui.background.MacBackground
 @Composable
 fun FluidBackground(
     coverData: Any? = null,
+    predecodedBitmap: Bitmap? = null,
     isPlaying: Boolean = true,
     isIdle: Boolean = false,
     quality: FluidQuality = FluidQuality.STANDARD,
@@ -24,6 +26,7 @@ fun FluidBackground(
 ) {
     MacBackground(
         coverData = coverData,
+        predecodedBitmap = predecodedBitmap,
         quality = quality,
         playing = isPlaying,
         isIdle = isIdle,

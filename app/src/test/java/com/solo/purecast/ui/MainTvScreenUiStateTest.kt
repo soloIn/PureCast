@@ -97,4 +97,28 @@ class MainTvScreenUiStateTest {
         assertTrue(uiState.isCoverExpanded)
         assertTrue(uiState.isTransitioning)
     }
+
+    @Test
+    fun coverVisualFingerprintTreatsMinorReencodeDiffAsEquivalentAndDistinctCoversAsDifferent() {
+        val base = com.solo.purecast.ui.components.CoverVisualFingerprint(
+            dHash = 0x0F0F0F0F0F0F0F0FL,
+            avgR = 120,
+            avgG = 80,
+            avgB = 40
+        )
+        val reencodedSameAlbum = com.solo.purecast.ui.components.CoverVisualFingerprint(
+            dHash = 0x0F0F0F0F0F0F0F0DL, // 1-bit jitter
+            avgR = 122,
+            avgG = 79,
+            avgB = 41
+        )
+        val differentAlbum = com.solo.purecast.ui.components.CoverVisualFingerprint(
+            dHash = 0x5555555555555555L,
+            avgR = 30,
+            avgG = 140,
+            avgB = 210
+        )
+        assertTrue(base.isVisuallyEquivalentTo(reencodedSameAlbum))
+        assertFalse(base.isVisuallyEquivalentTo(differentAlbum))
+    }
 }

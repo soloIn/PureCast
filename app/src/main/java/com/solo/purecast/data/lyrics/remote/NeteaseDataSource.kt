@@ -1,9 +1,11 @@
 package com.solo.purecast.data.lyrics.remote
 
 import com.solo.purecast.data.lyrics.ChineseConverter
+import com.solo.purecast.data.lyrics.LyricCandidateScorer
 import com.solo.purecast.data.lyrics.LyricsQuerySpec
 import com.solo.purecast.data.lyrics.MetadataNormalizer
 import com.solo.purecast.data.lyrics.parser.LrcParser
+import com.solo.purecast.model.LyricFormat
 import com.solo.purecast.model.LyricTimeline
 import com.solo.purecast.util.Logger
 import org.json.JSONObject
@@ -18,23 +20,29 @@ import kotlin.math.abs
  * 3. 自动将繁体中文歌词与翻译归一化为规范简体中文。
  */
 class NeteaseDataSource(
-    private val httpClient: LyricsHttpClient
+    private val httpClient: LyricsHttpClient,
+    private val searchApiUrl: String = SEARCH_API_URL,
+    private val lyricApiUrl: String = LYRIC_API_URL
 ) {
 
     /**
      * 💡 检索网易云完整歌词（包含原文与简体中文逐句翻译）
      */
     suspend fun fetch(spec: LyricsQuerySpec): LyricTimeline? {
-        val songIds = searchCandidateSongIds(spec.cleanArtist, spec.cleanTitle, spec.durationMs)
+        val songIds = searchCandidateSongIds(spec)
         if (songIds.isEmpty()) return null
 
+        var pendingInstrumental: LyricTimeline? = null
         for (songId in songIds) {
-            val timeline = fetchLyricsBySongId(songId, spec.durationMs)
-            if (timeline != null && timeline.lines.isNotEmpty()) {
+            val timeline = fetchLyricsBySongId(songId, spec.durationMs) ?: continue
+            if (!timeline.isInstrumental && timeline.lines.isNotEmpty()) {
                 return timeline
             }
+            if (timeline.isInstrumental && pendingInstrumental == null) {
+                pendingInstrumental = timeline
+            }
         }
-        return null
+        return pendingInstrumental
     }
 
     suspend fun fetch(artist: String, title: String, durationMs: Long): LyricTimeline? =
@@ -44,18 +52,17 @@ class NeteaseDataSource(
      * 💡 检索纯简体中文逐句翻译时间轴 (时间戳 -> 译文)，用于为已有歌词补齐翻译
      */
     suspend fun fetchTranslationTimeline(spec: LyricsQuerySpec): List<Pair<Long, String>>? {
-        val songIds = searchCandidateSongIds(spec.cleanArtist, spec.cleanTitle, spec.durationMs)
+        val songIds = searchCandidateSongIds(spec)
         if (songIds.isEmpty()) return null
 
         for (songId in songIds) {
-            val url = "$LYRIC_API_URL?id=$songId&lv=1&kv=1&tv=1"
+            val url = "$lyricApiUrl?id=$songId&lv=1&kv=1&tv=1"
             try {
                 val resp = httpClient.get(url, timeoutMs = TIMEOUT_MS)
                 if (!resp.isSuccessful || resp.body.isBlank()) continue
 
                 val root = JSONObject(resp.body)
-                val tlyricStr = root.optJSONObject("tlyric")?.optString("lyric") ?: continue
-                if (tlyricStr.isBlank()) continue
+                val tlyricStr = root.optJSONObject("tlyric")?.optCleanString("lyric") ?: continue
 
                 val lines = parseTranslationLines(tlyricStr)
                 if (lines.isNotEmpty()) {
@@ -72,7 +79,13 @@ class NeteaseDataSource(
     suspend fun fetchTranslationTimeline(artist: String, title: String, durationMs: Long): List<Pair<Long, String>>? =
         fetchTranslationTimeline(MetadataNormalizer.buildQuerySpec(artist = artist, title = title, durationMs = durationMs))
 
-    private suspend fun searchCandidateSongIds(cleanArtist: String, cleanTitle: String, durationMs: Long): List<Long> {
+    private suspend fun searchCandidateSongIds(spec: LyricsQuerySpec): List<Long> {
+        val cleanArtist = spec.cleanArtist
+        val cleanTitle = spec.cleanTitle
+        val expectedArtist = spec.exactArtist.ifBlank { cleanArtist }
+        val expectedTitle = spec.exactTitle.ifBlank { cleanTitle }
+        val durationMs = spec.durationMs
+
         if (cleanTitle.isBlank() && cleanArtist.isBlank()) return emptyList()
 
         val queries = mutableListOf<String>()
@@ -85,7 +98,7 @@ class NeteaseDataSource(
 
         for (query in queries) {
             val encodedQuery = URLEncoder.encode(query, "UTF-8")
-            val searchUrl = "$SEARCH_API_URL?s=$encodedQuery&type=1&limit=8"
+            val searchUrl = "$searchApiUrl?s=$encodedQuery&type=1&limit=8"
 
             try {
                 val resp = httpClient.get(searchUrl, timeoutMs = TIMEOUT_MS)
@@ -95,25 +108,33 @@ class NeteaseDataSource(
                 val songs = root.optJSONObject("result")?.optJSONArray("songs") ?: continue
                 if (songs.length() == 0) continue
 
-                val candidateList = mutableListOf<Pair<Long, Long>>() // id to durationDiff
+                val scoredCandidates = mutableListOf<Pair<Long, Float>>()
 
                 for (i in 0 until songs.length()) {
                     val song = songs.getJSONObject(i)
                     val id = song.optLong("id")
-                    val songDuration = song.optLong("duration")
+                    if (id <= 0L) continue
+                    val candTitle = song.optCleanString("name") ?: continue
+                    val candArtist = extractNeteaseArtists(song)
+                    val songDuration = song.optLong("duration", 0L)
 
-                    val diff = if (durationMs > 0L && songDuration > 0L) {
-                        abs(songDuration - durationMs)
-                    } else {
-                        1000L * i // 保持原本顺序
+                    val score = LyricCandidateScorer.evaluate(
+                        expectedArtist = expectedArtist,
+                        expectedTitle = expectedTitle,
+                        expectedDurationMs = durationMs,
+                        candidateArtist = candArtist,
+                        candidateTitle = candTitle,
+                        candidateDurationMs = songDuration,
+                        candidateFormat = LyricFormat.LRC_LINE_SYNC
+                    )
+                    if (score.isPassed) {
+                        scoredCandidates.add(id to score.totalScore)
                     }
-                    candidateList.add(id to diff)
                 }
 
-                // 优先选择时长最接近的（容差 8s 内），其次按原本排名
-                val sortedIds = candidateList.sortedWith(compareBy<Pair<Long, Long>> { (id, diff) ->
-                    if (durationMs > 0L && diff <= 8000L) 0 else 1
-                }.thenBy { it.second }).map { it.first }
+                val sortedIds = scoredCandidates
+                    .sortedByDescending { it.second }
+                    .map { it.first }
 
                 if (sortedIds.isNotEmpty()) return sortedIds
             } catch (e: Exception) {
@@ -123,23 +144,61 @@ class NeteaseDataSource(
         return emptyList()
     }
 
+    private fun extractNeteaseArtists(song: JSONObject): String {
+        val artistsArr = song.optJSONArray("artists") ?: song.optJSONArray("ar") ?: return ""
+        val names = ArrayList<String>(artistsArr.length())
+        for (j in 0 until artistsArr.length()) {
+            val name = artistsArr.optJSONObject(j)?.optCleanString("name")
+            if (name != null) names.add(name)
+        }
+        return names.joinToString(" ")
+    }
+
+    private fun JSONObject.optCleanString(name: String): String? {
+        if (!has(name) || isNull(name)) return null
+        val v = optString(name, "").trim()
+        return if (v.isEmpty() || v.equals("null", ignoreCase = true)) null else v
+    }
+
     private suspend fun fetchLyricsBySongId(songId: Long, durationMs: Long): LyricTimeline? {
-        val url = "$LYRIC_API_URL?id=$songId&lv=1&kv=1&tv=1"
+        val url = "$lyricApiUrl?id=$songId&lv=1&kv=1&tv=1"
 
         return try {
             val resp = httpClient.get(url, timeoutMs = TIMEOUT_MS)
             if (!resp.isSuccessful || resp.body.isBlank()) return null
 
             val root = JSONObject(resp.body)
-            val lrcStr = root.optJSONObject("lrc")?.optString("lyric")?.trim() ?: ""
-            val tlyricStr = root.optJSONObject("tlyric")?.optString("lyric")?.trim() ?: ""
+            val isExplicitNoLyric = root.optBoolean("nolyric", false)
+            val lrcStr = root.optJSONObject("lrc")?.optCleanString("lyric")
+            val tlyricStr = root.optJSONObject("tlyric")?.optCleanString("lyric")
 
-            if (lrcStr.isBlank() || lrcStr.equals("null", ignoreCase = true)) return null
+            if (isExplicitNoLyric) {
+                Logger.lyrics.i(TAG, "网易云歌曲 id=$songId 显式声明 nolyric=true（纯音乐）")
+                return LyricTimeline(
+                    source = "Netease",
+                    format = LyricFormat.LRC_LINE_SYNC,
+                    isInstrumental = true,
+                    lines = emptyList(),
+                    durationMs = durationMs
+                )
+            }
+
+            if (lrcStr == null) return null
 
             val baseTimeline = LrcParser.parse(lrcStr, sourceName = "Netease", expectedDurationMs = durationMs) ?: return null
+            if (baseTimeline.lines.size == 1 && baseTimeline.lines[0].mainText.contains("纯音乐，请欣赏")) {
+                Logger.lyrics.i(TAG, "网易云歌曲 id=$songId 正文仅含纯音乐提示，识别为纯音乐")
+                return LyricTimeline(
+                    source = "Netease",
+                    format = LyricFormat.LRC_LINE_SYNC,
+                    isInstrumental = true,
+                    lines = emptyList(),
+                    durationMs = durationMs
+                )
+            }
 
             // 若存在网易云逐句中文翻译，对齐注入到每行歌词中
-            if (tlyricStr.isNotBlank()) {
+            if (tlyricStr != null) {
                 val translationLines = parseTranslationLines(tlyricStr)
                 if (translationLines.isNotEmpty()) {
                     val enrichedLines = baseTimeline.lines.map { line ->

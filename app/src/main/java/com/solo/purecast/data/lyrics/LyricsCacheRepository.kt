@@ -56,7 +56,7 @@ class LyricsCacheRepository(
         val artistKey = spec.cleanArtist
         val titleKey = spec.exactTitle.lowercase().ifEmpty { spec.cleanTitle }
         val durationBucket = if (spec.durationMs > 0) spec.durationMs / 3000L else 0L
-        val raw = "v4_${artistKey}_${titleKey}_$durationBucket"
+        val raw = "v5_${artistKey}_${titleKey}_$durationBucket"
 
         val digest = MessageDigest.getInstance("SHA-256")
         val bytes = digest.digest(raw.toByteArray(Charsets.UTF_8))
@@ -140,6 +140,15 @@ class LyricsCacheRepository(
         }
 
         return null
+    }
+
+    /**
+     * 💡 仅写入 L1 内存缓存（供远端推断的纯音乐结果使用，避免社区数据修正前被磁盘缓存永久锁死）
+     */
+    fun putMemoryOnly(key: String, timeline: LyricTimeline) {
+        synchronized(memoryCache) {
+            memoryCache[key] = timeline
+        }
     }
 
     /**

@@ -865,4 +865,36 @@ class StreamDemuxerTransactionTest {
         assertEquals(16, format.bitDepth)
         assertEquals(2, format.channels)
     }
+
+    @Test
+    fun `isHighFrequencyPollingSoapAction classifies read-only polling vs control actions accurately`() {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        try {
+            val server = UpnpRendererServer(
+                scope = scope,
+                dispatchEvent = { },
+                allocateSessionId = { 1L },
+                allocateSequence = { 1L },
+                onAcquireHardwareForStream = { _, _, _, _ -> 1L },
+                snapshotProvider = { PlayerSessionSnapshot() },
+                fastPath = HardwareFastPathController(FakeNativeFastPath()),
+                audioGateway = FakeAudioGateway()
+            )
+
+            assertTrue(server.isHighFrequencyPollingSoapAction("urn:schemas-upnp-org:service:AVTransport:1#GetTransportInfo"))
+            assertTrue(server.isHighFrequencyPollingSoapAction("urn:schemas-upnp-org:service:AVTransport:1#GetPositionInfo"))
+            assertTrue(server.isHighFrequencyPollingSoapAction("urn:schemas-upnp-org:service:ConnectionManager:1#GetProtocolInfo"))
+            assertTrue(server.isHighFrequencyPollingSoapAction("urn:schemas-upnp-org:service:RenderingControl:1#GetVolume"))
+
+            assertFalse(server.isHighFrequencyPollingSoapAction("urn:schemas-upnp-org:service:AVTransport:1#Play"))
+            assertFalse(server.isHighFrequencyPollingSoapAction("urn:schemas-upnp-org:service:AVTransport:1#Pause"))
+            assertFalse(server.isHighFrequencyPollingSoapAction("urn:schemas-upnp-org:service:AVTransport:1#Stop"))
+            assertFalse(server.isHighFrequencyPollingSoapAction("urn:schemas-upnp-org:service:AVTransport:1#Seek"))
+            assertFalse(server.isHighFrequencyPollingSoapAction("urn:schemas-upnp-org:service:AVTransport:1#SetAVTransportURI"))
+            assertFalse(server.isHighFrequencyPollingSoapAction("urn:schemas-upnp-org:service:RenderingControl:1#SetVolume"))
+            assertFalse(server.isHighFrequencyPollingSoapAction("urn:schemas-upnp-org:service:AVTransport:1#UnknownAction"))
+        } finally {
+            scope.cancel()
+        }
+    }
 }

@@ -9,27 +9,43 @@ import android.util.Log
 object Logger {
 
     class Category(private val categoryName: String) {
+        private val logTag = "PureCast:$categoryName"
+        // 💡 Android setprop 禁止属性名包含冒号 ':'，门控属性名使用无冒号形式（如 adb shell setprop log.tag.PureCastUPnP VERBOSE）
+        private val propTag = "PureCast$categoryName"
+
+        inline fun v(tag: String, messageProvider: () -> String) {
+            if (isVerboseEnabled()) {
+                Log.v(logTagForInline(), "[$tag] ${messageProvider()}")
+            }
+        }
+
+        @PublishedApi
+        internal fun isVerboseEnabled(): Boolean = Log.isLoggable(propTag, Log.VERBOSE)
+
+        @PublishedApi
+        internal fun logTagForInline(): String = logTag
+
         fun d(tag: String, message: String) {
-            Log.d("PureCast:$categoryName", "[$tag] $message")
+            Log.d(logTag, "[$tag] $message")
         }
 
         fun i(tag: String, message: String) {
-            Log.i("PureCast:$categoryName", "[$tag] $message")
+            Log.i(logTag, "[$tag] $message")
         }
 
         fun w(tag: String, message: String, throwable: Throwable? = null) {
             if (throwable != null) {
-                Log.w("PureCast:$categoryName", "[$tag] $message", throwable)
+                Log.w(logTag, "[$tag] $message", throwable)
             } else {
-                Log.w("PureCast:$categoryName", "[$tag] $message")
+                Log.w(logTag, "[$tag] $message")
             }
         }
 
         fun e(tag: String, message: String, throwable: Throwable? = null) {
             if (throwable != null) {
-                Log.e("PureCast:$categoryName", "[$tag] $message", throwable)
+                Log.e(logTag, "[$tag] $message", throwable)
             } else {
-                Log.e("PureCast:$categoryName", "[$tag] $message")
+                Log.e(logTag, "[$tag] $message")
             }
         }
     }

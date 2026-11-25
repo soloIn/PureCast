@@ -24,6 +24,28 @@ object LyricsRenderingMath {
     /** 歌曲尾奏进入静息延迟 (ms) */
     const val OUTRO_ENTER_DELAY_MS: Long = 1500L
 
+    /** 距下一歌词边界 <= 64ms 时切回逐帧 VSYNC 精确对齐 60Hz 帧边界 */
+    const val WAKEUP_VSYNC_HANDOFF_MS: Long = 64L
+
+    /** 粗睡眠提前 ~2 帧唤醒，吸收系统调度抖动后交由 VSYNC 精控 */
+    const val WAKEUP_VSYNC_LEAD_MARGIN_MS: Long = 32L
+
+    /** 单次粗睡眠上限 (ms)，兜底非 mutation 的微幅进度重锚定与外推钳位 */
+    const val WAKEUP_MAX_COARSE_SLEEP_MS: Long = 500L
+
+    /**
+     * 💡 计算播放态歌词边界唤醒策略：
+     * - `< 0L`  : 无后续边界（尾奏/空歌词），退出循环挂起等待 `mutationVersionFlow`；
+     * - `== 0L` : 已进入 VSYNC 精控窗口（`<= 64ms`）或已越过边界，交由 `withFrameNanos` 精确踩点并杜绝忙等；
+     * - `> 0L`  : 距离边界较远，执行粗睡眠 `delay(ms)`（单次上限 500ms）。
+     */
+    fun calculateNextWakeupDelayMs(nowMs: Long, nextBoundaryMs: Long): Long {
+        if (nextBoundaryMs == Long.MAX_VALUE) return -1L
+        val remainingMs = nextBoundaryMs - nowMs
+        if (remainingMs <= WAKEUP_VSYNC_HANDOFF_MS) return 0L
+        return (remainingMs - WAKEUP_VSYNC_LEAD_MARGIN_MS).coerceAtMost(WAKEUP_MAX_COARSE_SLEEP_MS)
+    }
+
     /**
      * 边界安全字符区间钳位计算
      * 自动去除词尾空白字符，并对 startChar 与 endChar 进行 [0, fullText.length - 1] 边界安全钳位。

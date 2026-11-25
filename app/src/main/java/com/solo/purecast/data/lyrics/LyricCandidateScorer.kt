@@ -41,20 +41,22 @@ object LyricCandidateScorer {
         isInstrumental: Boolean = false,
         isInstrumentalReported: Boolean = false
     ): ScoreResult {
-        // 1. 优先纯音乐判定（在进行任何标题剥离前执行，杜绝归一化冲刷关键字）
-        val isInst = isInstrumental || isInstrumentalReported ||
-            isInstrumentalTitle(expectedTitle) ||
-            isInstrumentalTitle(candidateTitle)
+        // 1. 纯音乐意图判定（保留原始标题信息，严禁拿候选伴奏版反推原唱为纯音乐）
+        val expectedIsInst = isInstrumentalTitle(expectedTitle)
+        val candidateTitleIsInst = isInstrumentalTitle(candidateTitle)
+        val candidateReportedInst = isInstrumental || isInstrumentalReported
 
-        if (isInst) {
+        // 💡 关键防误判护栏：待播曲目本身不是伴奏/纯音乐，而候选标题明确是伴奏/卡拉OK/纯音乐版 -> 一票否决
+        if (!expectedIsInst && candidateTitleIsInst) {
             return ScoreResult(
-                totalScore = 100.0f,
-                isPassed = true,
-                isInstrumental = true,
-                titleScore = 40.0f,
-                artistScore = 30.0f,
-                durationScore = 20.0f,
-                formatScore = 10.0f
+                totalScore = 0.0f,
+                isPassed = false,
+                isInstrumental = false,
+                titleScore = 0.0f,
+                artistScore = 0.0f,
+                durationScore = 0.0f,
+                formatScore = 0.0f,
+                vetoReason = "原唱曲目拒绝匹配伴奏/纯音乐版本候选: $candidateTitle"
             )
         }
 
@@ -97,14 +99,13 @@ object LyricCandidateScorer {
             val deltaMs = expectedDurationMs - candidateDurationMs
 
             // 💡 智能尾奏容忍机制 (Finding 2)：
-            // 若歌词由末句推导时长，且 candidateDurationMs < expectedDurationMs（典型的歌曲尾奏空白），
-            // 只要歌名和歌手相似度极高 (>=85% 或歌手未知时歌名极高) 且尾奏时差在 60 秒以内，判定为合法尾奏，不予一票否决！
+            // 仅对携带歌词时间轴的非纯音乐候选启用尾奏容忍；远端纯音乐标记条目无末句推导时长，必须严格满足 ±5s 时长匹配
             val isHighMetadataMatch = if (isArtistUnknown) {
                 titleScore >= 50.0f
             } else {
                 titleScore >= 34.0f && artistScore >= 24.0f
             }
-            val isAcceptableOutro = deltaMs in 0L..60_000L && isHighMetadataMatch
+            val isAcceptableOutro = !candidateReportedInst && deltaMs in 0L..60_000L && isHighMetadataMatch
 
             if (isAcceptableOutro) {
                 // 合法尾奏，根据尾奏时长给予递减时长分
@@ -142,21 +143,26 @@ object LyricCandidateScorer {
             durationScore = 10.0f * durationWeightMultiplier
         }
 
-        // 5. 格式优先级加权 (10 分)
-        val formatScore = when (candidateFormat) {
-            LyricFormat.TTML_SYLLABLE -> 10.0f
-            LyricFormat.LRC_WORD_SYNC -> 7.0f
-            LyricFormat.LRC_LINE_SYNC -> 4.0f
-            LyricFormat.PLAIN_TEXT -> 0.0f
+        // 5. 格式优先级加权 (10 分)：纯音乐候选格式分严格为 0，确保同列表中任意合格同步歌词永远优先胜出
+        val formatScore = if (candidateReportedInst) {
+            0.0f
+        } else {
+            when (candidateFormat) {
+                LyricFormat.TTML_SYLLABLE -> 10.0f
+                LyricFormat.LRC_WORD_SYNC -> 7.0f
+                LyricFormat.LRC_LINE_SYNC -> 4.0f
+                LyricFormat.PLAIN_TEXT -> 0.0f
+            }
         }
 
         val totalScore = titleScore + artistScore + durationScore + formatScore
         val isPassed = totalScore >= PASSING_THRESHOLD
+        val resolvedInstrumental = isPassed && (expectedIsInst || candidateReportedInst)
 
         return ScoreResult(
             totalScore = totalScore,
             isPassed = isPassed,
-            isInstrumental = false,
+            isInstrumental = resolvedInstrumental,
             titleScore = titleScore,
             artistScore = artistScore,
             durationScore = durationScore,
@@ -164,14 +170,16 @@ object LyricCandidateScorer {
         )
     }
 
+    private val INSTRUMENTAL_EN_REGEX = Regex(
+        """\b(?:instrumental|karaoke|off[\s-]?vocal|backing\s+track)\b""",
+        RegexOption.IGNORE_CASE
+    )
+
     fun isInstrumentalTitle(title: String): Boolean {
-        val lower = title.lowercase()
-        return lower.contains("instrumental") ||
-            lower.contains("纯音乐") ||
-            lower.contains("伴奏") ||
-            lower.contains("karaoke") ||
-            lower.contains("off vocal") ||
-            lower.contains("backing track")
+        if (title.isBlank()) return false
+        return INSTRUMENTAL_EN_REGEX.containsMatchIn(title) ||
+            title.contains("纯音乐") ||
+            title.contains("伴奏")
     }
 
     private val PART_TAG_REGEX = Regex("""\b(?:pt|part)\s*(\d+|ii|iii|iv|v)\b""", RegexOption.IGNORE_CASE)
