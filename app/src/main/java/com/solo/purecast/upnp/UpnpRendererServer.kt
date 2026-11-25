@@ -23,6 +23,7 @@ import com.solo.purecast.model.BusinessSessionState
 import com.solo.purecast.model.DurationState
 import com.solo.purecast.model.ErrorCode
 import com.solo.purecast.model.FlushReason
+import com.solo.purecast.model.HardwarePipelineState
 import com.solo.purecast.model.PlaybackError
 import com.solo.purecast.model.PlaybackStatus
 import com.solo.purecast.model.PlayerSessionSnapshot
@@ -114,6 +115,12 @@ class UpnpRendererServer(
     private var currentUri: String = ""
 
     @Volatile
+    private var nextUri: String = ""
+
+    @Volatile
+    private var nextMetadataXml: String = ""
+
+    @Volatile
     private var currentTrackMetadata = TrackMetadata()
 
     constructor(
@@ -201,6 +208,8 @@ class UpnpRendererServer(
         val stoppedEpoch = fastPath.emergencyMuteAndFlush(reason)
         synchronized(sessionStateLock) {
             isLocallyPaused = false
+            nextUri = ""
+            nextMetadataXml = ""
             val activeSnap = snapshotProvider()
             val canEmitStop = activeUpnpSessionId != 0L && sessionSetupDispatched &&
                 (activeSnap.sessionId == activeUpnpSessionId || (!isPreempted && (activeSnap.sessionId == 0L || activeSnap.activeProtocol == StreamProtocol.UPNP_DLNA)))
@@ -376,39 +385,128 @@ class UpnpRendererServer(
             onStreamEnded = { abortedByEpoch, _ ->
                 Logger.upnp.i(TAG, "StreamDemuxer 回调流结束 (abortedByEpoch=$abortedByEpoch)")
                 if (!abortedByEpoch) {
-                    val ep = fastPath.emergencyMuteAndFlush(FlushReason.STOP_OR_TEARDOWN)
-                    synchronized(sessionStateLock) {
-                        if (activeUpnpSessionId != 0L && snapshotProvider().sessionId == activeUpnpSessionId) {
-                            emitEventLocked(TrackCompleteEvent(newEpoch = ep))
+                    val queuedNext = synchronized(sessionStateLock) {
+                        val snap = snapshotProvider()
+                        val canGaplessAdvance = nextUri.isNotEmpty() &&
+                            sessionSetupDispatched &&
+                            activeUpnpSessionId != 0L &&
+                            (snap.sessionId == activeUpnpSessionId || snap.activeProtocol == StreamProtocol.UPNP_DLNA)
+                        if (canGaplessAdvance) {
+                            val targetUri = nextUri
+                            val targetMetaXml = nextMetadataXml
+                            val expectedSid = activeUpnpSessionId
+                            val expectedPrevUri = currentUri
+                            nextUri = ""
+                            nextMetadataXml = ""
+                            Triple(targetUri, targetMetaXml, expectedSid to expectedPrevUri)
+                        } else {
+                            null
                         }
-                        sessionSetupDispatched = false
                     }
-                    genaNotifier.notifyTransportState("STOPPED")
+                    if (queuedNext != null) {
+                        val (targetUri, targetMetaXml, expectedContext) = queuedNext
+                        val (expectedSid, expectedPrevUri) = expectedContext
+                        val parsedMeta = parseDidlLiteMetadata(targetMetaXml, targetUri)
+                        val committed = synchronized(sessionStateLock) {
+                            if (activeUpnpSessionId != expectedSid || !sessionSetupDispatched || currentUri != expectedPrevUri) {
+                                Logger.upnp.i(TAG, "无缝切歌已被并发停止或手动切歌抢占，放弃启动 nextUri=$targetUri")
+                                false
+                            } else {
+                                Logger.upnp.i(TAG, "自然播完无缝衔接 SetNextAVTransportURI: $targetUri")
+                                val switchEpoch = fastPath.emergencyMuteAndFlush(FlushReason.FLUSH_SWITCH)
+                                isLocallyPaused = false
+                                currentUri = targetUri
+                                currentTrackMetadata = parsedMeta
+                                trackGenerationCounter += 1L
+                                emitEventLocked(
+                                    TrackSwitchEvent(
+                                        flushReason = FlushReason.FLUSH_SWITCH,
+                                        newEpoch = switchEpoch,
+                                        trackUri = targetUri
+                                    )
+                                )
+                                emitEventLocked(
+                                    TrackBoundaryEvent(
+                                        trackKey = targetUri,
+                                        trackGeneration = trackGenerationCounter,
+                                        initialDurationState = parsedMeta.durationState,
+                                        seekCapability = parsedMeta.seekCapability,
+                                        trackUri = targetUri
+                                    )
+                                )
+                                emitFullMetadataPatchLocked(parsedMeta)
+                                emitEventLocked(
+                                    ProgressUpdateEvent(
+                                        positionMs = 0L,
+                                        durationMs = parsedMeta.durationMs,
+                                        trackGeneration = trackGenerationCounter
+                                    )
+                                )
+                                true
+                            }
+                        }
+                        if (committed) {
+                            fastPath.resumeStream()
+                            ensureDemuxer().start(targetUri)
+                            genaNotifier.notifyTransportState("PLAYING", currentTrackUri = targetUri)
+                        }
+                    } else {
+                        val ep = fastPath.emergencyMuteAndFlush(FlushReason.STOP_OR_TEARDOWN)
+                        synchronized(sessionStateLock) {
+                            if (activeUpnpSessionId != 0L && snapshotProvider().sessionId == activeUpnpSessionId) {
+                                emitEventLocked(TrackCompleteEvent(newEpoch = ep))
+                            }
+                            sessionSetupDispatched = false
+                        }
+                        genaNotifier.notifyTransportState("STOPPED")
+                    }
                 }
             },
             onError = { err ->
                 Logger.upnp.e(TAG, "StreamDemuxer 报错: $err")
                 val ep = fastPath.emergencyMuteAndFlush(FlushReason.STOP_OR_TEARDOWN)
-                synchronized(sessionStateLock) {
-                    if (activeUpnpSessionId == 0L) {
-                        activeUpnpSessionId = allocateSessionId()
-                    }
-                    emitEventLocked(
-                        ErrorReportedEvent(
-                            PlaybackError(
-                                code = ErrorCode.NETWORK_STREAM_ERROR,
-                                message = err,
-                                recoverable = true,
-                                timestampMs = clockMs()
-                            )
-                        )
+                val errorPayload = ErrorReportedEvent(
+                    PlaybackError(
+                        code = ErrorCode.NETWORK_STREAM_ERROR,
+                        message = err,
+                        recoverable = true,
+                        timestampMs = clockMs()
                     )
-                    if (snapshotProvider().sessionId == activeUpnpSessionId) {
+                )
+                synchronized(sessionStateLock) {
+                    val activeSnap = snapshotProvider()
+                    val hasBoundActiveSession = activeUpnpSessionId != 0L && activeSnap.sessionId == activeUpnpSessionId
+                    if (hasBoundActiveSession) {
+                        emitEventLocked(errorPayload)
                         emitEventLocked(StreamStopEvent(newEpoch = ep, isPreempted = false))
+                    } else {
+                        dispatchServiceEvent(errorPayload)
                     }
+                    nextUri = ""
+                    nextMetadataXml = ""
                     sessionSetupDispatched = false
+                    activeUpnpSessionId = 0L
                 }
                 genaNotifier.notifyTransportState("STOPPED")
+            },
+            onStreamRevokedMidPlayback = {
+                // 💡 遵循 UPnP 语义：未收到显式 SOAP Stop 前不因对端回收临时 URI (404/410) 而拆会话或误报异常，
+                // 仅静音切入过渡态，保留当前会话与最后元数据等待控制端推送下一曲
+                val switchEpoch = fastPath.emergencyMuteAndFlush(FlushReason.FLUSH_SWITCH)
+                synchronized(sessionStateLock) {
+                    val snap = snapshotProvider()
+                    if (activeUpnpSessionId != 0L && sessionSetupDispatched &&
+                        (snap.sessionId == activeUpnpSessionId || snap.activeProtocol == StreamProtocol.UPNP_DLNA)
+                    ) {
+                        emitEventLocked(
+                            TrackSwitchEvent(
+                                flushReason = FlushReason.FLUSH_SWITCH,
+                                newEpoch = switchEpoch,
+                                trackUri = currentUri
+                            )
+                        )
+                    }
+                }
             },
             onMetadataParsed = { title, artist, album ->
                 Logger.upnp.i(TAG, "从音频流容器提取到内嵌元数据: title=$title, artist=$artist, album=$album")
@@ -782,9 +880,13 @@ class UpnpRendererServer(
     }
 
     private fun handleSetNextAvTransportUri(body: String): String {
-        val nextUri = extractTagValue(body, "NextURI")
-        val nextMetadata = extractTagValue(body, "NextURIMetaData")
-        Logger.upnp.i(TAG, "SetNextAVTransportURI: nextUri=$nextUri")
+        val targetNextUri = extractTagValue(body, "NextURI")
+        val targetNextMetadata = extractTagValue(body, "NextURIMetaData")
+        synchronized(sessionStateLock) {
+            nextUri = targetNextUri
+            nextMetadataXml = if (targetNextUri.isNotEmpty()) targetNextMetadata else ""
+        }
+        Logger.upnp.i(TAG, "SetNextAVTransportURI: nextUri=$targetNextUri, hasMetadata=${targetNextMetadata.isNotEmpty()}")
         return buildSoapResponse("SetNextAVTransportURIResponse", "urn:schemas-upnp-org:service:AVTransport:1", "")
     }
 
@@ -810,6 +912,8 @@ class UpnpRendererServer(
             }
             synchronized(sessionStateLock) {
                 currentUri = uri
+                nextUri = ""
+                nextMetadataXml = ""
                 currentTrackMetadata = parsedMeta
                 val activeSnap = snapshotProvider()
                 val sameActiveSession = sessionSetupDispatched && activeUpnpSessionId != 0L &&
@@ -867,8 +971,28 @@ class UpnpRendererServer(
         }
 
         if (currentUri.isNotEmpty() && (demuxer?.isRunning() != true || demuxer?.getCurrentUri() != currentUri)) {
-            fastPath.resumeStream()
-            ensureDemuxer().start(currentUri)
+            var delegatedToHardwareReopen = false
+            val emittedResume = synchronized(sessionStateLock) {
+                val snap = snapshotProvider()
+                if (activeUpnpSessionId != 0L && snap.businessState == BusinessSessionState.PAUSED) {
+                    delegatedToHardwareReopen = (snap.hardwareState == HardwarePipelineState.RELEASED)
+                    emitEventLocked(
+                        StreamResumeEvent(
+                            protocol = StreamProtocol.UPNP_DLNA,
+                            resumedEpoch = fastPath.getCurrentBufferEpoch()
+                        )
+                    )
+                    true
+                } else {
+                    false
+                }
+            }
+            if (!emittedResume) {
+                fastPath.resumeStream()
+            }
+            if (!delegatedToHardwareReopen) {
+                ensureDemuxer().start(currentUri)
+            }
         } else {
             fastPath.resumeStream()
             val resumedEpoch = fastPath.getCurrentBufferEpoch()

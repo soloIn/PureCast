@@ -99,27 +99,45 @@ fun LyricsControlButton(
         }
     }
 
+    if (!enabled) {
+        Box(
+            modifier = modifier.size(buttonSize),
+            contentAlignment = Alignment.Center
+        ) {
+            Icon(
+                painter = painterResource(id = R.drawable.ic_quote_bubble),
+                contentDescription = contentDesc,
+                tint = iconColor,
+                modifier = Modifier.size(iconSize)
+            )
+        }
+        return
+    }
+
     Surface(
         onClick = onClick,
-        enabled = enabled,
+        enabled = true,
         modifier = modifier
             .size(buttonSize)
-            .then(if (enabled && focusRequester != null) Modifier.focusRequester(focusRequester) else Modifier)
-            .onFocusChanged { isFocused = enabled && it.isFocused },
+            .then(if (focusRequester != null) Modifier.focusRequester(focusRequester) else Modifier)
+            .onFocusChanged { isFocused = it.isFocused },
         shape = ClickableSurfaceDefaults.shape(shape),
         scale = ClickableSurfaceDefaults.scale(
             scale = 1.0f,
-            focusedScale = if (enabled) 1.12f else 1.0f,
-            pressedScale = if (enabled) 1.05f else 1.0f
+            focusedScale = 1.12f,
+            pressedScale = 1.05f
         ),
         colors = ClickableSurfaceDefaults.colors(
             containerColor = normalContainerColor,
             focusedContainerColor = focusedContainerColor,
-            pressedContainerColor = pressedContainerColor
+            pressedContainerColor = pressedContainerColor,
+            disabledContainerColor = Color.Transparent
         ),
         border = ClickableSurfaceDefaults.border(
             border = noBorder,
-            focusedBorder = noBorder
+            focusedBorder = noBorder,
+            disabledBorder = noBorder,
+            focusedDisabledBorder = noBorder
         ),
         glow = ClickableSurfaceDefaults.glow(
             glow = Glow.None,

@@ -603,6 +603,9 @@ class PlaybackService : LifecycleService() {
      * 💡 突破 Android 后台活动限制 (BAL)：收到推流时尝试将播放界面带至前台
      */
     fun wakeUpUiIfInBackground() {
+        if (MainActivity.isActivityForeground) {
+            return
+        }
         try {
             val intent = Intent(this, MainActivity::class.java).apply {
                 addFlags(

@@ -135,9 +135,15 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        isActivityForeground = true
         Logger.ui.i(TAG, "MainActivity onResume: 检查 USB DAC 授权状态与屏保常亮状态...")
         PlaybackService.registerUsbPermissionActivityStatic(this)
         updateKeepScreenOn()
+    }
+
+    override fun onPause() {
+        isActivityForeground = false
+        super.onPause()
     }
 
     private fun handleUsbAttachedIntent(intent: android.content.Intent?) {
@@ -176,6 +182,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onStop() {
+        isActivityForeground = false
         super.onStop()
         Logger.ui.i(TAG, "MainActivity onStop: 退入后台，清除 FLAG_KEEP_SCREEN_ON 释放屏保控制权")
         PlaybackService.registerUsbPermissionActivityStatic(null)
@@ -265,5 +272,9 @@ class MainActivity : ComponentActivity() {
 
     companion object {
         private const val TAG = "MainActivity"
+
+        @Volatile
+        var isActivityForeground: Boolean = false
+            private set
     }
 }

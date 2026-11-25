@@ -75,11 +75,11 @@ class GenaEventNotifier(
     }
 
     /**
-     * 广播播放状态变化 (PLAYING, PAUSED_PLAYBACK, STOPPED)
+     * 广播播放状态变化 (PLAYING, PAUSED_PLAYBACK, STOPPED)，可选携带当前曲目 URI（用于 SetNextAVTransportURI 无缝切歌同步）
      * 💡 P1-2 修复：通过每个订阅者独占的 sendMutex 串行化 HTTP NOTIFY 请求，杜绝 SEQ 并发乱序到达
      */
-    fun notifyTransportState(state: String) {
-        val xmlEvent = buildLastChangeEventXml(state)
+    fun notifyTransportState(state: String, currentTrackUri: String? = null) {
+        val xmlEvent = buildLastChangeEventXml(state, currentTrackUri)
         val now = System.currentTimeMillis()
 
         // 清理过期订阅
@@ -124,8 +124,26 @@ class GenaEventNotifier(
         }
     }
 
-    private fun buildLastChangeEventXml(state: String): String {
-        val escapedEvent = """&lt;Event xmlns="urn:schemas-upnp-org:metadata-1-0/AVT/"&gt;&lt;InstanceID val="0"&gt;&lt;TransportState val="$state"/&gt;&lt;TransportStatus val="OK"/&gt;&lt;/InstanceID&gt;&lt;/Event&gt;"""
+    private fun escapeXml(text: String): String = text
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace("\"", "&quot;")
+        .replace("'", "&apos;")
+
+    private fun buildLastChangeEventXml(state: String, currentTrackUri: String? = null): String {
+        val innerEvent = buildString {
+            append("""<Event xmlns="urn:schemas-upnp-org:metadata-1-0/AVT/"><InstanceID val="0">""")
+            append("""<TransportState val="${escapeXml(state)}"/>""")
+            append("""<TransportStatus val="OK"/>""")
+            if (!currentTrackUri.isNullOrEmpty()) {
+                val escapedUri = escapeXml(currentTrackUri)
+                append("""<AVTransportURI val="$escapedUri"/>""")
+                append("""<CurrentTrackURI val="$escapedUri"/>""")
+            }
+            append("""</InstanceID></Event>""")
+        }
+        val escapedEvent = escapeXml(innerEvent)
         return """<?xml version="1.0" encoding="utf-8"?>
 <e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0">
   <e:property>

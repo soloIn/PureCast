@@ -129,6 +129,11 @@ object NativeAudioEngine {
     external fun isStreaming(): Boolean
 
     /**
+     * 💡 检查声卡当前是否处于显式暂停态（仅反映 is_explicitly_paused_，不含切歌/Seek Flush 预充静音）
+     */
+    external fun isExplicitlyPaused(): Boolean
+
+    /**
      * FLAC 解码器采样格式解析与首帧写入事件回调
      */
     interface FlacFormatCallback {

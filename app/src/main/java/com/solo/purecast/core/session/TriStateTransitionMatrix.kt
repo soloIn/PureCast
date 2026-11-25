@@ -128,6 +128,9 @@ internal object TriStateTransitionMatrix {
                 addCancelAllTimers(effects)
                 // 💡 R4 契约：为 StreamSetup 进入 TRANSITIONING 注册 5000ms 过渡态看门狗超时
                 effects += TransitionEffect.ScheduleTransitionTimeout(envelope.sessionId)
+                if (snap.errors.containsKey(ErrorCode.NETWORK_STREAM_ERROR)) {
+                    effects += TransitionEffect.CancelTransientErrorDismiss(ErrorCode.NETWORK_STREAM_ERROR)
+                }
 
                 val nextSnap = snap.copy(
                     sessionId = envelope.sessionId,
@@ -152,7 +155,7 @@ internal object TriStateTransitionMatrix {
                     progressAnchorDelayMs = 0L,
                     progressRevision = snap.progressRevision + 1L,
                     lastProgressFromUserSeek = false,
-                    errors = clearTransientCommandErrors(snap.errors),
+                    errors = clearTransientCommandErrors(snap.errors) - ErrorCode.NETWORK_STREAM_ERROR,
                     uiProtectionActive = false
                 )
                 return TransitionOutput(
@@ -189,6 +192,9 @@ internal object TriStateTransitionMatrix {
                     HardwarePipelineState.EXCLUSIVE_ACTIVE
                 }
 
+                if (snap.errors.containsKey(ErrorCode.NETWORK_STREAM_ERROR)) {
+                    effects += TransitionEffect.CancelTransientErrorDismiss(ErrorCode.NETWORK_STREAM_ERROR)
+                }
                 val nextSnap = snap.copy(
                     transportState = TransportPipeState.STREAMING,
                     businessState = nextBiz,
@@ -204,7 +210,7 @@ internal object TriStateTransitionMatrix {
                         isExclusive = isExclusiveActiveOrReconfiguring(nextHw)
                     ),
                     progressAnchorDelayMs = 0L,
-                    errors = clearTransientCommandErrors(snap.errors),
+                    errors = clearTransientCommandErrors(snap.errors) - ErrorCode.NETWORK_STREAM_ERROR,
                     uiProtectionActive = false
                 )
                 return TransitionOutput(
@@ -232,18 +238,25 @@ internal object TriStateTransitionMatrix {
                 // 必须保持 PAUSED 状态，严禁进入 TRANSITIONING（避免大屏跳回播放中 5 秒），维持挂起定时器
                 if (snap.businessState == BusinessSessionState.PAUSED) {
                     effects += TransitionEffect.ScheduleSuspendTimeout(snap.sessionId)
+                    if (snap.errors.containsKey(ErrorCode.NETWORK_STREAM_ERROR)) {
+                        effects += TransitionEffect.CancelTransientErrorDismiss(ErrorCode.NETWORK_STREAM_ERROR)
+                    }
                     val pausedSnap = snap.copy(
                         transportState = TransportPipeState.INTERRUPTED,
                         hardwareState = muteIfExclusive(snap.hardwareState),
                         currentEpoch = ev.newEpoch,
                         progressPositionMs = nextPositionMs,
-                        progressAnchorDelayMs = 0L
+                        progressAnchorDelayMs = 0L,
+                        errors = snap.errors - ErrorCode.NETWORK_STREAM_ERROR
                     )
                     return TransitionOutput(ctx.copy(snapshot = pausedSnap, pendingDebounceToken = 0L), effects)
                 }
 
                 // 💡 R4 契约：为切歌/换代进入 TRANSITIONING 注册 5000ms 过渡态看门狗超时
                 effects += TransitionEffect.ScheduleTransitionTimeout(snap.sessionId)
+                if (snap.errors.containsKey(ErrorCode.NETWORK_STREAM_ERROR)) {
+                    effects += TransitionEffect.CancelTransientErrorDismiss(ErrorCode.NETWORK_STREAM_ERROR)
+                }
 
                 val nextSnap = snap.copy(
                     transportState = TransportPipeState.INTERRUPTED,
@@ -251,7 +264,8 @@ internal object TriStateTransitionMatrix {
                     hardwareState = muteIfExclusive(snap.hardwareState),
                     currentEpoch = ev.newEpoch,
                     progressPositionMs = nextPositionMs,
-                    progressAnchorDelayMs = 0L
+                    progressAnchorDelayMs = 0L,
+                    errors = snap.errors - ErrorCode.NETWORK_STREAM_ERROR
                 )
                 return TransitionOutput(ctx.copy(snapshot = nextSnap, pendingDebounceToken = 0L), effects)
             }
@@ -862,9 +876,15 @@ internal object TriStateTransitionMatrix {
             }
 
             is ErrorReportedEvent -> {
+                val reportEffects = if (ev.error.code == ErrorCode.NETWORK_STREAM_ERROR) {
+                    val ts = if (ev.error.timestampMs > 0L) ev.error.timestampMs else nowMs
+                    listOf(TransitionEffect.ScheduleTransientErrorDismiss(ErrorCode.NETWORK_STREAM_ERROR, ts))
+                } else {
+                    emptyList()
+                }
                 return TransitionOutput(
                     ctx.copy(snapshot = snap.copy(errors = snap.errors + (ev.error.code to ev.error))),
-                    emptyList()
+                    reportEffects
                 )
             }
 

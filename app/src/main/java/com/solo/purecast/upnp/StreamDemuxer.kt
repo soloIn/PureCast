@@ -33,6 +33,7 @@ interface DemuxerAudioGateway {
         callback: NativeAudioEngine.FlacFormatCallback
     ): Boolean
     fun isStreaming(): Boolean = true
+    fun isExplicitlyPaused(): Boolean = !isStreaming()
 }
 
 /**
@@ -52,6 +53,7 @@ object NativeDemuxerAudioGateway : DemuxerAudioGateway {
     ): Boolean = NativeAudioEngine.decodeFlacStream(inputStream, callback)
 
     override fun isStreaming(): Boolean = NativeAudioEngine.isStreaming()
+    override fun isExplicitlyPaused(): Boolean = NativeAudioEngine.isExplicitlyPaused()
 }
 
 /**
@@ -105,7 +107,8 @@ class StreamDemuxer(
     private val onError: (String) -> Unit = {},
     private val onMetadataParsed: ((title: String?, artist: String?, album: String?) -> Unit)? = null,
     private val onPositionUpdated: ((positionMs: Long) -> Unit)? = null,
-    private val onSeekFlush: (() -> Long)? = null
+    private val onSeekFlush: (() -> Long)? = null,
+    private val onStreamRevokedMidPlayback: (() -> Unit)? = null
 ) {
 
     private var streamingJob: Job? = null
@@ -258,57 +261,47 @@ class StreamDemuxer(
                     // 💡 寻道成功建立 206 传输后，重启进度轮询循环，彻底解决 seekTo 后播放进度永久冻结的缺陷 (P0)
                     startProgressTicker(thisSession)
 
-                    val pcmBuffer = ByteArray(32768)
-                    var seekFirstPacketEmitted = false
-                        val currentSpec = DemuxedStreamSpec(
-                            sampleRate = currentSampleRate,
-                            bitDepth = currentBitDepth,
-                            channels = currentChannels,
-                            codec = "WAV",
-                            durationMs = durMs,
-                            durationState = DurationState.FIXED,
-                            seekCapability = SeekCapability.SEEKABLE
-                        )
-                        while (isActive && isDemuxing && thisSession == sessionToken.get() && !abortedByEpoch) {
-                            val bytesRead = inputStream.read(pcmBuffer, 0, pcmBuffer.size)
-                            if (bytesRead == -1) break
-                            if (bytesRead > 0) {
-                                var offset = 0
-                                var remaining = bytesRead
-                                while (remaining > 0 && isActive && isDemuxing && thisSession == sessionToken.get()) {
-                                    val written = audioGateway.writePcm(pcmBuffer, offset, remaining, seekEpoch)
-                                    if (written > 0) {
-                                        totalBytesStreamed += written // 💡 仅在实际写入环形缓冲区后累加，杜绝预累加引发的 ~186ms 进度抖动
-                                        if (!seekFirstPacketEmitted) {
-                                            seekFirstPacketEmitted = true
-                                            onFirstDataPacket(seekEpoch, currentSpec) // 💡 P0-2 修复：寻道后首帧通知解除 TRANSITIONING 并取消 5s 看门狗
-                                        }
-                                        offset += written
-                                        remaining -= written
-                                    } else if (written < 0) {
-                                        // 💡 修复 Finding 7: 区分世代抢占 (-2) 与真实管道故障 (-1, -3)
-                                        if (written == -2) {
-                                            Logger.upnp.i(TAG, "Seek writePcm 收到世代过期 (-2)，安全中止本轮写入: epoch=$seekEpoch")
-                                        } else {
-                                            Logger.upnp.e(TAG, "Seek writePcm 遭遇底层管道致命错误: ret=$written, epoch=$seekEpoch")
-                                            val errorMsg = if (written == -1) "Audio pipeline closed" else "Audio latch timeout"
-                                            onError(errorMsg)
-                                        }
-                                        abortedByEpoch = true
-                                        break
-                                    } else {
-                                        delay(5L)
-                                    }
-                                }
+                    val currentSpec = DemuxedStreamSpec(
+                        sampleRate = currentSampleRate,
+                        bitDepth = currentBitDepth,
+                        channels = currentChannels,
+                        codec = "WAV",
+                        durationMs = durMs,
+                        durationState = DurationState.FIXED,
+                        seekCapability = SeekCapability.SEEKABLE
+                    )
+                    val hasDataSizeLimit = wavDataSizeBytes > 0L && wavDataSizeBytes < 0x7FFFFFFFL
+                    abortedByEpoch = streamWavPcmLoop(
+                        streamUrl = url,
+                        thisSession = thisSession,
+                        initialConnection = connection,
+                        initialInputStream = inputStream,
+                        spec = currentSpec,
+                        hasDataSizeLimit = hasDataSizeLimit,
+                        wavDataSizeBytes = wavDataSizeBytes,
+                        logPrefix = "Seek",
+                        currentEpochProvider = { seekEpoch },
+                        onConnectionSwapped = { newConn, newStream ->
+                            val prevConn = connection
+                            val prevStream = inputStream
+                            connection = newConn
+                            inputStream = newStream
+                            if (thisSession == sessionToken.get()) {
+                                activeConnection = newConn
+                                activeInputStream = newStream
+                            } else {
+                                if (activeConnection === prevConn) activeConnection = null
+                                if (activeInputStream === prevStream) activeInputStream = null
                             }
                         }
+                    )
 
                         if (!abortedByEpoch && thisSession == sessionToken.get()) {
                             Logger.upnp.i(TAG, "Seek 音频流拉取完毕，等待排空 (session=$thisSession)...")
                             var waitCount = 0
                             var pausedWaitCount = 0
                             while (isActive && isDemuxing && thisSession == sessionToken.get() && audioGateway.getAvailableRead() > 0 && waitCount < 120) {
-                                if (!audioGateway.isStreaming()) {
+                                if (audioGateway.isExplicitlyPaused()) {
                                     delay(50)
                                     if (++pausedWaitCount > 12000) { // 💡 P1-3 修复：暂停态等待上限 10 分钟 (600s)，对齐协调器挂起回收契约
                                         abortedByEpoch = true
@@ -539,65 +532,30 @@ class StreamDemuxer(
 
                     val wavDataSizeBytes = format.dataSize
                     val hasDataSizeLimit = wavDataSizeBytes > 0L && wavDataSizeBytes < 0x7FFFFFFFL
-                    val pcmBuffer = ByteArray(32768)
-                    var firstPacketEmitted = false
-
-                    while (isActive && isDemuxing && thisSession == sessionToken.get() && !abortedByEpoch) {
-                        if (hasDataSizeLimit && totalBytesStreamed >= wavDataSizeBytes) {
-                            Logger.upnp.i(TAG, "已到达 WAV dataSize 边界 ($totalBytesStreamed/$wavDataSizeBytes 字节)，停止继续读取 (session=$thisSession)")
-                            break
-                        }
-
-                        val maxToRead = if (hasDataSizeLimit) {
-                            (wavDataSizeBytes - totalBytesStreamed).coerceAtMost(pcmBuffer.size.toLong()).toInt()
-                        } else {
-                            pcmBuffer.size
-                        }
-
-                        val bytesRead = inputStream.read(pcmBuffer, 0, maxToRead)
-                        if (bytesRead == -1) {
-                            Logger.upnp.i(TAG, "音频流正常读取至 EOF 边界 (session=$thisSession)")
-                            break
-                        }
-
-                        if (bytesRead > 0) {
-                            var offset = 0
-                            var remaining = bytesRead
-                            while (remaining > 0 && isActive && isDemuxing && thisSession == sessionToken.get()) {
-                                val currentEp = this@StreamDemuxer.acquiredEpoch
-                                val written = audioGateway.writePcm(pcmBuffer, offset, remaining, currentEp)
-                                if (written > 0) {
-                                    totalBytesStreamed += written // 💡 仅在实际写入环形缓冲区后累加，杜绝预累加引发的 ~186ms 进度抖动
-                                    if (!firstPacketEmitted) {
-                                        firstPacketEmitted = true
-                                        onFirstDataPacket(currentEp, spec)
-                                    }
-                                    offset += written
-                                    remaining -= written
-                                } else if (written < 0) {
-                                    // 💡 修复 Finding 7: 区分世代抢占 (-2) 与真实管道故障 (-1, -3)
-                                    if (written == -2) {
-                                        Logger.upnp.i(TAG, "WAV writePcm 收到世代过期 (-2)，安全中止本轮写入: epoch=$currentEp")
-                                    } else {
-                                        Logger.upnp.e(TAG, "WAV writePcm 遭遇底层管道致命错误: ret=$written, epoch=$currentEp")
-                                        val errorMsg = if (written == -1) "Audio pipeline closed" else "Audio latch timeout"
-                                        onError(errorMsg)
-                                    }
-                                    abortedByEpoch = true
-                                    break
-                                } else {
-                                    val avail = audioGateway.getBufferAvailable()
-                                    val needed = (remaining - avail).coerceAtLeast(0)
-                                    val waitMs = if (bytesPerSecond > 0L && needed > 0) {
-                                        ((needed.toLong() * 1000L) / bytesPerSecond).coerceIn(5L, 20L)
-                                    } else {
-                                        5L
-                                    }
-                                    delay(waitMs)
-                                }
+                    abortedByEpoch = streamWavPcmLoop(
+                        streamUrl = streamUrl,
+                        thisSession = thisSession,
+                        initialConnection = connection,
+                        initialInputStream = inputStream,
+                        spec = spec,
+                        hasDataSizeLimit = hasDataSizeLimit,
+                        wavDataSizeBytes = wavDataSizeBytes,
+                        logPrefix = "WAV",
+                        currentEpochProvider = { this@StreamDemuxer.acquiredEpoch },
+                        onConnectionSwapped = { newConn, newStream ->
+                            val prevConn = connection
+                            val prevStream = inputStream
+                            connection = newConn
+                            inputStream = newStream
+                            if (thisSession == sessionToken.get()) {
+                                activeConnection = newConn
+                                activeInputStream = newStream
+                            } else {
+                                if (activeConnection === prevConn) activeConnection = null
+                                if (activeInputStream === prevStream) activeInputStream = null
                             }
                         }
-                    }
+                    )
                 } else {
                     Logger.upnp.e(TAG, "未知的音频流魔数: $magicStr，拦截直通以防杂音")
                     throw IllegalArgumentException("不支持的非 WAV/FLAC 格式流: $magicStr")
@@ -612,7 +570,7 @@ class StreamDemuxer(
                     while (isActive && isDemuxing && thisSession == sessionToken.get() && audioGateway.getAvailableRead() > 0 && waitCount < 120) {
                         // 💡 暂停态下底层 fill_isoc_transfer 填零静音，环形缓冲被冻结不会被消费。
                         // 此时若累计 waitCount 会导致 6 秒超时误判 EOF 强停。暂停期间挂起循环等待，不计入排空超时。
-                        if (!audioGateway.isStreaming()) {
+                        if (audioGateway.isExplicitlyPaused()) {
                             delay(50)
                             if (++pausedWaitCount > 12000) { // 💡 P1-3: 暂停态等待上限 10 分钟 (600s)，对齐协调器挂起回收契约
                                 abortedByEpoch = true
@@ -668,14 +626,16 @@ class StreamDemuxer(
                     isDemuxing = false
                     // 💡 防御空流假播完：区分 FLAC（通过 Native 统计解码帧数）与 WAV（通过读取流累加字节），
                     // 若两者均未产生任何实际推流或未获取到合法硬件世代，强制标记为中断，杜绝误触发切歌
+                    val finalBytesStreamed = totalBytesStreamed
+                    val finalFlacFrames = audioGateway.getFlacDecodedFrames()
                     val hasStreamedData = if (isFlacStream) {
-                        audioGateway.getFlacDecodedFrames() > 0L
+                        finalFlacFrames > 0L
                     } else {
-                        totalBytesStreamed > 0L
+                        finalBytesStreamed > 0L
                     }
                     val isAborted = abortedByEpoch || !hasStreamedData || this@StreamDemuxer.acquiredEpoch <= 0L
                     onStreamEnded(isAborted, this@StreamDemuxer.acquiredEpoch)
-                    Logger.upnp.i(TAG, "活跃会话 (session=$thisSession) 结束 (abortedByEpoch=$isAborted, isFlac=$isFlacStream, totalBytesStreamed=$totalBytesStreamed, flacFrames=${audioGateway.getFlacDecodedFrames()})")
+                    Logger.upnp.i(TAG, "活跃会话 (session=$thisSession) 结束 (abortedByEpoch=$isAborted, isFlac=$isFlacStream, totalBytesStreamed=$finalBytesStreamed, flacFrames=$finalFlacFrames)")
                 } else {
                     Logger.upnp.i(TAG, "旧协程 (session=$thisSession) 资源清理完成，当前活跃会话为 ${sessionToken.get()}，跳过全局状态重置")
                 }
@@ -696,6 +656,250 @@ class StreamDemuxer(
         streamingJob?.cancel()
         streamingJob = null
         audioGateway.resetFlacDecodedFrames()
+    }
+
+    /**
+     * 💡 帧对齐 WAV PCM 流式读取、背压写入、暂停态断流挂起与 HTTP Range 自动断点续传共用循环
+     */
+    private suspend fun streamWavPcmLoop(
+        streamUrl: String,
+        thisSession: Long,
+        initialConnection: HttpURLConnection,
+        initialInputStream: InputStream,
+        spec: DemuxedStreamSpec,
+        hasDataSizeLimit: Boolean,
+        wavDataSizeBytes: Long,
+        logPrefix: String,
+        currentEpochProvider: () -> Long,
+        onConnectionSwapped: (HttpURLConnection?, InputStream?) -> Unit
+    ): Boolean {
+        var connection: HttpURLConnection? = initialConnection
+        var inputStream: InputStream? = initialInputStream
+        val bytesPerFrame = (spec.channels * (spec.bitDepth / 8)).coerceAtLeast(1)
+        val maxChunkBytes = (16384 / bytesPerFrame).coerceAtLeast(1) * bytesPerFrame
+        val minWriteChunk = (4096 / bytesPerFrame).coerceAtLeast(1) * bytesPerFrame
+        val pcmBuffer = ByteArray(maxChunkBytes + bytesPerFrame)
+        var carryLen = 0
+        var firstPacketEmitted = false
+        var abortedByEpoch = false
+        var reconnectAttempts = 0
+
+        while (kotlin.coroutines.coroutineContext[Job]?.isActive != false && isDemuxing && thisSession == sessionToken.get() && !abortedByEpoch) {
+            val logicalStreamed = seekBaseBytes + totalBytesStreamed
+            if (hasDataSizeLimit && logicalStreamed >= wavDataSizeBytes) {
+                Logger.upnp.i(TAG, "已到达 WAV dataSize 边界 ($logicalStreamed/$wavDataSizeBytes 字节)，停止继续读取 (session=$thisSession)")
+                break
+            }
+
+            val maxToRead = if (hasDataSizeLimit) {
+                (wavDataSizeBytes - logicalStreamed - carryLen.toLong()).coerceAtMost(maxChunkBytes.toLong()).toInt()
+            } else {
+                maxChunkBytes
+            }
+            if (maxToRead <= 0) {
+                break
+            }
+
+            val bytesRead: Int = try {
+                val r = inputStream!!.read(pcmBuffer, carryLen, maxToRead)
+                if (r == -1) {
+                    if (hasDataSizeLimit && (logicalStreamed + carryLen.toLong()) < wavDataSizeBytes) {
+                        throw java.io.EOFException("unexpected end of stream")
+                    }
+                    Logger.upnp.i(TAG, "音频流正常读取至 EOF 边界 (session=$thisSession)")
+                    break
+                }
+                r
+            } catch (ioe: java.io.IOException) {
+                if (kotlin.coroutines.coroutineContext[Job]?.isActive == false || !isDemuxing || thisSession != sessionToken.get()) {
+                    abortedByEpoch = true
+                    break
+                }
+                try { inputStream?.close() } catch (_: Exception) {}
+                try { connection?.disconnect() } catch (_: Exception) {}
+                connection = null
+                inputStream = null
+                onConnectionSwapped(null, null)
+
+                var disconnectedWhilePaused = false
+                if (audioGateway.isExplicitlyPaused()) {
+                    disconnectedWhilePaused = true
+                    Logger.upnp.i(TAG, "音频流在暂停期间被对端断开，挂起等待恢复播放后自动续传 (session=$thisSession, reason=${ioe.message})")
+                    var pausedWaitCount = 0
+                    while (kotlin.coroutines.coroutineContext[Job]?.isActive != false && isDemuxing && thisSession == sessionToken.get() && audioGateway.isExplicitlyPaused()) {
+                        delay(50)
+                        if (++pausedWaitCount > 12000) {
+                            abortedByEpoch = true
+                            break
+                        }
+                    }
+                    if (abortedByEpoch || kotlin.coroutines.coroutineContext[Job]?.isActive == false || !isDemuxing || thisSession != sessionToken.get()) {
+                        abortedByEpoch = true
+                        break
+                    }
+                    reconnectAttempts = 0
+                }
+
+                val resumeDataOffset = seekBaseBytes + totalBytesStreamed
+                val canRangeReconnect = hasDataSizeLimit &&
+                    wavDataStartOffsetBytes > 0L &&
+                    resumeDataOffset >= 0L &&
+                    resumeDataOffset < wavDataSizeBytes
+
+                if (!canRangeReconnect) {
+                    throw ioe
+                }
+
+                var reconnected = false
+                var reachedTrueEof = false
+                var lastError: Exception = ioe
+                while (reconnectAttempts < MAX_RANGE_RECONNECT_ATTEMPTS && kotlin.coroutines.coroutineContext[Job]?.isActive != false && isDemuxing && thisSession == sessionToken.get()) {
+                    val backoffMs = if (disconnectedWhilePaused && reconnectAttempts == 0) {
+                        0L
+                    } else {
+                        RANGE_RECONNECT_BACKOFF_MS[reconnectAttempts.coerceAtMost(RANGE_RECONNECT_BACKOFF_MS.lastIndex)]
+                    }
+                    if (backoffMs > 0L) {
+                        delay(backoffMs)
+                    }
+                    if (kotlin.coroutines.coroutineContext[Job]?.isActive == false || !isDemuxing || thisSession != sessionToken.get()) {
+                        abortedByEpoch = true
+                        break
+                    }
+                    reconnectAttempts++
+                    val nextByteOffset = wavDataStartOffsetBytes + (seekBaseBytes + totalBytesStreamed)
+                    var nextConn: HttpURLConnection? = null
+                    try {
+                        Logger.upnp.i(TAG, "尝试 HTTP Range 断点续传 (session=$thisSession, attempt=$reconnectAttempts/$MAX_RANGE_RECONNECT_ATTEMPTS, range=bytes=$nextByteOffset-)")
+                        nextConn = (URL(streamUrl).openConnection() as HttpURLConnection).apply {
+                            connectTimeout = 8000
+                            readTimeout = 15000
+                            requestMethod = "GET"
+                            setRequestProperty("User-Agent", "PureCast-UPnP-Renderer/1.0")
+                            setRequestProperty("Connection", "keep-alive")
+                            setRequestProperty("Range", "bytes=$nextByteOffset-")
+                        }
+                        onConnectionSwapped(nextConn, null)
+                        nextConn.connect()
+                        if (kotlin.coroutines.coroutineContext[Job]?.isActive == false || !isDemuxing || thisSession != sessionToken.get()) {
+                            try { nextConn.disconnect() } catch (_: Exception) {}
+                            onConnectionSwapped(null, null)
+                            abortedByEpoch = true
+                            break
+                        }
+                        val code = nextConn.responseCode
+                        if (code == HttpURLConnection.HTTP_PARTIAL) {
+                            val nextIn = BufferedInputStream(nextConn.inputStream, 64 * 1024)
+                            if (kotlin.coroutines.coroutineContext[Job]?.isActive == false || !isDemuxing || thisSession != sessionToken.get()) {
+                                try { nextIn.close() } catch (_: Exception) {}
+                                try { nextConn.disconnect() } catch (_: Exception) {}
+                                onConnectionSwapped(null, null)
+                                abortedByEpoch = true
+                                break
+                            }
+                            connection = nextConn
+                            inputStream = nextIn
+                            carryLen = 0
+                            onConnectionSwapped(nextConn, nextIn)
+                            Logger.upnp.i(TAG, "HTTP Range 断点续传成功 (session=$thisSession, attempt=$reconnectAttempts, offset=$nextByteOffset)")
+                            reconnected = true
+                            break
+                        } else {
+                            try { nextConn.disconnect() } catch (_: Exception) {}
+                            onConnectionSwapped(null, null)
+                            if (code == 416) {
+                                // 💡 HTTP 416 (Range Not Satisfiable) 表示对端实际音频流已到达真实 EOF（常见于动态转码 WAV 头部估算 dataSize 略大于实际解码长度）
+                                Logger.upnp.i(TAG, "HTTP Range 续传返回 416，判定对端音频流已到达真实 EOF (session=$thisSession, streamed=${seekBaseBytes + totalBytesStreamed}/$wavDataSizeBytes)")
+                                reachedTrueEof = true
+                                break
+                            }
+                            if ((code == 404 || code == 410) && onStreamRevokedMidPlayback != null) {
+                                Logger.upnp.i(TAG, "对端已回收当前临时流 URI (status=$code, session=$thisSession)，保持会话等待新推流")
+                                onStreamRevokedMidPlayback.invoke()
+                                abortedByEpoch = true
+                                break
+                            }
+                            if (code == 404 || code == 410 || code == HttpURLConnection.HTTP_OK) {
+                                Logger.upnp.w(TAG, "HTTP Range 断点续传不可恢复 (status=$code, session=$thisSession)，立即停止重试")
+                                throw IllegalStateException("HTTP 请求失败: 状态码 $code")
+                            }
+                            lastError = IllegalStateException("HTTP 请求失败: 状态码 $code")
+                        }
+                    } catch (e: CancellationException) {
+                        try { nextConn?.disconnect() } catch (_: Exception) {}
+                        throw e
+                    } catch (e: IllegalStateException) {
+                        throw e
+                    } catch (e: java.io.IOException) {
+                        try { nextConn?.disconnect() } catch (_: Exception) {}
+                        onConnectionSwapped(null, null)
+                        lastError = e
+                    }
+                }
+                if (abortedByEpoch || reachedTrueEof) break
+                if (!reconnected) {
+                    throw lastError
+                }
+                continue
+            }
+
+            if (bytesRead > 0) {
+                val totalAvailable = carryLen + bytesRead
+                val alignedLen = (totalAvailable / bytesPerFrame) * bytesPerFrame
+                val newCarryLen = totalAvailable - alignedLen
+                var offset = 0
+                var remaining = alignedLen
+                while (remaining > 0 && kotlin.coroutines.coroutineContext[Job]?.isActive != false && isDemuxing && thisSession == sessionToken.get()) {
+                    val avail = audioGateway.getBufferAvailable()
+                    val targetMin = minOf(remaining, minWriteChunk)
+                    if (avail < targetMin) {
+                        if (audioGateway.isExplicitlyPaused()) {
+                            delay(50)
+                            continue
+                        }
+                        val needed = (targetMin - avail).coerceAtLeast(bytesPerFrame)
+                        val waitMs = if (bytesPerSecond > 0L) {
+                            ((needed.toLong() * 1000L) / bytesPerSecond).coerceIn(10L, 50L)
+                        } else {
+                            10L
+                        }
+                        delay(waitMs)
+                        continue
+                    }
+                    val toWrite = (minOf(remaining, avail, maxChunkBytes) / bytesPerFrame) * bytesPerFrame
+                    val currentEp = currentEpochProvider()
+                    val written = audioGateway.writePcm(pcmBuffer, offset, toWrite, currentEp)
+                    if (written > 0) {
+                        totalBytesStreamed += written // 💡 仅在实际写入环形缓冲区后累加，杜绝预累加引发的 ~186ms 进度抖动
+                        reconnectAttempts = 0
+                        if (!firstPacketEmitted) {
+                            firstPacketEmitted = true
+                            onFirstDataPacket(currentEp, spec)
+                        }
+                        offset += written
+                        remaining -= written
+                    } else if (written < 0) {
+                        // 💡 修复 Finding 7: 区分世代抢占 (-2) 与真实管道故障 (-1, -3)
+                        if (written == -2) {
+                            Logger.upnp.i(TAG, "$logPrefix writePcm 收到世代过期 (-2)，安全中止本轮写入: epoch=$currentEp")
+                        } else {
+                            Logger.upnp.e(TAG, "$logPrefix writePcm 遭遇底层管道致命错误: ret=$written, epoch=$currentEp")
+                            val errorMsg = if (written == -1) "Audio pipeline closed" else "Audio latch timeout"
+                            onError(errorMsg)
+                        }
+                        abortedByEpoch = true
+                        break
+                    } else {
+                        delay(15L)
+                    }
+                }
+                if (newCarryLen > 0) {
+                    System.arraycopy(pcmBuffer, alignedLen, pcmBuffer, 0, newCarryLen)
+                }
+                carryLen = newCarryLen
+            }
+        }
+        return abortedByEpoch
     }
 
     private fun startProgressTicker(session: Long) {
@@ -957,5 +1161,7 @@ class StreamDemuxer(
 
     companion object {
         private const val TAG = "StreamDemuxer"
+        private const val MAX_RANGE_RECONNECT_ATTEMPTS = 3
+        private val RANGE_RECONNECT_BACKOFF_MS = longArrayOf(150L, 400L, 800L)
     }
 }

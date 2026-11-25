@@ -84,6 +84,7 @@ fun LyricsScreen(
     coverHash: Int = 0,
     hasDarkBackground: Boolean,
     isCoverExpanded: Boolean = true,
+    skipButtonsEnabled: Boolean = true,
     onPlayPauseClick: () -> Unit,
     onPreviousClick: () -> Unit,
     onNextClick: () -> Unit,
@@ -278,12 +279,13 @@ fun LyricsScreen(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(20.dp)
             ) {
-                // 上一曲按钮 (⏮)
+                // 上一曲按钮 (⏮) - UPnP 协议下禁用且不可获焦
                 TransportIconButton(
                     iconResId = R.drawable.ic_backward_end_fill,
                     contentDescription = "上一曲",
                     buttonSize = 48.dp,
                     iconSize = 24.dp,
+                    enabled = skipButtonsEnabled,
                     hasDarkBackground = hasDarkBackground,
                     onClick = onPreviousClick
                 )
@@ -299,12 +301,13 @@ fun LyricsScreen(
                     onClick = onPlayPauseClick
                 )
 
-                // 下一曲按钮 (⏭)
+                // 下一曲按钮 (⏭) - UPnP 协议下禁用且不可获焦
                 TransportIconButton(
                     iconResId = R.drawable.ic_forward_end_fill,
                     contentDescription = "下一曲",
                     buttonSize = 48.dp,
                     iconSize = 24.dp,
+                    enabled = skipButtonsEnabled,
                     hasDarkBackground = hasDarkBackground,
                     onClick = onNextClick
                 )

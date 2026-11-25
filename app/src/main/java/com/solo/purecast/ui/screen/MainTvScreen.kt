@@ -73,6 +73,7 @@ import com.solo.purecast.model.PlaybackStatus
 import com.solo.purecast.ui.background.FluidQuality
 import com.solo.purecast.model.PlayerSessionSnapshot
 import com.solo.purecast.model.SeekCapability
+import com.solo.purecast.model.StreamProtocol
 import com.solo.purecast.model.TrackMetadata
 import com.solo.purecast.service.PlaybackService
 import com.solo.purecast.ui.components.FluidBackground
@@ -445,6 +446,7 @@ fun MainTvScreen(
                         coverHash = persistentCoverHash,
                         hasDarkBackground = hasDarkBackground,
                         isCoverExpanded = uiState.isCoverExpanded,
+                        skipButtonsEnabled = !uiState.isIdle && uiState.audioPath.protocol != StreamProtocol.UPNP_DLNA,
                         onPlayPauseClick = onTogglePlayPause,
                         onPreviousClick = onPreviousTrack,
                         onNextClick = onNextTrack,
@@ -672,6 +674,7 @@ fun MainTvScreen(
                         PlaybackControls(
                             playbackStatus = playbackStatus,
                             hasDarkBackground = hasDarkBackground,
+                            skipButtonsEnabled = !uiState.isIdle && uiState.audioPath.protocol != StreamProtocol.UPNP_DLNA,
                             lyricState = lyricUiState,
                             isLyricsExpanded = isLyricsExpanded,
                             onLyricsClick = {

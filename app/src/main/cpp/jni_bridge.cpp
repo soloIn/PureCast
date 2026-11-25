@@ -516,6 +516,13 @@ Java_com_solo_purecast_core_nativebridge_NativeAudioEngine_isStreaming(
     return purecast::AudioEngine::instance().is_streaming() ? JNI_TRUE : JNI_FALSE;
 }
 
+JNIEXPORT jboolean JNICALL
+Java_com_solo_purecast_core_nativebridge_NativeAudioEngine_isExplicitlyPaused(
+    JNIEnv * /* env */,
+    jobject /* thiz */) {
+    return purecast::AudioEngine::instance().is_paused() ? JNI_TRUE : JNI_FALSE;
+}
+
 struct JniFormatCallbackData {
     JNIEnv* env;
     jobject callback_obj;

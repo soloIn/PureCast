@@ -23,7 +23,8 @@ object MetadataNormalizer {
 
     // 占位歌手识别集合
     private val PLACEHOLDER_ARTISTS = setOf(
-        "unknown", "unknown artist", "<unknown>", "未知", "未知歌手", "群星", "various artists", "va"
+        "unknown", "unknown artist", "<unknown>", "未知", "未知歌手", "群星", "various artists", "va",
+        "purecast", "purecast tv"
     )
 
     /**

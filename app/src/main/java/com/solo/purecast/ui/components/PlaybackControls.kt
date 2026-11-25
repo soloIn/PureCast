@@ -53,6 +53,7 @@ fun PlaybackControls(
     onSettingsClick: () -> Unit,
     modifier: Modifier = Modifier,
     hasDarkBackground: Boolean = true,
+    skipButtonsEnabled: Boolean = true,
     lyricState: LyricUiState = LyricUiState.Idle,
     isLyricsExpanded: Boolean = false,
     onLyricsClick: () -> Unit = {},
@@ -63,6 +64,7 @@ fun PlaybackControls(
     val isPlaying = playbackStatus == PlaybackStatus.PLAYING
     val isIdle = playbackStatus == PlaybackStatus.IDLE || playbackStatus == PlaybackStatus.STOPPED
     val transportButtonsEnabled = !isIdle
+    val canSkipTrack = transportButtonsEnabled && skipButtonsEnabled
     val lyricsButtonEnabled = !isIdle
 
     Row(
@@ -70,13 +72,13 @@ fun PlaybackControls(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(16.dp)
     ) {
-        // 1. 上一曲按钮 (⏮) - 待机状态下半透明禁用
+        // 1. 上一曲按钮 (⏮) - 待机或协议不支持切歌 (如 UPnP) 时半透明禁用且不可获焦
         TransportIconButton(
             iconResId = R.drawable.ic_backward_end_fill,
             contentDescription = "上一曲",
             buttonSize = 48.dp,
             iconSize = 24.dp,
-            enabled = transportButtonsEnabled,
+            enabled = canSkipTrack,
             hasDarkBackground = hasDarkBackground,
             onClick = onPreviousClick
         )
@@ -95,13 +97,13 @@ fun PlaybackControls(
             onClick = onPlayPauseClick
         )
 
-        // 3. 下一曲按钮 (⏭) - 待机状态下半透明禁用
+        // 3. 下一曲按钮 (⏭) - 待机或协议不支持切歌 (如 UPnP) 时半透明禁用且不可获焦
         TransportIconButton(
             iconResId = R.drawable.ic_forward_end_fill,
             contentDescription = "下一曲",
             buttonSize = 48.dp,
             iconSize = 24.dp,
-            enabled = transportButtonsEnabled,
+            enabled = canSkipTrack,
             hasDarkBackground = hasDarkBackground,
             onClick = onNextClick
         )
@@ -162,14 +164,33 @@ internal fun TransportIconButton(
         }
     }
 
+    // 💡 禁用态不挂载 TV Material3 可点击 Surface：彻底消除默认灰底方块/外框，并从焦点树完全移除确保方向键 100% 跳过
+    if (!enabled) {
+        val disabledIconColor = if (hasDarkBackground) {
+            Color.White.copy(alpha = 0.22f)
+        } else {
+            Color(0xFF1C1C1E).copy(alpha = 0.22f)
+        }
+        Box(
+            modifier = Modifier.size(buttonSize),
+            contentAlignment = Alignment.Center
+        ) {
+            Icon(
+                painter = painterResource(id = iconResId),
+                contentDescription = contentDescription,
+                tint = disabledIconColor,
+                modifier = Modifier.size(iconSize)
+            )
+        }
+        return
+    }
+
     val shape = if (isCircle) CircleShape else RoundedCornerShape(14.dp)
     val noBorder = Border(BorderStroke(0.dp, Color.Transparent))
 
     val focusedContainerColor = if (hasDarkBackground) Color(0x22FFFFFF) else Color(0x18000000)
     val pressedContainerColor = if (hasDarkBackground) Color(0x3DFFFFFF) else Color(0x26000000)
-    val iconColor = if (!enabled) {
-        if (hasDarkBackground) Color.White.copy(alpha = 0.22f) else Color(0xFF1C1C1E).copy(alpha = 0.22f)
-    } else if (hasDarkBackground) {
+    val iconColor = if (hasDarkBackground) {
         if (isFocused) Color.White else Color.White.copy(alpha = 0.55f)
     } else {
         if (isFocused) Color(0xFF1C1C1E) else Color(0xFF1C1C1E).copy(alpha = 0.55f)
@@ -177,25 +198,28 @@ internal fun TransportIconButton(
 
     Surface(
         onClick = onClick,
-        enabled = enabled,
+        enabled = true,
         modifier = Modifier
             .size(buttonSize)
-            .then(if (enabled && focusRequester != null) Modifier.focusRequester(focusRequester) else Modifier)
-            .onFocusChanged { isFocused = enabled && it.isFocused },
+            .then(if (focusRequester != null) Modifier.focusRequester(focusRequester) else Modifier)
+            .onFocusChanged { isFocused = it.isFocused },
         shape = ClickableSurfaceDefaults.shape(shape),
         scale = ClickableSurfaceDefaults.scale(
             scale = 1.0f,
-            focusedScale = if (enabled) 1.12f else 1.0f,
-            pressedScale = if (enabled) 1.05f else 1.0f
+            focusedScale = 1.12f,
+            pressedScale = 1.05f
         ),
         colors = ClickableSurfaceDefaults.colors(
             containerColor = Color.Transparent,
             focusedContainerColor = focusedContainerColor,
-            pressedContainerColor = pressedContainerColor
+            pressedContainerColor = pressedContainerColor,
+            disabledContainerColor = Color.Transparent
         ),
         border = ClickableSurfaceDefaults.border(
             border = noBorder,
-            focusedBorder = noBorder
+            focusedBorder = noBorder,
+            disabledBorder = noBorder,
+            focusedDisabledBorder = noBorder
         ),
         glow = ClickableSurfaceDefaults.glow(
             glow = Glow.None,
