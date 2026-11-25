@@ -108,7 +108,7 @@ class StreamDemuxer(
     private val onMetadataParsed: ((title: String?, artist: String?, album: String?) -> Unit)? = null,
     private val onPositionUpdated: ((positionMs: Long) -> Unit)? = null,
     private val onSeekFlush: (() -> Long)? = null,
-    private val onStreamRevokedMidPlayback: (() -> Unit)? = null
+    private val onStreamRevokedMidPlayback: (() -> Boolean)? = null
 ) {
 
     private var streamingJob: Job? = null
@@ -413,6 +413,11 @@ class StreamDemuxer(
 
                 connection.connect()
                 val responseCode = connection.responseCode
+                if ((responseCode == 404 || responseCode == 410) && onStreamRevokedMidPlayback?.invoke() == true) {
+                    Logger.upnp.i(TAG, "对端已回收当前临时流 URI (initial GET status=$responseCode, session=$thisSession)，保持会话等待新推流")
+                    abortedByEpoch = true
+                    return@launch
+                }
                 if (responseCode !in 200..299) {
                     throw IllegalStateException("HTTP 请求失败: 状态码 $responseCode")
                 }
@@ -813,9 +818,8 @@ class StreamDemuxer(
                                 reachedTrueEof = true
                                 break
                             }
-                            if ((code == 404 || code == 410) && onStreamRevokedMidPlayback != null) {
+                            if ((code == 404 || code == 410) && onStreamRevokedMidPlayback?.invoke() == true) {
                                 Logger.upnp.i(TAG, "对端已回收当前临时流 URI (status=$code, session=$thisSession)，保持会话等待新推流")
-                                onStreamRevokedMidPlayback.invoke()
                                 abortedByEpoch = true
                                 break
                             }

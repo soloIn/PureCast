@@ -343,23 +343,54 @@ class UsbDeviceManagerTest {
             hardwareBridge = usbManager
         )
 
-        // 1. 插入但无权限 -> TransitionEffect 触发 requestUsbPermission -> PERMISSION_PENDING，禁止 openDevice
+        // 1. 纯后台冷启动（permissionActivity == null）扫描到未授权设备：严禁主动弹窗，保持 ATTACHED 且禁止 openDevice
         assertFalse(usbManager.scanAndAttachDevice())
         testScheduler.runCurrent()
         flushExecutor(hwExecutor)
         testScheduler.runCurrent()
-        assertEquals(HardwarePipelineState.PERMISSION_PENDING, coordinator.snapshot.value.hardwareState)
+        assertEquals(HardwarePipelineState.ATTACHED, coordinator.snapshot.value.hardwareState)
         assertTrue(nativeBridge.openCalls.isEmpty())
-        assertTrue(systemBridge.requestedPermissions.isNotEmpty())
+        assertTrue(
+            "纯后台无前台 Activity 时不得调用 systemBridge.requestPermission 叠加开机弹窗",
+            systemBridge.requestedPermissions.isEmpty()
+        )
 
-        // 2. 用户点拒绝 -> USB_PERMISSION_DENIED 错误注入，状态停留在 PERMISSION_PENDING
+        // 2. 前台 Activity 绑定后触发扫描授权 -> 进入 PERMISSION_PENDING 并弹出一次授权框
+        val fakeActivity = Activity()
+        usbManager.scanAndRequestPermissionAsync(fakeActivity)
+        flushExecutor(hwExecutor)
+        testScheduler.runCurrent()
+        assertEquals(HardwarePipelineState.PERMISSION_PENDING, coordinator.snapshot.value.hardwareState)
+        assertEquals(1, systemBridge.requestedPermissions.size)
+
+        // 3. 用户点拒绝 -> USB_PERMISSION_DENIED 错误注入，状态停留在 PERMISSION_PENDING
         usbManager.onPermissionResult(dac, granted = false)
         testScheduler.runCurrent()
         assertEquals(HardwarePipelineState.PERMISSION_PENDING, coordinator.snapshot.value.hardwareState)
         assertTrue(coordinator.snapshot.value.errors.containsKey(ErrorCode.USB_PERMISSION_DENIED))
         assertTrue(nativeBridge.openCalls.isEmpty())
 
-        // 3. 再次弹框后用户授权 -> 统一停留在 RELEASED 且清除错误，仍不空转 openDevice
+        // 4. 拒绝后返回 MainActivity.onResume() 再次自动检查：同一连接周期内不得无限重弹
+        usbManager.scanAndRequestPermissionAsync(fakeActivity, forceRetry = false)
+        flushExecutor(hwExecutor)
+        testScheduler.runCurrent()
+        assertEquals(
+            "用户拒绝后同一次物理连接内 onResume 自动检查不得重复弹窗",
+            1,
+            systemBridge.requestedPermissions.size
+        )
+
+        // 5. 设置页手动点击“独占接管”(forceRetry = true) 允许重新弹窗
+        usbManager.scanAndRequestPermissionAsync(fakeActivity, forceRetry = true)
+        flushExecutor(hwExecutor)
+        testScheduler.runCurrent()
+        assertEquals(
+            "显式 forceRetry=true 应允许重新发起 USB 授权弹窗",
+            2,
+            systemBridge.requestedPermissions.size
+        )
+
+        // 6. 用户授权通过 -> 统一停留在 RELEASED 且清除错误，仍不空转 openDevice
         systemBridge.permissionGranted = true
         usbManager.onPermissionResult(dac, granted = true)
         testScheduler.runCurrent()

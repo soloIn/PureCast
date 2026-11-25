@@ -490,14 +490,15 @@ class UpnpRendererServer(
                 genaNotifier.notifyTransportState("STOPPED")
             },
             onStreamRevokedMidPlayback = {
-                // 💡 遵循 UPnP 语义：未收到显式 SOAP Stop 前不因对端回收临时 URI (404/410) 而拆会话或误报异常，
-                // 仅静音切入过渡态，保留当前会话与最后元数据等待控制端推送下一曲
-                val switchEpoch = fastPath.emergencyMuteAndFlush(FlushReason.FLUSH_SWITCH)
-                synchronized(sessionStateLock) {
+                // 💡 遵循 UPnP 语义：仅在已有活跃 UPnP 会话且未收到显式 SOAP Stop 时，不因对端回收临时 URI (404/410)
+                // （包括无缝衔接过期 SetNextAVTransportURI 时的首包 404）而拆会话或误报异常，
+                // 仅静音切入过渡态，保留当前会话与最后元数据等待控制端推送下一曲；冷启动无活跃会话时返回 false 走正常报错。
+                val handled = synchronized(sessionStateLock) {
                     val snap = snapshotProvider()
-                    if (activeUpnpSessionId != 0L && sessionSetupDispatched &&
+                    val isActiveSession = activeUpnpSessionId != 0L && sessionSetupDispatched &&
                         (snap.sessionId == activeUpnpSessionId || snap.activeProtocol == StreamProtocol.UPNP_DLNA)
-                    ) {
+                    if (isActiveSession) {
+                        val switchEpoch = fastPath.emergencyMuteAndFlush(FlushReason.FLUSH_SWITCH)
                         emitEventLocked(
                             TrackSwitchEvent(
                                 flushReason = FlushReason.FLUSH_SWITCH,
@@ -506,7 +507,9 @@ class UpnpRendererServer(
                             )
                         )
                     }
+                    isActiveSession
                 }
+                handled
             },
             onMetadataParsed = { title, artist, album ->
                 Logger.upnp.i(TAG, "从音频流容器提取到内嵌元数据: title=$title, artist=$artist, album=$album")

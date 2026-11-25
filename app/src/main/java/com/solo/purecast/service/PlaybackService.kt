@@ -765,7 +765,7 @@ class PlaybackService : LifecycleService() {
 
             if (!attached && !snap.audioPath.isDacConnected) {
                 withContext(Dispatchers.Main) {
-                    usbDeviceManager.scanAndRequestPermissionAsync(activity)
+                    usbDeviceManager.scanAndRequestPermissionAsync(activity, forceRetry = true)
                     onResult(false, "未连接可用 USB DAC 设备")
                 }
                 return@launch
@@ -773,7 +773,7 @@ class PlaybackService : LifecycleService() {
 
             if (!hasPerm) {
                 withContext(Dispatchers.Main) {
-                    usbDeviceManager.scanAndRequestPermissionAsync(activity)
+                    usbDeviceManager.scanAndRequestPermissionAsync(activity, forceRetry = true)
                     onResult(false, "正在请求 USB 权限，请在电视弹窗中确认")
                 }
                 return@launch

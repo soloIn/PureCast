@@ -264,6 +264,10 @@ class UsbDeviceManager internal constructor(
     private val deviceGeneration = AtomicLong(0L)
     private val hardwareSequence = AtomicLong(0L)
 
+    // 💡 记录当前物理连接代数（deviceGeneration）内用户是否已明确拒绝系统 USB 授权弹窗，
+    // 防止 MainActivity.onResume() / onNewIntent() 返回前台后在同一连接周期内无限循环弹窗
+    private val deniedDeviceGeneration = AtomicLong(-1L)
+
     @Volatile
     private var permissionActivityRef: WeakReference<Activity>? = null
 
@@ -321,13 +325,15 @@ class UsbDeviceManager internal constructor(
     }
 
     /**
-     * 💡 在 HardwareExecutor 线程一次扫描并在未授权时发起系统授权弹窗，消除 UI 主线程阻塞与重复遍历
+     * 💡 在 HardwareExecutor 线程一次扫描并在未授权时发起系统授权弹窗，消除 UI 主线程阻塞与重复遍历。
+     * [forceRetry] 为 false 时（如 MainActivity.onResume 自动检查），若当前物理连接周期内用户已拒绝过授权则跳过重弹；
+     * [forceRetry] 为 true 时（如设置页手动点击“独占接管”），重置拒绝标记并强制发起授权请求。
      */
-    fun scanAndRequestPermissionAsync(activity: Activity) {
+    fun scanAndRequestPermissionAsync(activity: Activity, forceRetry: Boolean = false) {
         bindPermissionActivity(activity)
         executeOnHardwareAsync {
             if (!scanAndAttachDeviceInternal() && activeDevice != null) {
-                requestPermissionInternal(activity, null)
+                requestPermissionInternal(activity, null, forceRetry = forceRetry)
             }
         }
     }
@@ -378,6 +384,7 @@ class UsbDeviceManager internal constructor(
         if (!isSameActive) {
             deviceGeneration.incrementAndGet()
             isPermissionRequesting.set(false)
+            deniedDeviceGeneration.set(-1L)
             Logger.usb.i(
                 TAG,
                 "检测到 USB DAC 插入: ${descriptor.productName}, gen=${deviceGeneration.get()}, hasPermission=$hasPerm"
@@ -389,6 +396,7 @@ class UsbDeviceManager internal constructor(
                 )
             )
         } else if (hasPerm && isPermissionRequesting.getAndSet(false)) {
+            deniedDeviceGeneration.set(-1L)
             emitHardwareEventLocked(
                 UsbPermissionGrantedEvent(
                     deviceName = descriptor.productName,
@@ -436,6 +444,7 @@ class UsbDeviceManager internal constructor(
         releaseUsbExclusiveInternal()
         activeDevice = null
         isPermissionRequesting.set(false)
+        deniedDeviceGeneration.set(-1L)
 
         deviceGeneration.incrementAndGet()
         emitHardwareEventLocked(
@@ -455,6 +464,11 @@ class UsbDeviceManager internal constructor(
 
     private fun handlePermissionResultInternal(descriptor: UsbDeviceDescriptor?, granted: Boolean) {
         isPermissionRequesting.set(false)
+        if (granted) {
+            deniedDeviceGeneration.set(-1L)
+        } else {
+            deniedDeviceGeneration.set(deviceGeneration.get())
+        }
         val resolved = descriptor ?: activeDevice ?: systemBridge.scanAudioDevice()
         if (resolved == null) {
             Logger.usb.w(TAG, "收到 USB 权限回调但当前无关联设备: granted=$granted")
@@ -471,22 +485,36 @@ class UsbDeviceManager internal constructor(
     }
 
     /**
-     * 💡 由前台 Activity 或 Coordinator TransitionEffect 触发原生 USB 授权请求
+     * 💡 由前台 Activity 或设置页显式触发原生 USB 授权请求
      */
     fun requestPermissionWithActivity(activity: Activity) {
         bindPermissionActivity(activity)
         executeOnHardwareAsync {
-            requestPermissionInternal(activity, null)
+            requestPermissionInternal(activity, null, forceRetry = true)
         }
     }
 
     override fun requestUsbPermission(deviceName: String) {
         executeOnHardwareAsync {
-            requestPermissionInternal(permissionActivityRef?.get(), deviceName)
+            val activity = permissionActivityRef?.get()
+            if (activity == null) {
+                // 💡 纯后台冷启动（无前台宿主 Activity）严禁主动调 usbManager.requestPermission()，
+                // 避免 system_server 绕过 BAL 在开机 UsbConfirmActivity 上方叠出第二个弹窗导致默认偏好被反向抹除
+                Logger.usb.i(
+                    TAG,
+                    "当前无前台宿主 Activity（纯后台），跳过自动发起 USB 权限弹窗 ($deviceName)，等待前台界面或推流阶段再请求"
+                )
+                return@executeOnHardwareAsync
+            }
+            requestPermissionInternal(activity, deviceName, forceRetry = false)
         }
     }
 
-    private fun requestPermissionInternal(activity: Activity?, targetDeviceName: String?) {
+    private fun requestPermissionInternal(
+        activity: Activity?,
+        targetDeviceName: String?,
+        forceRetry: Boolean = false
+    ) {
         val device = activeDevice ?: systemBridge.scanAudioDevice()?.also { activeDevice = it }
         if (device == null) {
             Logger.usb.w(TAG, "requestUsbPermission 失败: 无可用 USB 设备 ($targetDeviceName)")
@@ -501,8 +529,19 @@ class UsbDeviceManager internal constructor(
         if (systemBridge.hasPermission(device)) {
             Logger.usb.i(TAG, "设备已拥有访问授权 (${device.productName})，同步回执入 RELEASED")
             isPermissionRequesting.set(false)
+            deniedDeviceGeneration.set(-1L)
             emitHardwareEventLocked(
                 UsbPermissionGrantedEvent(deviceName = device.productName, granted = true)
+            )
+            return
+        }
+
+        if (forceRetry) {
+            deniedDeviceGeneration.set(-1L)
+        } else if (deniedDeviceGeneration.get() == deviceGeneration.get()) {
+            Logger.usb.d(
+                TAG,
+                "当前物理连接周期 (gen=${deviceGeneration.get()}) 用户已拒绝 USB 授权，跳过自动重复弹窗 (${device.productName})"
             )
             return
         }
@@ -564,7 +603,7 @@ class UsbDeviceManager internal constructor(
 
         if (!systemBridge.hasPermission(device)) {
             Logger.usb.w(TAG, "openDeviceWithCurrentFd 失败: 缺少 USB 权限 (${device.productName})")
-            requestPermissionInternal(permissionActivityRef?.get(), device.productName)
+            requestPermissionInternal(permissionActivityRef?.get(), device.productName, forceRetry = true)
             return Result.failure(SecurityException("缺少 USB 设备权限"))
         }
 

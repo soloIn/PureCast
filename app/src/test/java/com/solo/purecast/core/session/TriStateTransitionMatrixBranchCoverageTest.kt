@@ -659,4 +659,139 @@ class TriStateTransitionMatrixBranchCoverageTest {
         )
         assertEquals(BusinessSessionState.PLAYING, outUpnpResume.nextContext.snapshot.businessState)
     }
+
+    @Test
+    fun networkStreamErrorDismissAndPositiveAnchorDelayBranches() {
+        val tm = TrackTransactionManager()
+        val netErr = PlaybackError(
+            code = ErrorCode.NETWORK_STREAM_ERROR,
+            message = "network glitch",
+            recoverable = true,
+            timestampMs = 500L
+        )
+
+        // 1. ErrorReportedEvent: NETWORK_STREAM_ERROR 分别覆盖 timestampMs > 0L 与 timestampMs == 0L 回退 nowMs
+        val baseCtx = TransitionContext(snapshot = PlayerSessionSnapshot(sessionId = 1L))
+        val errWithTs = TriStateTransitionMatrix.reduce(
+            ctx = baseCtx,
+            envelope = envelope(ErrorReportedEvent(netErr), origin = EventOrigin.SERVICE),
+            trackManager = tm,
+            nowMs = 2000L
+        )
+        assertTrue(
+            errWithTs.effects.contains(
+                TransitionEffect.ScheduleTransientErrorDismiss(ErrorCode.NETWORK_STREAM_ERROR, 500L)
+            )
+        )
+
+        val errWithoutTs = TriStateTransitionMatrix.reduce(
+            ctx = baseCtx,
+            envelope = envelope(ErrorReportedEvent(netErr.copy(timestampMs = 0L)), origin = EventOrigin.SERVICE),
+            trackManager = tm,
+            nowMs = 2000L
+        )
+        assertTrue(
+            errWithoutTs.effects.contains(
+                TransitionEffect.ScheduleTransientErrorDismiss(ErrorCode.NETWORK_STREAM_ERROR, 2000L)
+            )
+        )
+
+        val nonNetworkErr = TriStateTransitionMatrix.reduce(
+            ctx = baseCtx,
+            envelope = envelope(
+                ErrorReportedEvent(
+                    PlaybackError(
+                        code = ErrorCode.USB_OPEN_FAILED,
+                        message = "usb open failed",
+                        recoverable = true,
+                        timestampMs = 2000L
+                    )
+                ),
+                origin = EventOrigin.SERVICE
+            ),
+            trackManager = tm,
+            nowMs = 2000L
+        )
+        assertTrue(nonNetworkErr.effects.isEmpty())
+
+        // 2. FirstDataPacketEvent 清除已有 NETWORK_STREAM_ERROR 并取消其延时消失定时器
+        val firstPacketCtx = TransitionContext(
+            snapshot = PlayerSessionSnapshot(
+                sessionId = 1L,
+                activeProtocol = StreamProtocol.UPNP_DLNA,
+                businessState = BusinessSessionState.TRANSITIONING,
+                hardwareState = HardwarePipelineState.EXCLUSIVE_MUTED,
+                errors = mapOf(ErrorCode.NETWORK_STREAM_ERROR to netErr)
+            )
+        )
+        val outFirst = TriStateTransitionMatrix.reduce(
+            ctx = firstPacketCtx,
+            envelope = envelope(
+                FirstDataPacketEvent(StreamProtocol.UPNP_DLNA, 2L, 44100, 16, 2, "FLAC"),
+                origin = EventOrigin.UPNP
+            ),
+            trackManager = tm,
+            nowMs = 2100L
+        )
+        assertFalse(outFirst.nextContext.snapshot.errors.containsKey(ErrorCode.NETWORK_STREAM_ERROR))
+        assertTrue(outFirst.effects.contains(TransitionEffect.CancelTransientErrorDismiss(ErrorCode.NETWORK_STREAM_ERROR)))
+
+        // 3. TrackSwitchEvent 在 PAUSED 与 PLAYING 态均清除 NETWORK_STREAM_ERROR 并取消其定时器
+        val pausedSwitchCtx = TransitionContext(
+            snapshot = PlayerSessionSnapshot(
+                sessionId = 1L,
+                businessState = BusinessSessionState.PAUSED,
+                hardwareState = HardwarePipelineState.EXCLUSIVE_MUTED,
+                errors = mapOf(ErrorCode.NETWORK_STREAM_ERROR to netErr)
+            )
+        )
+        val outPausedSwitch = TriStateTransitionMatrix.reduce(
+            ctx = pausedSwitchCtx,
+            envelope = envelope(TrackSwitchEvent(newEpoch = 3L)),
+            trackManager = tm,
+            nowMs = 2200L
+        )
+        assertFalse(outPausedSwitch.nextContext.snapshot.errors.containsKey(ErrorCode.NETWORK_STREAM_ERROR))
+        assertTrue(outPausedSwitch.effects.contains(TransitionEffect.CancelTransientErrorDismiss(ErrorCode.NETWORK_STREAM_ERROR)))
+
+        val playingSwitchCtx = pausedSwitchCtx.copy(
+            snapshot = pausedSwitchCtx.snapshot.copy(businessState = BusinessSessionState.PLAYING)
+        )
+        val outPlayingSwitch = TriStateTransitionMatrix.reduce(
+            ctx = playingSwitchCtx,
+            envelope = envelope(TrackSwitchEvent(newEpoch = 4L)),
+            trackManager = tm,
+            nowMs = 2300L
+        )
+        assertFalse(outPlayingSwitch.nextContext.snapshot.errors.containsKey(ErrorCode.NETWORK_STREAM_ERROR))
+        assertTrue(outPlayingSwitch.effects.contains(TransitionEffect.CancelTransientErrorDismiss(ErrorCode.NETWORK_STREAM_ERROR)))
+
+        // 4. ProgressUpdateEvent: 非 USER_ACTION 但携带 anchorDelayMs > 0L 时放行 0ms 进度更新
+        val earlyPlayingCtx = TransitionContext(
+            snapshot = PlayerSessionSnapshot(
+                sessionId = 1L,
+                trackGeneration = 2L,
+                businessState = BusinessSessionState.PLAYING,
+                progressPositionMs = 1500L,
+                progressDurationMs = 200_000L,
+                progressRevision = 3L
+            )
+        )
+        val outAnchorDelay = TriStateTransitionMatrix.reduce(
+            ctx = earlyPlayingCtx,
+            envelope = envelope(
+                ProgressUpdateEvent(
+                    positionMs = 0L,
+                    durationMs = 200_000L,
+                    trackGeneration = 2L,
+                    anchorDelayMs = 500L
+                ),
+                origin = EventOrigin.AIRPLAY
+            ),
+            trackManager = tm,
+            nowMs = 2400L
+        )
+        assertEquals(0L, outAnchorDelay.nextContext.snapshot.progressPositionMs)
+        assertEquals(500L, outAnchorDelay.nextContext.snapshot.progressAnchorDelayMs)
+    }
 }
